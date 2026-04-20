@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.1.1 — 2026-04-20
+
+- `Engine#handle_accepted` and `Engine#handle_connected` now return the
+  `ConnectionLifecycle` they just built (previously `nil`). This lets
+  frame-oriented out-of-tree transports such as
+  [`zzq-websocket`](https://github.com/paddor/zzq-websocket) attach
+  cancel-supervisors to the per-connection barrier so teardown
+  propagates into request/response fiber trees cleanly. Additive and
+  backwards-compatible — the existing `Engine#bind` call-site still
+  discards the return value.
+
 ## v0.1.0 — 2026-04-20
 
 - First release. Async-native MQTT 3.1.1 + 5.0 client and broker in

@@ -111,11 +111,14 @@ module ZZQ
 
 
     # Called by transports for each accepted connection. Hands off to
-    # routing so the broker can read CONNECT / write CONNACK.
+    # routing so the broker can read CONNECT / write CONNACK. Returns
+    # the +ConnectionLifecycle+ so frame-oriented transports (e.g.
+    # WebSocket) can attach cancel-supervisors to its barrier.
     def handle_accepted(io, endpoint:)
       lifecycle = ConnectionLifecycle.new(self, endpoint: endpoint)
       mqtt = lifecycle.begin_handshake!(io)
       @routing.handle_accepted(mqtt, lifecycle) if @routing.respond_to?(:handle_accepted)
+      lifecycle
     rescue => e
       lifecycle.handshake_failed!(error: e)
       raise unless e.is_a?(ConnectionRejected) || CONNECTION_LOST.any? { |c| e.is_a?(c) }
@@ -123,11 +126,14 @@ module ZZQ
 
 
     # Called by transports for each dialed connection. Hands off to
-    # routing so the client can write CONNECT / read CONNACK.
+    # routing so the client can write CONNECT / read CONNACK. Returns
+    # the +ConnectionLifecycle+ so frame-oriented transports (e.g.
+    # WebSocket) can attach cancel-supervisors to its barrier.
     def handle_connected(io, endpoint:)
       lifecycle = ConnectionLifecycle.new(self, endpoint: endpoint)
       mqtt = lifecycle.begin_handshake!(io)
       @routing.handle_connected(mqtt, lifecycle) if @routing.respond_to?(:handle_connected)
+      lifecycle
     rescue => e
       lifecycle.handshake_failed!(error: e)
       raise unless e.is_a?(ConnectionRejected) || CONNECTION_LOST.any? { |c| e.is_a?(c) }
