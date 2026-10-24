@@ -940,6 +940,62 @@ mod mqtt_sn {
         };
         assert_eq!(id, id1);
     }
+
+    /// Denies publishes to `plant/valve`.
+    struct NoValve;
+
+    impl zzq_broker::Authorizer for NoValve {
+        fn may_publish(&self, _client: &zzq_broker::ClientInfo<'_>, topic: &str) -> bool {
+            topic != "plant/valve"
+        }
+
+        fn may_subscribe(&self, _client: &zzq_broker::ClientInfo<'_>, _filter: &str) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn connectionless_publishes_are_authorized() {
+        let opts = BrokerOptions {
+            authorizer: Some(Arc::new(NoValve)),
+            sn_predefined: vec![
+                (5, "plant/valve".to_owned()),
+                (6, "$SYS/x".to_owned()),
+                (7, "plant/ok".to_owned()),
+            ],
+            ..BrokerOptions::default()
+        };
+        let (ctx, _broker, uri, addr) = bind_sn(opts).await;
+        let mut watch = client(&ctx, &uri, "watch", Version::V5).await;
+        watch.subscribe("plant/#", QoS::AtMostOnce).await.unwrap();
+        watch.subscribe("$SYS/x", QoS::AtMostOnce).await.unwrap();
+        let anon = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        anon.connect(&addr).await.unwrap();
+        for id in [5, 6, 7] {
+            let flags = Flags {
+                qos: SnQoS::NoConnection,
+                retain: true,
+                ..Flags::default()
+            };
+            send(
+                &anon,
+                &Packet::Publish {
+                    flags,
+                    topic: Topic::Predefined(id),
+                    msg_id: 0,
+                    data: b"open",
+                },
+            )
+            .await;
+        }
+        assert_eq!(next(&mut watch).await.topic, "plant/ok");
+        nothing(&mut watch).await;
+        let mut late = client(&ctx, &uri, "late", Version::V5).await;
+        late.subscribe("plant/valve", QoS::AtMostOnce)
+            .await
+            .unwrap();
+        nothing(&mut late).await;
+    }
 }
 
 #[cfg(feature = "quic")]

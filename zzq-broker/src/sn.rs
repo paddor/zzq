@@ -26,6 +26,7 @@ use zzq_tokio::transport::udp::MAX_DATAGRAM;
 use crate::broker::Shared;
 use crate::lane::Control;
 use crate::msg::Msg;
+use crate::options::{AuthDecision, ClientInfo, ConnectInfo};
 
 /// Datagrams queued per client before the gateway drops new ones.
 const CLIENT_QUEUE: usize = 1024;
@@ -98,7 +99,8 @@ fn predefined(shared: &Shared, id: u16) -> Option<&str> {
         .map(|(_, t)| t.as_str())
 }
 
-/// QoS -1: a publish from a client without a connection.
+/// QoS -1: a publish from a client without a connection. The hooks see a
+/// client with an empty ID and no credentials.
 fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, data: &[u8]) {
     let name = match topic {
         Topic::Predefined(id) => predefined(shared, id).map(str::to_owned),
@@ -108,6 +110,31 @@ fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, d
     let Some(name) = name.filter(|t| zzq_proto::topic::validate_name(t).is_ok()) else {
         return;
     };
+    let o = &shared.opts;
+    if name.starts_with("$SYS/") || crate::msg::too_deep(&name, o.max_topic_levels) {
+        return;
+    }
+    let info = ConnectInfo {
+        client_id: "",
+        username: None,
+        password: None,
+        version: Version::V311,
+        peer_cert: None,
+    };
+    if let Some(auth) = &o.authenticator
+        && auth.authenticate(&info) != AuthDecision::Allow
+    {
+        return;
+    }
+    let client = ClientInfo {
+        client_id: "",
+        username: None,
+    };
+    if let Some(acl) = &o.authorizer
+        && !acl.may_publish(&client, &name)
+    {
+        return;
+    }
     let msg = Msg::new(&name, data, &[], QoS::AtMostOnce, retain);
     let lane = shared.ctx.next_lane().index();
     let _ = shared.lanes[lane].control.send(Control::Publish(msg));

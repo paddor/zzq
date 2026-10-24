@@ -31,7 +31,8 @@ pub trait Authenticator: Send + Sync + 'static {
     fn authenticate(&self, info: &ConnectInfo<'_>) -> AuthDecision;
 }
 
-/// The client a publish or subscribe comes from.
+/// The client a publish or subscribe comes from. MQTT-SN QoS -1 publishes
+/// come from a client with an empty ID, and are authenticated as one.
 #[derive(Debug, Clone, Copy)]
 pub struct ClientInfo<'a> {
     pub client_id: &'a str,
