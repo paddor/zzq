@@ -56,6 +56,13 @@ pub(crate) async fn gateway(shared: Arc<Shared>, socket: UdpSocket) {
         };
         match packet {
             sn::Packet::Connect { .. } => {
+                // A live client handles its CONNECT: a resend, the end of
+                // its sleep, or a new start.
+                let live = clients.borrow().get(&addr).map(|(_, tx)| tx.clone());
+                if let Some(tx) = live.filter(|tx| !tx.is_closed()) {
+                    let _ = tx.try_send(datagram.to_vec());
+                    continue;
+                }
                 let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
                 next_id += 1;
                 clients.borrow_mut().insert(addr, (next_id, tx));
@@ -164,6 +171,13 @@ struct Client {
     buffered: VecDeque<Vec<u8>>,
     /// Datagrams waiting for an ack, by message type and ID.
     unacked: FxHashMap<(u8, u16), Retry>,
+    /// Client ID from CONNECT.
+    id: String,
+    /// Nothing but CONNECT came since the connection started, so another
+    /// CONNECT is a resend.
+    fresh: bool,
+    /// Return code of the CONNACK sent, to answer a resent CONNECT.
+    connack: Option<u8>,
     /// MQTT packets the gateway itself sends to the broker.
     to_broker: Vec<u8>,
     /// Packet IDs of QoS 2 messages dropped for lack of a topic ID, waiting
@@ -177,6 +191,9 @@ impl Client {
             shared: shared.clone(),
             socket,
             addr,
+            id: String::new(),
+            fresh: true,
+            connack: None,
             to_broker: Vec::new(),
             dropped: FxHashSet::default(),
             topics: FxHashMap::default(),
@@ -197,11 +214,17 @@ impl Client {
         mut self,
         id: u64,
         mut rx: mpsc::Receiver<Vec<u8>>,
-        connect: Vec<u8>,
+        mut connect: Vec<u8>,
         clients: Clients,
     ) {
-        if let Some(mut pipe) = self.connect(&mut rx, &connect).await {
-            self.serve(&mut rx, &mut pipe).await;
+        while let Some(mut pipe) = self.connect(&mut rx, &connect).await {
+            let Some(again) = self.serve(&mut rx, &mut pipe).await else {
+                break;
+            };
+            // A new CONNECT starts over, like a new client. The old MQTT
+            // connection closes as lost.
+            connect = again;
+            self = Client::new(&self.shared, self.socket.clone(), self.addr);
         }
         let mut map = clients.borrow_mut();
         if map.get(&self.addr).is_some_and(|(i, _)| *i == id) {
@@ -230,6 +253,7 @@ impl Client {
         else {
             return None;
         };
+        client_id.clone_into(&mut self.id);
         let will = if flags.will {
             Some(self.will_exchange(rx).await?)
         } else {
@@ -267,11 +291,7 @@ impl Client {
         &self,
         rx: &mut mpsc::Receiver<Vec<u8>>,
     ) -> Option<(Flags, String, Vec<u8>)> {
-        self.send(&sn::Packet::WillTopicReq).await;
-        let topic = tokio::time::timeout(WILL_TIMEOUT, rx.recv())
-            .await
-            .ok()
-            .flatten()?;
+        let topic = self.ask(rx, &sn::Packet::WillTopicReq).await?;
         let Ok((
             sn::Packet::WillTopic {
                 flags: Some(flags),
@@ -283,26 +303,55 @@ impl Client {
             return None;
         };
         let topic = topic.to_owned();
-        self.send(&sn::Packet::WillMsgReq).await;
-        let msg = tokio::time::timeout(WILL_TIMEOUT, rx.recv())
-            .await
-            .ok()
-            .flatten()?;
+        let msg = self.ask(rx, &sn::Packet::WillMsgReq).await?;
         let Ok((sn::Packet::WillMsg { message }, _)) = sn::decode(&msg) else {
             return None;
         };
         Some((flags, topic, message.to_vec()))
     }
 
-    async fn serve(&mut self, rx: &mut mpsc::Receiver<Vec<u8>>, pipe: &mut DuplexStream) {
+    /// Sends `request` and waits for the answer. A resent CONNECT means the
+    /// request got lost: it goes out again.
+    async fn ask(
+        &self,
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        request: &sn::Packet<'_>,
+    ) -> Option<Vec<u8>> {
+        let deadline = tokio::time::Instant::now() + WILL_TIMEOUT;
+        loop {
+            self.send(request).await;
+            let answer = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .ok()
+                .flatten()?;
+            if !matches!(sn::decode(&answer), Ok((sn::Packet::Connect { .. }, _))) {
+                return Some(answer);
+            }
+        }
+    }
+
+    /// Serves the client until it leaves. Returns a CONNECT that starts the
+    /// client over.
+    async fn serve(
+        &mut self,
+        rx: &mut mpsc::Receiver<Vec<u8>>,
+        pipe: &mut DuplexStream,
+    ) -> Option<Vec<u8>> {
         let mut buf = BytesMut::with_capacity(64 << 10);
         let mut out = Vec::new();
         let mut tick = tokio::time::interval(TICK.min(self.shared.opts.sn_retry));
         loop {
             tokio::select! {
                 datagram = rx.recv() => {
-                    let Some(datagram) = datagram else { return };
+                    let datagram = datagram?;
                     let Ok((packet, _)) = sn::decode(&datagram) else { continue };
+                    if let sn::Packet::Connect { flags, client_id, .. } = packet {
+                        if !self.reconnects(flags, client_id).await {
+                            continue;
+                        }
+                        return Some(datagram);
+                    }
+                    self.fresh = false;
                     self.acked(&packet);
                     if self.asleep.is_some() && !self.stays_asleep(&packet).await {
                         self.wake().await;
@@ -316,12 +365,12 @@ impl Client {
                         Inbound::Disconnect => {
                             let _ = pipe.write_all(&out).await;
                             self.send(&sn::Packet::Disconnect { duration: None }).await;
-                            return;
+                            return None;
                         }
                     }
                     if !out.is_empty() {
                         if pipe.write_all(&out).await.is_err() {
-                            return;
+                            return None;
                         }
                         out.clear();
                     }
@@ -329,15 +378,15 @@ impl Client {
                 n = pipe.read_buf(&mut buf) => {
                     if !matches!(n, Ok(n) if n > 0) {
                         self.send(&sn::Packet::Disconnect { duration: None }).await;
-                        return;
+                        return None;
                     }
                     if !self.relay(&mut buf, pipe).await {
-                        return;
+                        return None;
                     }
                 }
                 _ = tick.tick() => {
                     if !self.on_tick(pipe).await {
-                        return;
+                        return None;
                     }
                 }
             }
@@ -364,6 +413,24 @@ impl Client {
         }
         let packets = std::mem::take(&mut self.to_broker);
         pipe.write_all(&packets).await.is_ok()
+    }
+
+    /// Handles a CONNECT on a live connection. A sleeping client wakes up,
+    /// and a resend gets the CONNACK again. Returns true for a new start.
+    async fn reconnects(&mut self, flags: Flags, client_id: &str) -> bool {
+        if self.asleep.is_some() && !flags.clean_session {
+            self.send(&sn::Packet::ConnAck { code: sn::ACCEPTED }).await;
+            self.wake().await;
+            return false;
+        }
+        if !self.fresh || client_id != self.id {
+            return true;
+        }
+        // The broker's CONNACK may still be on its way.
+        if let Some(code) = self.connack {
+            self.send(&sn::Packet::ConnAck { code }).await;
+        }
+        false
     }
 
     /// Sends a datagram, or buffers it while the client sleeps. QoS 1/2
@@ -685,6 +752,7 @@ impl Client {
                 } else {
                     sn::REJECTED_NOT_SUPPORTED
                 };
+                self.connack = Some(code);
                 push(&sn::Packet::ConnAck { code });
             }
             Packet::Publish(p) => return self.publish_out(&p),

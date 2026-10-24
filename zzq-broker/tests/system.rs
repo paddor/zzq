@@ -1038,6 +1038,44 @@ mod mqtt_sn {
             assert_eq!(flags.dup, dup);
         }
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resent_connect_gets_connack_again() {
+        let (ctx, _broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
+        let mut watch = client(&ctx, &uri, "watch", Version::V5).await;
+        watch.subscribe("sn/will", QoS::AtMostOnce).await.unwrap();
+        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.connect(&addr).await.unwrap();
+        let connect = Packet::Connect {
+            flags: Flags {
+                clean_session: true,
+                will: true,
+                ..Flags::default()
+            },
+            duration: 30,
+            client_id: "lossy-link",
+        };
+        send(&s, &connect).await;
+        // The first WILLTOPICREQ got lost: the client sends CONNECT again.
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillTopicReq);
+        send(&s, &connect).await;
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillTopicReq);
+        let will_topic = Packet::WillTopic {
+            flags: Some(Flags::default()),
+            topic: "sn/will",
+        };
+        send(&s, &will_topic).await;
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillMsgReq);
+        send(&s, &Packet::WillMsg { message: b"gone" }).await;
+        let connack = Packet::ConnAck { code: sn::ACCEPTED };
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, connack);
+        // The CONNACK got lost too.
+        send(&s, &connect).await;
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, connack);
+        send(&s, &Packet::PingReq { client_id: None }).await;
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
+        nothing(&mut watch).await;
+    }
 }
 
 #[cfg(feature = "quic")]
