@@ -8,3 +8,4 @@ perf.data*
 /*.log
 /fuzz/afl/seeds/
 /fuzz/afl/out/
+/.chart_hw

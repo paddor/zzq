@@ -16,6 +16,9 @@ workspace = true
 [dependencies]
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-broker.workspace = true
+plotters.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
 
 [dev-dependencies]

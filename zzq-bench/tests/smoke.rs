@@ -110,3 +110,44 @@ fn the_perf_gate_runs_one_case() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn the_chart_tool_draws_both_charts_from_the_cache() {
+    let dir = std::env::temp_dir().join(format!("zzq-chart-{}", std::process::id()));
+    let cache = dir.join("cache/zzq");
+    std::fs::create_dir_all(&cache).unwrap();
+    let brokers = [
+        r#"{"run_id":"2026-10-24T00:00:00Z","impl":"zzq-1io","config":"default","kind":"throughput","scenario":"pairs","pubs":1,"subs":1,"qos":0,"msg_size":16,"msgs_s":1e6}"#,
+        r#"{"run_id":"2026-10-24T00:00:00Z","impl":"rmqtt","version":"0.24.0","config":"tuned","kind":"rtt","qos":1,"msg_size":256,"p50_us":40,"p99_us":50,"p999_us":900}"#,
+    ];
+    std::fs::write(cache.join("brokers.jsonl"), brokers.join("\n")).unwrap();
+    let client = r#"{"run_id":"2026-10-24T00:00:00Z","impl":"rumqttc","version":"0.25.1","kind":"sub","qos":2,"msg_size":1024,"msgs_s":5e5}"#;
+    std::fs::write(cache.join("clients.jsonl"), client).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_zzq_chart"))
+        .current_dir(&dir)
+        .env("XDG_CACHE_HOME", dir.join("cache"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() && stderr.contains("missing:"),
+        "{stderr}"
+    );
+    for (file, texts) in [
+        (
+            "brokers.svg",
+            ["MQTT brokers", "rmqtt v0.24.0", "p99.9: 900"],
+        ),
+        (
+            "clients.svg",
+            ["MQTT clients", "rumqttc v0.25.1", "subscribe"],
+        ),
+    ] {
+        let svg = std::fs::read_to_string(dir.join("doc/charts").join(file)).unwrap();
+        for text in texts {
+            assert!(svg.contains(text), "{file} lacks {text}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

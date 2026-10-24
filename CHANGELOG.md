@@ -18,4 +18,6 @@ Notable changes to zzq. The format follows
   connection and resource limits, and `Broker::shutdown`.
 - `zzq-client`: async and blocking client with reconnect, session resume,
   Receive Maximum and input checks before encoding.
-- `zzq-bench`: load generator and local performance gates.
+- `zzq-bench`: load generator, local performance gates, and `zzq_chart`,
+  which draws broker and client comparison charts from the result cache in
+  `~/.cache/zzq`.
