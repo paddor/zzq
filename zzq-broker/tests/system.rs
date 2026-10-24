@@ -996,6 +996,48 @@ mod mqtt_sn {
             .unwrap();
         nothing(&mut late).await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publish_after_register_is_retransmitted() {
+        let opts = BrokerOptions {
+            sn_retry: Duration::from_millis(200),
+            ..BrokerOptions::default()
+        };
+        let (ctx, _broker, uri, addr) = bind_sn(opts).await;
+        let s = sn_client(&addr, "reg").await;
+        send(
+            &s,
+            &Packet::Subscribe {
+                flags: qos(SnQoS::AtLeastOnce),
+                msg_id: 1,
+                topic: Topic::Name("r/#"),
+            },
+        )
+        .await;
+        recv(&s).await;
+        let publ = client(&ctx, &uri, "p", Version::V5).await;
+        publ.publish("r/a", "x", QoS::AtLeastOnce, false)
+            .await
+            .unwrap();
+        let Packet::Register {
+            topic_id, msg_id, ..
+        } = sn::decode(&recv(&s).await).unwrap().0
+        else {
+            panic!("expected REGISTER");
+        };
+        let regack = Packet::RegAck {
+            topic_id,
+            msg_id,
+            code: sn::ACCEPTED,
+        };
+        send(&s, &regack).await;
+        for dup in [false, true] {
+            let Packet::Publish { flags, .. } = sn::decode(&recv(&s).await).unwrap().0 else {
+                panic!("expected PUBLISH");
+            };
+            assert_eq!(flags.dup, dup);
+        }
+    }
 }
 
 #[cfg(feature = "quic")]

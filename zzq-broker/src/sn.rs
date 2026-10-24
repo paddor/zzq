@@ -502,7 +502,7 @@ impl Client {
             sn::Packet::RegAck { msg_id, .. } => {
                 if let Some(topic_id) = self.registering.remove(&msg_id) {
                     for d in self.held.remove(&topic_id).unwrap_or_default() {
-                        let _ = self.socket.send_to(&d, self.addr).await;
+                        self.deliver(d).await;
                     }
                 }
             }
