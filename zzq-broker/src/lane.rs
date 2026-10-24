@@ -355,6 +355,9 @@ impl Lane {
                 Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
                 _ => delayed.filter(|_| ends),
             };
+            // Packets queued for the old connection must not reach the new
+            // one; the inflight window is resent below.
+            s.out.clear();
             if let Some(old) = old {
                 Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
                 self.stats.connections -= 1;

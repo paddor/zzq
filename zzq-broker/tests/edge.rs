@@ -84,6 +84,15 @@ impl Raw {
         (raw, connack)
     }
 
+    async fn subscribe(&mut self, filter: &str, qos: QoS) {
+        let mut out = Vec::new();
+        let opts = SubscriptionOptions::qos(qos);
+        encode::subscribe(self.version, 1, &[], &[(filter, opts)], &mut out);
+        self.write(&out).await;
+        let (byte1, _) = self.packet().await.expect("SUBACK");
+        assert_eq!(byte1 >> 4, 9);
+    }
+
     async fn write(&mut self, bytes: &[u8]) {
         self.s.write_all(bytes).await.unwrap();
     }
@@ -871,6 +880,43 @@ async fn will_expiry_starts_when_the_will_goes_out() {
     assert_eq!(next(&mut late).await.payload, "bye");
     tokio::time::sleep(Duration::from_millis(2500)).await;
     assert_eq!(broker.stats().await.unwrap().retained, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn takeover_drops_output_queued_for_the_old_connection() {
+    let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
+    let fields = ConnectFields {
+        version: Version::V311,
+        clean_start: false,
+        keep_alive: 0,
+        properties: &[],
+        client_id: "stuck",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (mut old, _) = Raw::connect_with(&uri, &fields).await;
+    old.subscribe("flood", QoS::AtMostOnce).await;
+    // The old connection stops reading, so output piles up for it.
+    let publ = Client::connect(&ctx, &uri, ClientOptions::new("flooder"))
+        .await
+        .unwrap();
+    let chunk = vec![b'f'; 64 << 10];
+    for _ in 0..400 {
+        publ.publish("flood", chunk.clone(), QoS::AtMostOnce, false)
+            .await
+            .unwrap();
+    }
+    publ.publish("barrier", "", QoS::AtLeastOnce, false)
+        .await
+        .unwrap();
+    let (mut new, _) = Raw::connect_with(&uri, &fields).await;
+    let mut ping = Vec::new();
+    encode::pingreq(&mut ping);
+    new.write(&ping).await;
+    let (byte1, _) = new.packet().await.expect("PINGRESP");
+    assert_eq!(byte1 >> 4, 13, "stale output after CONNACK");
+    drop(old);
 }
 
 #[tokio::test(flavor = "multi_thread")]
