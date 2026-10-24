@@ -800,3 +800,23 @@ async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
         spare.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_busy_or_full_brokers_are_retried() {
+        for code in [
+            ReasonCode::SERVER_UNAVAILABLE,
+            ReasonCode::SERVER_BUSY,
+            ReasonCode::QUOTA_EXCEEDED,
+            ReasonCode::CONNECTION_RATE_EXCEEDED,
+        ] {
+            assert!(retryable(code), "{code}");
+        }
+        for code in [ReasonCode::NOT_AUTHORIZED, ReasonCode::BANNED] {
+            assert!(!retryable(code), "{code}");
+        }
+    }
+}

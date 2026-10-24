@@ -292,6 +292,21 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
+    fn typed_getters_and_iteration_agree() {
+        let props = [
+            Property::Binary(CORRELATION_DATA, b"id"),
+            Property::U16(RECEIVE_MAXIMUM, 3),
+        ];
+        let mut out = Vec::new();
+        encode_all(&props, &mut out);
+        let parsed = Properties::try_from(out.as_slice()).unwrap();
+        assert_eq!(parsed.get_binary(CORRELATION_DATA), Some(&b"id"[..]));
+        assert_eq!(parsed.get_binary(RECEIVE_MAXIMUM), None);
+        assert_eq!((&parsed).into_iter().count(), 2);
+        assert!(props.iter().all(|p| !p.is_empty() && p.len() > 1));
+    }
+
+    #[test]
     fn encoded_properties_parse_back_unchanged() {
         let props = [
             Property::U32(SESSION_EXPIRY_INTERVAL, 60),

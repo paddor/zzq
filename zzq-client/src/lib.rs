@@ -459,3 +459,17 @@ impl Client {
         self.cmd.send(cmd).map_err(|_| Error::Closed)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reconnect_backs_off_from_100_ms_to_30_s() {
+        let r = Reconnect::default();
+        assert_eq!(
+            (r.min, r.max),
+            (Duration::from_millis(100), Duration::from_secs(30))
+        );
+    }
+}

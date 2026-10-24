@@ -470,6 +470,25 @@ mod tests {
     }
 
     #[test]
+    fn short_or_foreign_logs_are_refused() {
+        let dir = std::env::temp_dir().join(format!("zzq-persist-bad-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("retained.log");
+        for (bytes, why) in [
+            (b"ZZQRET\x00".to_vec(), "short header"),
+            (b"other".to_vec(), "not a zzq retained log"),
+        ] {
+            fs::write(&path, bytes).unwrap();
+            let e = FilePersistence::open(&path).unwrap_err();
+            assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+            assert!(e.to_string().starts_with(why), "{e}");
+        }
+        let p = FilePersistence::open(dir.join("fresh.log")).unwrap();
+        assert!(format!("{p:?}").starts_with("FilePersistence"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn survives_reopen_and_torn_tail() {
         let dir = std::env::temp_dir().join(format!("zzq-persist-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();

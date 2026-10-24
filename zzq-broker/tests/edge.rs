@@ -1141,3 +1141,120 @@ async fn errors_say_what_failed_and_keep_the_cause() {
     assert_eq!(e.to_string(), "loading retained messages failed");
     assert_eq!(e.source().unwrap().to_string(), "disk gone");
 }
+
+/// A v5 PUBLISH with `props`.
+fn publish_v5(topic: &str, props: &[zzq_proto::property::Property<'_>], payload: &[u8]) -> Vec<u8> {
+    let mut raw = Vec::new();
+    zzq_proto::property::encode_all(props, &mut raw);
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        topic,
+        pkid: 0,
+        properties: &raw,
+    };
+    let mut out = Vec::new();
+    encode::publish(&h, payload, &mut out);
+    out
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn inbound_topic_aliases_resolve_and_bad_ones_disconnect() {
+    use zzq_proto::property::{Property, TOPIC_ALIAS};
+    let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
+    let mut sub = Client::connect(&ctx, &uri, ClientOptions::new("alias-sub"))
+        .await
+        .unwrap();
+    sub.subscribe("ta/#", QoS::AtMostOnce).await.unwrap();
+    let mut raw = Raw::connect(&uri, "alias-pub", Version::V5, 0).await;
+    raw.write(&publish_v5(
+        "ta/x",
+        &[Property::U16(TOPIC_ALIAS, 1)],
+        b"set",
+    ))
+    .await;
+    raw.write(&publish_v5("", &[Property::U16(TOPIC_ALIAS, 1)], b"used"))
+        .await;
+    for payload in ["set", "used"] {
+        let m = next(&mut sub).await;
+        assert_eq!(
+            (m.topic.as_str(), &m.payload[..]),
+            ("ta/x", payload.as_bytes())
+        );
+    }
+    for (alias, code) in [
+        (2, zzq_proto::reason::PROTOCOL_ERROR),
+        (0, zzq_proto::reason::TOPIC_ALIAS_INVALID),
+    ] {
+        let mut raw = Raw::connect(&uri, "alias-bad", Version::V5, 0).await;
+        raw.write(&publish_v5("", &[Property::U16(TOPIC_ALIAS, alias)], b"x"))
+            .await;
+        let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
+        assert_eq!((byte1 >> 4, packet[2]), (14, code), "alias {alias}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn messages_over_the_client_maximum_packet_size_are_dropped() {
+    use zzq_proto::property::{MAXIMUM_PACKET_SIZE, Property};
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let props = [Property::U32(MAXIMUM_PACKET_SIZE, 64)];
+    let fields = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &props,
+        client_id: "small",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (mut small, _) = Raw::connect_with(&uri, &fields).await;
+    small.subscribe("mps/#", QoS::AtMostOnce).await;
+    let publ = Client::connect(&ctx, &uri, ClientOptions::new("mps-pub"))
+        .await
+        .unwrap();
+    publ.publish("mps/big", vec![b'x'; 100], QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    publ.publish("mps/fits", "ok", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let (_, packet) = small.packet().await.expect("PUBLISH");
+    let Some((zzq_proto::Packet::Publish(p), _)) =
+        decode(&packet, Version::V5, usize::MAX).unwrap()
+    else {
+        panic!("expected PUBLISH");
+    };
+    assert_eq!(p.topic, "mps/fits");
+    assert_eq!(broker.stats().await.unwrap().dropped_too_large, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn each_share_group_gets_one_copy() {
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let mut groups = Vec::new();
+    for (id, filter) in [("g1", "$share/g1/s/#"), ("g2", "$share/g2/s/#")] {
+        let c = Client::connect(&ctx, &uri, ClientOptions::new(id))
+            .await
+            .unwrap();
+        c.subscribe(filter, QoS::AtMostOnce).await.unwrap();
+        groups.push(c);
+    }
+    broker.publish("s/x", "both", QoS::AtMostOnce).unwrap();
+    for c in &mut groups {
+        assert_eq!(next(c).await.payload, "both");
+    }
+    let bad = broker.publish("s/+", "x", QoS::AtMostOnce);
+    assert!(
+        matches!(bad, Err(zzq_broker::Error::InvalidTopic(_))),
+        "{bad:?}"
+    );
+    let shown = format!("{broker:?} {:?}", BrokerOptions::default());
+    assert!(
+        shown.contains("Broker") && shown.contains("max_topic_levels"),
+        "{shown}"
+    );
+}

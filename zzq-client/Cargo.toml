@@ -29,3 +29,5 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", 
 
 [dev-dependencies]
 zzq-broker.workspace = true
+zzq-proto = { workspace = true, features = ["std"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

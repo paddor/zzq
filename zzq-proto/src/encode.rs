@@ -494,6 +494,19 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
+    fn a_sink_needs_only_put() {
+        struct Count(usize);
+        impl Sink for Count {
+            fn put(&mut self, bytes: &[u8]) {
+                self.0 += bytes.len();
+            }
+        }
+        let mut count = Count(0);
+        connack(&ConnAckFields::default(), Version::V311, &mut count);
+        assert_eq!(count.0, 4);
+    }
+
+    #[test]
     #[cfg(debug_assertions)]
     #[should_panic(expected = "field over MAX_FIELD_LEN")]
     fn oversized_field_panics_in_debug_builds() {

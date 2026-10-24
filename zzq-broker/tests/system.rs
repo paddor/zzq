@@ -1111,6 +1111,61 @@ mod mqtt_sn {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn predefined_topics_and_publishes_held_for_register() {
+        let opts = BrokerOptions {
+            sn_predefined: vec![(9, "pre/t".to_owned())],
+            ..BrokerOptions::default()
+        };
+        let (ctx, _broker, uri, addr) = bind_sn(opts).await;
+        let s = sn_client(&addr, "pre").await;
+        for (msg_id, topic) in [(1, Topic::Predefined(9)), (2, Topic::Name("r/#"))] {
+            let sub = Packet::Subscribe {
+                flags: qos(SnQoS::AtMostOnce),
+                msg_id,
+                topic,
+            };
+            send(&s, &sub).await;
+            recv(&s).await;
+        }
+        let publ = client(&ctx, &uri, "p", Version::V5).await;
+        publ.publish("pre/t", "known", QoS::AtMostOnce)
+            .await
+            .unwrap();
+        assert!(matches!(
+            sn::decode(&recv(&s).await).unwrap().0,
+            Packet::Publish {
+                topic: Topic::Predefined(9),
+                data: b"known",
+                ..
+            }
+        ));
+        // Both arrive before the REGACK: the second waits with the first.
+        for payload in ["one", "two"] {
+            publ.publish("r/a", payload, QoS::AtMostOnce).await.unwrap();
+        }
+        let Packet::Register {
+            topic_id, msg_id, ..
+        } = sn::decode(&recv(&s).await).unwrap().0
+        else {
+            panic!("expected REGISTER");
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let regack = Packet::RegAck {
+            topic_id,
+            msg_id,
+            code: sn::ACCEPTED,
+        };
+        send(&s, &regack).await;
+        for want in [&b"one"[..], b"two"] {
+            let got = recv(&s).await;
+            let Packet::Publish { data, .. } = sn::decode(&got).unwrap().0 else {
+                panic!("expected PUBLISH");
+            };
+            assert_eq!(data, want);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resent_connect_gets_connack_again() {
         let (ctx, _broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
         let mut watch = client(&ctx, &uri, "watch", Version::V5).await;
@@ -1453,6 +1508,12 @@ fn blocking_client_round_trip() {
         let m = c.recv().unwrap();
         assert_eq!((m.payload, m.qos as u8), (format!("{qos}").into(), qos));
     }
+    assert!(!c.connected().session_present);
+    c.publish_retained("b/kept", "r", QoS::AtLeastOnce).unwrap();
+    let m = c.recv().unwrap();
+    assert_eq!((m.topic.as_str(), m.retain), ("b/kept", false));
+    let codes = c.unsubscribe(&["b/#"]).unwrap();
+    assert_eq!(codes, [zzq_client::ReasonCode::SUCCESS]);
     rt.block_on(async {
         let inside = zzq_client::blocking::Client::connect(&ctx, &uri, ClientOptions::new("x"));
         assert!(matches!(inside, Err(zzq_client::Error::InAsync)));

@@ -263,6 +263,38 @@ mod tests {
         Msg::new(topic, b"x", &[], QoS::AtMostOnce, true)
     }
 
+    /// Keeps what the store persists.
+    #[derive(Default)]
+    struct Recorded(std::sync::Mutex<Vec<Retained>>);
+
+    impl Persistence for Recorded {
+        fn load_retained(&self) -> std::io::Result<Vec<Retained>> {
+            Ok(Vec::new())
+        }
+
+        fn set_retained(&self, msg: &Retained) {
+            self.0.lock().unwrap().push(msg.clone());
+        }
+
+        fn remove_retained(&self, _: &str) {}
+    }
+
+    #[test]
+    fn persisted_messages_keep_their_deadline() {
+        let p = Arc::new(Recorded::default());
+        let persist: Arc<dyn Persistence> = p.clone();
+        let mut store = RetainedStore::new(Some(persist), usize::MAX).unwrap();
+        let mut m = msg("kept");
+        m.expires_at = Some(Instant::now() + std::time::Duration::from_secs(60));
+        store.set(&m);
+        let at = p.0.lock().unwrap()[0].expires_at.unwrap();
+        assert!(at > SystemTime::now() + std::time::Duration::from_secs(50));
+        assert_eq!(
+            format!("{store:?}"),
+            "RetainedStore { len: 1, persist: true, .. }"
+        );
+    }
+
     /// The tree agrees with matching every topic against the filter.
     #[test]
     fn matches_like_a_scan() {
