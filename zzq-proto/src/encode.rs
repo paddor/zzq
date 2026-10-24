@@ -455,7 +455,9 @@ pub fn put_props<S: Sink + ?Sized>(props: &[Property<'_>], out: &mut S) {
     property::encode_all(props, out);
 }
 
+// The tests encode into `Vec`, a `Sink` only with `alloc`.
 #[cfg(test)]
+#[cfg(feature = "alloc")]
 mod tests {
     use super::*;
     use crate::packet::{Packet, decode};

@@ -1,5 +1,8 @@
 //! Decoding arbitrary bytes never panics.
 
+// The samples are encoded into `Vec`, a `Sink` only with `alloc`.
+#![cfg(feature = "alloc")]
+
 use zzq_proto::encode::{self, ConnectFields, PublishHeader, WillFields};
 use zzq_proto::property::{self, Property};
 use zzq_proto::{Packet, QoS, SubscriptionOptions, Version, decode};

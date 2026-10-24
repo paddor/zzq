@@ -668,7 +668,9 @@ const fn kind_of(p: &Packet<'_>) -> u8 {
     }
 }
 
+// The tests encode into `Vec`, a `Sink` only with `alloc`.
 #[cfg(test)]
+#[cfg(feature = "alloc")]
 mod tests {
     use super::*;
     use std::vec::Vec;

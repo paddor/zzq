@@ -253,7 +253,9 @@ pub fn encode_all<S: Sink + ?Sized>(props: &[Property<'_>], out: &mut S) {
     }
 }
 
+// The tests encode into `Vec`, a `Sink` only with `alloc`.
 #[cfg(test)]
+#[cfg(feature = "alloc")]
 mod tests {
     use super::*;
     use std::vec::Vec;
