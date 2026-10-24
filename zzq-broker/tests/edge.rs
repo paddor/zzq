@@ -53,13 +53,6 @@ impl Raw {
 
     /// Connects and also returns the CONNACK packet.
     async fn connect_ack(uri: &str, id: &str, version: Version, keep_alive: u16) -> (Raw, Vec<u8>) {
-        let addr = uri.trim_start_matches("tcp://");
-        let s = TcpStream::connect(addr).await.unwrap();
-        let mut raw = Raw {
-            s,
-            buf: Vec::new(),
-            version,
-        };
         let c = ConnectFields {
             version,
             clean_start: true,
@@ -70,11 +63,24 @@ impl Raw {
             username: None,
             password: None,
         };
+        Raw::connect_with(uri, &c).await
+    }
+
+    /// Sends `c` and returns the connection and its CONNACK, which must be
+    /// the first packet.
+    async fn connect_with(uri: &str, c: &ConnectFields<'_>) -> (Raw, Vec<u8>) {
+        let addr = uri.trim_start_matches("tcp://");
+        let s = TcpStream::connect(addr).await.unwrap();
+        let mut raw = Raw {
+            s,
+            buf: Vec::new(),
+            version: c.version,
+        };
         let mut out = Vec::new();
-        encode::connect(&c, &mut out);
+        encode::connect(c, &mut out);
         raw.s.write_all(&out).await.unwrap();
         let (byte1, connack) = raw.packet().await.expect("CONNACK");
-        assert_eq!(byte1 >> 4, 2);
+        assert_eq!(byte1 >> 4, 2, "first packet must be CONNACK");
         (raw, connack)
     }
 
@@ -762,7 +768,8 @@ async fn takeover_cancels_a_delayed_will() {
         .await
         .unwrap();
     watch.subscribe("wills/#", QoS::AtLeastOnce).await.unwrap();
-    let delayed = || ClientOptions {
+    let delayed = |clean_start| ClientOptions {
+        clean_start,
         session_expiry: 60,
         will: Some(LastWill {
             topic: "wills/late".to_owned(),
@@ -773,11 +780,97 @@ async fn takeover_cancels_a_delayed_will() {
         }),
         ..ClientOptions::new("delayed")
     };
-    let _old = Client::connect(&ctx, &uri, delayed()).await.unwrap();
-    let new = Client::connect(&ctx, &uri, delayed()).await.unwrap();
+    let _old = Client::connect(&ctx, &uri, delayed(false)).await.unwrap();
+    let new = Client::connect(&ctx, &uri, delayed(false)).await.unwrap();
     tokio::time::sleep(Duration::from_millis(1500)).await;
     nothing(&mut watch).await;
-    new.disconnect().await;
+    // A clean start ends the session, and with it the delay.
+    let _clean = Client::connect(&ctx, &uri, delayed(true)).await.unwrap();
+    let m = timeout(Duration::from_millis(700), watch.recv())
+        .await
+        .expect("will on session end")
+        .unwrap();
+    assert_eq!(m.payload, "old");
+    drop(new);
+    nothing(&mut watch).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn will_timer_of_an_earlier_connection_does_not_fire() {
+    let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
+    let mut watch = Client::connect(&ctx, &uri, ClientOptions::new("watch3"))
+        .await
+        .unwrap();
+    watch.subscribe("wills/#", QoS::AtLeastOnce).await.unwrap();
+    let opts = |payload: &str| ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        will: Some(LastWill {
+            topic: "wills/twice".to_owned(),
+            payload: payload.to_owned().into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            delay: 2,
+        }),
+        ..ClientOptions::new("twice")
+    };
+    // Lost at t0, back at t0 + 0.3 s, lost again at t0 + 1 s.
+    drop(Client::connect(&ctx, &uri, opts("old")).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let again = Client::connect(&ctx, &uri, opts("new")).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    drop(again);
+    let m = timeout(Duration::from_secs(4), watch.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(m.payload, "new");
+    nothing(&mut watch).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn will_expiry_starts_when_the_will_goes_out() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let mut watch = Client::connect(&ctx, &uri, ClientOptions::new("watch4"))
+        .await
+        .unwrap();
+    watch.subscribe("wills/#", QoS::AtLeastOnce).await.unwrap();
+    let props = [zzq_proto::property::Property::U32(
+        zzq_proto::property::MESSAGE_EXPIRY_INTERVAL,
+        1,
+    )];
+    let c = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &[],
+        client_id: "expiring-will",
+        will: Some(encode::WillFields {
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            properties: &props,
+            topic: "wills/exp",
+            payload: b"bye",
+        }),
+        username: None,
+        password: None,
+    };
+    let (raw, _) = Raw::connect_with(&uri, &c).await;
+    // Older than its expiry before it goes out.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    drop(raw);
+    assert_eq!(next(&mut watch).await.payload, "bye");
+    let mut late = Client::connect(&ctx, &uri, ClientOptions::new("late4"))
+        .await
+        .unwrap();
+    late.subscribe("wills/exp", QoS::AtLeastOnce).await.unwrap();
+    assert_eq!(next(&mut late).await.payload, "bye");
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(broker.stats().await.unwrap().retained, 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

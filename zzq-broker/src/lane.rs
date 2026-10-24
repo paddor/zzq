@@ -162,6 +162,7 @@ pub(crate) struct Lane {
     pub(crate) stats: LaneStats,
     next_conn_id: u64,
     next_client_no: u64,
+    next_will_id: u64,
     pub(crate) shut_down: bool,
 }
 
@@ -183,6 +184,7 @@ impl Lane {
             stats: LaneStats::default(),
             next_conn_id: 0,
             next_client_no: 0,
+            next_will_id: 0,
             shut_down: false,
         }
     }
@@ -293,13 +295,14 @@ impl Lane {
         }
     }
 
-    /// Ends a session for good.
+    /// Ends a session for good. A will still waiting for its delay goes
+    /// out now.
     fn remove_session(&mut self, key: Key) {
         if let Some(s) = self.sessions.get_mut(key) {
             s.conn = None;
         }
         self.release_waiters(key);
-        let Some(s) = self.sessions.remove(key) else {
+        let Some(mut s) = self.sessions.remove(key) else {
             return;
         };
         let sub = self.sub_ref(key);
@@ -308,6 +311,9 @@ impl Lane {
         }
         if self.by_client.get(&s.client_id) == Some(&key) {
             self.by_client.remove(&s.client_id);
+        }
+        if let Some((_, will)) = s.delayed_will.take() {
+            self.publish_will(will);
         }
     }
 
@@ -333,21 +339,30 @@ impl Lane {
         let max_expiry = self.shared.opts.max_session_expiry;
         let mut present = false;
         let mut key = self.by_client.get(c.client_id.as_str()).copied();
-        if let Some(k) = key {
-            if let Some(old) = self.sessions.get_mut(k).and_then(|s| s.conn.take()) {
-                let version = self.sessions.get(k).map_or(c.version, |s| s.version);
-                Self::kick(&old, version, reason::SESSION_TAKEN_OVER);
+        if let Some(k) = key
+            && let Some(s) = self.sessions.get_mut(k)
+        {
+            // The old session ends if the new connection starts clean or the
+            // old one kept no session.
+            let ends = c.clean_start || s.expiry == 0;
+            // The old connection ends without DISCONNECT, so its will goes
+            // out now, unless it has a delay and the session goes on: the
+            // new connection came first and cancels it. So does a will of
+            // an earlier connection that waits for its delay.
+            let old = s.conn.take();
+            let delayed = s.delayed_will.take().map(|(_, m)| m);
+            let will = match s.will.take() {
+                Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
+                _ => delayed.filter(|_| ends),
+            };
+            if let Some(old) = old {
+                Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
                 self.stats.connections -= 1;
-                // The old connection ends without DISCONNECT, so its will
-                // goes out, unless it has a delay: the new connection came
-                // first and cancels it.
-                if let Some(w) = self.sessions.get_mut(k).and_then(|s| s.will.take())
-                    && w.delay == 0
-                {
-                    self.publish_owned(&w.msg);
-                }
             }
-            if c.clean_start {
+            if let Some(will) = will {
+                self.publish_will(will);
+            }
+            if ends {
                 self.remove_session(k);
                 key = None;
             } else {
@@ -444,7 +459,7 @@ impl Lane {
         }
         if let Some(w) = will {
             if w.delay == 0 || expiry == 0 {
-                self.publish_owned(&w.msg);
+                self.publish_will(w.msg);
             } else {
                 let delay = Duration::from_secs(u64::from(w.delay.min(expiry)));
                 self.schedule_will(key, w.msg, delay);
@@ -452,22 +467,40 @@ impl Lane {
         }
     }
 
-    fn schedule_will(&self, key: Key, msg: Msg, delay: Duration) {
+    /// Publishes `msg` after `delay`, unless a new connection or the end of
+    /// the session takes it first.
+    fn schedule_will(&mut self, key: Key, msg: Msg, delay: Duration) {
         let Some(lane) = crate::broker::lane_ref(self.shared.id) else {
             return;
         };
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        self.next_will_id += 1;
+        let id = self.next_will_id;
+        s.delayed_will = Some((id, msg));
         tokio::task::spawn_local(async move {
             tokio::time::sleep(delay).await;
             {
                 let mut l = lane.borrow_mut();
-                if l.sessions.get(key).is_some_and(|s| s.conn.is_some()) {
+                let Some((_, msg)) = l
+                    .sessions
+                    .get_mut(key)
+                    .and_then(|s| s.delayed_will.take_if(|(i, _)| *i == id))
+                else {
                     return;
-                }
-                l.publish_owned(&msg);
+                };
+                l.publish_will(msg);
                 l.flush();
             }
             crate::broker::ship(&lane).await;
         });
+    }
+
+    /// Publishes a will. Its Message Expiry Interval starts now.
+    fn publish_will(&mut self, mut msg: Msg) {
+        msg.expires_at = crate::msg::expiry(msg.props());
+        self.publish_owned(&msg);
     }
 
     /// Routes a message that is not from a client connection.

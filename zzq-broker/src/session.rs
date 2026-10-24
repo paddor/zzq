@@ -79,6 +79,9 @@ pub(crate) struct Session {
     pub(crate) expiry: u32,
     pub(crate) expires_at: Option<Instant>,
     pub(crate) will: Option<Will>,
+    /// Will of a lost connection waiting for its delay, and the ID of its
+    /// timer.
+    pub(crate) delayed_will: Option<(u64, Msg)>,
     /// Encoded packets waiting for the writer.
     pub(crate) out: Vec<u8>,
     /// The writer's second buffer, swapped with `out` on each write.
@@ -121,6 +124,7 @@ impl Session {
             expiry: 0,
             expires_at: None,
             will: None,
+            delayed_will: None,
             out: Vec::new(),
             spare: Vec::new(),
             dirty: false,
