@@ -5,6 +5,8 @@
 //! assigned to one lane and stay there. Transports produce plain sockets
 //! that can move between lanes; the lane wraps them for async IO.
 
+#![forbid(unsafe_code)]
+
 pub mod context;
 pub mod endpoint;
 mod error;

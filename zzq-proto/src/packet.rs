@@ -259,6 +259,10 @@ pub fn decode_body(byte1: u8, body: &[u8], version: Version) -> Result<Packet<'_
 /// A PUBLISH topic name: UTF-8 without U+0000 or wildcards. Empty is allowed
 /// here for v5 topic aliases.
 #[inline]
+#[expect(
+    unsafe_code,
+    reason = "skips a second UTF-8 scan on the hot decode path"
+)]
 fn topic_name(b: &[u8]) -> Result<&str, DecodeError> {
     if b.iter().all(|&c| c < 0x80 && !matches!(c, 0 | b'+' | b'#')) {
         // SAFETY: every byte is ASCII, and ASCII is valid UTF-8.

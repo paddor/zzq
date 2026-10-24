@@ -4,6 +4,8 @@
 //! [`Client`] handle talks to it through channels and can be used from any
 //! runtime.
 
+#![forbid(unsafe_code)]
+
 pub mod blocking;
 mod conn;
 

@@ -26,11 +26,6 @@ pub(crate) struct Msg {
 struct Span(u32, u32);
 
 impl Span {
-    fn of(part: &[u8], base: *const u8) -> Span {
-        let at = (part.as_ptr() as usize).wrapping_sub(base as usize);
-        Span(at as u32, part.len() as u32)
-    }
-
     fn get(self, buf: &[u8]) -> &[u8] {
         let (at, len) = (self.0 as usize, self.1 as usize);
         buf.get(at..at + len).unwrap_or_default()
@@ -57,6 +52,10 @@ impl Msg {
     }
 
     #[inline]
+    #[expect(
+        unsafe_code,
+        reason = "topics are read per delivery; UTF-8 is checked on decode"
+    )]
     pub(crate) fn topic(&self) -> &str {
         let b = self.topic.get(&self.buf);
         // SAFETY: the span holds a copy or a slice of a `&str` topic.
@@ -143,23 +142,21 @@ impl Publication<'_> {
         if let Some(c) = self.chunk
             && parts.iter().all(|b| b.is_empty() || within(c, b))
         {
+            // Offset in `c` of a part that lies inside it.
+            let offset = |b: &[u8]| b.as_ptr() as usize - c.as_ptr() as usize;
             let live = parts.iter().filter(|b| !b.is_empty());
-            let start = live.clone().map(|b| b.as_ptr() as usize).min();
-            let end = live.map(|b| b.as_ptr() as usize + b.len()).max();
+            let start = live.clone().map(|b| offset(b)).min();
+            let end = live.map(|b| offset(b) + b.len()).max();
             if let (Some(start), Some(end)) = (start, end) {
-                let base = start as *const u8;
-                // SAFETY: all parts lie inside `c`, so the range between
-                // them does too.
-                let whole = unsafe { std::slice::from_raw_parts(base, end - start) };
                 let at = |b: &[u8]| {
                     if b.is_empty() {
                         Span(0, 0)
                     } else {
-                        Span::of(b, base)
+                        Span((offset(b) - start) as u32, b.len() as u32)
                     }
                 };
                 return Msg {
-                    buf: c.slice_ref(whole),
+                    buf: c.slice(start..end),
                     topic: at(parts[0]),
                     props: at(parts[1]),
                     payload: at(parts[2]),
