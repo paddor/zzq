@@ -8,23 +8,40 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::{Buf, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{Notify, mpsc, oneshot};
-use zzq_proto::encode::{self, AckFields, ConnectFields, PublishHeader, WillFields};
-use zzq_proto::packet::{ConnAck, Publish, decode};
+use tokio::sync::{Notify, oneshot};
+use zzq_proto::encode::{self, AckFields, ConnectFields, WillFields};
+use zzq_proto::packet::{ConnAck, Publish, decode, fixed_header};
 use zzq_proto::property::{self, Property};
 use zzq_proto::{Packet, PacketType, QoS, ReasonCode, SubscriptionOptions, Version, reason};
 use zzq_tokio::transport::{Driver, TransportOptions};
 use zzq_tokio::{Context, Endpoint};
 
-use crate::{ClientOptions, Cmd, Connected, Error, Message, Result};
+use crate::acks::Acks;
+use crate::submit::{self, Batch, Op};
+use crate::{ClientOptions, Cmd, Connected, Error, Message, Result, inbox};
 
 /// Largest packet accepted from the broker.
 const MAX_PACKET: usize = 256 << 20;
+
+/// Read buffer size. Received payloads are slices of it.
+const READ_BUF: usize = 64 << 10;
+
+/// Spare room below which a read gets a fresh buffer first.
+const READ_MIN: usize = 8 << 10;
+
+/// How long the call woken for a batch of publish acks has to wake the
+/// others before the session does.
+const CHAIN_WAIT: Duration = Duration::from_millis(1);
+
+/// Output past which the session takes no new requests until the writer
+/// catches up.
+const OUT_ROOM: usize = 1 << 20;
 
 /// Connects, then keeps the session going until the client disconnects,
 /// the handle is dropped, or a connection fails without `reconnect`.
@@ -58,7 +75,7 @@ pub(crate) async fn run_session(
                 }
             }
         }
-        if s.ended || s.opts.reconnect.is_none() || s.cmd.is_closed() {
+        if s.ended || s.opts.reconnect.is_none() || s.submit.dropped() {
             break;
         }
         if s.established {
@@ -70,12 +87,12 @@ pub(crate) async fn run_session(
         }
         delay = (delay * 2).min(max);
     }
-    s.fail_pending();
 }
 
 #[derive(Debug)]
 enum Pending {
-    Publish(Option<oneshot::Sender<Result<()>>>),
+    /// A QoS 1/2 publish and its ack slot.
+    Publish(usize),
     Sub(oneshot::Sender<Result<Vec<ReasonCode>>>, Change),
     /// A resubscribe after reconnecting, nobody waits for it.
     Restore,
@@ -92,8 +109,9 @@ enum Change {
 #[derive(Debug)]
 pub(crate) struct Session {
     pub(crate) opts: ClientOptions,
-    pub(crate) cmd: mpsc::UnboundedReceiver<Cmd>,
-    pub(crate) inbox: mpsc::Sender<Message>,
+    pub(crate) submit: submit::Receiver,
+    acks: Arc<Acks>,
+    pub(crate) inbox: inbox::Sender,
     pub(crate) connack: Option<oneshot::Sender<Result<Connected>>>,
     pending: FxHashMap<u16, Pending>,
     /// Encoded requests not yet acked, by packet ID, with their send order.
@@ -105,8 +123,14 @@ pub(crate) struct Session {
     next_pkid: u16,
     /// Granted subscriptions: filter, options and Subscription Identifier.
     subs: Vec<(String, SubscriptionOptions, u32)>,
-    /// Commands that came while offline.
-    backlog: VecDeque<Cmd>,
+    /// Requests taken from the queue, kept for their capacity.
+    batch: Batch,
+    /// Acks taken from the inbox, kept for their capacity.
+    taken: Vec<(u16, QoS)>,
+    /// Publish acks of the current read, for the waiting calls.
+    finished: Vec<(usize, Result<()>)>,
+    /// Woken calls have finished calls to wake.
+    chained: bool,
     /// QoS 1/2 publishes beyond the broker's Receive Maximum.
     waiting: VecDeque<Cmd>,
     /// QoS 1/2 publishes sent and not yet acked.
@@ -122,13 +146,15 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn new(
         opts: ClientOptions,
-        cmd: mpsc::UnboundedReceiver<Cmd>,
-        inbox: mpsc::Sender<Message>,
+        submit: submit::Receiver,
+        acks: Arc<Acks>,
+        inbox: inbox::Sender,
         connack: oneshot::Sender<Result<Connected>>,
     ) -> Session {
         Session {
             opts,
-            cmd,
+            submit,
+            acks,
             inbox,
             connack: Some(connack),
             pending: FxHashMap::default(),
@@ -138,7 +164,10 @@ impl Session {
             unconsumed: FxHashSet::default(),
             next_pkid: 0,
             subs: Vec::new(),
-            backlog: VecDeque::new(),
+            batch: Batch::default(),
+            taken: Vec::new(),
+            finished: Vec::new(),
+            chained: false,
             waiting: VecDeque::new(),
             inflight: 0,
             quota: usize::from(u16::MAX),
@@ -170,12 +199,26 @@ struct Out {
     closed: std::cell::Cell<bool>,
     /// Answered once DISCONNECT is written.
     bye: RefCell<Option<oneshot::Sender<()>>>,
+    /// Wakes the session once the writer took full output.
+    drained: Notify,
+    /// The writer failed.
+    broken: std::cell::Cell<bool>,
 }
 
 impl Out {
+    /// Appends output. The writer was woken already if there was some.
     fn push(&self, f: impl FnOnce(&mut Vec<u8>)) {
-        f(&mut self.buf.borrow_mut());
-        self.wake.notify_one();
+        let mut buf = self.buf.borrow_mut();
+        let wake = buf.is_empty();
+        f(&mut buf);
+        if wake {
+            self.wake.notify_one();
+        }
+    }
+
+    /// Whether the session may take more requests.
+    fn has_room(&self) -> bool {
+        self.buf.borrow().len() < OUT_ROOM
     }
 
     fn close(&self) {
@@ -195,7 +238,7 @@ where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    let mut buf = BytesMut::with_capacity(64 << 10);
+    let mut buf = BytesMut::with_capacity(READ_BUF);
     let resume = s.connack.is_none();
     let handshake = handshake(&s.opts, resume, &mut r, &mut w, &mut buf);
     let connected = tokio::time::timeout(s.opts.connect_timeout, handshake)
@@ -237,35 +280,47 @@ impl Conn<'_> {
     /// Reads, runs commands and pings until the connection ends.
     async fn serve<R: AsyncRead + Unpin>(&mut self, r: &mut R, buf: &mut BytesMut) -> Result<()> {
         self.input(buf).await?;
-        for cmd in std::mem::take(&mut self.s.backlog) {
-            self.command(cmd);
+        // Requests made while offline.
+        if !self.requests() {
+            return Ok(());
         }
+        self.ack_taken();
         let ka = u64::from(self.s.opts.keep_alive);
         let mut ping = tokio::time::interval(Duration::from_secs(ka.max(1)));
         ping.tick().await;
         let mut last_rx = Instant::now();
+        let chain = tokio::time::sleep(CHAIN_WAIT);
+        tokio::pin!(chain);
+        let mut chain_armed = false;
         loop {
+            make_room(buf);
+            if self.s.chained && !chain_armed {
+                chain.as_mut().reset((Instant::now() + CHAIN_WAIT).into());
+                chain_armed = true;
+            }
             tokio::select! {
-                cmd = self.s.cmd.recv() => match cmd {
-                    Some(Cmd::Disconnect { reason, done }) => {
-                        let v = self.s.opts.version;
-                        self.out.push(|b| encode::reason_only(PacketType::Disconnect, v, reason.into(), &[], b));
-                        self.s.ended = true;
-                        *self.out.bye.borrow_mut() = Some(done);
+                () = self.s.submit.ready(), if self.out.has_room() => {
+                    if !self.requests() {
                         return Ok(());
                     }
-                    Some(c) => self.command(c),
-                    None => {
-                        self.s.ended = true;
-                        return Ok(());
+                }
+                () = self.out.drained.notified(), if !self.out.has_room() => {
+                    if self.out.broken.get() {
+                        return Err(Error::Closed);
                     }
-                },
+                }
                 n = r.read_buf(buf) => {
                     if !matches!(n, Ok(n) if n > 0) {
                         return Err(Error::Closed);
                     }
                     last_rx = Instant::now();
                     self.input(buf).await?;
+                }
+                () = self.s.inbox.acked() => self.ack_taken(),
+                () = &mut chain, if chain_armed => {
+                    chain_armed = false;
+                    self.s.chained = false;
+                    self.s.acks.wake_chained();
                 }
                 _ = ping.tick(), if ka > 0 => {
                     if last_rx.elapsed() > Duration::from_millis(ka * 1500) {
@@ -348,11 +403,9 @@ impl Conn<'_> {
     /// a free packet ID.
     fn blocked(&self, cmd: &Cmd) -> bool {
         match cmd {
-            Cmd::Publish { qos, .. } if *qos != QoS::AtMostOnce => {
-                self.s.inflight >= self.s.quota || !self.ids_left()
-            }
+            Cmd::Publish { .. } => self.s.inflight >= self.s.quota || !self.ids_left(),
             Cmd::Subscribe { .. } | Cmd::Unsubscribe { .. } => !self.ids_left(),
-            _ => false,
+            Cmd::Disconnect { .. } => false,
         }
     }
 
@@ -400,21 +453,14 @@ impl Conn<'_> {
         let v = self.s.opts.version;
         // Not blocked, so a packet ID is free.
         match cmd {
-            Cmd::Publish {
-                topic,
-                payload,
-                qos,
-                retain,
-                done,
-            } => {
-                let pkid = if qos == QoS::AtMostOnce {
-                    0
-                } else {
-                    let Some(pkid) = self.pkid() else { return };
-                    self.s.inflight += 1;
-                    pkid
+            Cmd::Publish { mut packet, slot } => {
+                let Some(pkid) = self.pkid() else {
+                    self.s.finished.push((slot, Err(Error::Closed)));
+                    return;
                 };
-                self.send_publish(&topic, &payload, (qos, retain, pkid), done);
+                self.s.inflight += 1;
+                set_pkid(&mut packet, pkid);
+                self.send_tracked(pkid, packet, Pending::Publish(slot));
             }
             Cmd::Subscribe {
                 filters,
@@ -436,72 +482,134 @@ impl Conn<'_> {
                 encode::unsubscribe(v, pkid, &[], &list, &mut b);
                 self.send_tracked(pkid, b, Pending::Sub(done, Change::Remove(filters)));
             }
-            Cmd::Ack { pkid, qos } => self.ack_taken(pkid, qos),
             Cmd::Disconnect { .. } => {}
         }
     }
 
-    fn send_publish(
-        &mut self,
-        topic: &str,
-        payload: &[u8],
-        (qos, retain, pkid): (QoS, bool, u16),
-        done: Option<oneshot::Sender<Result<()>>>,
-    ) {
-        let h = PublishHeader {
-            version: self.s.opts.version,
-            dup: false,
-            qos,
-            retain,
-            topic,
-            pkid,
-            properties: &[],
-        };
-        if qos == QoS::AtMostOnce {
-            self.out.push(|b| encode::publish(&h, payload, b));
-        } else {
-            let mut b = Vec::new();
-            encode::publish(&h, payload, &mut b);
-            self.send_tracked(pkid, b, Pending::Publish(done));
+    /// Runs the queued requests. Returns false once the session ends:
+    /// DISCONNECT went out or the handle is gone.
+    fn requests(&mut self) -> bool {
+        let mut batch = std::mem::take(&mut self.s.batch);
+        let dropped = self.s.submit.take(&mut batch);
+        let mut at = 0;
+        let mut open = true;
+        while let Some(op) = batch.ops.pop_front() {
+            match op {
+                Op::Publish { len, qos, slot } => {
+                    let packet = &batch.bytes[at..at + len];
+                    at += len;
+                    if qos == QoS::AtMostOnce {
+                        self.out.push(|b| b.extend_from_slice(packet));
+                    } else {
+                        let packet = packet.to_vec();
+                        self.command(Cmd::Publish { packet, slot });
+                    }
+                }
+                Op::Cmd(Cmd::Disconnect { reason, done }) => {
+                    let v = self.s.opts.version;
+                    self.out.push(|b| {
+                        encode::reason_only(PacketType::Disconnect, v, reason.into(), &[], b);
+                    });
+                    *self.out.bye.borrow_mut() = Some(done);
+                    // The requests after it fail with the session.
+                    open = false;
+                    break;
+                }
+                Op::Cmd(cmd) => self.command(cmd),
+            }
+        }
+        if open {
+            batch.clear();
+        }
+        self.s.batch = batch;
+        self.finish_acks();
+        if !open || dropped {
+            self.s.ended = true;
+            return false;
+        }
+        true
+    }
+
+    /// Hands the publish acks gathered so far to the waiting calls.
+    fn finish_acks(&mut self) {
+        if !self.s.finished.is_empty() {
+            self.s.chained |= self.s.acks.finish(&mut self.s.finished);
         }
     }
 
-    /// Acks a message the application took.
-    fn ack_taken(&mut self, pkid: u16, qos: QoS) {
-        let kind = match qos {
-            QoS::AtMostOnce => return,
-            QoS::AtLeastOnce => PacketType::PubAck,
-            QoS::ExactlyOnce => {
-                self.s.unconsumed.remove(&pkid);
-                PacketType::PubRec
+    /// Acks the messages the application took.
+    fn ack_taken(&mut self) {
+        let mut acks = std::mem::take(&mut self.s.taken);
+        self.s.inbox.take_acks(&mut acks);
+        if !acks.is_empty() {
+            for (pkid, qos) in &acks {
+                if *qos == QoS::ExactlyOnce {
+                    self.s.unconsumed.remove(pkid);
+                }
             }
-        };
-        let v = self.s.opts.version;
-        self.out
-            .push(|b| encode::ack(&AckFields::new(kind, pkid), v, b));
+            let v = self.s.opts.version;
+            self.out.push(|b| {
+                for &(pkid, qos) in &acks {
+                    let kind = if qos == QoS::ExactlyOnce {
+                        PacketType::PubRec
+                    } else {
+                        PacketType::PubAck
+                    };
+                    encode::ack(&AckFields::new(kind, pkid), v, b);
+                }
+            });
+            acks.clear();
+        }
+        self.s.taken = acks;
     }
 
+    /// Handles the whole packets in `buf`, then hands their messages to
+    /// the client handle.
     async fn input(&mut self, buf: &mut BytesMut) -> Result<()> {
-        loop {
-            let (msg, n) = match decode(buf, self.s.opts.version, MAX_PACKET) {
-                Ok(Some((packet, n))) => (self.packet(packet)?, n),
-                Ok(None) => return Ok(()),
-                Err(_) => return Err(Error::Protocol("malformed packet")),
-            };
-            buf.advance(n);
-            if let Some(m) = msg
-                && self.s.inbox.send(m).await.is_err()
-            {
-                self.s.ended = true;
-                return Err(Error::Closed);
-            }
+        let n = complete_len(buf)?;
+        if n == 0 {
+            return Ok(());
         }
+        let chunk = buf.split_to(n).freeze();
+        let res = self.packets(&chunk).await;
+        self.finish_acks();
+        // Messages before a bad packet still go out.
+        self.deliver().await?;
+        res
     }
 
-    fn packet(&mut self, packet: Packet<'_>) -> Result<Option<Message>> {
+    async fn packets(&mut self, chunk: &Bytes) -> Result<()> {
+        let mut at = 0;
+        while at < chunk.len() {
+            let Ok(Some((packet, n))) = decode(&chunk[at..], self.s.opts.version, MAX_PACKET)
+            else {
+                return Err(Error::Protocol("malformed packet"));
+            };
+            at += n;
+            if let Some(m) = self.packet(packet, chunk)? {
+                self.s.inbox.push(m);
+                if self.s.inbox.full() {
+                    self.deliver().await?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Queues the decoded messages for the handle.
+    async fn deliver(&mut self) -> Result<()> {
+        if self.s.inbox.flush().await.is_err() {
+            self.s.ended = true;
+            return Err(Error::Closed);
+        }
+        Ok(())
+    }
+
+    /// Handles one packet of `chunk`. A PUBLISH becomes a message.
+    fn packet(&mut self, packet: Packet<'_>, chunk: &Bytes) -> Result<Option<Message>> {
         let v = self.s.opts.version;
         match packet {
-            Packet::Publish(p) => return Ok(self.publish(&p)),
+            Packet::Publish(p) => return Ok(self.publish(&p, chunk)),
             Packet::PubAck(a) | Packet::PubComp(a) => self.done(a.pkid, a.reason),
             Packet::PubRec(a) => {
                 if a.reason >= 0x80 {
@@ -555,21 +663,20 @@ impl Conn<'_> {
 
     fn done(&mut self, pkid: u16, code: u8) {
         self.s.unacked.remove(&pkid);
-        let Some(Pending::Publish(tx)) = self.s.pending.remove(&pkid) else {
+        let Some(Pending::Publish(slot)) = self.s.pending.remove(&pkid) else {
             return;
         };
-        if let Some(tx) = tx {
-            let _ = tx.send(if code >= 0x80 {
-                Err(Error::Rejected(code.into()))
-            } else {
-                Ok(())
-            });
-        }
+        let res = if code >= 0x80 {
+            Err(Error::Rejected(code.into()))
+        } else {
+            Ok(())
+        };
+        self.s.finished.push((slot, res));
         self.s.inflight = self.s.inflight.saturating_sub(1);
         self.send_waiting();
     }
 
-    fn publish(&mut self, p: &Publish<'_>) -> Option<Message> {
+    fn publish(&mut self, p: &Publish<'_>, chunk: &Bytes) -> Option<Message> {
         // Acks wait until the application takes the message.
         let ack = match p.qos {
             QoS::AtMostOnce => None,
@@ -599,7 +706,7 @@ impl Conn<'_> {
             .collect();
         Some(Message {
             topic: p.topic.to_owned(),
-            payload: bytes::Bytes::copy_from_slice(p.payload),
+            payload: chunk.slice_ref(p.payload),
             qos: p.qos,
             retain: p.retain,
             subscription_ids,
@@ -609,57 +716,74 @@ impl Conn<'_> {
 }
 
 impl Session {
-    /// Waits `delay` before the next connect. Takes commands meanwhile, so
-    /// `disconnect` works while offline. Returns false to stop.
+    /// Waits `delay` before the next connect. Watches the requests meanwhile,
+    /// so `disconnect` works while offline. Returns false to stop.
     async fn wait_offline(&mut self, delay: Duration) -> bool {
         let sleep = tokio::time::sleep(delay);
         tokio::pin!(sleep);
         loop {
             tokio::select! {
                 () = &mut sleep => return true,
-                cmd = self.cmd.recv() => match cmd {
-                    Some(Cmd::Disconnect { done, .. }) => {
+                () = self.submit.ready() => {
+                    if let Some(done) = self.submit.take_disconnect() {
                         let _ = done.send(());
                         self.ended = true;
                         return false;
                     }
-                    Some(c) => self.backlog.push_back(c),
-                    None => {
+                    if self.submit.dropped() {
                         self.ended = true;
                         return false;
                     }
-                },
+                }
             }
         }
     }
 
-    /// Fails every request still waiting for an ack.
+    /// Fails every request still waiting for an ack, and refuses new ones.
     fn fail_pending(&mut self) {
-        for cmd in self.backlog.drain(..).chain(self.waiting.drain(..)) {
+        let queued = self.submit.close();
+        let left = std::mem::take(&mut self.batch);
+        let mut cmds: Vec<Cmd> = self.waiting.drain(..).collect();
+        for op in left.ops.into_iter().chain(queued.ops) {
+            match op {
+                Op::Publish {
+                    qos: QoS::AtMostOnce,
+                    ..
+                } => {}
+                Op::Publish { slot, .. } => self.finished.push((slot, Err(Error::Closed))),
+                Op::Cmd(cmd) => cmds.push(cmd),
+            }
+        }
+        for cmd in cmds {
             match cmd {
-                Cmd::Publish { done: Some(tx), .. } => {
-                    let _ = tx.send(Err(Error::Closed));
-                }
+                Cmd::Publish { slot, .. } => self.finished.push((slot, Err(Error::Closed))),
                 Cmd::Subscribe { done, .. } | Cmd::Unsubscribe { done, .. } => {
                     let _ = done.send(Err(Error::Closed));
                 }
                 Cmd::Disconnect { done, .. } => {
                     let _ = done.send(());
                 }
-                Cmd::Publish { done: None, .. } | Cmd::Ack { .. } => {}
             }
         }
         for (_, p) in self.pending.drain() {
             match p {
-                Pending::Publish(Some(tx)) => {
-                    let _ = tx.send(Err(Error::Closed));
-                }
+                Pending::Publish(slot) => self.finished.push((slot, Err(Error::Closed))),
                 Pending::Sub(tx, _) => {
                     let _ = tx.send(Err(Error::Closed));
                 }
-                Pending::Publish(None) | Pending::Restore => {}
+                Pending::Restore => {}
             }
         }
+        self.acks.finish(&mut self.finished);
+        self.acks.wake_chained();
+    }
+}
+
+impl Drop for Session {
+    /// Whether it ended, failed or was dropped with its lane, the waiting
+    /// calls learn the session is gone.
+    fn drop(&mut self) {
+        self.fail_pending();
     }
 }
 
@@ -761,6 +885,48 @@ fn connack(c: &ConnAck<'_>, version: Version) -> Result<(Connected, u16)> {
     Ok((connected, quota))
 }
 
+/// Sets the packet ID of an encoded QoS 1/2 PUBLISH.
+fn set_pkid(packet: &mut [u8], pkid: u16) {
+    let Ok(Some(h)) = fixed_header(packet) else {
+        return;
+    };
+    let at = h.header_len;
+    let Some(&[a, b]) = packet.get(at..at + 2) else {
+        return;
+    };
+    let at = at + 2 + usize::from(u16::from_be_bytes([a, b]));
+    if let Some(id) = packet.get_mut(at..at + 2) {
+        id.copy_from_slice(&pkid.to_be_bytes());
+    }
+}
+
+/// Length of the whole packets at the front of `buf`.
+fn complete_len(buf: &[u8]) -> Result<usize> {
+    let mut at = 0;
+    loop {
+        match fixed_header(&buf[at..]) {
+            Ok(Some(h)) if h.packet_len() > MAX_PACKET => {
+                return Err(Error::Protocol("malformed packet"));
+            }
+            Ok(Some(h)) if at + h.packet_len() <= buf.len() => at += h.packet_len(),
+            Ok(_) => return Ok(at),
+            Err(_) => return Err(Error::Protocol("malformed packet")),
+        }
+    }
+}
+
+/// Makes room for the next read, and for all of a partial packet. Messages
+/// still hold slices of a full buffer, so a new one takes over.
+fn make_room(buf: &mut BytesMut) {
+    let partial = match fixed_header(buf) {
+        Ok(Some(h)) => h.packet_len().min(MAX_PACKET),
+        _ => 0,
+    };
+    if buf.capacity() - buf.len() < READ_MIN || buf.capacity() < partial {
+        buf.reserve((READ_BUF / 2).max(partial.saturating_sub(buf.len())));
+    }
+}
+
 /// Refusals worth another attempt: the broker is busy or full, not
 /// rejecting the client.
 const fn retryable(code: ReasonCode) -> bool {
@@ -777,6 +943,9 @@ async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
     let mut spare = Vec::new();
     loop {
         let buf = std::mem::replace(&mut *out.buf.borrow_mut(), std::mem::take(&mut spare));
+        if buf.len() >= OUT_ROOM {
+            out.drained.notify_one();
+        }
         if buf.is_empty() {
             if out.closed.get() {
                 let _ = w.shutdown().await;
@@ -794,6 +963,8 @@ async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
             continue;
         }
         if w.write_all(&buf).await.is_err() {
+            out.broken.set(true);
+            out.drained.notify_one();
             return;
         }
         spare = buf;

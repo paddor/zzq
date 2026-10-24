@@ -17,21 +17,24 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
+use std::pin::pin;
+use std::sync::Arc;
+use std::task::{self, Poll, Wake, Waker};
+
 use bytes::Bytes;
-use tokio::sync::mpsc;
 use zzq_proto::{QoS, SubscriptionOptions};
 use zzq_tokio::Context;
 
 use crate::{
-    Ack, ClientOptions, Cmd, Connected, Error, Message, ReasonCode, Result, publish_cmd, start,
+    Ack, ClientOptions, Cmd, Connected, Error, Link, Message, ReasonCode, Result, inbox, start,
     subscribe_cmd, unsubscribe_cmd,
 };
 
 /// A connected client with blocking calls.
 #[derive(Debug)]
 pub struct Client {
-    cmd: mpsc::UnboundedSender<Cmd>,
-    inbox: mpsc::Receiver<Message>,
+    link: Link,
+    inbox: inbox::Receiver,
     connected: Connected,
 }
 
@@ -47,6 +50,36 @@ fn wait<T>(rx: Ack<T>) -> Result<T> {
     rx.blocking_recv().map_err(|_| Error::Closed)?
 }
 
+/// Runs `f` to completion on this thread, parking it while `f` waits.
+fn block_on<F: Future>(f: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    thread_local! {
+        static WAKER: Waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+    }
+
+    let mut f = pin!(f);
+    WAKER.with(|waker| {
+        let mut cx = task::Context::from_waker(waker);
+        loop {
+            if let Poll::Ready(out) = f.as_mut().poll(&mut cx) {
+                return out;
+            }
+            std::thread::park();
+        }
+    })
+}
+
 impl Client {
     /// Connects to `uri` and waits for CONNACK.
     ///
@@ -59,7 +92,7 @@ impl Client {
         let st = start(ctx, uri, opts)?;
         let connected = wait(st.connack)?;
         Ok(Client {
-            cmd: st.cmd,
+            link: st.link,
             inbox: st.inbox,
             connected,
         })
@@ -70,14 +103,15 @@ impl Client {
         &self.connected
     }
 
-    /// Publishes. QoS 0 returns once queued; QoS 1 and 2 wait for the ack.
+    /// Publishes. QoS 0 returns once queued, waiting while about 1 MiB is
+    /// queued already; QoS 1 and 2 wait for the ack.
     ///
     /// # Errors
     ///
     /// As [`crate::Client::publish`], and [`Error::InAsync`] inside an async
     /// runtime.
     pub fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, payload.into(), qos, false)
+        self.send_publish(topic, &payload.into(), qos, false)
     }
 
     /// Publishes a retained message: the broker keeps it for later
@@ -87,14 +121,12 @@ impl Client {
     ///
     /// As [`Client::publish`].
     pub fn publish_retained(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, payload.into(), qos, true)
+        self.send_publish(topic, &payload.into(), qos, true)
     }
 
-    fn send_publish(&self, topic: &str, payload: Bytes, qos: QoS, retain: bool) -> Result<()> {
+    fn send_publish(&self, topic: &str, payload: &[u8], qos: QoS, retain: bool) -> Result<()> {
         not_in_async()?;
-        let (cmd, rx) = publish_cmd(topic, payload, qos, retain)?;
-        self.send(cmd)?;
-        rx.map_or(Ok(()), wait)
+        block_on(self.link.publish(topic, payload, qos, retain))?.map_or(Ok(()), block_on)
     }
 
     /// Subscribes to one filter with a maximum QoS. Returns the granted
@@ -125,7 +157,7 @@ impl Client {
     ) -> Result<Vec<ReasonCode>> {
         not_in_async()?;
         let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
-        self.send(cmd)?;
+        self.link.send(cmd)?;
         wait(rx)
     }
 
@@ -137,7 +169,7 @@ impl Client {
     pub fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
         not_in_async()?;
         let (cmd, rx) = unsubscribe_cmd(filters)?;
-        self.send(cmd)?;
+        self.link.send(cmd)?;
         wait(rx)
     }
 
@@ -145,9 +177,7 @@ impl Client {
     /// when called inside an async runtime.
     pub fn recv(&mut self) -> Option<Message> {
         not_in_async().ok()?;
-        let m = self.inbox.blocking_recv()?;
-        crate::ack(&self.cmd, &m);
-        Some(m)
+        block_on(self.inbox.recv())
     }
 
     /// Sends DISCONNECT and closes.
@@ -157,6 +187,7 @@ impl Client {
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
+            .link
             .send(Cmd::Disconnect {
                 reason: ReasonCode::SUCCESS,
                 done: tx,
@@ -165,9 +196,5 @@ impl Client {
         {
             let _ = rx.blocking_recv();
         }
-    }
-
-    fn send(&self, cmd: Cmd) -> Result<()> {
-        self.cmd.send(cmd).map_err(|_| Error::Closed)
     }
 }

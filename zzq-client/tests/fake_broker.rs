@@ -179,3 +179,57 @@ async fn a_resent_qos2_publish_already_taken_is_acked_again() {
     assert_eq!(peer.packet().await.0 >> 4, 7, "PUBCOMP");
     assert!(timeout(Duration::from_millis(200), c.recv()).await.is_err());
 }
+
+#[tokio::test]
+async fn disconnect_while_offline_behind_queued_publishes_returns_at_once() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        reconnect: Some(Reconnect {
+            min: Duration::from_secs(60),
+            max: Duration::from_secs(60),
+        }),
+        ..ClientOptions::new("offline")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let peer = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    drop(peer);
+    // The session sees the connection go and waits a minute to reconnect.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.publish("t", "queued", QoS::AtMostOnce).await.unwrap();
+    // The session has seen the publish by the time DISCONNECT comes.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    timeout(WAIT, c.disconnect()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_publish_waiting_for_its_ack_fails_once_the_connection_is_lost() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("lost"))
+                .await
+                .unwrap()
+        }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let c = std::sync::Arc::new(connecting.await.unwrap());
+    let publish = tokio::spawn({
+        let c = c.clone();
+        async move { c.publish("t", "x", QoS::AtLeastOnce).await }
+    });
+    assert_eq!(peer.packet().await.0 >> 4, 3, "PUBLISH");
+    drop(peer);
+    let res = timeout(WAIT, publish).await.unwrap().unwrap();
+    assert!(matches!(res, Err(zzq_client::Error::Closed)), "{res:?}");
+    assert!(matches!(
+        c.publish("t", "x", QoS::AtLeastOnce).await,
+        Err(zzq_client::Error::Closed)
+    ));
+}

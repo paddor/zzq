@@ -33,14 +33,19 @@
 
 #![forbid(unsafe_code)]
 
+mod acks;
 pub mod blocking;
 mod check;
 mod conn;
+mod inbox;
+mod submit;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
+use zzq_proto::encode::PublishHeader;
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]
 pub use zzq_tokio::transport::tls::TlsOptions;
@@ -119,9 +124,10 @@ pub struct ClientOptions {
     pub password: Option<Bytes>,
     /// Will the broker publishes if the connection is lost.
     pub will: Option<LastWill>,
-    /// Messages buffered for [`Client::recv`] before the connection waits.
-    /// QoS 1/2 messages are acked when taken, and v5 brokers are asked to
-    /// keep at most this many unacked.
+    /// Messages queued for [`Client::recv`] before the connection waits.
+    /// `recv` takes the queue in batches, so up to twice this many can be
+    /// in memory. QoS 1/2 messages are acked when taken, and v5 brokers are
+    /// asked to keep at most this many unacked.
     pub inbox: usize,
     /// Transport settings, such as trust anchors for `tls://`.
     pub transport: TransportOptions,
@@ -210,13 +216,8 @@ pub struct Connected {
 
 #[derive(Debug)]
 pub(crate) enum Cmd {
-    Publish {
-        topic: String,
-        payload: Bytes,
-        qos: QoS,
-        retain: bool,
-        done: Option<oneshot::Sender<Result<()>>>,
-    },
+    /// A queued QoS 1/2 PUBLISH, packet ID 0 until sent, and its ack slot.
+    Publish { packet: Vec<u8>, slot: usize },
     Subscribe {
         filters: Vec<(String, SubscriptionOptions)>,
         sub_id: u32,
@@ -230,67 +231,84 @@ pub(crate) enum Cmd {
         reason: ReasonCode,
         done: oneshot::Sender<()>,
     },
-    /// The application took a QoS 1/2 message: ack it.
-    Ack { pkid: u16, qos: QoS },
 }
 
-/// Acks a QoS 1/2 message now that the application has it, so the
-/// broker's window, and with it the inbox, stays bounded.
-fn ack(cmd: &mpsc::UnboundedSender<Cmd>, m: &Message) {
-    if let Some(pkid) = m.ack {
-        let _ = cmd.send(Cmd::Ack { pkid, qos: m.qos });
+/// A handle's way to its session task: requests go out, publish acks
+/// come back.
+#[derive(Debug)]
+struct Link {
+    submit: submit::Sender,
+    acks: Arc<acks::Acks>,
+    version: Version,
+}
+
+impl Link {
+    /// Queues a publish, waiting while the queue is full. QoS 1/2 return
+    /// the wait for the ack.
+    async fn publish(
+        &self,
+        topic: &str,
+        payload: &[u8],
+        qos: QoS,
+        retain: bool,
+    ) -> Result<Option<acks::AckWait>> {
+        check::publish(topic, payload.len())?;
+        let h = PublishHeader {
+            version: self.version,
+            dup: false,
+            qos,
+            retain,
+            topic,
+            pkid: 0,
+            properties: &[],
+        };
+        if qos == QoS::AtMostOnce {
+            self.submit.publish(&h, payload, 0).await?;
+            return Ok(None);
+        }
+        let mut wait = acks::AckWait::new(&self.acks);
+        self.submit.publish(&h, payload, wait.slot()).await?;
+        wait.queued();
+        Ok(Some(wait))
+    }
+
+    fn send(&self, cmd: Cmd) -> Result<()> {
+        self.submit.send(cmd)
     }
 }
 
-/// Channels to a starting session task.
+/// A starting session task.
 struct Start {
-    cmd: mpsc::UnboundedSender<Cmd>,
-    inbox: mpsc::Receiver<Message>,
+    link: Link,
+    inbox: inbox::Receiver,
     connack: oneshot::Receiver<Result<Connected>>,
 }
 
 fn start(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Start> {
     check::options(&opts)?;
     let endpoint = uri.parse::<Endpoint>()?;
-    let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let (inbox_tx, inbox_rx) = mpsc::channel(opts.inbox.max(1));
-    let (ack_tx, ack_rx) = oneshot::channel();
+    let (submit_tx, submit_rx) = submit::channel();
+    let acks = Arc::new(acks::Acks::default());
+    let (inbox_tx, inbox_rx) = inbox::channel(opts.inbox);
+    let (connack_tx, connack_rx) = oneshot::channel();
     let ctx2 = ctx.clone();
     let transport = opts.transport.clone();
-    let session = conn::Session::new(opts, cmd_rx, inbox_tx, ack_tx);
+    let version = opts.version;
+    let session = conn::Session::new(opts, submit_rx, acks.clone(), inbox_tx, connack_tx);
     ctx.next_lane()
         .spawn(move || conn::run_session(ctx2, endpoint, transport, session))?;
     Ok(Start {
-        cmd: cmd_tx,
+        link: Link {
+            submit: submit_tx,
+            acks,
+            version,
+        },
         inbox: inbox_rx,
-        connack: ack_rx,
+        connack: connack_rx,
     })
 }
 
 type Ack<T> = oneshot::Receiver<Result<T>>;
-
-fn publish_cmd(
-    topic: &str,
-    payload: Bytes,
-    qos: QoS,
-    retain: bool,
-) -> Result<(Cmd, Option<Ack<()>>)> {
-    check::publish(topic, payload.len())?;
-    let (tx, rx) = if qos == QoS::AtMostOnce {
-        (None, None)
-    } else {
-        let (tx, rx) = oneshot::channel();
-        (Some(tx), Some(rx))
-    };
-    let cmd = Cmd::Publish {
-        topic: topic.to_owned(),
-        payload,
-        qos,
-        retain,
-        done: tx,
-    };
-    Ok((cmd, rx))
-}
 
 fn subscribe_cmd(
     filters: &[(&str, SubscriptionOptions)],
@@ -319,8 +337,8 @@ fn unsubscribe_cmd(filters: &[&str]) -> Result<(Cmd, Ack<Vec<ReasonCode>>)> {
 /// A connected client.
 #[derive(Debug)]
 pub struct Client {
-    cmd: mpsc::UnboundedSender<Cmd>,
-    inbox: mpsc::Receiver<Message>,
+    link: Link,
+    inbox: inbox::Receiver,
     connected: Connected,
 }
 
@@ -337,7 +355,7 @@ impl Client {
         let st = start(ctx, uri, opts)?;
         let connected = st.connack.await.map_err(|_| Error::Closed)??;
         Ok(Client {
-            cmd: st.cmd,
+            link: st.link,
             inbox: st.inbox,
             connected,
         })
@@ -348,7 +366,8 @@ impl Client {
         &self.connected
     }
 
-    /// Publishes. QoS 0 returns once queued; QoS 1 and 2 wait for the ack.
+    /// Publishes. QoS 0 returns once queued, waiting while about 1 MiB is
+    /// queued already; QoS 1 and 2 wait for the ack.
     ///
     /// # Errors
     ///
@@ -381,10 +400,8 @@ impl Client {
         qos: QoS,
         retain: bool,
     ) -> Result<()> {
-        let (cmd, rx) = publish_cmd(topic, payload, qos, retain)?;
-        self.send(cmd)?;
-        match rx {
-            Some(rx) => rx.await.map_err(|_| Error::Closed)?,
+        match self.link.publish(topic, &payload, qos, retain).await? {
+            Some(wait) => wait.await,
             None => Ok(()),
         }
     }
@@ -418,7 +435,7 @@ impl Client {
         sub_id: u32,
     ) -> Result<Vec<ReasonCode>> {
         let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
-        self.send(cmd)?;
+        self.link.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
     }
 
@@ -429,23 +446,21 @@ impl Client {
     /// As [`Client::subscribe`].
     pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
         let (cmd, rx) = unsubscribe_cmd(filters)?;
-        self.send(cmd)?;
+        self.link.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
     }
 
     /// Next received message. `None` once the client is gone for good:
     /// disconnected, refused, or lost without [`ClientOptions::reconnect`].
     pub async fn recv(&mut self) -> Option<Message> {
-        let m = self.inbox.recv().await?;
-        ack(&self.cmd, &m);
-        Some(m)
+        self.inbox.recv().await
     }
 
     /// Sends DISCONNECT and closes. [`ReasonCode::DISCONNECT_WITH_WILL`]
     /// asks a v5 broker for the will.
     pub async fn disconnect_with(self, reason: ReasonCode) {
         let (tx, rx) = oneshot::channel();
-        if self.send(Cmd::Disconnect { reason, done: tx }).is_ok() {
+        if self.link.send(Cmd::Disconnect { reason, done: tx }).is_ok() {
             let _ = rx.await;
         }
     }
@@ -453,10 +468,6 @@ impl Client {
     /// Sends DISCONNECT and closes.
     pub async fn disconnect(self) {
         self.disconnect_with(ReasonCode::SUCCESS).await;
-    }
-
-    fn send(&self, cmd: Cmd) -> Result<()> {
-        self.cmd.send(cmd).map_err(|_| Error::Closed)
     }
 }
 
