@@ -82,7 +82,7 @@ impl<'a> Cursor<'a> {
         if n == 0 {
             return Ok(Properties::EMPTY);
         }
-        Properties::parse(self.bytes(n)?)
+        Properties::try_from(self.bytes(n)?)
     }
 }
 

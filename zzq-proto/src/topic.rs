@@ -17,10 +17,10 @@ pub fn validate_filter(filter: &str) -> Result<(), DecodeError> {
     if filter.is_empty() || filter.len() > 65_535 {
         return Err(DecodeError::InvalidTopic);
     }
-    let body = match SharedFilter::parse(filter) {
-        Some(Ok(s)) => s.filter,
-        Some(Err(e)) => return Err(e),
-        None => filter,
+    let body = if is_shared(filter) {
+        SharedFilter::try_from(filter)?.filter
+    } else {
+        filter
     };
     let mut levels = body.split('/').peekable();
     while let Some(level) = levels.next() {
@@ -60,20 +60,28 @@ pub struct SharedFilter<'a> {
     pub filter: &'a str,
 }
 
-impl<'a> SharedFilter<'a> {
-    /// `None` if `filter` is not shared, an error if it is malformed.
-    pub fn parse(filter: &'a str) -> Option<Result<Self, DecodeError>> {
-        let rest = filter.strip_prefix("$share/")?;
-        let Some((group, inner)) = rest.split_once('/') else {
-            return Some(Err(DecodeError::InvalidTopic));
-        };
+/// Whether `filter` is a `$share/` subscription, valid or not.
+pub fn is_shared(filter: &str) -> bool {
+    filter.starts_with("$share/")
+}
+
+impl<'a> TryFrom<&'a str> for SharedFilter<'a> {
+    type Error = DecodeError;
+
+    /// Splits a `$share/{group}/{filter}` filter. Unshared filters, empty or
+    /// wildcard groups and empty filters are invalid.
+    fn try_from(filter: &'a str) -> Result<Self, DecodeError> {
+        let rest = filter
+            .strip_prefix("$share/")
+            .ok_or(DecodeError::InvalidTopic)?;
+        let (group, inner) = rest.split_once('/').ok_or(DecodeError::InvalidTopic)?;
         if group.is_empty() || group.contains(['+', '#']) || inner.is_empty() {
-            return Some(Err(DecodeError::InvalidTopic));
+            return Err(DecodeError::InvalidTopic);
         }
-        Some(Ok(SharedFilter {
+        Ok(SharedFilter {
             group,
             filter: inner,
-        }))
+        })
     }
 }
 
@@ -131,8 +139,9 @@ mod tests {
 
     #[test]
     fn share_prefix_splits_into_group_and_filter() {
-        let s = SharedFilter::parse("$share/g1/a/+").unwrap().unwrap();
+        let s = SharedFilter::try_from("$share/g1/a/+").unwrap();
         assert_eq!((s.group, s.filter), ("g1", "a/+"));
-        assert!(SharedFilter::parse("a/b").is_none());
+        assert!(SharedFilter::try_from("a/b").is_err());
+        assert!(is_shared("$share/g/x") && !is_shared("a/b"));
     }
 }

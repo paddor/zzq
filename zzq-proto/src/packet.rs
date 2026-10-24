@@ -280,7 +280,7 @@ fn topic_name(b: &[u8]) -> Result<&str, DecodeError> {
 
 #[inline]
 fn publish(flags: u8, body: &[u8], v5: bool) -> Result<Publish<'_>, DecodeError> {
-    let qos = QoS::from_u8((flags >> 1) & 0x03)?;
+    let qos = QoS::try_from((flags >> 1) & 0x03)?;
     let dup = flags & 0x08 != 0;
     if dup && qos == QoS::AtMostOnce {
         return Err(DecodeError::Malformed);
@@ -379,7 +379,7 @@ fn will<'a>(c: &mut Cursor<'a>, flags: u8, v5: bool) -> Result<Option<Will<'a>>,
     let topic = c.string()?;
     validate_name(topic)?;
     Ok(Some(Will {
-        qos: QoS::from_u8((flags >> 3) & 0x03)?,
+        qos: QoS::try_from((flags >> 3) & 0x03)?,
         retain: flags & 0x20 != 0,
         properties,
         topic,

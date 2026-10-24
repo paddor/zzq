@@ -705,7 +705,7 @@ impl Client {
             .await;
             return;
         };
-        let opts = SubscriptionOptions::qos(flags.qos.mqtt());
+        let opts = SubscriptionOptions::from(flags.qos.mqtt());
         encode::subscribe(Version::V311, msg_id.max(1), &[], &[(&filter, opts)], out);
         self.sub_filter.insert(msg_id.max(1), filter);
     }

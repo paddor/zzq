@@ -470,7 +470,7 @@ mod tests {
     fn oversized_field_panics_in_debug_builds() {
         let long = "x".repeat(MAX_FIELD_LEN + 1);
         let mut out = Vec::new();
-        let opts = SubscriptionOptions::qos(QoS::AtMostOnce);
+        let opts = SubscriptionOptions::from(QoS::AtMostOnce);
         subscribe(Version::V311, 1, &[], &[(&long, opts)], &mut out);
     }
 
@@ -572,7 +572,7 @@ mod tests {
             let want = if version.is_v5() {
                 opts
             } else {
-                SubscriptionOptions::qos(QoS::ExactlyOnce)
+                SubscriptionOptions::from(QoS::ExactlyOnce)
             };
             assert_eq!(
                 filters,

@@ -67,7 +67,7 @@ impl Client {
 
     /// Subscribes to one filter with a maximum QoS. Returns the granted code.
     pub fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
-        let codes = self.subscribe_with(&[(filter, SubscriptionOptions::qos(qos))], 0)?;
+        let codes = self.subscribe_with(&[(filter, SubscriptionOptions::from(qos))], 0)?;
         Ok(codes
             .first()
             .copied()

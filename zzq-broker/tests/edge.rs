@@ -86,7 +86,7 @@ impl Raw {
 
     async fn subscribe(&mut self, filter: &str, qos: QoS) {
         let mut out = Vec::new();
-        let opts = SubscriptionOptions::qos(qos);
+        let opts = SubscriptionOptions::from(qos);
         encode::subscribe(self.version, 1, &[], &[(filter, opts)], &mut out);
         self.write(&out).await;
         let (byte1, _) = self.packet().await.expect("SUBACK");
@@ -648,7 +648,7 @@ async fn max_keep_alive_applies_to_silent_clients() {
     };
     let (_ctx, _broker, uri) = setup(1, opts).await;
     let (mut raw, connack) = Raw::connect_ack(&uri, "forever", Version::V5, 0).await;
-    let props = zzq_proto::Properties::parse(&connack[5..]).unwrap();
+    let props = zzq_proto::Properties::try_from(&connack[5..]).unwrap();
     assert_eq!(
         props.get_int(zzq_proto::property::SERVER_KEEP_ALIVE),
         Some(1)
@@ -729,7 +729,7 @@ async fn no_local_needs_every_overlapping_subscription() {
     let mut c = Client::connect(&ctx, &uri, ClientOptions::new("self"))
         .await
         .unwrap();
-    let mut no_local = SubscriptionOptions::qos(QoS::AtLeastOnce);
+    let mut no_local = SubscriptionOptions::from(QoS::AtLeastOnce);
     no_local.no_local = true;
     c.subscribe_with(&[("o/#", no_local)], 0).await.unwrap();
     c.publish("o/x", "hidden", QoS::AtLeastOnce, false)
@@ -750,9 +750,9 @@ async fn overlapping_subscriptions_carry_every_identifier() {
     let mut c = Client::connect(&ctx, &uri, ClientOptions::new("ids"))
         .await
         .unwrap();
-    let q1 = SubscriptionOptions::qos(QoS::AtLeastOnce);
+    let q1 = SubscriptionOptions::from(QoS::AtLeastOnce);
     c.subscribe_with(&[("m/#", q1)], 1).await.unwrap();
-    c.subscribe_with(&[("m/+", SubscriptionOptions::qos(QoS::AtMostOnce))], 2)
+    c.subscribe_with(&[("m/+", SubscriptionOptions::from(QoS::AtMostOnce))], 2)
         .await
         .unwrap();
     c.publish("m/x", "both", QoS::AtLeastOnce, false)
@@ -946,7 +946,7 @@ async fn publisher_subscription_identifier_is_a_protocol_error() {
     let mut sub = Client::connect(&ctx, &uri, ClientOptions::new("spoofed"))
         .await
         .unwrap();
-    sub.subscribe_with(&[("spoof", SubscriptionOptions::qos(QoS::AtMostOnce))], 1)
+    sub.subscribe_with(&[("spoof", SubscriptionOptions::from(QoS::AtMostOnce))], 1)
         .await
         .unwrap();
     let mut raw = Raw::connect(&uri, "spoofer", Version::V5, 0).await;

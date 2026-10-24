@@ -204,7 +204,7 @@ struct Start {
 
 fn start(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Start> {
     check::options(&opts)?;
-    let endpoint = Endpoint::parse(uri)?;
+    let endpoint = uri.parse::<Endpoint>()?;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (inbox_tx, inbox_rx) = mpsc::channel(opts.inbox.max(1));
     let (ack_tx, ack_rx) = oneshot::channel();
@@ -313,7 +313,7 @@ impl Client {
     /// Subscribes to one filter with a maximum QoS. Returns the granted code.
     pub async fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
         let codes = self
-            .subscribe_with(&[(filter, SubscriptionOptions::qos(qos))], 0)
+            .subscribe_with(&[(filter, SubscriptionOptions::from(qos))], 0)
             .await?;
         Ok(codes
             .first()

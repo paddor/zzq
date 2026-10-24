@@ -13,10 +13,12 @@ pub enum QoS {
     ExactlyOnce = 2,
 }
 
-impl QoS {
+impl TryFrom<u8> for QoS {
+    type Error = DecodeError;
+
     /// Converts a wire value.
     #[inline]
-    pub const fn from_u8(v: u8) -> Result<QoS, DecodeError> {
+    fn try_from(v: u8) -> Result<QoS, DecodeError> {
         match v {
             0 => Ok(QoS::AtMostOnce),
             1 => Ok(QoS::AtLeastOnce),
@@ -114,15 +116,17 @@ pub struct SubscriptionOptions {
     pub retain_handling: u8,
 }
 
-impl SubscriptionOptions {
+impl From<QoS> for SubscriptionOptions {
     /// Options with only a QoS.
-    pub fn qos(qos: QoS) -> Self {
+    fn from(qos: QoS) -> Self {
         SubscriptionOptions {
             qos,
             ..Self::default()
         }
     }
+}
 
+impl SubscriptionOptions {
     /// Parses the options byte.
     pub fn from_byte(b: u8, version: Version) -> Result<Self, DecodeError> {
         if version.is_v5() {
@@ -130,7 +134,7 @@ impl SubscriptionOptions {
                 return Err(DecodeError::Malformed);
             }
             Ok(SubscriptionOptions {
-                qos: QoS::from_u8(b & 0x03)?,
+                qos: QoS::try_from(b & 0x03)?,
                 no_local: b & 0x04 != 0,
                 retain_as_published: b & 0x08 != 0,
                 retain_handling: (b >> 4) & 0x03,
@@ -139,7 +143,7 @@ impl SubscriptionOptions {
             if b & 0xfc != 0 {
                 return Err(DecodeError::Malformed);
             }
-            Ok(SubscriptionOptions::qos(QoS::from_u8(b)?))
+            Ok(SubscriptionOptions::from(QoS::try_from(b)?))
         }
     }
 

@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
 use zzq_proto::SubscriptionOptions;
-use zzq_proto::topic::SharedFilter;
+use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::trie::TopicTrie;
 
 use crate::slab::Key;
@@ -134,7 +134,7 @@ impl SubIndex {
 
     /// Removes the subscription of `sub` to `filter`.
     pub(crate) fn remove(&mut self, filter: &str, sub: SubRef) -> bool {
-        let share = SharedFilter::parse(filter).map(|_| filter);
+        let share = is_shared(filter).then_some(filter);
         let removed = self.trie.remove(inner_filter(filter), |e| {
             e.sub == sub && e.share.as_deref() == share
         });
@@ -247,10 +247,7 @@ fn fill(
 }
 
 fn inner_filter(filter: &str) -> &str {
-    match SharedFilter::parse(filter) {
-        Some(Ok(s)) => s.filter,
-        _ => filter,
-    }
+    SharedFilter::try_from(filter).map_or(filter, |s| s.filter)
 }
 
 #[cfg(test)]
@@ -271,7 +268,7 @@ mod tests {
     fn entry(n: u32, qos: QoS, share: Option<&str>) -> Entry {
         Entry {
             sub: sub(n),
-            opts: SubscriptionOptions::qos(qos),
+            opts: SubscriptionOptions::from(qos),
             sub_id: SubIds::default(),
             share: share.map(Arc::from),
         }

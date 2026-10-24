@@ -100,7 +100,7 @@ pub fn publish(out: &mut Vec<u8>, head: Head<'_>, payload: &[u8]) {
     let h = PublishHeader {
         version: version(head.v5),
         dup: false,
-        qos: QoS::from_u8(head.qos).unwrap_or_default(),
+        qos: QoS::try_from(head.qos).unwrap_or_default(),
         retain: false,
         topic: head.topic,
         pkid: head.pkid,
@@ -158,7 +158,7 @@ pub fn connect(
                 zzq_proto::varint::decode(&body[2..])
                     .ok()
                     .flatten()
-                    .and_then(|(len, n)| Properties::parse(body.get(2 + n..2 + n + len)?).ok())
+                    .and_then(|(len, n)| Properties::try_from(body.get(2 + n..2 + n + len)?).ok())
                     .and_then(|p| p.get_int(property::RECEIVE_MAXIMUM))
                     .map(|v| v as u16)
             } else {
@@ -178,7 +178,7 @@ pub fn subscribe(
     v5: bool,
 ) -> io::Result<()> {
     let mut out = Vec::new();
-    let opts = SubscriptionOptions::qos(QoS::from_u8(qos).unwrap_or_default());
+    let opts = SubscriptionOptions::from(QoS::try_from(qos).unwrap_or_default());
     encode::subscribe(version(v5), 1, &[], &[(filter, opts)], &mut out);
     s.write_all(&out)?;
     loop {

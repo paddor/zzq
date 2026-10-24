@@ -145,7 +145,7 @@ impl Broker {
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
     /// endpoint, with the actual port for port 0.
     pub async fn bind(&self, uri: &str) -> Result<Endpoint> {
-        let endpoint = Endpoint::parse(uri)?;
+        let endpoint = uri.parse::<Endpoint>()?;
         let (tx, rx) = oneshot::channel();
         let shared = self.shared.clone();
         let lane = self.shared.ctx.next_lane().clone();

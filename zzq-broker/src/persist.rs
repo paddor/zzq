@@ -371,7 +371,7 @@ fn put_bytes(b: &mut Vec<u8>, data: &[u8]) {
 fn decode_set(body: &[u8]) -> Option<Retained> {
     let mut f = Fields(body.strip_prefix(&[SET])?);
     let topic = f.topic()?.to_owned();
-    let qos = QoS::from_u8(f.take(1)?[0]).ok()?;
+    let qos = QoS::try_from(f.take(1)?[0]).ok()?;
     let ms = u64::from_be_bytes(f.take(8)?.try_into().ok()?);
     let properties = Bytes::copy_from_slice(f.bytes()?);
     let payload = Bytes::copy_from_slice(f.bytes()?);

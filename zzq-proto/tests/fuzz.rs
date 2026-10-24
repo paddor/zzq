@@ -69,7 +69,7 @@ fn samples() -> Vec<Vec<u8>> {
             &props,
             &[
                 ("a/+", SubscriptionOptions::default()),
-                ("#", SubscriptionOptions::qos(QoS::ExactlyOnce)),
+                ("#", SubscriptionOptions::from(QoS::ExactlyOnce)),
             ],
             &mut b,
         );

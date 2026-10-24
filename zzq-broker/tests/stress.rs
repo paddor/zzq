@@ -104,7 +104,7 @@ fn packet(r: &mut Rng, v: Version, out: &mut Vec<u8>) {
             encode::publish(&h, &payload, out);
         }
         4 | 5 => {
-            let opts = SubscriptionOptions::qos(qos(r));
+            let opts = SubscriptionOptions::from(qos(r));
             encode::subscribe(v, pkid, &[], &[(*r.pick(FILTERS), opts)], out);
         }
         6 => encode::unsubscribe(v, pkid, &[], &[*r.pick(FILTERS)], out),

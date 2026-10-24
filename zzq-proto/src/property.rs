@@ -110,18 +110,22 @@ pub struct Properties<'a> {
     raw: &'a [u8],
 }
 
-impl<'a> Properties<'a> {
-    /// No properties.
-    pub const EMPTY: Properties<'static> = Properties { raw: &[] };
+impl<'a> TryFrom<&'a [u8]> for Properties<'a> {
+    type Error = DecodeError;
 
     /// Validates raw property bytes (without the length prefix).
-    pub fn parse(raw: &'a [u8]) -> Result<Self, DecodeError> {
+    fn try_from(raw: &'a [u8]) -> Result<Self, DecodeError> {
         let mut c = Cursor::new(raw);
         while !c.is_empty() {
             read_one(&mut c)?;
         }
         Ok(Properties { raw })
     }
+}
+
+impl<'a> Properties<'a> {
+    /// No properties.
+    pub const EMPTY: Properties<'static> = Properties { raw: &[] };
 
     /// The raw property bytes, without the length prefix.
     #[inline]
@@ -273,7 +277,7 @@ mod tests {
         let mut out = Vec::new();
         encode_all(&props, &mut out);
         assert_eq!(out.len(), encoded_len(&props));
-        let parsed = Properties::parse(&out).unwrap();
+        let parsed = Properties::try_from(out.as_slice()).unwrap();
         let back: Vec<_> = parsed.iter().collect();
         assert_eq!(back, props);
         assert_eq!(parsed.get_int(RECEIVE_MAXIMUM), Some(10));
@@ -282,13 +286,16 @@ mod tests {
 
     #[test]
     fn rejects_unknown_and_truncated() {
-        assert_eq!(Properties::parse(&[0x7f, 0]), Err(DecodeError::Malformed));
         assert_eq!(
-            Properties::parse(&[RECEIVE_MAXIMUM, 0]),
+            Properties::try_from(&[0x7f, 0][..]),
             Err(DecodeError::Malformed)
         );
         assert_eq!(
-            Properties::parse(&[SUBSCRIPTION_IDENTIFIER, 0]),
+            Properties::try_from(&[RECEIVE_MAXIMUM, 0][..]),
+            Err(DecodeError::Malformed)
+        );
+        assert_eq!(
+            Properties::try_from(&[SUBSCRIPTION_IDENTIFIER, 0][..]),
             Err(DecodeError::Protocol)
         );
     }

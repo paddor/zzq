@@ -14,7 +14,7 @@ use tokio::sync::{Notify, oneshot};
 use zzq_proto::encode::{self, SubAckFields};
 use zzq_proto::packet::{Ack, Publish, Subscribe, Unsubscribe, decode};
 use zzq_proto::property::{self, Property};
-use zzq_proto::topic::SharedFilter;
+use zzq_proto::topic::is_shared;
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 
 use crate::broker::Shared;
@@ -292,7 +292,7 @@ impl Lane {
             sub: self.sub_ref(key),
             opts,
             sub_id: SubIds::one(sub_id),
-            share: SharedFilter::parse(filter).map(|_| Arc::from(filter)),
+            share: is_shared(filter).then(|| Arc::from(filter)),
         }
     }
 
@@ -1398,6 +1398,5 @@ fn may_subscribe(acl: Option<&dyn Authorizer>, s: &Session, filter: &str) -> boo
 /// Whether a subscription gets the retained messages it matches, by
 /// Retain Handling. Shared subscriptions never do.
 fn retained_wanted(filter: &str, opts: SubscriptionOptions, existed: bool) -> bool {
-    SharedFilter::parse(filter).is_none()
-        && (opts.retain_handling == 0 || (opts.retain_handling == 1 && !existed))
+    !is_shared(filter) && (opts.retain_handling == 0 || (opts.retain_handling == 1 && !existed))
 }

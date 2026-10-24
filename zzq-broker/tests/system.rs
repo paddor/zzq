@@ -252,7 +252,7 @@ async fn no_local_and_subscription_ids() {
     let mut c = client(&ctx, &uri, "c", Version::V5).await;
     let opts = SubscriptionOptions {
         no_local: true,
-        ..SubscriptionOptions::qos(QoS::AtMostOnce)
+        ..SubscriptionOptions::from(QoS::AtMostOnce)
     };
     c.subscribe_with(&[("own", opts)], 0).await.unwrap();
     c.subscribe_with(&[("tagged", SubscriptionOptions::default())], 42)

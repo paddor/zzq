@@ -371,7 +371,7 @@ impl Session {
                         .saturating_duration_since(Instant::now())
                         .as_secs()
                         .max(1);
-                    let parsed = zzq_proto::Properties::parse(f.props).unwrap_or_default();
+                    let parsed = zzq_proto::Properties::try_from(f.props).unwrap_or_default();
                     for p in parsed.iter().filter(|p| p.id() != MESSAGE_EXPIRY_INTERVAL) {
                         p.encode(&mut props_buf);
                     }

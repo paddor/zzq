@@ -198,7 +198,7 @@ pub(crate) fn expiry(props: &[u8]) -> Option<Instant> {
     if props.is_empty() {
         return None;
     }
-    let p = zzq_proto::Properties::parse(props).ok()?;
+    let p = zzq_proto::Properties::try_from(props).ok()?;
     let seconds = p.get_int(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL)?;
     Some(Instant::now() + Duration::from_secs(u64::from(seconds)))
 }

@@ -43,8 +43,7 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    /// Parses an endpoint URI.
-    pub fn parse(uri: &str) -> Result<Endpoint> {
+    fn parse_uri(uri: &str) -> Result<Endpoint> {
         let bad = |why| Error::InvalidEndpoint {
             uri: uri.to_owned(),
             why,
@@ -166,8 +165,9 @@ impl fmt::Display for Endpoint {
 impl std::str::FromStr for Endpoint {
     type Err = Error;
 
+    /// Parses an endpoint URI such as `tcp://localhost:1883`.
     fn from_str(s: &str) -> Result<Endpoint> {
-        Endpoint::parse(s)
+        Endpoint::parse_uri(s)
     }
 }
 
@@ -185,24 +185,24 @@ mod tests {
     #[test]
     fn parses_every_scheme_with_default_ports() {
         assert_eq!(
-            Endpoint::parse("tcp://localhost").unwrap(),
+            "tcp://localhost".parse::<Endpoint>().unwrap(),
             tcp("localhost", 1883)
         );
         assert_eq!(
-            Endpoint::parse("tcp://0.0.0.0:1999").unwrap(),
+            "tcp://0.0.0.0:1999".parse::<Endpoint>().unwrap(),
             tcp("0.0.0.0", 1999)
         );
-        assert_eq!(Endpoint::parse("tcp://[::1]:7").unwrap(), tcp("::1", 7));
-        assert_eq!(Endpoint::parse("tcp://[::1]").unwrap(), tcp("::1", 1883));
+        assert_eq!("tcp://[::1]:7".parse::<Endpoint>().unwrap(), tcp("::1", 7));
+        assert_eq!("tcp://[::1]".parse::<Endpoint>().unwrap(), tcp("::1", 1883));
         assert_eq!(
-            Endpoint::parse("tls://h").unwrap(),
+            "tls://h".parse::<Endpoint>().unwrap(),
             Endpoint::Tls {
                 host: "h".into(),
                 port: 8883
             }
         );
         assert_eq!(
-            Endpoint::parse("ws://h:9").unwrap(),
+            "ws://h:9".parse::<Endpoint>().unwrap(),
             Endpoint::Ws {
                 host: "h".into(),
                 port: 9,
@@ -210,15 +210,15 @@ mod tests {
             }
         );
         assert_eq!(
-            Endpoint::parse("ipc://@abc").unwrap(),
+            "ipc://@abc".parse::<Endpoint>().unwrap(),
             Endpoint::Ipc("@abc".into())
         );
         assert_eq!(
-            Endpoint::parse("inproc://x").unwrap(),
+            "inproc://x".parse::<Endpoint>().unwrap(),
             Endpoint::Inproc("x".into())
         );
         assert_eq!(
-            Endpoint::parse("tcp://[::1]:7").unwrap().to_string(),
+            "tcp://[::1]:7".parse::<Endpoint>().unwrap().to_string(),
             "tcp://[::1]:7"
         );
     }
@@ -234,7 +234,7 @@ mod tests {
             "tcp://h/p",
             "inproc://",
         ] {
-            assert!(Endpoint::parse(bad).is_err(), "{bad}");
+            assert!(bad.parse::<Endpoint>().is_err(), "{bad}");
         }
     }
 }
