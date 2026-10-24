@@ -145,21 +145,30 @@ impl Endpoint {
     }
 }
 
+/// Host and port of `host[:port]` or `[host][:port]`. Only a bracketed host
+/// may contain `:`, as IPv6 addresses do, and no host may be empty or
+/// contain brackets, so every endpoint prints back as one that parses.
 fn split_host_port(authority: &str, default: u16) -> Option<(String, u16)> {
-    if let Some(v6) = authority.strip_prefix('[') {
+    let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
         let (host, rest) = v6.split_once(']')?;
         let port = match rest.strip_prefix(':') {
-            Some(p) => p.parse().ok()?,
-            None if rest.is_empty() => default,
+            Some(p) => Some(p),
+            None if rest.is_empty() => None,
             None => return None,
         };
-        return Some((host.to_owned(), port));
+        (host, port)
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.contains(':') => (host, Some(port)),
+            Some(_) => return None,
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() || host.contains(['[', ']']) {
+        return None;
     }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => Some((host.to_owned(), port.parse().ok()?)),
-        None if !authority.is_empty() => Some((authority.to_owned(), default)),
-        Some(_) | None => None,
-    }
+    let port = port.map_or(Some(default), |p| p.parse().ok())?;
+    Some((host.to_owned(), port))
 }
 
 fn format_host_port(host: &str, port: u16) -> String {
@@ -260,6 +269,12 @@ mod tests {
             "tcp://:1",
             "tcp://h/p",
             "inproc://",
+            "tcp://[]",
+            "tcp://[[x]",
+            "tcp://[a]b]:1",
+            "tcp://a:b:1",
+            "tcp://a]:1",
+            "wss://[]/p",
         ] {
             assert!(bad.parse::<Endpoint>().is_err(), "{bad}");
         }

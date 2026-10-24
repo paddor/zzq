@@ -2,7 +2,14 @@
 //! target, plus inputs that once failed. Run with `cargo afl test`.
 
 /// Minimized inputs that made a target fail, by target name.
-const REGRESSIONS: &[(&str, &[u8])] = &[];
+const REGRESSIONS: &[(&str, &[u8])] = &[
+    // Hosts that parsed but printed as URIs that did not.
+    ("endpoint", b"tcp://[]"),
+    ("endpoint", b"tcp://[[[1T]"),
+    ("endpoint", b"tcp://q-:1]:0"),
+    ("endpoint", b"udp://0.::1]:88::8::::4::::::::::0"),
+    ("endpoint", b"wss://[]/8"),
+];
 
 fn variants(seed: &[u8]) -> Vec<Vec<u8>> {
     let mut out = vec![seed.to_vec()];
