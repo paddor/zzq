@@ -92,7 +92,7 @@ struct Lane {
 }
 
 struct Inner {
-    lanes: Vec<Lane>,
+    lanes: Box<[Lane]>,
     next: AtomicUsize,
     threads: Mutex<Vec<(ThreadId, JoinHandle<()>)>>,
     inproc: Arc<Registry>,
@@ -158,7 +158,7 @@ impl Context {
         }
         Ok(Context {
             inner: Arc::new(Inner {
-                lanes,
+                lanes: lanes.into_boxed_slice(),
                 next: AtomicUsize::new(0),
                 threads: Mutex::new(threads),
                 inproc: Arc::default(),

@@ -173,9 +173,9 @@ impl AsyncWrite for QuicWriter {
 /// sockets, so the kernel spreads connections over the lanes. Each lane
 /// runs the handshakes and the quinn tasks of its own connections.
 pub struct QuicListener {
-    endpoints: Vec<quinn::Endpoint>,
+    endpoints: Box<[quinn::Endpoint]>,
     accepted: mpsc::UnboundedReceiver<Stream>,
-    tasks: Vec<tokio::task::AbortHandle>,
+    tasks: Box<[tokio::task::AbortHandle]>,
     host: String,
     port: u16,
 }
@@ -244,9 +244,9 @@ impl QuicListener {
             tasks.push(task);
         }
         Ok(QuicListener {
-            endpoints,
+            endpoints: endpoints.into_boxed_slice(),
             accepted,
-            tasks,
+            tasks: tasks.into_boxed_slice(),
             host: host.to_owned(),
             port: bound.port(),
         })

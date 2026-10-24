@@ -62,7 +62,7 @@ pub(crate) struct Shared {
     pub(crate) ctx: Context,
     pub(crate) opts: BrokerOptions,
     pub(crate) retained: Mutex<RetainedStore>,
-    pub(crate) lanes: Vec<LaneTx>,
+    pub(crate) lanes: Box<[LaneTx]>,
     /// Connected clients on all lanes, for `max_connections`.
     pub(crate) connections: AtomicUsize,
     /// Accept loops and other tasks stopped when the broker is dropped.
@@ -116,7 +116,7 @@ impl Broker {
             ctx: ctx.clone(),
             opts,
             retained: Mutex::new(retained),
-            lanes,
+            lanes: lanes.into_boxed_slice(),
             connections: AtomicUsize::new(0),
             tasks: Mutex::default(),
         });

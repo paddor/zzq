@@ -151,7 +151,7 @@ pub(crate) struct Lane {
     by_client: FxHashMap<Box<str>, Key>,
     index: SubIndex,
     dirty: Vec<Key>,
-    remote: Vec<Vec<Remote>>,
+    remote: Box<[Vec<Remote>]>,
     held: Vec<Held>,
     /// First congested target of the publish being routed.
     hit: Option<Hit>,
