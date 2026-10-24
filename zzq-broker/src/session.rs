@@ -17,6 +17,9 @@ use crate::slab::Key;
 
 /// Empty write buffers above this size are freed by the lane sweep.
 const IDLE_BUFFER: usize = 64 << 10;
+/// Unacked messages beyond which a session counts as slow: new messages
+/// for it get their own copy instead of pinning read buffers.
+const SLOW_INFLIGHT: usize = 256;
 
 /// Will message of a connection.
 #[derive(Debug, Clone)]
@@ -209,10 +212,7 @@ impl Session {
     /// Delivers a QoS 1 or 2 message: sends it if the window allows, queues
     /// it otherwise.
     pub(crate) fn deliver_qos12(&mut self, item: Queued, max_queued: usize) -> Outcome {
-        if self.conn.is_some()
-            && self.queue.is_empty()
-            && self.inflight.len() < usize::from(self.window)
-        {
+        if !self.would_queue() {
             return self.send_inflight(item);
         }
         let mut outcome = Outcome::Queued;
@@ -222,6 +222,21 @@ impl Session {
         }
         self.queue.push_back(item);
         outcome
+    }
+
+    /// Whether a QoS 1/2 delivery now would wait in the queue.
+    #[inline]
+    pub(crate) fn would_queue(&self) -> bool {
+        self.conn.is_none()
+            || !self.queue.is_empty()
+            || self.inflight.len() >= usize::from(self.window)
+    }
+
+    /// Whether a QoS 1/2 delivery now may stay a while: queued, or behind
+    /// many unacked messages.
+    #[inline]
+    pub(crate) fn holds_long(&self) -> bool {
+        self.would_queue() || self.inflight.len() >= SLOW_INFLIGHT
     }
 
     fn send_inflight(&mut self, item: Queued) -> Outcome {

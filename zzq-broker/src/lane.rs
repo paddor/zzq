@@ -918,8 +918,9 @@ impl Lane {
             }
         } else {
             let msg = owned.get_or_insert_with(|| p.to_msg());
-            // Offline queues live long; do not let them pin read buffers.
-            if s.conn.is_none() && p.chunk.is_some_and(|c| msg.pins(c)) {
+            // A slow or offline session may hold a message long; do not let
+            // it pin read buffers.
+            if s.holds_long() && p.chunk.is_some_and(|c| msg.pins(c)) {
                 *msg = msg.compact();
             }
             let msg = if last { owned.take() } else { owned.clone() }.unwrap_or_else(|| p.to_msg());
