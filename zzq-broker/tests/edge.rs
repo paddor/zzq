@@ -410,9 +410,17 @@ async fn queued_messages_expire() {
         assert_eq!(byte1 >> 4, 4, "PUBACK");
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
-    let mut c = Client::connect(&ctx, &uri, durable).await.unwrap();
+    let mut c = Client::connect(&ctx, &uri, durable.clone()).await.unwrap();
     assert_eq!(next(&mut c).await.payload, "long");
     nothing(&mut c).await;
+    assert_eq!(broker.stats().await.unwrap().dropped_expired, 1);
+    // The count outlives the session.
+    c.disconnect().await;
+    let clean = ClientOptions {
+        clean_start: true,
+        ..durable
+    };
+    Client::connect(&ctx, &uri, clean).await.unwrap();
     assert_eq!(broker.stats().await.unwrap().dropped_expired, 1);
 }
 

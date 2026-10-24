@@ -305,6 +305,7 @@ impl Lane {
         let Some(mut s) = self.sessions.remove(key) else {
             return;
         };
+        self.stats.dropped_expired += s.expired;
         let sub = self.sub_ref(key);
         for filter in s.subs.keys() {
             self.unsubscribe_entry(filter, sub, None);
@@ -1158,12 +1159,13 @@ impl Lane {
             Control::Stats(reply) => {
                 let mut stats = self.stats;
                 stats.sessions = self.sessions.len() as u64;
-                stats.dropped_expired = self
+                // Removed sessions added theirs to `self.stats`.
+                stats.dropped_expired += self
                     .sessions
                     .keys()
                     .filter_map(|k| self.sessions.get(k))
                     .map(|s| s.expired)
-                    .sum();
+                    .sum::<u64>();
                 let _ = reply.send(stats);
             }
             Control::Shutdown => self.shutdown(),
