@@ -7,6 +7,7 @@ use zzq_tokio::transport::TransportOptions;
 
 /// What a client presented in CONNECT.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ConnectInfo<'a> {
     pub client_id: &'a str,
     pub username: Option<&'a str>,
@@ -19,6 +20,7 @@ pub struct ConnectInfo<'a> {
 
 /// Result of [`Authenticator::authenticate`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum AuthDecision {
     Allow,
     /// Rejects with a v5 CONNACK reason code. v3.1.1 clients get the closest
@@ -34,6 +36,7 @@ pub trait Authenticator: Send + Sync + 'static {
 /// The client a publish or subscribe comes from. MQTT-SN QoS -1 publishes
 /// come from a client with an empty ID, and are authenticated as one.
 #[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
 pub struct ClientInfo<'a> {
     pub client_id: &'a str,
     pub username: Option<&'a str>,

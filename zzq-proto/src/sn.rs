@@ -63,6 +63,7 @@ impl SnQoS {
 
 /// How a topic is referenced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Topic<'a> {
     /// A topic ID from REGISTER.
     Id(u16),
@@ -142,6 +143,7 @@ impl Flags {
 
 /// An MQTT-SN message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Packet<'a> {
     Advertise {
         gw_id: u8,

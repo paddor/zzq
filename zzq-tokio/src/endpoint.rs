@@ -15,6 +15,7 @@ pub const UDP_PORT: u16 = 1884;
 
 /// A parsed endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Endpoint {
     /// `tcp://host[:port]`
     Tcp { host: String, port: u16 },

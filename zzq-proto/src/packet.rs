@@ -9,6 +9,7 @@ use crate::{DecodeError, Properties, QoS, SubscriptionOptions, Version, varint};
 
 /// Fixed header of a packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct FixedHeader {
     /// First byte: packet type and flags.
     pub byte1: u8,
@@ -44,6 +45,7 @@ pub fn fixed_header(buf: &[u8]) -> Result<Option<FixedHeader>, DecodeError> {
 
 /// CONNECT will message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Will<'a> {
     pub qos: QoS,
     pub retain: bool,
@@ -54,6 +56,7 @@ pub struct Will<'a> {
 
 /// CONNECT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Connect<'a> {
     pub version: Version,
     pub clean_start: bool,
@@ -67,6 +70,7 @@ pub struct Connect<'a> {
 
 /// CONNACK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConnAck<'a> {
     pub session_present: bool,
     /// v5 reason code or v3.1.1 return code.
@@ -76,6 +80,7 @@ pub struct ConnAck<'a> {
 
 /// PUBLISH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Publish<'a> {
     pub dup: bool,
     pub qos: QoS,
@@ -90,6 +95,7 @@ pub struct Publish<'a> {
 
 /// PUBACK, PUBREC, PUBREL or PUBCOMP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Ack<'a> {
     pub pkid: u16,
     pub reason: u8,
@@ -163,6 +169,7 @@ impl<'a> Iterator for FilterIter<'a> {
 
 /// SUBACK or UNSUBACK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SubAck<'a> {
     pub pkid: u16,
     pub properties: Properties<'a>,
@@ -172,6 +179,7 @@ pub struct SubAck<'a> {
 
 /// DISCONNECT or AUTH.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ReasonOnly<'a> {
     pub reason: u8,
     pub properties: Properties<'a>,

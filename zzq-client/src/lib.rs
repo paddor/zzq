@@ -142,6 +142,7 @@ impl ClientOptions {
 
 /// A received message.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Message {
     pub topic: String,
     pub payload: Bytes,
@@ -155,6 +156,7 @@ pub struct Message {
 
 /// CONNACK details.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Connected {
     pub session_present: bool,
     /// Client ID assigned by a v5 broker, if the client sent none.

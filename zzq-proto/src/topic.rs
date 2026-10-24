@@ -55,6 +55,7 @@ pub fn matches(filter: &str, topic: &str) -> bool {
 
 /// A `$share/{group}/{filter}` subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct SharedFilter<'a> {
     pub group: &'a str,
     pub filter: &'a str,

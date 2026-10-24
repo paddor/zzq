@@ -30,6 +30,7 @@ impl TryFrom<u8> for QoS {
 
 /// Protocol version negotiated by CONNECT.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum Version {
     /// MQTT 3.1 (protocol name `MQIsdp`), handled like 3.1.1.
     V31,

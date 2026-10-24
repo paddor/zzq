@@ -71,6 +71,7 @@ pub(crate) struct Shared {
 
 /// Broker counters.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Stats {
     pub connections: u64,
     pub sessions: u64,

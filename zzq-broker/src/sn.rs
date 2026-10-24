@@ -115,7 +115,8 @@ fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, d
     let name = match topic {
         Topic::Predefined(id) => predefined(shared, id).map(str::to_owned),
         Topic::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
-        Topic::Id(_) | Topic::Name(_) => None,
+        // Topic IDs need a connection; other forms are not supported.
+        _ => None,
     };
     let Some(name) = name.filter(|t| zzq_proto::topic::validate_name(t).is_ok()) else {
         return;
@@ -535,6 +536,7 @@ impl Client {
             Topic::Predefined(id) => predefined(&self.shared, id).map(str::to_owned),
             Topic::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
             Topic::Name(n) => Some(n.to_owned()),
+            _ => None,
         }
     }
 
