@@ -18,6 +18,9 @@ pub const REJECTED_NOT_SUPPORTED: u8 = 0x03;
 /// Protocol ID in CONNECT.
 pub const PROTOCOL_ID: u8 = 0x01;
 
+/// Longest message: its length field is a `u16`.
+pub const MAX_LEN: usize = 65_535;
+
 /// MQTT-SN QoS, which adds QoS -1: publish without a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SnQoS {
@@ -498,9 +501,15 @@ pub fn encoded_len(p: &Packet<'_>) -> usize {
 }
 
 /// Writes `p`.
+///
+/// # Panics
+///
+/// In debug builds, if [`encoded_len`] is over [`MAX_LEN`]. Release builds
+/// write a malformed length.
 #[expect(clippy::too_many_lines, reason = "one arm per message type")]
 pub fn encode<S: Sink + ?Sized>(p: &Packet<'_>, out: &mut S) {
     let len = length_field(p);
+    debug_assert!(len <= MAX_LEN, "message over sn::MAX_LEN");
     if len <= 255 {
         out.put_u8(len as u8);
     } else {

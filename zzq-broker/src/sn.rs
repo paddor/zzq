@@ -34,6 +34,9 @@ const CLIENT_QUEUE: usize = 1024;
 const PIPE_BYTES: usize = 256 << 10;
 /// How often retransmissions and sleep deadlines are checked.
 const TICK: Duration = Duration::from_secs(1);
+/// Largest UDP payload over IPv4, and so the largest datagram the gateway
+/// sends.
+const MAX_SEND: usize = 65_507;
 /// Time a client has to answer WILLTOPICREQ and WILLMSGREQ.
 const WILL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -801,35 +804,19 @@ impl Client {
             retain: p.retain,
             ..Flags::default()
         };
-        let predefined_id = self
-            .shared
-            .opts
-            .sn_predefined
-            .iter()
-            .find(|(_, t)| t == p.topic)
-            .map(|(i, _)| *i);
+        // The topic ID form is the longest PUBLISH header.
+        let probe = sn::Packet::Publish {
+            flags,
+            topic: Topic::Id(0),
+            msg_id: p.pkid,
+            data: p.payload,
+        };
+        if sn::encoded_len(&probe) > MAX_SEND {
+            self.drop_publish(p);
+            return Vec::new();
+        }
         let mut out = Vec::new();
-        let (topic, pending) = if let Some(id) = predefined_id {
-            (Topic::Predefined(id), None)
-        } else if p.topic.len() == 2 {
-            let b = p.topic.as_bytes();
-            (Topic::Short([b[0], b[1]]), None)
-        } else if let Some(&id) = self.ids.get(p.topic) {
-            let pending = self.registering.values().any(|&t| t == id).then_some(id);
-            (Topic::Id(id), pending)
-        } else if let Some(id) = self.topic_id_for(p.topic) {
-            let msg_id = self.msg_id();
-            self.registering.insert(msg_id, id);
-            let reg = sn::Packet::Register {
-                topic_id: id,
-                msg_id,
-                topic: p.topic,
-            };
-            let mut d = Vec::with_capacity(sn::encoded_len(&reg));
-            sn::encode(&reg, &mut d);
-            out.push(d);
-            (Topic::Id(id), Some(id))
-        } else {
+        let Some((topic, pending)) = self.topic_out(p.topic, &mut out) else {
             self.drop_publish(p);
             return out;
         };
@@ -848,8 +835,45 @@ impl Client {
         out
     }
 
-    /// Drops a broker PUBLISH the client has no topic ID for, and acks it
-    /// so the session's window moves on.
+    /// The topic form for a PUBLISH on `topic`, and the topic ID whose
+    /// REGISTER is not acked yet. The REGISTER for a new topic goes to
+    /// `out`. `None` if the client cannot get a topic ID.
+    fn topic_out(
+        &mut self,
+        topic: &str,
+        out: &mut Vec<Vec<u8>>,
+    ) -> Option<(Topic<'static>, Option<u16>)> {
+        let predefined = &self.shared.opts.sn_predefined;
+        if let Some((id, _)) = predefined.iter().find(|(_, t)| t == topic) {
+            return Some((Topic::Predefined(*id), None));
+        }
+        if let [a, b] = *topic.as_bytes() {
+            return Some((Topic::Short([a, b]), None));
+        }
+        if let Some(&id) = self.ids.get(topic) {
+            let pending = self.registering.values().any(|&t| t == id).then_some(id);
+            return Some((Topic::Id(id), pending));
+        }
+        if !register_fits(topic) {
+            return None;
+        }
+        let id = self.topic_id_for(topic)?;
+        let msg_id = self.msg_id();
+        self.registering.insert(msg_id, id);
+        let reg = sn::Packet::Register {
+            topic_id: id,
+            msg_id,
+            topic,
+        };
+        let mut d = Vec::with_capacity(sn::encoded_len(&reg));
+        sn::encode(&reg, &mut d);
+        out.push(d);
+        Some((Topic::Id(id), Some(id)))
+    }
+
+    /// Drops a broker PUBLISH the client cannot get, for lack of a topic ID
+    /// or because it does not fit a datagram, and acks it so the session's
+    /// window moves on.
     fn drop_publish(&mut self, p: &zzq_proto::packet::Publish<'_>) {
         match p.qos {
             QoS::AtMostOnce => {}
@@ -860,6 +884,16 @@ impl Client {
             }
         }
     }
+}
+
+/// Whether a REGISTER of `topic` fits a datagram.
+fn register_fits(topic: &str) -> bool {
+    let reg = sn::Packet::Register {
+        topic_id: 0,
+        msg_id: 0,
+        topic,
+    };
+    sn::encoded_len(&reg) <= MAX_SEND
 }
 
 /// Whether a SUBSCRIBE filter names one normal topic, which gets a topic

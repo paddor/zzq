@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod blocking;
+mod check;
 mod conn;
 
 use std::time::Duration;
@@ -32,6 +33,15 @@ pub enum Error {
     Rejected(u8),
     #[error("protocol error: {0}")]
     Protocol(&'static str),
+    /// A topic name or filter is not valid.
+    #[error("invalid topic {0:?}")]
+    InvalidTopic(String),
+    /// A string or binary field is longer than 65535 bytes.
+    #[error("{0} longer than 65535 bytes")]
+    TooLong(&'static str),
+    /// A packet would be larger than MQTT can encode.
+    #[error("packet larger than MQTT allows")]
+    TooLarge,
     #[error("connection closed")]
     Closed,
     #[error("blocking call inside an async runtime")]
@@ -186,6 +196,7 @@ struct Start {
 }
 
 fn start(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Start> {
+    check::options(&opts)?;
     let endpoint = Endpoint::parse(uri)?;
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (inbox_tx, inbox_rx) = mpsc::channel(opts.inbox.max(1));
@@ -204,7 +215,13 @@ fn start(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Start> {
 
 type Ack<T> = oneshot::Receiver<Result<T>>;
 
-fn publish_cmd(topic: &str, payload: Bytes, qos: QoS, retain: bool) -> (Cmd, Option<Ack<()>>) {
+fn publish_cmd(
+    topic: &str,
+    payload: Bytes,
+    qos: QoS,
+    retain: bool,
+) -> Result<(Cmd, Option<Ack<()>>)> {
+    check::publish(topic, payload.len())?;
     let (tx, rx) = if qos == QoS::AtMostOnce {
         (None, None)
     } else {
@@ -218,26 +235,31 @@ fn publish_cmd(topic: &str, payload: Bytes, qos: QoS, retain: bool) -> (Cmd, Opt
         retain,
         done: tx,
     };
-    (cmd, rx)
+    Ok((cmd, rx))
 }
 
-fn subscribe_cmd(filters: &[(&str, SubscriptionOptions)], sub_id: u32) -> (Cmd, Ack<Vec<u8>>) {
+fn subscribe_cmd(
+    filters: &[(&str, SubscriptionOptions)],
+    sub_id: u32,
+) -> Result<(Cmd, Ack<Vec<u8>>)> {
+    check::filters(filters.iter().map(|(f, _)| *f))?;
     let (tx, rx) = oneshot::channel();
     let cmd = Cmd::Subscribe {
         filters: filters.iter().map(|(f, o)| ((*f).to_owned(), *o)).collect(),
         sub_id,
         done: tx,
     };
-    (cmd, rx)
+    Ok((cmd, rx))
 }
 
-fn unsubscribe_cmd(filters: &[&str]) -> (Cmd, Ack<Vec<u8>>) {
+fn unsubscribe_cmd(filters: &[&str]) -> Result<(Cmd, Ack<Vec<u8>>)> {
+    check::filters(filters.iter().copied())?;
     let (tx, rx) = oneshot::channel();
     let cmd = Cmd::Unsubscribe {
         filters: filters.iter().map(|f| (*f).to_owned()).collect(),
         done: tx,
     };
-    (cmd, rx)
+    Ok((cmd, rx))
 }
 
 /// A connected client.
@@ -273,7 +295,7 @@ impl Client {
         qos: QoS,
         retain: bool,
     ) -> Result<()> {
-        let (cmd, rx) = publish_cmd(topic, payload.into(), qos, retain);
+        let (cmd, rx) = publish_cmd(topic, payload.into(), qos, retain)?;
         self.send(cmd)?;
         match rx {
             Some(rx) => rx.await.map_err(|_| Error::Closed)?,
@@ -296,14 +318,14 @@ impl Client {
         filters: &[(&str, SubscriptionOptions)],
         sub_id: u32,
     ) -> Result<Vec<u8>> {
-        let (cmd, rx) = subscribe_cmd(filters, sub_id);
+        let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
         self.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
     }
 
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
     pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<u8>> {
-        let (cmd, rx) = unsubscribe_cmd(filters);
+        let (cmd, rx) = unsubscribe_cmd(filters)?;
         self.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
     }

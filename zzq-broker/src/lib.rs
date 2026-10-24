@@ -38,6 +38,9 @@ pub enum Error {
     Engine(#[from] zzq_tokio::Error),
     #[error("invalid topic: {0:?}")]
     InvalidTopic(String),
+    /// A message would be larger than MQTT can encode.
+    #[error("message larger than MQTT allows")]
+    TooLarge,
     #[error("broker is shut down")]
     Closed,
     #[error("persistence: {0}")]

@@ -1062,3 +1062,40 @@ async fn client_waits_for_a_free_packet_id() {
     broker.write(&suback).await;
     assert_eq!(sub.await.unwrap().unwrap(), 0);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn client_and_broker_refuse_what_mqtt_cannot_encode() {
+    use zzq_client::Error;
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let c = Client::connect(&ctx, &uri, ClientOptions::new("limits"))
+        .await
+        .unwrap();
+    let long = "t".repeat(70_000);
+    // Zeroed and never touched, so the allocation stays cheap.
+    let huge = bytes::Bytes::from(vec![0u8; zzq_proto::varint::MAX]);
+    for (topic, payload) in [
+        ("a/+", bytes::Bytes::new()),
+        (long.as_str(), bytes::Bytes::new()),
+    ] {
+        let r = c.publish(topic, payload, QoS::AtMostOnce, false).await;
+        assert!(matches!(r, Err(Error::InvalidTopic(_))), "{r:?}");
+    }
+    let r = c.publish("a", huge.clone(), QoS::AtLeastOnce, false).await;
+    assert!(matches!(r, Err(Error::TooLarge)), "{r:?}");
+    let r = c.subscribe("a/#/b", QoS::AtMostOnce).await;
+    assert!(matches!(r, Err(Error::InvalidTopic(_))), "{r:?}");
+    let r = c.unsubscribe(&["a+"]).await;
+    assert!(matches!(r, Err(Error::InvalidTopic(_))), "{r:?}");
+    let opts = ClientOptions {
+        password: Some(long.clone().into()),
+        ..ClientOptions::new("long-password")
+    };
+    let r = Client::connect(&ctx, &uri, opts).await;
+    assert!(matches!(r, Err(Error::TooLong("password"))), "{r:?}");
+    let r = broker.publish("a", huge, QoS::AtMostOnce, false);
+    assert!(matches!(r, Err(zzq_broker::Error::TooLarge)), "{r:?}");
+    // Still usable.
+    c.publish("a", "fine", QoS::AtLeastOnce, false)
+        .await
+        .unwrap();
+}

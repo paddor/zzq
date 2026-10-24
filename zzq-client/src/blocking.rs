@@ -60,7 +60,7 @@ impl Client {
         retain: bool,
     ) -> Result<()> {
         not_in_async()?;
-        let (cmd, rx) = publish_cmd(topic, payload.into(), qos, retain);
+        let (cmd, rx) = publish_cmd(topic, payload.into(), qos, retain)?;
         self.send(cmd)?;
         rx.map_or(Ok(()), wait)
     }
@@ -79,7 +79,7 @@ impl Client {
         sub_id: u32,
     ) -> Result<Vec<u8>> {
         not_in_async()?;
-        let (cmd, rx) = subscribe_cmd(filters, sub_id);
+        let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
         self.send(cmd)?;
         wait(rx)
     }
@@ -87,7 +87,7 @@ impl Client {
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
     pub fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<u8>> {
         not_in_async()?;
-        let (cmd, rx) = unsubscribe_cmd(filters);
+        let (cmd, rx) = unsubscribe_cmd(filters)?;
         self.send(cmd)?;
         wait(rx)
     }

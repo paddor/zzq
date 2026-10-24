@@ -3,9 +3,18 @@
 //! Every encoder knows the exact packet size before writing and writes into
 //! a [`Sink`]: a `Vec<u8>` with `alloc`, or a [`SliceSink`] over a fixed
 //! buffer.
+//!
+//! Encoders take valid input: strings and binary fields of at most
+//! [`MAX_FIELD_LEN`] bytes, and packets with a remaining length of at most
+//! [`varint::MAX`]. Check sizes first, for example with
+//! [`PublishHeader::remaining`]. Larger input panics in debug builds and
+//! writes a malformed packet in release builds.
 
 use crate::property::{self, Property};
 use crate::{PacketType, QoS, SubscriptionOptions, Version, varint};
+
+/// Longest string or binary field: its length prefix is a `u16`.
+pub const MAX_FIELD_LEN: usize = 65_535;
 
 /// Byte output for encoders.
 pub trait Sink {
@@ -27,6 +36,7 @@ pub trait Sink {
     /// Appends a variable byte integer.
     #[inline]
     fn put_varint(&mut self, v: usize) {
+        debug_assert!(v <= varint::MAX, "remaining length over varint::MAX");
         let mut buf = [0; 4];
         let n = varint::encode(v, &mut buf);
         self.put(&buf[..n]);
@@ -35,6 +45,7 @@ pub trait Sink {
     /// Appends length-prefixed binary data.
     #[inline]
     fn put_binary(&mut self, b: &[u8]) {
+        debug_assert!(b.len() <= MAX_FIELD_LEN, "field over MAX_FIELD_LEN");
         self.put_u16(b.len() as u16);
         self.put(b);
     }
@@ -450,6 +461,16 @@ mod tests {
     use crate::packet::{Packet, decode};
     use crate::property::{RECEIVE_MAXIMUM, USER_PROPERTY};
     use std::vec::Vec;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "field over MAX_FIELD_LEN")]
+    fn oversized_field_panics_in_debug_builds() {
+        let long = "x".repeat(MAX_FIELD_LEN + 1);
+        let mut out = Vec::new();
+        let opts = SubscriptionOptions::qos(QoS::AtMostOnce);
+        subscribe(Version::V311, 1, &[], &[(&long, opts)], &mut out);
+    }
 
     fn one(buf: &[u8], version: Version) -> Packet<'_> {
         let (p, n) = decode(buf, version, usize::MAX).unwrap().unwrap();

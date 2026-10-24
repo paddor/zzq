@@ -1040,6 +1040,51 @@ mod mqtt_sn {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn message_too_large_for_a_datagram_is_dropped_and_acked() {
+        let opts = BrokerOptions {
+            max_inflight: 1,
+            ..BrokerOptions::default()
+        };
+        let (ctx, _broker, uri, addr) = bind_sn(opts).await;
+        let s = sn_client(&addr, "small").await;
+        send(
+            &s,
+            &Packet::Subscribe {
+                flags: qos(SnQoS::AtLeastOnce),
+                msg_id: 1,
+                topic: Topic::Name("big/#"),
+            },
+        )
+        .await;
+        recv(&s).await;
+        let publ = client(&ctx, &uri, "p", Version::V5).await;
+        publ.publish("big/a", vec![b'x'; 70_000], QoS::AtLeastOnce, false)
+            .await
+            .unwrap();
+        // Acked to the broker, so the one-message window lets this through.
+        publ.publish("big/a", "small", QoS::AtLeastOnce, false)
+            .await
+            .unwrap();
+        let Packet::Register {
+            topic_id, msg_id, ..
+        } = sn::decode(&recv(&s).await).unwrap().0
+        else {
+            panic!("expected REGISTER");
+        };
+        let regack = Packet::RegAck {
+            topic_id,
+            msg_id,
+            code: sn::ACCEPTED,
+        };
+        send(&s, &regack).await;
+        let got = recv(&s).await;
+        assert!(matches!(
+            sn::decode(&got).unwrap().0,
+            Packet::Publish { data: b"small", .. }
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn resent_connect_gets_connack_again() {
         let (ctx, _broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
         let mut watch = client(&ctx, &uri, "watch", Version::V5).await;

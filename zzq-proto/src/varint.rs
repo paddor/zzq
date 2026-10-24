@@ -39,8 +39,14 @@ pub const fn len(value: usize) -> usize {
 }
 
 /// Encodes `value` into `out` and returns the number of bytes written.
+///
+/// # Panics
+///
+/// In debug builds, if `value` is larger than [`MAX`]. Release builds
+/// write a malformed integer.
 #[inline]
 pub const fn encode(mut value: usize, out: &mut [u8; 4]) -> usize {
+    debug_assert!(value <= MAX, "value over varint::MAX");
     let mut i = 0;
     loop {
         let mut b = (value & 0x7f) as u8;
@@ -59,6 +65,13 @@ pub const fn encode(mut value: usize, out: &mut [u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "value over varint::MAX")]
+    fn value_over_max_panics_in_debug_builds() {
+        encode(MAX + 1, &mut [0; 4]);
+    }
 
     #[test]
     fn every_length_class_round_trips() {

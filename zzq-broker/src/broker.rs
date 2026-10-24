@@ -186,6 +186,18 @@ impl Broker {
             return Err(Error::InvalidTopic(topic.to_owned()));
         }
         let payload: Bytes = payload.into();
+        let h = zzq_proto::encode::PublishHeader {
+            version: zzq_proto::Version::V5,
+            dup: false,
+            qos,
+            retain,
+            topic,
+            pkid: 1,
+            properties: &[],
+        };
+        if h.remaining(payload.len()) > zzq_proto::varint::MAX {
+            return Err(Error::TooLarge);
+        }
         let msg = Msg::new(topic, &payload, &[], qos, retain);
         publish(&self.shared, msg)
     }
