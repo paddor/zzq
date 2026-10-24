@@ -494,6 +494,30 @@ async fn tls_pub_sub_on_any_lane() {
     }
 }
 
+#[cfg(feature = "tls")]
+#[tokio::test(flavor = "multi_thread")]
+async fn tls_client_skips_verification_only_when_asked() {
+    let (server_tls, _) = test_tls();
+    let opts = BrokerOptions {
+        transport: server_tls,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, _) = setup_with(1, opts).await;
+    let uri = broker.bind("tls://127.0.0.1:0").await.unwrap().to_string();
+    let tls = |danger| ClientOptions {
+        transport: zzq_client::TransportOptions {
+            tls: Some(zzq_client::TlsOptions {
+                danger_accept_invalid_certs: danger,
+                ..Default::default()
+            }),
+        },
+        ..ClientOptions::new("anyone")
+    };
+    assert!(Client::connect(&ctx, &uri, tls(false)).await.is_err());
+    let c = Client::connect(&ctx, &uri, tls(true)).await.unwrap();
+    c.publish("t", "x", QoS::AtLeastOnce, false).await.unwrap();
+}
+
 mod mqtt_sn {
     use super::*;
     use tokio::net::UdpSocket;

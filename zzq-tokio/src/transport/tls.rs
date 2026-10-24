@@ -35,8 +35,10 @@ pub struct TlsOptions {
     /// Name to verify the server certificate against. Defaults to the host
     /// of the endpoint.
     pub server_name: Option<String>,
-    /// Accept any server certificate. For tests only.
-    pub accept_invalid_certs: bool,
+    /// Accept any server certificate when connecting. Handshake signatures
+    /// are still checked, but anyone on the path can impersonate the
+    /// server. For tests and local development only.
+    pub danger_accept_invalid_certs: bool,
     /// ALPN protocols, in preference order.
     pub alpn: Vec<Vec<u8>>,
 }
@@ -52,7 +54,10 @@ impl fmt::Debug for TlsOptions {
             .field("trust_pem", &self.trust_pem.as_ref().map(Vec::len))
             .field("client_ca_pem", &self.client_ca_pem.as_ref().map(Vec::len))
             .field("server_name", &self.server_name)
-            .field("accept_invalid_certs", &self.accept_invalid_certs)
+            .field(
+                "danger_accept_invalid_certs",
+                &self.danger_accept_invalid_certs,
+            )
             .field("alpn", &self.alpn)
             .finish()
     }
@@ -137,7 +142,7 @@ pub(crate) fn client_config(o: &TlsOptions) -> Result<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(|e| bad(&e.to_string()))?;
-    let builder = if o.accept_invalid_certs {
+    let builder = if o.danger_accept_invalid_certs {
         builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(AnyServer(provider())))
