@@ -1,7 +1,6 @@
 //! Retained messages.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::BTreeSet;
 use std::fmt;
 use std::sync::Arc;
 use std::time::{Instant, SystemTime};
@@ -21,7 +20,8 @@ pub(crate) struct RetainedStore {
     /// Retained messages refused because `max` was reached.
     pub(crate) rejected: u64,
     /// When messages with a Message Expiry Interval run out, soonest first.
-    expiring: BinaryHeap<Reverse<(Instant, Box<str>)>>,
+    /// One entry per stored topic with a deadline.
+    expiring: BTreeSet<(Instant, Box<str>)>,
     persist: Option<Arc<dyn Persistence>>,
 }
 
@@ -38,7 +38,7 @@ impl Default for RetainedStore {
             len: 0,
             max: usize::MAX,
             rejected: 0,
-            expiring: BinaryHeap::new(),
+            expiring: BTreeSet::new(),
             persist: None,
         }
     }
@@ -81,8 +81,9 @@ impl RetainedStore {
     /// payload.
     pub(crate) fn set(&mut self, msg: &Msg) {
         if msg.payload().is_empty() {
-            if remove(&mut self.root, msg.topic().split('/')) {
+            if let Some(old) = remove(&mut self.root, msg.topic().split('/')) {
                 self.len -= 1;
+                reschedule(&mut self.expiring, msg.topic(), old.expires_at, None);
             }
         } else if self.len >= self.max && self.stored(msg.topic()).is_none() {
             self.rejected += 1;
@@ -103,15 +104,18 @@ impl RetainedStore {
     }
 
     fn insert(&mut self, msg: Msg) {
-        if let Some(t) = msg.expires_at {
-            self.expiring.push(Reverse((t, Box::from(msg.topic()))));
-        }
         let mut node = &mut self.root;
         for level in msg.topic().split('/') {
             node = node.children.entry(level.into()).or_default();
         }
-        if node.msg.replace(msg).is_none() {
+        let new = msg.expires_at;
+        let old = node.msg.replace(msg);
+        if old.is_none() {
             self.len += 1;
+        }
+        if let Some(m) = &node.msg {
+            let old = old.and_then(|o| o.expires_at);
+            reschedule(&mut self.expiring, m.topic(), old, new);
         }
     }
 
@@ -129,27 +133,19 @@ impl RetainedStore {
 
     /// Drops messages whose Message Expiry Interval ran out.
     pub(crate) fn sweep(&mut self, now: Instant) {
-        while let Some(Reverse((t, _))) = self.expiring.peek()
+        while let Some((t, _)) = self.expiring.first()
             && *t <= now
         {
-            let Some(Reverse((t, topic))) = self.expiring.pop() else {
+            let Some((_, topic)) = self.expiring.pop_first() else {
                 break;
             };
-            // Skip entries for messages replaced since.
-            if self.expires_at(&topic) != Some(t) {
-                continue;
-            }
-            if remove(&mut self.root, topic.split('/')) {
+            if remove(&mut self.root, topic.split('/')).is_some() {
                 self.len -= 1;
             }
             if let Some(p) = &self.persist {
                 p.remove_retained(&topic);
             }
         }
-    }
-
-    fn expires_at(&self, topic: &str) -> Option<Instant> {
-        self.stored(topic)?.expires_at
     }
 
     /// The message retained for `topic`.
@@ -199,15 +195,33 @@ fn push(node: &Node, now: Instant, out: &mut Vec<Msg>) {
     }
 }
 
-/// Removes the message at `levels` and prunes empty nodes. Returns whether
-/// there was one.
-fn remove<'a>(node: &mut Node, mut levels: impl Iterator<Item = &'a str>) -> bool {
+/// Moves the expiry entry of `topic` from deadline `old` to `new`.
+fn reschedule(
+    expiring: &mut BTreeSet<(Instant, Box<str>)>,
+    topic: &str,
+    old: Option<Instant>,
+    new: Option<Instant>,
+) {
+    let Some(at) = old.or(new).filter(|_| old != new) else {
+        return;
+    };
+    let mut entry = (at, Box::<str>::from(topic));
+    if old.is_some() {
+        expiring.remove(&entry);
+    }
+    if let Some(t) = new {
+        entry.0 = t;
+        expiring.insert(entry);
+    }
+}
+
+/// Removes the message at `levels` and prunes empty nodes. Returns the
+/// message, if there was one.
+fn remove<'a>(node: &mut Node, mut levels: impl Iterator<Item = &'a str>) -> Option<Msg> {
     let Some(level) = levels.next() else {
-        return node.msg.take().is_some();
+        return node.msg.take();
     };
-    let Some(child) = node.children.get_mut(level) else {
-        return false;
-    };
+    let child = node.children.get_mut(level)?;
     let removed = remove(child, levels);
     if child.msg.is_none() && child.children.is_empty() {
         node.children.remove(level);
@@ -306,5 +320,19 @@ mod tests {
             .collect();
         left.sort();
         assert_eq!(left, ["e/kept", "e/plain"]);
+    }
+
+    #[test]
+    fn republished_topic_keeps_one_expiry_entry() {
+        let mut store = RetainedStore::default();
+        let now = Instant::now();
+        for i in 0..100 {
+            let mut m = msg("status");
+            m.expires_at = Some(now + std::time::Duration::from_secs(60 + i));
+            store.set(&m);
+        }
+        assert_eq!((store.len(), store.expiring.len()), (1, 1));
+        store.set(&Msg::new("status", &[], &[], QoS::AtMostOnce, true));
+        assert_eq!((store.len(), store.expiring.len()), (0, 0));
     }
 }
