@@ -883,6 +883,37 @@ async fn will_expiry_starts_when_the_will_goes_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn publisher_subscription_identifier_is_a_protocol_error() {
+    let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
+    let mut sub = Client::connect(&ctx, &uri, ClientOptions::new("spoofed"))
+        .await
+        .unwrap();
+    sub.subscribe_with(&[("spoof", SubscriptionOptions::qos(QoS::AtMostOnce))], 1)
+        .await
+        .unwrap();
+    let mut raw = Raw::connect(&uri, "spoofer", Version::V5, 0).await;
+    let mut props = Vec::new();
+    zzq_proto::property::Property::VarInt(zzq_proto::property::SUBSCRIPTION_IDENTIFIER, 7)
+        .encode(&mut props);
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        topic: "spoof",
+        pkid: 0,
+        properties: &props,
+    };
+    let mut out = Vec::new();
+    encode::publish(&h, b"x", &mut out);
+    raw.write(&out).await;
+    let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
+    assert_eq!(byte1 >> 4, 14);
+    assert_eq!(packet[2], zzq_proto::reason::PROTOCOL_ERROR);
+    nothing(&mut sub).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn takeover_drops_output_queued_for_the_old_connection() {
     let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
     let fields = ConnectFields {

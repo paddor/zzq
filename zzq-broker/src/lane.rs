@@ -632,6 +632,13 @@ impl Lane {
         let receive_max = usize::from(self.shared.opts.receive_maximum);
         let s = self.sessions.get_mut(key).ok_or(Close::Kicked)?;
         let (aliased, filtered_props) = if s.version.is_v5() && !p.properties.is_empty() {
+            // Subscription Identifiers are the broker's to set [MQTT-3.3.4-6].
+            if p.properties
+                .get_int(property::SUBSCRIPTION_IDENTIFIER)
+                .is_some()
+            {
+                return Err(Close::Protocol(reason::PROTOCOL_ERROR));
+            }
             resolve_alias(s, p, opts_alias_max)?
         } else {
             (None, None)
