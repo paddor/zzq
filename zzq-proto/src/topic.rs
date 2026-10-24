@@ -82,7 +82,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn names() {
+    fn names_reject_empty_and_wildcards() {
         assert!(validate_name("a/b").is_ok());
         assert!(validate_name("/").is_ok());
         assert!(validate_name("").is_err());
@@ -91,7 +91,7 @@ mod tests {
     }
 
     #[test]
-    fn filters() {
+    fn filters_take_wildcards_only_as_whole_levels() {
         for ok in ["#", "+", "a/+/b", "a/#", "+/+", "/", "$share/g/a/#"] {
             assert!(validate_filter(ok).is_ok(), "{ok}");
         }
@@ -109,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn matching() {
+    fn wildcards_match_levels_but_not_dollar_topics() {
         let cases = [
             ("a/b", "a/b", true),
             ("a/+", "a/b", true),
@@ -130,7 +130,7 @@ mod tests {
     }
 
     #[test]
-    fn shared() {
+    fn share_prefix_splits_into_group_and_filter() {
         let s = SharedFilter::parse("$share/g1/a/+").unwrap().unwrap();
         assert_eq!((s.group, s.filter), ("g1", "a/+"));
         assert!(SharedFilter::parse("a/b").is_none());

@@ -61,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trip() {
+    fn every_length_class_round_trips() {
         for v in [0, 1, 127, 128, 16_383, 16_384, 2_097_151, 2_097_152, MAX] {
             let mut out = [0; 4];
             let n = encode(v, &mut out);
@@ -71,7 +71,7 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_and_malformed() {
+    fn short_input_is_incomplete_and_a_fifth_byte_malformed() {
         assert_eq!(decode(&[0x80]), Ok(None));
         assert_eq!(
             decode(&[0x80, 0x80, 0x80, 0x80]),

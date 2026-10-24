@@ -278,7 +278,7 @@ mod tests {
     }
 
     #[test]
-    fn dedups_and_groups() {
+    fn overlapping_subscriptions_merge_and_groups_rotate() {
         let mut idx = SubIndex::default();
         idx.add("a/+", entry(1, QoS::AtMostOnce, None));
         idx.add("a/b", entry(1, QoS::ExactlyOnce, None));

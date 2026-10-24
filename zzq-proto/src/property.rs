@@ -259,7 +259,7 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
-    fn round_trip() {
+    fn encoded_properties_parse_back_unchanged() {
         let props = [
             Property::U32(SESSION_EXPIRY_INTERVAL, 60),
             Property::U16(RECEIVE_MAXIMUM, 10),

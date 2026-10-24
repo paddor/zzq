@@ -185,7 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn parses() {
+    fn parses_every_scheme_with_default_ports() {
         assert_eq!(
             Endpoint::parse("tcp://localhost").unwrap(),
             tcp("localhost", 1883)
@@ -226,7 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects() {
+    fn rejects_malformed_uris() {
         for bad in [
             "tcp:/x",
             "mqtt://x",

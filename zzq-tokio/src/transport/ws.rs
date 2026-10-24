@@ -497,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_lengths() {
+    fn frame_header_grows_with_payload_length() {
         for len in [0, 125, 126, 65_535, 65_536] {
             let payload = vec![7u8; len];
             let mut out = Vec::new();
