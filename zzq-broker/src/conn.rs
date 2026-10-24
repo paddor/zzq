@@ -259,7 +259,7 @@ async fn read_connect<R: AsyncRead + Unpin>(
                         peer_cert,
                     };
                     if let AuthDecision::Deny(code) = auth.authenticate(&info) {
-                        return Err((Some(c.version), code));
+                        return Err((Some(c.version), code.into()));
                     }
                 }
                 let owned = OwnedConnect::from_packet(&c);

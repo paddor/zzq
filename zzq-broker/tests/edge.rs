@@ -10,7 +10,7 @@ use tokio::time::timeout;
 use zzq_broker::{Broker, BrokerOptions, Config, Context};
 use zzq_client::{Client, ClientOptions, LastWill, Message};
 use zzq_proto::encode::{self, AckFields, ConnectFields, PublishHeader};
-use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version, decode};
+use zzq_proto::{PacketType, QoS, ReasonCode, SubscriptionOptions, Version, decode};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -446,11 +446,10 @@ async fn authorizer_limits_publish_and_subscribe() {
     let mut c = Client::connect(&ctx, &uri, ClientOptions::new("alice"))
         .await
         .unwrap();
-    assert_eq!(
-        c.subscribe("#", QoS::AtLeastOnce).await.unwrap(),
-        zzq_proto::reason::NOT_AUTHORIZED
-    );
-    assert_eq!(c.subscribe("+/#", QoS::AtLeastOnce).await.unwrap(), 1);
+    let any = c.subscribe("#", QoS::AtLeastOnce).await.unwrap();
+    let own = c.subscribe("+/#", QoS::AtLeastOnce).await.unwrap();
+    let want = (ReasonCode::NOT_AUTHORIZED, ReasonCode::GRANTED_QOS_1);
+    assert_eq!((any, own), want);
     c.publish("alice/x", "mine", QoS::AtLeastOnce, false)
         .await
         .unwrap();
@@ -459,7 +458,10 @@ async fn authorizer_limits_publish_and_subscribe() {
         .publish("bob/x", "theirs", QoS::AtLeastOnce, false)
         .await
         .unwrap_err();
-    assert!(matches!(err, zzq_client::Error::Rejected(0x87)), "{err}");
+    assert!(
+        matches!(err, zzq_client::Error::Rejected(ReasonCode::NOT_AUTHORIZED)),
+        "{err}"
+    );
     c.publish("bob/x", "theirs", QoS::AtMostOnce, false)
         .await
         .unwrap();
@@ -491,7 +493,10 @@ async fn authorizer_limits_publish_and_subscribe() {
     };
     let refused = Client::connect(&ctx, &uri, sneaky).await;
     assert!(
-        matches!(refused, Err(zzq_client::Error::Refused(0x87))),
+        matches!(
+            refused,
+            Err(zzq_client::Error::Refused(ReasonCode::NOT_AUTHORIZED))
+        ),
         "{refused:?}"
     );
 }
@@ -507,7 +512,10 @@ async fn clients_cannot_publish_to_sys() {
         .publish("$SYS/fake", "x", QoS::AtLeastOnce, false)
         .await
         .unwrap_err();
-    assert!(matches!(err, zzq_client::Error::Rejected(0x87)), "{err}");
+    assert!(
+        matches!(err, zzq_client::Error::Rejected(ReasonCode::NOT_AUTHORIZED)),
+        "{err}"
+    );
     nothing(&mut c).await;
 }
 
@@ -600,7 +608,10 @@ async fn max_connections_refuses_extra_clients() {
         .unwrap();
     let refused = Client::connect(&ctx, &uri, ClientOptions::new("c")).await;
     assert!(
-        matches!(refused, Err(zzq_client::Error::Refused(0x97))),
+        matches!(
+            refused,
+            Err(zzq_client::Error::Refused(ReasonCode::QUOTA_EXCEEDED))
+        ),
         "{refused:?}"
     );
     // Taking over a connected session needs no new slot.
@@ -658,9 +669,12 @@ async fn deep_topics_are_rejected() {
         .unwrap();
     assert_eq!(
         c.subscribe(&deep(200), QoS::AtMostOnce).await.unwrap(),
-        zzq_proto::reason::TOPIC_FILTER_INVALID
+        ReasonCode::TOPIC_FILTER_INVALID
     );
-    assert_eq!(c.subscribe(&deep(128), QoS::AtMostOnce).await.unwrap(), 0);
+    assert_eq!(
+        c.subscribe(&deep(128), QoS::AtMostOnce).await.unwrap(),
+        ReasonCode::SUCCESS
+    );
     // Deep enough to overflow a recursive matcher's stack.
     let mut raw = Raw::connect(&uri, "deeper", Version::V5, 0).await;
     let topic = deep(30_000);
@@ -1060,7 +1074,7 @@ async fn client_waits_for_a_free_packet_id() {
         &mut suback,
     );
     broker.write(&suback).await;
-    assert_eq!(sub.await.unwrap().unwrap(), 0);
+    assert_eq!(sub.await.unwrap().unwrap(), ReasonCode::SUCCESS);
 }
 
 #[tokio::test(flavor = "multi_thread")]

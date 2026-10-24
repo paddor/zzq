@@ -9,7 +9,7 @@ use zzq_proto::{QoS, SubscriptionOptions};
 use zzq_tokio::Context;
 
 use crate::{
-    Ack, ClientOptions, Cmd, Connected, Error, Message, Result, publish_cmd, reason, start,
+    Ack, ClientOptions, Cmd, Connected, Error, Message, ReasonCode, Result, publish_cmd, start,
     subscribe_cmd, unsubscribe_cmd,
 };
 
@@ -66,9 +66,12 @@ impl Client {
     }
 
     /// Subscribes to one filter with a maximum QoS. Returns the granted code.
-    pub fn subscribe(&self, filter: &str, qos: QoS) -> Result<u8> {
+    pub fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
         let codes = self.subscribe_with(&[(filter, SubscriptionOptions::qos(qos))], 0)?;
-        Ok(codes.first().copied().unwrap_or(reason::UNSPECIFIED_ERROR))
+        Ok(codes
+            .first()
+            .copied()
+            .unwrap_or(ReasonCode::UNSPECIFIED_ERROR))
     }
 
     /// Subscribes to several filters, optionally with a v5 Subscription
@@ -77,7 +80,7 @@ impl Client {
         &self,
         filters: &[(&str, SubscriptionOptions)],
         sub_id: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<ReasonCode>> {
         not_in_async()?;
         let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
         self.send(cmd)?;
@@ -85,7 +88,7 @@ impl Client {
     }
 
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
-    pub fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<u8>> {
+    pub fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
         not_in_async()?;
         let (cmd, rx) = unsubscribe_cmd(filters)?;
         self.send(cmd)?;
@@ -109,7 +112,7 @@ impl Client {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .send(Cmd::Disconnect {
-                reason: reason::SUCCESS,
+                reason: ReasonCode::SUCCESS,
                 done: tx,
             })
             .is_ok()

@@ -25,7 +25,7 @@ pub use options::{
     AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo,
 };
 pub use persist::{FilePersistence, Persistence, Retained};
-pub use zzq_proto::QoS;
+pub use zzq_proto::{QoS, ReasonCode};
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]
 pub use zzq_tokio::transport::tls::TlsOptions;

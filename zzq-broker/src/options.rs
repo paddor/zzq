@@ -2,7 +2,7 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zzq_proto::Version;
+use zzq_proto::{ReasonCode, Version};
 use zzq_tokio::transport::TransportOptions;
 
 /// What a client presented in CONNECT.
@@ -23,7 +23,7 @@ pub enum AuthDecision {
     Allow,
     /// Rejects with a v5 CONNACK reason code. v3.1.1 clients get the closest
     /// return code.
-    Deny(u8),
+    Deny(ReasonCode),
 }
 
 /// Decides whether a client may connect.

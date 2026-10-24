@@ -17,7 +17,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use zzq_proto::encode::{self, AckFields, ConnectFields, PublishHeader, WillFields};
 use zzq_proto::packet::{ConnAck, Publish, decode};
 use zzq_proto::property::{self, Property};
-use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions};
+use zzq_proto::{Packet, PacketType, QoS, ReasonCode, SubscriptionOptions, Version, reason};
 use zzq_tokio::transport::{Driver, TransportOptions};
 use zzq_tokio::{Context, Endpoint};
 
@@ -76,7 +76,7 @@ pub(crate) async fn run_session(
 #[derive(Debug)]
 enum Pending {
     Publish(Option<oneshot::Sender<Result<()>>>),
-    Sub(oneshot::Sender<Result<Vec<u8>>>, Change),
+    Sub(oneshot::Sender<Result<Vec<ReasonCode>>>, Change),
     /// A resubscribe after reconnecting, nobody waits for it.
     Restore,
 }
@@ -249,7 +249,7 @@ impl Conn<'_> {
                 cmd = self.s.cmd.recv() => match cmd {
                     Some(Cmd::Disconnect { reason, done }) => {
                         let v = self.s.opts.version;
-                        self.out.push(|b| encode::reason_only(PacketType::Disconnect, v, reason, &[], b));
+                        self.out.push(|b| encode::reason_only(PacketType::Disconnect, v, reason.into(), &[], b));
                         self.s.ended = true;
                         *self.out.bye.borrow_mut() = Some(done);
                         return Ok(());
@@ -524,7 +524,7 @@ impl Conn<'_> {
                 match self.s.pending.remove(&ack.pkid) {
                     Some(Pending::Sub(tx, change)) => {
                         self.apply(change, ack.codes);
-                        let _ = tx.send(Ok(ack.codes.to_vec()));
+                        let _ = tx.send(Ok(ack.codes.iter().map(|&c| c.into()).collect()));
                     }
                     Some(Pending::Restore | Pending::Publish(_)) | None => {}
                 }
@@ -560,7 +560,7 @@ impl Conn<'_> {
         };
         if let Some(tx) = tx {
             let _ = tx.send(if code >= 0x80 {
-                Err(Error::Rejected(code))
+                Err(Error::Rejected(code.into()))
             } else {
                 Ok(())
             });
@@ -722,7 +722,7 @@ where
     loop {
         match decode(buf, opts.version, MAX_PACKET) {
             Ok(Some((Packet::ConnAck(c), n))) => {
-                let res = connack(&c);
+                let res = connack(&c, opts.version);
                 buf.advance(n);
                 return res;
             }
@@ -737,9 +737,15 @@ where
 }
 
 /// CONNACK details and the broker's Receive Maximum.
-fn connack(c: &ConnAck<'_>) -> Result<(Connected, u16)> {
+fn connack(c: &ConnAck<'_>, version: Version) -> Result<(Connected, u16)> {
     if c.code != 0 {
-        return Err(Error::Refused(c.code));
+        // v3.1.1 return codes become the v5 codes with the same meaning.
+        let code = if version.is_v5() {
+            c.code
+        } else {
+            reason::v311::to_v5(c.code)
+        };
+        return Err(Error::Refused(code.into()));
     }
     let connected = Connected {
         session_present: c.session_present,
@@ -757,10 +763,14 @@ fn connack(c: &ConnAck<'_>) -> Result<(Connected, u16)> {
 
 /// Refusals worth another attempt: the broker is busy or full, not
 /// rejecting the client.
-const fn retryable(code: u8) -> bool {
-    // v5 Server unavailable, Server busy, Quota exceeded, Connection rate
-    // exceeded; v3.1.1 Server unavailable.
-    matches!(code, 0x88 | 0x89 | 0x97 | 0x9f | 3)
+const fn retryable(code: ReasonCode) -> bool {
+    matches!(
+        code,
+        ReasonCode::SERVER_UNAVAILABLE
+            | ReasonCode::SERVER_BUSY
+            | ReasonCode::QUOTA_EXCEEDED
+            | ReasonCode::CONNECTION_RATE_EXCEEDED
+    )
 }
 
 async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {

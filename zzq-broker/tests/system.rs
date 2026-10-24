@@ -15,7 +15,7 @@ use zzq_broker::{
     AuthDecision, Authenticator, Broker, BrokerOptions, Config, ConnectInfo, Context,
 };
 use zzq_client::{Client, ClientOptions, LastWill, Message};
-use zzq_proto::{QoS, SubscriptionOptions, Version};
+use zzq_proto::{QoS, ReasonCode, SubscriptionOptions, Version};
 
 const WAIT: Duration = Duration::from_secs(5);
 
@@ -85,7 +85,8 @@ async fn pub_sub_all_qos_both_versions() {
         let mut sub = client(&ctx, &uri, "sub", version).await;
         let publ = client(&ctx, &uri, "pub", version).await;
         for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
-            assert_eq!(sub.subscribe("t/q", qos).await.unwrap(), qos as u8);
+            let granted = sub.subscribe("t/q", qos).await.unwrap();
+            assert_eq!(granted, ReasonCode::from(qos as u8));
             publ.publish("t/q", format!("{qos:?}"), qos, false)
                 .await
                 .unwrap();
@@ -140,7 +141,10 @@ async fn wildcards_and_unsubscribe() {
     .collect();
     assert_eq!(got, ["a/b/c", "z", "z/1/2"]);
     nothing(&mut sub).await;
-    assert_eq!(sub.unsubscribe(&["z/#", "nope"]).await.unwrap(), [0, 0x11]);
+    assert_eq!(
+        sub.unsubscribe(&["z/#", "nope"]).await.unwrap(),
+        [ReasonCode::SUCCESS, ReasonCode::NO_SUBSCRIPTION_EXISTED]
+    );
     publ.publish("z/1", "x", QoS::AtMostOnce, false)
         .await
         .unwrap();
@@ -376,7 +380,7 @@ impl Authenticator for OnlyAlice {
         if info.username == Some("alice") && info.password == Some(&b"secret"[..]) {
             AuthDecision::Allow
         } else {
-            AuthDecision::Deny(zzq_proto::reason::BAD_USER_NAME_OR_PASSWORD)
+            AuthDecision::Deny(ReasonCode::BAD_USER_NAME_OR_PASSWORD)
         }
     }
 }
@@ -393,13 +397,25 @@ async fn authenticator() {
         ..ClientOptions::new("b")
     };
     let err = Client::connect(&ctx, &uri, bad.clone()).await.unwrap_err();
-    assert!(matches!(err, zzq_client::Error::Refused(0x86)), "{err}");
+    assert!(
+        matches!(
+            err,
+            zzq_client::Error::Refused(ReasonCode::BAD_USER_NAME_OR_PASSWORD)
+        ),
+        "{err}"
+    );
     let v4 = ClientOptions {
         version: Version::V311,
         ..bad
     };
     let err = Client::connect(&ctx, &uri, v4).await.unwrap_err();
-    assert!(matches!(err, zzq_client::Error::Refused(4)), "{err}");
+    assert!(
+        matches!(
+            err,
+            zzq_client::Error::Refused(ReasonCode::BAD_USER_NAME_OR_PASSWORD)
+        ),
+        "{err}"
+    );
     let good = ClientOptions {
         username: Some("alice".into()),
         password: Some("secret".into()),
@@ -426,7 +442,13 @@ async fn assigned_client_id() {
         ..ClientOptions::default()
     };
     let err = Client::connect(&ctx, &uri, v4).await.unwrap_err();
-    assert!(matches!(err, zzq_client::Error::Refused(2)), "{err}");
+    assert!(
+        matches!(
+            err,
+            zzq_client::Error::Refused(ReasonCode::CLIENT_IDENTIFIER_NOT_VALID)
+        ),
+        "{err}"
+    );
     // An assigned ID finds its session again, whichever lane accepted it.
     let (ctx, _broker, uri) = setup(3).await;
     for _ in 0..6 {
@@ -1167,9 +1189,7 @@ async fn quic_refusal_reaches_the_client() {
     assert!(
         matches!(
             refused,
-            Err(zzq_client::Error::Refused(
-                zzq_proto::reason::QUOTA_EXCEEDED
-            ))
+            Err(zzq_client::Error::Refused(ReasonCode::QUOTA_EXCEEDED))
         ),
         "{refused:?}"
     );
@@ -1283,7 +1303,7 @@ impl Authenticator for CertIs {
         if info.peer_cert == Some(self.0.as_slice()) {
             AuthDecision::Allow
         } else {
-            AuthDecision::Deny(zzq_proto::reason::NOT_AUTHORIZED)
+            AuthDecision::Deny(ReasonCode::NOT_AUTHORIZED)
         }
     }
 }

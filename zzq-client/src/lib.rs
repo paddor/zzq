@@ -20,17 +20,17 @@ pub use zzq_tokio::transport::TransportOptions;
 pub use zzq_tokio::transport::tls::TlsOptions;
 use zzq_tokio::{Context, Endpoint};
 
-pub use zzq_proto::reason;
+pub use zzq_proto::{ReasonCode, reason};
 
 /// Client errors.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error(transparent)]
     Engine(#[from] zzq_tokio::Error),
-    #[error("connection refused with code {0:#04x}")]
-    Refused(u8),
-    #[error("rejected with reason code {0:#04x}")]
-    Rejected(u8),
+    #[error("connection refused: {0}")]
+    Refused(ReasonCode),
+    #[error("rejected: {0}")]
+    Rejected(ReasonCode),
     #[error("protocol error: {0}")]
     Protocol(&'static str),
     /// A topic name or filter is not valid.
@@ -166,14 +166,14 @@ pub(crate) enum Cmd {
     Subscribe {
         filters: Vec<(String, SubscriptionOptions)>,
         sub_id: u32,
-        done: oneshot::Sender<Result<Vec<u8>>>,
+        done: oneshot::Sender<Result<Vec<ReasonCode>>>,
     },
     Unsubscribe {
         filters: Vec<String>,
-        done: oneshot::Sender<Result<Vec<u8>>>,
+        done: oneshot::Sender<Result<Vec<ReasonCode>>>,
     },
     Disconnect {
-        reason: u8,
+        reason: ReasonCode,
         done: oneshot::Sender<()>,
     },
     /// The application took a QoS 1/2 message: ack it.
@@ -241,7 +241,7 @@ fn publish_cmd(
 fn subscribe_cmd(
     filters: &[(&str, SubscriptionOptions)],
     sub_id: u32,
-) -> Result<(Cmd, Ack<Vec<u8>>)> {
+) -> Result<(Cmd, Ack<Vec<ReasonCode>>)> {
     check::filters(filters.iter().map(|(f, _)| *f))?;
     let (tx, rx) = oneshot::channel();
     let cmd = Cmd::Subscribe {
@@ -252,7 +252,7 @@ fn subscribe_cmd(
     Ok((cmd, rx))
 }
 
-fn unsubscribe_cmd(filters: &[&str]) -> Result<(Cmd, Ack<Vec<u8>>)> {
+fn unsubscribe_cmd(filters: &[&str]) -> Result<(Cmd, Ack<Vec<ReasonCode>>)> {
     check::filters(filters.iter().copied())?;
     let (tx, rx) = oneshot::channel();
     let cmd = Cmd::Unsubscribe {
@@ -304,11 +304,14 @@ impl Client {
     }
 
     /// Subscribes to one filter with a maximum QoS. Returns the granted code.
-    pub async fn subscribe(&self, filter: &str, qos: QoS) -> Result<u8> {
+    pub async fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
         let codes = self
             .subscribe_with(&[(filter, SubscriptionOptions::qos(qos))], 0)
             .await?;
-        Ok(codes.first().copied().unwrap_or(reason::UNSPECIFIED_ERROR))
+        Ok(codes
+            .first()
+            .copied()
+            .unwrap_or(ReasonCode::UNSPECIFIED_ERROR))
     }
 
     /// Subscribes to several filters, optionally with a v5 Subscription
@@ -317,14 +320,14 @@ impl Client {
         &self,
         filters: &[(&str, SubscriptionOptions)],
         sub_id: u32,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<ReasonCode>> {
         let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
         self.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
     }
 
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
-    pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<u8>> {
+    pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
         let (cmd, rx) = unsubscribe_cmd(filters)?;
         self.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
@@ -338,8 +341,9 @@ impl Client {
         Some(m)
     }
 
-    /// Sends DISCONNECT and closes. v5 reason `0x04` asks for the will.
-    pub async fn disconnect_with(self, reason: u8) {
+    /// Sends DISCONNECT and closes. [`ReasonCode::DISCONNECT_WITH_WILL`]
+    /// asks a v5 broker for the will.
+    pub async fn disconnect_with(self, reason: ReasonCode) {
         let (tx, rx) = oneshot::channel();
         if self.send(Cmd::Disconnect { reason, done: tx }).is_ok() {
             let _ = rx.await;
@@ -348,7 +352,7 @@ impl Client {
 
     /// Sends DISCONNECT and closes.
     pub async fn disconnect(self) {
-        self.disconnect_with(reason::SUCCESS).await;
+        self.disconnect_with(ReasonCode::SUCCESS).await;
     }
 
     fn send(&self, cmd: Cmd) -> Result<()> {
