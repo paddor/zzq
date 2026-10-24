@@ -17,3 +17,6 @@ workspace = true
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-broker.workspace = true
 tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

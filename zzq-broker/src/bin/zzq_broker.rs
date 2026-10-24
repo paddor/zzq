@@ -87,21 +87,33 @@ fn tls(a: &Args, _opts: &mut BrokerOptions) -> Result<(), String> {
     Ok(())
 }
 
+/// An error with its causes, outermost first.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        out.push_str(": ");
+        out.push_str(&c.to_string());
+        cause = c.source();
+    }
+    out
+}
+
 async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
     let config = Config {
         io_threads: a.lanes,
         name: "zzq".to_owned(),
         busy_poll: a.busy_poll,
     };
-    let ctx = Context::with_config(&config).map_err(|e| format!("context: {e}"))?;
+    let ctx = Context::with_config(&config).map_err(|e| format!("context: {}", chain(&e)))?;
     let broker = Broker::new(&ctx, opts)
         .await
-        .map_err(|e| format!("broker: {e}"))?;
+        .map_err(|e| format!("broker: {}", chain(&e)))?;
     for uri in &a.binds {
         let ep = broker
             .bind(uri)
             .await
-            .map_err(|e| format!("bind {uri}: {e}"))?;
+            .map_err(|e| format!("bind {uri}: {}", chain(&e)))?;
         println!("{ep}");
     }
     std::future::pending::<()>().await;
