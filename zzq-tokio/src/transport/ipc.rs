@@ -1,0 +1,112 @@
+//! `ipc://` Unix domain sockets. A leading `@` selects the Linux abstract
+//! namespace.
+
+use std::io;
+use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
+use std::path::PathBuf;
+
+use crate::endpoint::Endpoint;
+use crate::transport::Stream;
+use crate::{Error, Result};
+
+/// A bound Unix socket. Removes its socket file on drop.
+#[derive(Debug)]
+pub struct IpcListener {
+    inner: tokio::net::UnixListener,
+    name: String,
+    file: Option<PathBuf>,
+}
+
+impl IpcListener {
+    pub(crate) fn bind(name: &str) -> Result<IpcListener> {
+        let in_use = |e: io::Error| match e.kind() {
+            io::ErrorKind::AddrInUse => Error::AddressInUse(format!("ipc://{name}")),
+            _ => Error::Io(e),
+        };
+        let (std, file) = if let Some(abs) = name.strip_prefix('@') {
+            (bind_abstract(abs).map_err(in_use)?, None)
+        } else {
+            let path = PathBuf::from(name);
+            if path.exists() && StdStream::connect(&path).is_err() {
+                let _ = std::fs::remove_file(&path);
+            }
+            (StdListener::bind(&path).map_err(in_use)?, Some(path))
+        };
+        std.set_nonblocking(true)?;
+        Ok(IpcListener {
+            inner: tokio::net::UnixListener::from_std(std)?,
+            name: name.to_owned(),
+            file,
+        })
+    }
+
+    pub(crate) async fn accept(&mut self) -> Result<Stream> {
+        let (s, _) = self.inner.accept().await?;
+        Ok(Stream::Ipc(s.into_std()?))
+    }
+
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        Endpoint::Ipc(self.name.clone())
+    }
+}
+
+impl Drop for IpcListener {
+    fn drop(&mut self) {
+        if let Some(path) = &self.file {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+pub(crate) async fn connect(name: &str) -> Result<Stream> {
+    let refused = |e: io::Error| match e.kind() {
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => {
+            Error::Refused(format!("ipc://{name}"))
+        }
+        _ => Error::Io(e),
+    };
+    if let Some(abs) = name.strip_prefix('@') {
+        let s = connect_abstract(abs).map_err(refused)?;
+        s.set_nonblocking(true)?;
+        return Ok(Stream::Ipc(s));
+    }
+    let s = tokio::net::UnixStream::connect(name)
+        .await
+        .map_err(refused)?;
+    Ok(Stream::Ipc(s.into_std()?))
+}
+
+pub(crate) fn into_async(s: StdStream) -> io::Result<tokio::net::UnixStream> {
+    s.set_nonblocking(true)?;
+    tokio::net::UnixStream::from_std(s)
+}
+
+#[cfg(target_os = "linux")]
+fn bind_abstract(name: &str) -> io::Result<StdListener> {
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+    StdListener::bind_addr(&addr)
+}
+
+#[cfg(target_os = "linux")]
+fn connect_abstract(name: &str) -> io::Result<StdStream> {
+    use std::os::linux::net::SocketAddrExt;
+    let addr = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+    StdStream::connect_addr(&addr)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_abstract(_: &str) -> io::Result<StdListener> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "abstract sockets need Linux",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn connect_abstract(_: &str) -> io::Result<StdStream> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "abstract sockets need Linux",
+    ))
+}

@@ -1,0 +1,34 @@
+[package]
+name = "zzq-tokio"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Tokio engine for zzq: IO lanes, transports and endpoints."
+keywords = ["mqtt", "tokio", "async"]
+categories = ["network-programming", "asynchronous"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["tls", "quic"]
+# `tls://` with rustls and ring.
+tls = ["dep:rustls", "dep:tokio-rustls"]
+# `quic://` with quinn. Certificates come from the TLS options.
+quic = ["tls", "dep:quinn", "dep:socket2"]
+
+[dependencies]
+socket2 = { workspace = true, optional = true, features = ["all"] }
+quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }
+zzq-proto = { workspace = true, features = ["std"] }
+bytes = { workspace = true, features = ["std"] }
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
