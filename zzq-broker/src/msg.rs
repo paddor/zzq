@@ -116,6 +116,9 @@ pub(crate) struct Publication<'a> {
     pub(crate) raw: Option<(&'a [u8], Version)>,
     /// Buffer the borrowed fields point into, to make owned slices.
     pub(crate) chunk: Option<&'a Bytes>,
+    /// Deadline of a stored message. `None` for a live publish, whose
+    /// Message Expiry Interval in `props` starts now.
+    pub(crate) expires_at: Option<Instant>,
 }
 
 impl Publication<'_> {
@@ -129,13 +132,14 @@ impl Publication<'_> {
             retain: msg.retain,
             raw: None,
             chunk: None,
+            expires_at: msg.expires_at,
         }
     }
 
     /// Slices the publication out of its read buffer, or copies it.
     pub(crate) fn to_msg(&self) -> Msg {
         let parts = [self.topic.as_bytes(), self.props, self.payload];
-        let expires_at = expiry(self.props);
+        let expires_at = self.expires_at.or_else(|| expiry(self.props));
         if let Some(c) = self.chunk
             && parts.iter().all(|b| b.is_empty() || within(c, b))
         {

@@ -197,7 +197,7 @@ impl Session {
             dup: false,
             pkid: 0,
             sub_id,
-            expires_at: None,
+            expires_at: p.expires_at,
         };
         if self.encode(&item) {
             Outcome::Sent

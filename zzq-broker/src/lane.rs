@@ -674,6 +674,7 @@ impl Lane {
             retain: p.retain,
             raw: plain.then_some((raw, version)),
             chunk: Some(chunk),
+            expires_at: None,
         };
         let mut owned = None;
         if p.retain {
@@ -867,6 +868,7 @@ impl Lane {
             retain: p.retain,
             raw: (p.qos == QoS::AtMostOnce).then_some((&packet[..n], version)),
             chunk: Some(chunk),
+            expires_at: None,
         };
         let from = from.filter(|f| f.lane == self.id).map(|f| f.key);
         let (m, _) = self.index.lookup(p.topic);

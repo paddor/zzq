@@ -883,6 +883,42 @@ async fn will_expiry_starts_when_the_will_goes_out() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn retained_qos0_delivery_carries_the_time_left() {
+    let (_ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
+    let mut publ = Raw::connect(&uri, "ttl-pub", Version::V5, 0).await;
+    let mut props = Vec::new();
+    zzq_proto::property::Property::U32(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL, 10)
+        .encode(&mut props);
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtLeastOnce,
+        retain: true,
+        topic: "ttl",
+        pkid: 1,
+        properties: &props,
+    };
+    let mut out = Vec::new();
+    encode::publish(&h, b"x", &mut out);
+    publ.write(&out).await;
+    assert_eq!(publ.packet().await.unwrap().0 >> 4, 4, "PUBACK");
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let mut sub = Raw::connect(&uri, "ttl-sub", Version::V5, 0).await;
+    sub.subscribe("ttl", QoS::AtMostOnce).await;
+    let (_, packet) = sub.packet().await.expect("retained PUBLISH");
+    let Some((zzq_proto::Packet::Publish(p), _)) =
+        decode(&packet, Version::V5, usize::MAX).unwrap()
+    else {
+        panic!("expected PUBLISH");
+    };
+    let left = p
+        .properties
+        .get_int(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL)
+        .unwrap();
+    assert!(left <= 8, "expiry {left}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn publisher_subscription_identifier_is_a_protocol_error() {
     let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
     let mut sub = Client::connect(&ctx, &uri, ClientOptions::new("spoofed"))
