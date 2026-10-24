@@ -1331,12 +1331,13 @@ async fn client_reconnects_and_restores_subscriptions() {
     c.subscribe("rc/#", QoS::AtLeastOnce).await.unwrap();
     drop(broker1);
     drop(ctx1);
-    // Published while the broker is down: waits, then goes out.
+    // Published while the broker is down: waits, then goes out. Retained,
+    // so the watcher gets it even if the client reconnects first.
     let c = Arc::new(tokio::sync::Mutex::new(c));
     let publisher = c.clone();
     let late = tokio::spawn(async move {
         let c = publisher.lock().await;
-        c.publish("rc/late", "after", QoS::AtLeastOnce, false).await
+        c.publish("rc/late", "after", QoS::AtLeastOnce, true).await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let ctx2 = Context::with_config(&Config::default()).unwrap();
