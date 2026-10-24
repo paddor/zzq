@@ -399,9 +399,18 @@ fn accept_key(key: &str) -> String {
     base64(&sha1(&input))
 }
 
-#[expect(clippy::many_single_char_names, clippy::unreadable_literal)]
+#[expect(
+    clippy::many_single_char_names,
+    reason = "SHA-1 names its working variables a to e"
+)]
 fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h: [u32; 5] = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0];
+    let mut h: [u32; 5] = [
+        0x6745_2301,
+        0xEFCD_AB89,
+        0x98BA_DCFE,
+        0x1032_5476,
+        0xC3D2_E1F0,
+    ];
     let bit_len = (data.len() as u64) * 8;
     let mut padded = data.to_vec();
     padded.push(0x80);
