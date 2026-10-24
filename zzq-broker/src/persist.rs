@@ -87,10 +87,29 @@ impl std::fmt::Debug for FilePersistence {
 }
 
 impl FilePersistence {
-    /// Opens or creates the log at `path`. With `sync`, every batch of
-    /// writes is synced to disk before the next one.
-    pub fn open(path: impl AsRef<Path>, sync: bool) -> io::Result<FilePersistence> {
-        let path = path.as_ref().to_owned();
+    /// Opens or creates the log at `path`. Writes reach the OS in batches
+    /// and the disk when the OS flushes them.
+    ///
+    /// # Errors
+    ///
+    /// If the log cannot be read, compacted or created, or the writer thread
+    /// cannot start.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<FilePersistence> {
+        Self::open_with(path.as_ref(), false)
+    }
+
+    /// Like [`FilePersistence::open`], but every batch of writes is synced
+    /// to disk before the next one.
+    ///
+    /// # Errors
+    ///
+    /// As [`FilePersistence::open`].
+    pub fn open_synced(path: impl AsRef<Path>) -> io::Result<FilePersistence> {
+        Self::open_with(path.as_ref(), true)
+    }
+
+    fn open_with(path: &Path, sync: bool) -> io::Result<FilePersistence> {
+        let path = path.to_owned();
         let live = read_log(&path)?;
         let file = compact(&path, &live)?;
         let loaded = live.values().filter_map(|b| decode_set(b)).collect();
@@ -449,7 +468,7 @@ mod tests {
         let path = dir.join("retained.log");
         let _ = fs::remove_file(&path);
         {
-            let p = FilePersistence::open(&path, false).unwrap();
+            let p = FilePersistence::open(&path).unwrap();
             assert!(p.load_retained().unwrap().is_empty());
             p.set_retained(&msg("a", "1"));
             p.set_retained(&msg("b", "2"));
@@ -462,17 +481,17 @@ mod tests {
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
         f.write_all(&[0, 0, 0, 40, 1, 2, 3]).unwrap();
         drop(f);
-        let p = FilePersistence::open(&path, true).unwrap();
+        let p = FilePersistence::open_synced(&path).unwrap();
         assert_eq!(
             sorted(p.load_retained().unwrap()),
             vec![msg("a", "3"), msg("c", "4")]
         );
         drop(p);
-        let p = FilePersistence::open(&path, false).unwrap();
+        let p = FilePersistence::open(&path).unwrap();
         assert_eq!(p.load_retained().unwrap().len(), 2);
         drop(p);
         fs::write(&path, b"garbage").unwrap();
-        assert!(FilePersistence::open(&path, false).is_err());
+        assert!(FilePersistence::open(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

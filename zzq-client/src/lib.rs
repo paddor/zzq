@@ -295,14 +295,39 @@ impl Client {
     }
 
     /// Publishes. QoS 0 returns once queued; QoS 1 and 2 wait for the ack.
-    pub async fn publish(
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTopic`] or [`Error::TooLarge`] for a message MQTT
+    /// cannot carry, [`Error::Rejected`] if the broker refuses it, and
+    /// [`Error::Closed`] once the client is gone.
+    pub async fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.into(), qos, false).await
+    }
+
+    /// Publishes a retained message: the broker keeps it for later
+    /// subscribers. An empty payload clears the topic.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::publish`].
+    pub async fn publish_retained(
         &self,
         topic: &str,
         payload: impl Into<Bytes>,
         qos: QoS,
+    ) -> Result<()> {
+        self.send_publish(topic, payload.into(), qos, true).await
+    }
+
+    async fn send_publish(
+        &self,
+        topic: &str,
+        payload: Bytes,
+        qos: QoS,
         retain: bool,
     ) -> Result<()> {
-        let (cmd, rx) = publish_cmd(topic, payload.into(), qos, retain)?;
+        let (cmd, rx) = publish_cmd(topic, payload, qos, retain)?;
         self.send(cmd)?;
         match rx {
             Some(rx) => rx.await.map_err(|_| Error::Closed)?,

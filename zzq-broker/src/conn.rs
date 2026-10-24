@@ -296,7 +296,11 @@ fn connack_error(version: Version, code: u8, out: &mut Vec<u8>) {
     } else {
         reason::v311::from_v5(code)
     };
-    encode::connack(version, false, code, &[], out);
+    let c = encode::ConnAckFields {
+        code,
+        ..encode::ConnAckFields::default()
+    };
+    encode::connack(&c, version, out);
 }
 
 /// Resolves the client ID and attaches the connection to its session.

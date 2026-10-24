@@ -396,7 +396,7 @@ impl Lane {
         s.window = c.receive_maximum.min(self.shared.opts.max_inflight).max(1);
         s.max_packet = c.max_packet_size;
         s.aliases.clear();
-        encode::connack(c.version, present, 0, &props, &mut s.out);
+        connack_ok(c.version, present, &props, &mut s.out);
         if present {
             s.resend();
         }
@@ -1221,6 +1221,16 @@ impl Lane {
             }
         }
     }
+}
+
+/// Queues a CONNACK accepting a connection.
+fn connack_ok(version: Version, present: bool, props: &[u8], out: &mut Vec<u8>) {
+    let ack = encode::ConnAckFields {
+        session_present: present,
+        code: reason::SUCCESS,
+        properties: props,
+    };
+    encode::connack(&ack, version, out);
 }
 
 /// Applies a v5 Topic Alias. Returns the aliased topic, if the publish had

@@ -87,9 +87,7 @@ async fn pub_sub_all_qos_both_versions() {
         for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
             let granted = sub.subscribe("t/q", qos).await.unwrap();
             assert_eq!(granted, ReasonCode::from(qos as u8));
-            publ.publish("t/q", format!("{qos:?}"), qos, false)
-                .await
-                .unwrap();
+            publ.publish("t/q", format!("{qos:?}"), qos).await.unwrap();
             let m = next(&mut sub).await;
             assert_eq!((m.topic.as_str(), m.qos, m.retain), ("t/q", qos, false));
             assert_eq!(m.payload, format!("{qos:?}"));
@@ -106,14 +104,10 @@ async fn versions_interoperate() {
     let mut v4 = client(&ctx, &uri, "b", Version::V311).await;
     v5.subscribe("x", QoS::AtLeastOnce).await.unwrap();
     v4.subscribe("x", QoS::AtLeastOnce).await.unwrap();
-    v4.publish("x", "from v4", QoS::AtMostOnce, false)
-        .await
-        .unwrap();
+    v4.publish("x", "from v4", QoS::AtMostOnce).await.unwrap();
     assert_eq!(next(&mut v5).await.payload, "from v4");
     assert_eq!(next(&mut v4).await.payload, "from v4");
-    v5.publish("x", "from v5", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    v5.publish("x", "from v5", QoS::AtLeastOnce).await.unwrap();
     assert_eq!(next(&mut v4).await.payload, "from v5");
     assert_eq!(next(&mut v5).await.payload, "from v5");
 }
@@ -126,11 +120,9 @@ async fn wildcards_and_unsubscribe() {
     sub.subscribe("a/+/c", QoS::AtMostOnce).await.unwrap();
     sub.subscribe("z/#", QoS::AtMostOnce).await.unwrap();
     for t in ["a/b/c", "a/b/d", "z", "z/1/2", "y"] {
-        publ.publish(t, t, QoS::AtMostOnce, false).await.unwrap();
+        publ.publish(t, t, QoS::AtMostOnce).await.unwrap();
     }
-    publ.publish("end", "", QoS::AtMostOnce, false)
-        .await
-        .unwrap();
+    publ.publish("end", "", QoS::AtMostOnce).await.unwrap();
     let got: Vec<String> = [
         next(&mut sub).await,
         next(&mut sub).await,
@@ -145,9 +137,7 @@ async fn wildcards_and_unsubscribe() {
         sub.unsubscribe(&["z/#", "nope"]).await.unwrap(),
         [ReasonCode::SUCCESS, ReasonCode::NO_SUBSCRIPTION_EXISTED]
     );
-    publ.publish("z/1", "x", QoS::AtMostOnce, false)
-        .await
-        .unwrap();
+    publ.publish("z/1", "x", QoS::AtMostOnce).await.unwrap();
     nothing(&mut sub).await;
 }
 
@@ -159,13 +149,13 @@ async fn retained_messages() {
     };
     let (ctx, broker, uri) = setup_with(1, opts).await;
     let publ = client(&ctx, &uri, "p", Version::V5).await;
-    publ.publish("r/1", "one", QoS::AtLeastOnce, true)
+    publ.publish_retained("r/1", "one", QoS::AtLeastOnce)
         .await
         .unwrap();
-    publ.publish("r/2", "two", QoS::AtMostOnce, true)
+    publ.publish_retained("r/2", "two", QoS::AtMostOnce)
         .await
         .unwrap();
-    publ.publish("r/2", "", QoS::AtLeastOnce, true)
+    publ.publish_retained("r/2", "", QoS::AtLeastOnce)
         .await
         .unwrap();
     let mut sub = client(&ctx, &uri, "s", Version::V5).await;
@@ -176,7 +166,7 @@ async fn retained_messages() {
         ("r/1", true, QoS::AtLeastOnce)
     );
     nothing(&mut sub).await;
-    publ.publish("r/1", "live", QoS::AtMostOnce, true)
+    publ.publish_retained("r/1", "live", QoS::AtMostOnce)
         .await
         .unwrap();
     let m = next(&mut sub).await;
@@ -228,7 +218,7 @@ async fn shared_subscription_splits_messages() {
         .unwrap();
     let publ = client(&ctx, &uri, "p", Version::V5).await;
     for i in 0..10 {
-        publ.publish("jobs/x", format!("{i}"), QoS::AtLeastOnce, false)
+        publ.publish("jobs/x", format!("{i}"), QoS::AtLeastOnce)
             .await
             .unwrap();
     }
@@ -258,10 +248,8 @@ async fn no_local_and_subscription_ids() {
     c.subscribe_with(&[("tagged", SubscriptionOptions::default())], 42)
         .await
         .unwrap();
-    c.publish("own", "x", QoS::AtMostOnce, false).await.unwrap();
-    c.publish("tagged", "y", QoS::AtMostOnce, false)
-        .await
-        .unwrap();
+    c.publish("own", "x", QoS::AtMostOnce).await.unwrap();
+    c.publish("tagged", "y", QoS::AtMostOnce).await.unwrap();
     let m = next(&mut c).await;
     assert_eq!(
         (m.topic.as_str(), m.subscription_ids.as_slice()),
@@ -282,7 +270,7 @@ async fn persistent_session(lanes: usize) {
     c.disconnect().await;
     let publ = client(&ctx, &uri, "p", Version::V5).await;
     for i in 0..3 {
-        publ.publish("jobs", format!("{i}"), QoS::AtLeastOnce, false)
+        publ.publish("jobs", format!("{i}"), QoS::AtLeastOnce)
             .await
             .unwrap();
     }
@@ -292,7 +280,7 @@ async fn persistent_session(lanes: usize) {
     for i in 0..3 {
         assert_eq!(next(&mut c).await.payload, format!("{i}"));
     }
-    publ.publish("jobs", "live", QoS::AtLeastOnce, false)
+    publ.publish("jobs", "live", QoS::AtLeastOnce)
         .await
         .unwrap();
     assert_eq!(next(&mut c).await.payload, "live");
@@ -315,7 +303,7 @@ async fn takeover_closes_old_connection() {
     let mut second = client(&ctx, &uri, "same", Version::V5).await;
     assert!(timeout(WAIT, first.recv()).await.unwrap().is_none());
     second.subscribe("t", QoS::AtMostOnce).await.unwrap();
-    broker.publish("t", "hi", QoS::AtMostOnce, false).unwrap();
+    broker.publish("t", "hi", QoS::AtMostOnce).unwrap();
     assert_eq!(next(&mut second).await.payload, "hi");
     assert_eq!(broker.stats().await.unwrap().connections, 1);
 }
@@ -331,7 +319,7 @@ async fn cross_lane_fan_out() {
     }
     let publ = client(&ctx, &uri, "p", Version::V5).await;
     for i in 0..50 {
-        publ.publish("fan", format!("{i}"), QoS::AtLeastOnce, false)
+        publ.publish("fan", format!("{i}"), QoS::AtLeastOnce)
             .await
             .unwrap();
     }
@@ -365,7 +353,7 @@ async fn ipc_and_inproc() {
         let p = Client::connect(&ctx, uri, ClientOptions::new("p"))
             .await
             .unwrap();
-        p.publish("t", uri.to_owned(), QoS::AtMostOnce, false)
+        p.publish("t", uri.to_owned(), QoS::AtMostOnce)
             .await
             .unwrap();
         assert_eq!(next(&mut sub).await.payload, uri.to_owned());
@@ -501,7 +489,7 @@ async fn tls_pub_sub_on_any_lane() {
         sub.subscribe("secure/#", QoS::AtLeastOnce).await.unwrap();
         let publ = Client::connect(&ctx, &uri, tls("tls-pub")).await.unwrap();
         for i in 0..20 {
-            publ.publish("secure/x", format!("{i}"), QoS::AtLeastOnce, false)
+            publ.publish("secure/x", format!("{i}"), QoS::AtLeastOnce)
                 .await
                 .unwrap();
         }
@@ -537,7 +525,7 @@ async fn tls_client_skips_verification_only_when_asked() {
     };
     assert!(Client::connect(&ctx, &uri, tls(false)).await.is_err());
     let c = Client::connect(&ctx, &uri, tls(true)).await.unwrap();
-    c.publish("t", "x", QoS::AtLeastOnce, false).await.unwrap();
+    c.publish("t", "x", QoS::AtLeastOnce).await.unwrap();
 }
 
 mod mqtt_sn {
@@ -672,9 +660,7 @@ mod mqtt_sn {
             panic!("expected SUBACK");
         };
         assert_ne!(cmd_id, 0);
-        mqtt.publish("cmd/x", "on", QoS::AtLeastOnce, false)
-            .await
-            .unwrap();
+        mqtt.publish("cmd/x", "on", QoS::AtLeastOnce).await.unwrap();
         let publ = recv(&s).await;
         let Packet::Publish {
             topic: Topic::Id(id),
@@ -706,9 +692,7 @@ mod mqtt_sn {
         )
         .await;
         recv(&s).await;
-        mqtt.publish("w/a", "wild", QoS::AtMostOnce, false)
-            .await
-            .unwrap();
+        mqtt.publish("w/a", "wild", QoS::AtMostOnce).await.unwrap();
         let reg = recv(&s).await;
         let Packet::Register {
             topic_id: wid,
@@ -828,7 +812,7 @@ mod mqtt_sn {
             Packet::Disconnect { duration: None }
         );
         let publ = client(&ctx, &uri, "p", Version::V5).await;
-        publ.publish("sleep/t", "a", QoS::AtLeastOnce, false)
+        publ.publish("sleep/t", "a", QoS::AtLeastOnce)
             .await
             .unwrap();
         quiet(&s).await;
@@ -879,7 +863,7 @@ mod mqtt_sn {
         let s = sn_client(&addr, "lossy").await;
         let id = subscribe(&s, "lossy/t").await;
         let publ = client(&ctx, &uri, "p", Version::V5).await;
-        publ.publish("lossy/t", "x", QoS::AtLeastOnce, false)
+        publ.publish("lossy/t", "x", QoS::AtLeastOnce)
             .await
             .unwrap();
         let first = recv(&s).await;
@@ -971,9 +955,7 @@ mod mqtt_sn {
         // lets a/1 through.
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         for topic in ["a/3", "a/1"] {
-            publ.publish(topic, topic, QoS::ExactlyOnce, false)
-                .await
-                .unwrap();
+            publ.publish(topic, topic, QoS::ExactlyOnce).await.unwrap();
         }
         let got = recv(&s).await;
         let Packet::Publish {
@@ -1062,9 +1044,7 @@ mod mqtt_sn {
         .await;
         recv(&s).await;
         let publ = client(&ctx, &uri, "p", Version::V5).await;
-        publ.publish("r/a", "x", QoS::AtLeastOnce, false)
-            .await
-            .unwrap();
+        publ.publish("r/a", "x", QoS::AtLeastOnce).await.unwrap();
         let Packet::Register {
             topic_id, msg_id, ..
         } = sn::decode(&recv(&s).await).unwrap().0
@@ -1104,11 +1084,11 @@ mod mqtt_sn {
         .await;
         recv(&s).await;
         let publ = client(&ctx, &uri, "p", Version::V5).await;
-        publ.publish("big/a", vec![b'x'; 70_000], QoS::AtLeastOnce, false)
+        publ.publish("big/a", vec![b'x'; 70_000], QoS::AtLeastOnce)
             .await
             .unwrap();
         // Acked to the broker, so the one-message window lets this through.
-        publ.publish("big/a", "small", QoS::AtLeastOnce, false)
+        publ.publish("big/a", "small", QoS::AtLeastOnce)
             .await
             .unwrap();
         let Packet::Register {
@@ -1228,13 +1208,11 @@ async fn websocket_plain_and_secure() {
             let mut web = Client::connect(&ctx, uri, opts).await.unwrap();
             web.subscribe("echo", QoS::AtMostOnce).await.unwrap();
             let big = vec![b'z'; 100_000];
-            web.publish("web/big", big.clone(), QoS::AtLeastOnce, false)
+            web.publish("web/big", big.clone(), QoS::AtLeastOnce)
                 .await
                 .unwrap();
             assert_eq!(next(&mut sub).await.payload, big);
-            sub.publish("echo", "back", QoS::AtMostOnce, false)
-                .await
-                .unwrap();
+            sub.publish("echo", "back", QoS::AtMostOnce).await.unwrap();
             assert_eq!(next(&mut web).await.payload, "back");
             web.disconnect().await;
         }
@@ -1269,7 +1247,7 @@ async fn quic_pub_sub_on_any_lane() {
             let mut c = Client::connect(&ctx, &uri, opts).await.unwrap();
             c.subscribe("echo/#", QoS::AtLeastOnce).await.unwrap();
             for i in 0..200 {
-                c.publish("quic/x", format!("{i}"), QoS::AtLeastOnce, false)
+                c.publish("quic/x", format!("{i}"), QoS::AtLeastOnce)
                     .await
                     .unwrap();
             }
@@ -1278,7 +1256,7 @@ async fn quic_pub_sub_on_any_lane() {
             }
             let big = vec![b'q'; 200_000];
             watcher
-                .publish("echo/big", big.clone(), QoS::AtLeastOnce, false)
+                .publish("echo/big", big.clone(), QoS::AtLeastOnce)
                 .await
                 .unwrap();
             assert_eq!(next(&mut c).await.payload, big);
@@ -1360,9 +1338,7 @@ async fn mutual_tls_identifies_clients() {
             .await
             .unwrap();
         c.subscribe("m/#", QoS::AtLeastOnce).await.unwrap();
-        c.publish("m/1", "hi", QoS::AtLeastOnce, false)
-            .await
-            .unwrap();
+        c.publish("m/1", "hi", QoS::AtLeastOnce).await.unwrap();
         assert_eq!(next(&mut c).await.payload, "hi");
         c.disconnect().await;
         let anonymous = Client::connect(&ctx, &uri, opts("nobody", false)).await;
@@ -1375,7 +1351,7 @@ async fn retained_messages_survive_restart() {
     let path = std::env::temp_dir().join(format!("zzq-retained-{}.log", std::process::id()));
     let _ = std::fs::remove_file(&path);
     for run in 0..2 {
-        let store = Arc::new(zzq_broker::FilePersistence::open(&path, false).unwrap());
+        let store = Arc::new(zzq_broker::FilePersistence::open(&path).unwrap());
         let opts = BrokerOptions {
             persistence: Some(store.clone()),
             ..BrokerOptions::default()
@@ -1384,7 +1360,7 @@ async fn retained_messages_survive_restart() {
         if run == 0 {
             let p = client(&ctx, &uri, "p", Version::V5).await;
             for (topic, payload) in [("keep/a", "A"), ("keep/b", "B"), ("keep/b", "")] {
-                p.publish(topic, payload, QoS::AtLeastOnce, true)
+                p.publish_retained(topic, payload, QoS::AtLeastOnce)
                     .await
                     .unwrap();
             }
@@ -1427,7 +1403,8 @@ async fn client_reconnects_and_restores_subscriptions() {
     let publisher = c.clone();
     let late = tokio::spawn(async move {
         let c = publisher.lock().await;
-        c.publish("rc/late", "after", QoS::AtLeastOnce, true).await
+        c.publish_retained("rc/late", "after", QoS::AtLeastOnce)
+            .await
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     let ctx2 = Context::with_config(&Config::default()).unwrap();
@@ -1444,7 +1421,7 @@ async fn client_reconnects_and_restores_subscriptions() {
     let mut watch = client(&ctx2, &uri, "watch", Version::V5).await;
     watch.subscribe("rc/late", QoS::AtLeastOnce).await.unwrap();
     broker2
-        .publish("rc/kept", "retained", QoS::AtLeastOnce, true)
+        .publish_retained("rc/kept", "retained", QoS::AtLeastOnce)
         .unwrap();
     timeout(WAIT, late).await.unwrap().unwrap().unwrap();
     let m = timeout(WAIT, async {
@@ -1470,8 +1447,7 @@ fn blocking_client_round_trip() {
         zzq_client::blocking::Client::connect(&ctx, &uri, ClientOptions::new("blocky")).unwrap();
     c.subscribe("b/#", QoS::ExactlyOnce).unwrap();
     for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
-        c.publish("b/x", format!("{}", qos as u8), qos, false)
-            .unwrap();
+        c.publish("b/x", format!("{}", qos as u8), qos).unwrap();
     }
     for qos in 0..3 {
         let m = c.recv().unwrap();
@@ -1503,7 +1479,7 @@ async fn client_respects_receive_maximum() {
                 } else {
                     QoS::ExactlyOnce
                 };
-                p.publish("rm/x", format!("{i}"), qos, false).await
+                p.publish("rm/x", format!("{i}"), qos).await
             })
         })
         .collect();
@@ -1556,17 +1532,14 @@ async fn bridge_loop_with_small_inbox_does_not_stall() {
     let flood: Vec<_> = (0..500)
         .map(|i| {
             let s = source.clone();
-            tokio::spawn(async move {
-                s.publish("in/x", format!("{i}"), QoS::AtLeastOnce, false)
-                    .await
-            })
+            tokio::spawn(async move { s.publish("in/x", format!("{i}"), QoS::AtLeastOnce).await })
         })
         .collect();
     timeout(Duration::from_secs(20), async {
         for _ in 0..500 {
             let m = bridge.recv().await.unwrap();
             bridge
-                .publish("out/x", m.payload, QoS::AtLeastOnce, false)
+                .publish("out/x", m.payload, QoS::AtLeastOnce)
                 .await
                 .unwrap();
         }
@@ -1602,9 +1575,7 @@ async fn quic_clients_on_every_lane() {
                 let mut c = Client::connect(&ctx, &uri, opts).await.unwrap();
                 let topic = format!("q/{i}");
                 c.subscribe(&topic, QoS::AtLeastOnce).await.unwrap();
-                c.publish(&topic, "hi", QoS::AtLeastOnce, false)
-                    .await
-                    .unwrap();
+                c.publish(&topic, "hi", QoS::AtLeastOnce).await.unwrap();
                 assert_eq!(next(&mut c).await.payload, "hi");
                 c.disconnect().await;
             })

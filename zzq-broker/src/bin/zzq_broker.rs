@@ -58,8 +58,7 @@ fn parse() -> Option<Args> {
 fn options(a: &Args) -> Result<BrokerOptions, String> {
     let mut opts = BrokerOptions::default();
     if let Some(path) = &a.retained_file {
-        let store =
-            zzq_broker::FilePersistence::open(path, false).map_err(|e| format!("{path}: {e}"))?;
+        let store = zzq_broker::FilePersistence::open(path).map_err(|e| format!("{path}: {e}"))?;
         opts.persistence = Some(std::sync::Arc::new(store));
     }
     tls(a, &mut opts)?;

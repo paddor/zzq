@@ -210,9 +210,7 @@ async fn random_traffic_keeps_the_broker_alive() {
         .await
         .unwrap();
     c.subscribe("after/#", QoS::AtLeastOnce).await.unwrap();
-    c.publish("after/x", "ok", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    c.publish("after/x", "ok", QoS::AtLeastOnce).await.unwrap();
     let m = timeout(Duration::from_secs(5), c.recv())
         .await
         .unwrap()

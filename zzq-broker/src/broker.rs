@@ -175,18 +175,30 @@ impl Broker {
     }
 
     /// Publishes a message as the broker itself.
-    pub fn publish(
-        &self,
-        topic: &str,
-        payload: impl Into<Bytes>,
-        qos: QoS,
-        retain: bool,
-    ) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTopic`] for a topic clients could not publish to, and
+    /// [`Error::TooLarge`] for a message MQTT cannot carry.
+    pub fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, &payload.into(), qos, false)
+    }
+
+    /// Publishes a retained message as the broker itself. An empty payload
+    /// clears the topic.
+    ///
+    /// # Errors
+    ///
+    /// As [`Broker::publish`].
+    pub fn publish_retained(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, &payload.into(), qos, true)
+    }
+
+    fn send_publish(&self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) -> Result<()> {
         validate_name(topic).map_err(|_| Error::InvalidTopic(topic.to_owned()))?;
         if crate::msg::too_deep(topic, self.shared.opts.max_topic_levels) {
             return Err(Error::InvalidTopic(topic.to_owned()));
         }
-        let payload: Bytes = payload.into();
         let h = zzq_proto::encode::PublishHeader {
             version: zzq_proto::Version::V5,
             dup: false,
@@ -199,7 +211,7 @@ impl Broker {
         if h.remaining(payload.len()) > zzq_proto::varint::MAX {
             return Err(Error::TooLarge);
         }
-        let msg = Msg::new(topic, &payload, &[], qos, retain);
+        let msg = Msg::new(topic, payload, &[], qos, retain);
         publish(&self.shared, msg)
     }
 

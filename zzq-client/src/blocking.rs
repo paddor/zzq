@@ -52,15 +52,28 @@ impl Client {
     }
 
     /// Publishes. QoS 0 returns once queued; QoS 1 and 2 wait for the ack.
-    pub fn publish(
-        &self,
-        topic: &str,
-        payload: impl Into<Bytes>,
-        qos: QoS,
-        retain: bool,
-    ) -> Result<()> {
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Client::publish`], and [`Error::InAsync`] inside an async
+    /// runtime.
+    pub fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.into(), qos, false)
+    }
+
+    /// Publishes a retained message: the broker keeps it for later
+    /// subscribers. An empty payload clears the topic.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::publish`].
+    pub fn publish_retained(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.into(), qos, true)
+    }
+
+    fn send_publish(&self, topic: &str, payload: Bytes, qos: QoS, retain: bool) -> Result<()> {
         not_in_async()?;
-        let (cmd, rx) = publish_cmd(topic, payload.into(), qos, retain)?;
+        let (cmd, rx) = publish_cmd(topic, payload, qos, retain)?;
         self.send(cmd)?;
         rx.map_or(Ok(()), wait)
     }

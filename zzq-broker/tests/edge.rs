@@ -196,7 +196,9 @@ async fn qos2_duplicate_is_delivered_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn retain_handling_and_retain_as_published() {
     let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
-    broker.publish("r", "kept", QoS::AtMostOnce, true).unwrap();
+    broker
+        .publish_retained("r", "kept", QoS::AtMostOnce)
+        .unwrap();
     let mut c = Client::connect(&ctx, &uri, ClientOptions::new("c"))
         .await
         .unwrap();
@@ -216,7 +218,9 @@ async fn retain_handling_and_retain_as_published() {
     assert!(next(&mut c).await.retain);
     c.subscribe_with(&[("r", if_new)], 0).await.unwrap();
     nothing(&mut c).await;
-    c.publish("r", "live", QoS::AtMostOnce, true).await.unwrap();
+    c.publish_retained("r", "live", QoS::AtMostOnce)
+        .await
+        .unwrap();
     let m = next(&mut c).await;
     assert!(m.retain, "retain_as_published keeps the flag");
 }
@@ -240,7 +244,7 @@ async fn offline_queue_drops_oldest() {
         .await
         .unwrap();
     for i in 0..5 {
-        p.publish("q", format!("{i}"), QoS::AtLeastOnce, false)
+        p.publish("q", format!("{i}"), QoS::AtLeastOnce)
             .await
             .unwrap();
     }
@@ -269,7 +273,7 @@ async fn unsuback_means_unsubscribed_on_every_lane() {
     for round in 0..20 {
         c.subscribe("x", QoS::AtLeastOnce).await.unwrap();
         for p in &publishers {
-            p.publish("x", format!("{round}"), QoS::AtLeastOnce, false)
+            p.publish("x", format!("{round}"), QoS::AtLeastOnce)
                 .await
                 .unwrap();
         }
@@ -278,9 +282,7 @@ async fn unsuback_means_unsubscribed_on_every_lane() {
         }
         c.unsubscribe(&["x"]).await.unwrap();
         for p in &publishers {
-            p.publish("x", "late", QoS::AtLeastOnce, false)
-                .await
-                .unwrap();
+            p.publish("x", "late", QoS::AtLeastOnce).await.unwrap();
         }
     }
     nothing(&mut c).await;
@@ -303,7 +305,7 @@ async fn shared_subscription_across_lanes() {
         .await
         .unwrap();
     for i in 0..30 {
-        p.publish("work", format!("{i}"), QoS::AtLeastOnce, false)
+        p.publish("work", format!("{i}"), QoS::AtLeastOnce)
             .await
             .unwrap();
     }
@@ -450,21 +452,19 @@ async fn authorizer_limits_publish_and_subscribe() {
     let own = c.subscribe("+/#", QoS::AtLeastOnce).await.unwrap();
     let want = (ReasonCode::NOT_AUTHORIZED, ReasonCode::GRANTED_QOS_1);
     assert_eq!((any, own), want);
-    c.publish("alice/x", "mine", QoS::AtLeastOnce, false)
+    c.publish("alice/x", "mine", QoS::AtLeastOnce)
         .await
         .unwrap();
     assert_eq!(next(&mut c).await.payload, "mine");
     let err = c
-        .publish("bob/x", "theirs", QoS::AtLeastOnce, false)
+        .publish("bob/x", "theirs", QoS::AtLeastOnce)
         .await
         .unwrap_err();
     assert!(
         matches!(err, zzq_client::Error::Rejected(ReasonCode::NOT_AUTHORIZED)),
         "{err}"
     );
-    c.publish("bob/x", "theirs", QoS::AtMostOnce, false)
-        .await
-        .unwrap();
+    c.publish("bob/x", "theirs", QoS::AtMostOnce).await.unwrap();
     nothing(&mut c).await;
     // v3 cannot be told no: the publish is acked and dropped.
     let old = ClientOptions {
@@ -473,10 +473,10 @@ async fn authorizer_limits_publish_and_subscribe() {
     };
     let carol = Client::connect(&ctx, &uri, old).await.unwrap();
     for qos in [QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce] {
-        carol.publish("bob/x", "theirs", qos, false).await.unwrap();
+        carol.publish("bob/x", "theirs", qos).await.unwrap();
     }
     carol
-        .publish("carol/x", "mine", QoS::ExactlyOnce, false)
+        .publish("carol/x", "mine", QoS::ExactlyOnce)
         .await
         .unwrap();
     assert_eq!(next(&mut c).await.payload, "mine");
@@ -509,7 +509,7 @@ async fn clients_cannot_publish_to_sys() {
         .unwrap();
     c.subscribe("$SYS/fake", QoS::AtLeastOnce).await.unwrap();
     let err = c
-        .publish("$SYS/fake", "x", QoS::AtLeastOnce, false)
+        .publish("$SYS/fake", "x", QoS::AtLeastOnce)
         .await
         .unwrap_err();
     assert!(
@@ -542,7 +542,7 @@ async fn slow_subscriber_slows_qos1_publishers_instead_of_dropping() {
                 .unwrap();
             tasks.push(tokio::spawn(async move {
                 for n in 0..1000 {
-                    c.publish(&format!("in/{i}"), format!("{n}"), QoS::AtLeastOnce, false)
+                    c.publish(&format!("in/{i}"), format!("{n}"), QoS::AtLeastOnce)
                         .await
                         .unwrap();
                 }
@@ -693,8 +693,12 @@ async fn deep_topics_are_rejected() {
     let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
     assert_eq!(byte1 >> 4, 14);
     assert_eq!(packet[2], zzq_proto::reason::TOPIC_NAME_INVALID);
-    assert!(broker.publish(&topic, "x", QoS::AtMostOnce, true).is_err());
-    c.publish("a/b", "still up", QoS::AtLeastOnce, false)
+    assert!(
+        broker
+            .publish_retained(&topic, "x", QoS::AtMostOnce)
+            .is_err()
+    );
+    c.publish("a/b", "still up", QoS::AtLeastOnce)
         .await
         .unwrap();
 }
@@ -732,14 +736,10 @@ async fn no_local_needs_every_overlapping_subscription() {
     let mut no_local = SubscriptionOptions::from(QoS::AtLeastOnce);
     no_local.no_local = true;
     c.subscribe_with(&[("o/#", no_local)], 0).await.unwrap();
-    c.publish("o/x", "hidden", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    c.publish("o/x", "hidden", QoS::AtLeastOnce).await.unwrap();
     nothing(&mut c).await;
     c.subscribe("o/x", QoS::AtMostOnce).await.unwrap();
-    c.publish("o/x", "seen", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    c.publish("o/x", "seen", QoS::AtLeastOnce).await.unwrap();
     assert_eq!(next(&mut c).await.payload, "seen");
     nothing(&mut c).await;
 }
@@ -755,9 +755,7 @@ async fn overlapping_subscriptions_carry_every_identifier() {
     c.subscribe_with(&[("m/+", SubscriptionOptions::from(QoS::AtMostOnce))], 2)
         .await
         .unwrap();
-    c.publish("m/x", "both", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    c.publish("m/x", "both", QoS::AtLeastOnce).await.unwrap();
     let m = next(&mut c).await;
     let mut ids = m.subscription_ids.clone();
     ids.sort_unstable();
@@ -778,7 +776,7 @@ async fn max_retained_refuses_new_topics() {
         .unwrap();
     c.subscribe("k/#", QoS::AtLeastOnce).await.unwrap();
     for (topic, payload) in [("k/1", "a"), ("k/2", "b"), ("k/3", "c"), ("k/1", "d")] {
-        c.publish(topic, payload, QoS::AtLeastOnce, true)
+        c.publish_retained(topic, payload, QoS::AtLeastOnce)
             .await
             .unwrap();
         assert_eq!(next(&mut c).await.payload, payload);
@@ -992,13 +990,11 @@ async fn takeover_drops_output_queued_for_the_old_connection() {
         .unwrap();
     let chunk = vec![b'f'; 64 << 10];
     for _ in 0..400 {
-        publ.publish("flood", chunk.clone(), QoS::AtMostOnce, false)
+        publ.publish("flood", chunk.clone(), QoS::AtMostOnce)
             .await
             .unwrap();
     }
-    publ.publish("barrier", "", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    publ.publish("barrier", "", QoS::AtLeastOnce).await.unwrap();
     let (mut new, _) = Raw::connect_with(&uri, &fields).await;
     let mut ping = Vec::new();
     encode::pingreq(&mut ping);
@@ -1033,13 +1029,13 @@ async fn client_waits_for_a_free_packet_id() {
     };
     assert_eq!(broker.packet().await.unwrap().0 >> 4, 1, "CONNECT");
     let mut out = Vec::new();
-    encode::connack(Version::V311, false, 0, &[], &mut out);
+    encode::connack(&encode::ConnAckFields::default(), Version::V311, &mut out);
     broker.write(&out).await;
     let c = std::sync::Arc::new(connecting.await.unwrap());
     // No Receive Maximum: every packet ID goes to an unacked publish.
     for _ in 0..u16::MAX {
         let c = c.clone();
-        tokio::spawn(async move { c.publish("t", "x", QoS::AtLeastOnce, false).await });
+        tokio::spawn(async move { c.publish("t", "x", QoS::AtLeastOnce).await });
     }
     for _ in 0..u16::MAX {
         assert_eq!(broker.packet().await.unwrap().0 >> 4, 3, "PUBLISH");
@@ -1091,10 +1087,10 @@ async fn client_and_broker_refuse_what_mqtt_cannot_encode() {
         ("a/+", bytes::Bytes::new()),
         (long.as_str(), bytes::Bytes::new()),
     ] {
-        let r = c.publish(topic, payload, QoS::AtMostOnce, false).await;
+        let r = c.publish(topic, payload, QoS::AtMostOnce).await;
         assert!(matches!(r, Err(Error::InvalidTopic(_))), "{r:?}");
     }
-    let r = c.publish("a", huge.clone(), QoS::AtLeastOnce, false).await;
+    let r = c.publish("a", huge.clone(), QoS::AtLeastOnce).await;
     assert!(matches!(r, Err(Error::TooLarge)), "{r:?}");
     let r = c.subscribe("a/#/b", QoS::AtMostOnce).await;
     assert!(matches!(r, Err(Error::InvalidTopic(_))), "{r:?}");
@@ -1106,12 +1102,10 @@ async fn client_and_broker_refuse_what_mqtt_cannot_encode() {
     };
     let r = Client::connect(&ctx, &uri, opts).await;
     assert!(matches!(r, Err(Error::TooLong("password"))), "{r:?}");
-    let r = broker.publish("a", huge, QoS::AtMostOnce, false);
+    let r = broker.publish("a", huge, QoS::AtMostOnce);
     assert!(matches!(r, Err(zzq_broker::Error::TooLarge)), "{r:?}");
     // Still usable.
-    c.publish("a", "fine", QoS::AtLeastOnce, false)
-        .await
-        .unwrap();
+    c.publish("a", "fine", QoS::AtLeastOnce).await.unwrap();
 }
 
 /// A store whose disk is gone.

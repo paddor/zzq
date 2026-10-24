@@ -236,24 +236,29 @@ pub fn ack<S: Sink + ?Sized>(a: &AckFields<'_>, version: Version, out: &mut S) {
     out.put(a.properties);
 }
 
-/// Writes CONNACK. For v3.1.1 `code` is the return code.
-pub fn connack<S: Sink + ?Sized>(
-    version: Version,
-    session_present: bool,
-    code: u8,
-    properties: &[u8],
-    out: &mut S,
-) {
+/// Fields of CONNACK.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnAckFields<'a> {
+    /// The server kept a session for the client.
+    pub session_present: bool,
+    /// v5 reason code, or the v3.1.1 return code.
+    pub code: u8,
+    /// Raw v5 properties.
+    pub properties: &'a [u8],
+}
+
+/// Writes CONNACK.
+pub fn connack<S: Sink + ?Sized>(c: &ConnAckFields<'_>, version: Version, out: &mut S) {
     let mut remaining = 2;
     if version.is_v5() {
-        remaining += props_block(properties.len());
+        remaining += props_block(c.properties.len());
     }
     out.put_header(0x20, remaining);
-    out.put_u8(u8::from(session_present));
-    out.put_u8(code);
+    out.put_u8(u8::from(c.session_present));
+    out.put_u8(c.code);
     if version.is_v5() {
-        out.put_varint(properties.len());
-        out.put(properties);
+        out.put_varint(c.properties.len());
+        out.put(c.properties);
     }
 }
 
@@ -608,7 +613,12 @@ mod tests {
         assert_eq!((s.pkid, s.codes), (4, &[0, 1, 0x80][..]));
 
         out.clear();
-        connack(Version::V5, true, 0x86, &[], &mut out);
+        let c = ConnAckFields {
+            session_present: true,
+            code: 0x86,
+            properties: &[],
+        };
+        connack(&c, Version::V5, &mut out);
         let Packet::ConnAck(c) = one(&out, Version::V5) else {
             panic!("not a connack");
         };
