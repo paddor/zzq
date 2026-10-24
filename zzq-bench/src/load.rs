@@ -23,13 +23,21 @@ pub enum Scenario {
 /// Load settings.
 #[derive(Debug, Clone)]
 pub struct Load {
+    /// Broker address, `host:port`.
     pub addr: String,
+    /// Speak v5 instead of v3.1.1.
     pub v5: bool,
+    /// Publish QoS, 0 to 2.
     pub qos: u8,
+    /// Payload size in bytes.
     pub size: usize,
+    /// Publisher connections.
     pub pubs: usize,
+    /// Subscriber connections.
     pub subs: usize,
+    /// Time to run before measuring.
     pub warmup: Duration,
+    /// Time to measure.
     pub measure: Duration,
     /// QoS 1/2 messages in flight per publisher.
     pub window: usize,
@@ -186,6 +194,10 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<(Vec<SubConn
 }
 
 /// Runs a throughput scenario.
+///
+/// # Errors
+///
+/// If a connection fails, the broker closes one, or a reply is malformed.
 pub fn throughput(scenario: Scenario, load: &Load) -> io::Result<Throughput> {
     let shape = Shape::new(scenario, load);
     let run = Arc::new(Run::default());
@@ -450,10 +462,15 @@ fn publish_acked(
 /// Latency result in microseconds.
 #[derive(Debug, Clone, Default)]
 pub struct Latency {
+    /// Median.
     pub p50: f64,
+    /// 90th percentile.
     pub p90: f64,
+    /// 99th percentile.
     pub p99: f64,
+    /// 99.9th percentile.
     pub p999: f64,
+    /// Slowest round trip.
     pub max: f64,
     /// Messages not delivered within one second.
     pub lost: u64,
@@ -461,6 +478,10 @@ pub struct Latency {
 
 /// One message in flight between two connections of one thread, QoS 0 or 1.
 /// The payload carries a sequence number, so `size` must be at least 8.
+///
+/// # Errors
+///
+/// If `size` is below 8 or `qos` above 1, if a connection fails, the broker closes one, or a reply is malformed.
 pub fn latency(load: &Load, iters: usize) -> io::Result<Latency> {
     if load.size < 8 || load.qos > 1 {
         return Err(io::Error::new(

@@ -1,9 +1,9 @@
 //! MQTT 3.1.1 and 5.0 broker.
 //!
 //! Each IO lane of the [`zzq_tokio::Context`] owns the sessions of the client
-//! IDs that hash to it and a copy of the subscription
-//! index. Publishes are matched on the publisher's lane; other lanes get
-//! each publish once, in bounded batches, and deliver to their own sessions.
+//! IDs that hash to it and a copy of the subscription index. Publishes are
+//! matched on the publisher's lane; other lanes get each publish once, in
+//! bounded batches, and deliver to their own sessions.
 //! WebSocket and MQTT-SN clients reach the broker through in-memory MQTT
 //! connections.
 

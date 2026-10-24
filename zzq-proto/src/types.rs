@@ -129,6 +129,11 @@ impl From<QoS> for SubscriptionOptions {
 
 impl SubscriptionOptions {
     /// Parses the options byte.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Malformed`] for reserved bits, an invalid QoS or retain
+    /// handling, or v5 bits in a v3.1.1 byte.
     pub fn from_byte(b: u8, version: Version) -> Result<Self, DecodeError> {
         if version.is_v5() {
             if b & 0xc0 != 0 || (b >> 4) & 0x03 == 3 {

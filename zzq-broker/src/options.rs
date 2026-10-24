@@ -9,9 +9,13 @@ use zzq_tokio::transport::TransportOptions;
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ConnectInfo<'a> {
+    /// Client ID, empty if the client wants one assigned.
     pub client_id: &'a str,
+    /// User name.
     pub username: Option<&'a str>,
+    /// Password.
     pub password: Option<&'a [u8]>,
+    /// Protocol version.
     pub version: Version,
     /// DER of the certificate the client presented over `tls://` or
     /// `quic://`, if the listener asks for one with `client_ca_pem`.
@@ -22,6 +26,7 @@ pub struct ConnectInfo<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum AuthDecision {
+    /// Lets the client connect.
     Allow,
     /// Rejects with a v5 CONNACK reason code. v3.1.1 clients get the closest
     /// return code.
@@ -30,6 +35,7 @@ pub enum AuthDecision {
 
 /// Decides whether a client may connect.
 pub trait Authenticator: Send + Sync + 'static {
+    /// Decides on one CONNECT. Runs on a lane thread and must not block.
     fn authenticate(&self, info: &ConnectInfo<'_>) -> AuthDecision;
 }
 
@@ -38,7 +44,9 @@ pub trait Authenticator: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ClientInfo<'a> {
+    /// Client ID.
     pub client_id: &'a str,
+    /// User name from CONNECT.
     pub username: Option<&'a str>,
 }
 

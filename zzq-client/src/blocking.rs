@@ -35,6 +35,11 @@ fn wait<T>(rx: Ack<T>) -> Result<T> {
 
 impl Client {
     /// Connects to `uri` and waits for CONNACK.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Client::connect`], and [`Error::InAsync`] inside an async
+    /// runtime.
     pub fn connect(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Client> {
         not_in_async()?;
         let st = start(ctx, uri, opts)?;
@@ -78,7 +83,13 @@ impl Client {
         rx.map_or(Ok(()), wait)
     }
 
-    /// Subscribes to one filter with a maximum QoS. Returns the granted code.
+    /// Subscribes to one filter with a maximum QoS. Returns the granted
+    /// QoS, or the reason the broker refused the filter.
+    ///
+    /// # Errors
+    ///
+    /// As [`crate::Client::subscribe`], and [`Error::InAsync`] inside an
+    /// async runtime.
     pub fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
         let codes = self.subscribe_with(&[(filter, SubscriptionOptions::from(qos))], 0)?;
         Ok(codes
@@ -89,6 +100,10 @@ impl Client {
 
     /// Subscribes to several filters, optionally with a v5 Subscription
     /// Identifier. Returns one code per filter.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
     pub fn subscribe_with(
         &self,
         filters: &[(&str, SubscriptionOptions)],
@@ -101,6 +116,10 @@ impl Client {
     }
 
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
     pub fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
         not_in_async()?;
         let (cmd, rx) = unsubscribe_cmd(filters)?;

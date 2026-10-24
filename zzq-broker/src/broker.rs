@@ -73,16 +73,25 @@ pub(crate) struct Shared {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Stats {
+    /// Connected clients.
     pub connections: u64,
+    /// Sessions, connected or not.
     pub sessions: u64,
     /// Subscriptions in the index of one lane (all lanes hold all of them).
     pub subscriptions: u64,
+    /// Retained messages stored.
     pub retained: u64,
+    /// Messages routed.
     pub publishes: u64,
+    /// Messages written to subscribers.
     pub deliveries: u64,
+    /// QoS 0 messages dropped because a connection's write buffer was full.
     pub dropped_buffer_full: u64,
+    /// QoS 0 messages for offline sessions.
     pub dropped_offline: u64,
+    /// QoS 1/2 messages dropped from a full session queue.
     pub dropped_queue_full: u64,
+    /// Messages larger than the subscriber's Maximum Packet Size.
     pub dropped_too_large: u64,
     /// Queued messages whose Message Expiry Interval ran out.
     pub dropped_expired: u64,
@@ -98,6 +107,11 @@ pub struct Broker {
 
 impl Broker {
     /// Starts a broker on the lanes of `ctx`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Persistence`] if stored retained messages cannot be loaded,
+    /// and [`Error::Transport`] if the lanes have stopped.
     pub async fn new(ctx: &Context, opts: BrokerOptions) -> Result<Broker> {
         let n = ctx.lanes();
         let mut lanes = Vec::with_capacity(n);
@@ -145,6 +159,11 @@ impl Broker {
 
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
     /// endpoint, with the actual port for port 0.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] if the URI is invalid or binding fails, for
+    /// example because the address is in use.
     pub async fn bind(&self, uri: &str) -> Result<Endpoint> {
         let endpoint = uri.parse::<Endpoint>()?;
         let (tx, rx) = oneshot::channel();
@@ -217,6 +236,10 @@ impl Broker {
     }
 
     /// Current counters, summed over lanes.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] once the broker has stopped.
     pub async fn stats(&self) -> Result<Stats> {
         collect(&self.shared).await
     }

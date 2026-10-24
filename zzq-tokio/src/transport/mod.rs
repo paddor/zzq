@@ -86,6 +86,10 @@ pub trait Driver {
 impl Stream {
     /// Reads into `buf` until `done` returns true, without binding the stream
     /// to the current lane, so it can still move to another one.
+    ///
+    /// # Errors
+    ///
+    /// If reading fails or the peer closes first.
     pub async fn prefetch(
         self,
         buf: &mut BytesMut,
@@ -137,6 +141,13 @@ impl Stream {
     }
 
     /// DER of the certificate the peer presented over TLS or QUIC.
+    #[cfg_attr(
+        not(feature = "tls"),
+        expect(
+            clippy::missing_const_for_fn,
+            reason = "not const with the tls feature"
+        )
+    )]
     pub fn peer_cert(&self) -> Option<Vec<u8>> {
         match self {
             #[cfg(feature = "tls")]
@@ -153,6 +164,11 @@ impl Stream {
     }
 
     /// Splits the stream on the current lane and runs `driver` on it.
+    ///
+    /// # Errors
+    ///
+    /// If the stream cannot be registered with the lane, or the TLS or
+    /// WebSocket handshake fails.
     pub async fn drive<D: Driver>(self, driver: D) -> Result<D::Output> {
         match self {
             Stream::Tcp(s) => {
@@ -223,6 +239,12 @@ pub enum Listener {
 
 impl Listener {
     /// Binds `endpoint`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AddressInUse`], [`Error::Unsupported`] for a transport that
+    /// is not built in, [`Error::Tls`] for missing or bad TLS settings, and
+    /// [`Error::Io`] otherwise.
     pub async fn bind(
         ctx: &Context,
         endpoint: &Endpoint,
@@ -269,6 +291,10 @@ impl Listener {
     }
 
     /// Waits for the next connection.
+    ///
+    /// # Errors
+    ///
+    /// If accepting fails, or [`Error::Closed`] once the listener stops.
     pub async fn accept(&mut self) -> Result<Stream> {
         match self {
             Listener::Tcp(l) => l.accept().await,
@@ -300,6 +326,11 @@ impl Listener {
 }
 
 /// Connects to `endpoint`.
+///
+/// # Errors
+///
+/// [`Error::Refused`], [`Error::Tls`] for a failed handshake or bad
+/// settings, [`Error::Unsupported`], and [`Error::Io`] otherwise.
 #[doc(hidden)]
 pub async fn connect(
     ctx: &Context,

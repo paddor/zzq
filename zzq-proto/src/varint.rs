@@ -9,6 +9,10 @@ pub const MAX: usize = 268_435_455;
 ///
 /// Returns `Ok(None)` if `buf` ends before the integer does, and
 /// `(value, length)` otherwise.
+///
+/// # Errors
+///
+/// [`DecodeError::Malformed`] if the integer runs past four bytes.
 #[inline]
 pub fn decode(buf: &[u8]) -> Result<Option<(usize, usize)>, DecodeError> {
     let mut value = 0usize;

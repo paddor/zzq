@@ -3,6 +3,10 @@
 use crate::DecodeError;
 
 /// Checks a topic name: not empty, no wildcards, at most 65535 bytes.
+///
+/// # Errors
+///
+/// [`DecodeError::InvalidTopic`] if the name breaks one of these rules.
 #[inline]
 pub fn validate_name(topic: &str) -> Result<(), DecodeError> {
     let b = topic.as_bytes();
@@ -13,6 +17,11 @@ pub fn validate_name(topic: &str) -> Result<(), DecodeError> {
 }
 
 /// Checks a topic filter: `+` fills a whole level, `#` fills the last one.
+///
+/// # Errors
+///
+/// [`DecodeError::InvalidTopic`] if the filter is empty, too long, uses a
+/// wildcard inside a level, or is a malformed `$share/` filter.
 pub fn validate_filter(filter: &str) -> Result<(), DecodeError> {
     if filter.is_empty() || filter.len() > 65_535 {
         return Err(DecodeError::InvalidTopic);
@@ -57,7 +66,9 @@ pub fn matches(filter: &str, topic: &str) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SharedFilter<'a> {
+    /// Share name: subscribers in one group split the messages.
     pub group: &'a str,
+    /// The filter after the group.
     pub filter: &'a str,
 }
 

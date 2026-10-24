@@ -8,9 +8,13 @@ use zzq_proto::packet::fixed_header;
 use zzq_proto::property::{self, Properties};
 use zzq_proto::{QoS, SubscriptionOptions, Version};
 
+/// First byte of PUBACK.
 pub const PUBACK: u8 = 0x40;
+/// First byte of PUBREC.
 pub const PUBREC: u8 = 0x50;
+/// First byte of PUBREL.
 pub const PUBREL: u8 = 0x62;
+/// First byte of PUBCOMP.
 pub const PUBCOMP: u8 = 0x70;
 
 /// Buffered packet reader over a blocking socket.
@@ -33,6 +37,10 @@ impl Default for Reader {
 
 impl Reader {
     /// Reads more bytes. `Ok(0)` means the peer closed.
+    ///
+    /// # Errors
+    ///
+    /// If the read fails.
     pub fn fill<R: Read>(&mut self, s: &mut R) -> io::Result<usize> {
         if self.pos > 0 {
             self.buf.copy_within(self.pos..self.len, 0);
@@ -89,9 +97,13 @@ pub fn publish_payload(body: &[u8], qos: u8, v5: bool) -> &[u8] {
 /// PUBLISH header fields for [`publish`].
 #[derive(Debug, Clone, Copy)]
 pub struct Head<'a> {
+    /// Topic name.
     pub topic: &'a str,
+    /// QoS, 0 to 2.
     pub qos: u8,
+    /// Packet ID, ignored for QoS 0.
     pub pkid: u16,
+    /// Encode for v5.
     pub v5: bool,
 }
 
@@ -125,6 +137,10 @@ fn invalid(what: String) -> io::Error {
 }
 
 /// Connects and waits for CONNACK. Returns the v5 Receive Maximum.
+///
+/// # Errors
+///
+/// If a connection fails, the broker closes one, or a reply is malformed.
 pub fn connect(
     addr: &str,
     client_id: &str,
@@ -170,6 +186,10 @@ pub fn connect(
 }
 
 /// Subscribes and waits for SUBACK.
+///
+/// # Errors
+///
+/// If a connection fails, the broker closes one, or a reply is malformed.
 pub fn subscribe(
     s: &mut TcpStream,
     rd: &mut Reader,

@@ -18,25 +18,51 @@ pub const UDP_PORT: u16 = 1884;
 #[non_exhaustive]
 pub enum Endpoint {
     /// `tcp://host[:port]`
-    Tcp { host: String, port: u16 },
+    Tcp {
+        /// Host name or address.
+        host: String,
+        /// Port, 1883 by default.
+        port: u16,
+    },
     /// `tls://host[:port]`
-    Tls { host: String, port: u16 },
+    Tls {
+        /// Host name or address.
+        host: String,
+        /// Port, 8883 by default.
+        port: u16,
+    },
     /// `ws://host[:port][/path]`
     Ws {
+        /// Host name or address.
         host: String,
+        /// Port, 80 by default.
         port: u16,
+        /// Request path, `/mqtt` by default.
         path: String,
     },
     /// `wss://host[:port][/path]`
     Wss {
+        /// Host name or address.
         host: String,
+        /// Port, 443 by default.
         port: u16,
+        /// Request path, `/mqtt` by default.
         path: String,
     },
     /// `quic://host[:port]`
-    Quic { host: String, port: u16 },
+    Quic {
+        /// Host name or address.
+        host: String,
+        /// Port, 14567 by default.
+        port: u16,
+    },
     /// `udp://host[:port]`, MQTT-SN
-    Udp { host: String, port: u16 },
+    Udp {
+        /// Host name or address.
+        host: String,
+        /// Port, 1884 by default.
+        port: u16,
+    },
     /// `ipc://path`, or `ipc://@name` for the Linux abstract namespace
     Ipc(String),
     /// `inproc://name`, within one context

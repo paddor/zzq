@@ -132,11 +132,17 @@ pub const fn packet_len(remaining: usize) -> usize {
 /// Fields of an outgoing PUBLISH.
 #[derive(Debug, Clone, Copy)]
 pub struct PublishHeader<'a> {
+    /// Protocol version of the receiver.
     pub version: Version,
+    /// The packet is a retransmission.
     pub dup: bool,
+    /// Delivery QoS.
     pub qos: QoS,
+    /// Retain flag.
     pub retain: bool,
+    /// Topic name, empty with a v5 topic alias.
     pub topic: &'a str,
+    /// Packet ID, ignored for QoS 0.
     pub pkid: u16,
     /// Raw v5 property bytes, without the length prefix.
     pub properties: &'a [u8],
@@ -194,8 +200,11 @@ pub fn publish<S: Sink + ?Sized>(h: &PublishHeader<'_>, payload: &[u8], out: &mu
 /// Fields of PUBACK, PUBREC, PUBREL or PUBCOMP.
 #[derive(Debug, Clone, Copy)]
 pub struct AckFields<'a> {
+    /// `PubAck`, `PubRec`, `PubRel` or `PubComp`.
     pub kind: PacketType,
+    /// Packet ID of the PUBLISH.
     pub pkid: u16,
+    /// v5 reason code, ignored for v3.1.1.
     pub reason: u8,
     /// Raw v5 property bytes, without the length prefix.
     pub properties: &'a [u8],
@@ -267,9 +276,11 @@ pub fn connack<S: Sink + ?Sized>(c: &ConnAckFields<'_>, version: Version, out: &
 pub struct SubAckFields<'a> {
     /// `SubAck` or `UnsubAck`.
     pub kind: PacketType,
+    /// Packet ID of the SUBSCRIBE or UNSUBSCRIBE.
     pub pkid: u16,
     /// Raw v5 property bytes, without the length prefix.
     pub properties: &'a [u8],
+    /// One reason code per filter. A v3.1.1 UNSUBACK has none.
     pub codes: &'a [u8],
 }
 
@@ -329,23 +340,36 @@ pub fn reason_only<S: Sink + ?Sized>(
 /// Will message for [`ConnectFields`].
 #[derive(Debug, Clone, Copy)]
 pub struct WillFields<'a> {
+    /// QoS the will is published with.
     pub qos: QoS,
+    /// The will is published as retained.
     pub retain: bool,
+    /// v5 will properties, such as the Will Delay Interval.
     pub properties: &'a [Property<'a>],
+    /// Will topic.
     pub topic: &'a str,
+    /// Will payload.
     pub payload: &'a [u8],
 }
 
 /// Fields of an outgoing CONNECT.
 #[derive(Debug, Clone, Copy)]
 pub struct ConnectFields<'a> {
+    /// Protocol version to speak.
     pub version: Version,
+    /// Clean Start (v5) or Clean Session (v3.1.1).
     pub clean_start: bool,
+    /// Keep alive in seconds, 0 for none.
     pub keep_alive: u16,
+    /// v5 CONNECT properties.
     pub properties: &'a [Property<'a>],
+    /// Client ID, empty to have a v5 server assign one.
     pub client_id: &'a str,
+    /// Will message.
     pub will: Option<WillFields<'a>>,
+    /// User name.
     pub username: Option<&'a str>,
+    /// Password.
     pub password: Option<&'a [u8]>,
 }
 

@@ -57,12 +57,20 @@ impl LaneHandle {
     }
 
     /// Runs `job` on the lane thread, inside its local task set.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] once the lane has stopped.
     pub fn run(&self, job: impl FnOnce() + Send + 'static) -> Result<()> {
         self.tx.send(Box::new(job)).map_err(|_| Error::Closed)
     }
 
     /// Spawns a local task on the lane. `f` builds the future on the lane, so
     /// the future does not need to be `Send`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] once the lane has stopped.
     pub fn spawn<F, Fut>(&self, f: F) -> Result<()>
     where
         F: FnOnce() -> Fut + Send + 'static,
@@ -74,6 +82,10 @@ impl LaneHandle {
     }
 
     /// Runs `f` on the lane and returns its result.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] once the lane has stopped.
     pub async fn call<R, F>(&self, f: F) -> Result<R>
     where
         R: Send + 'static,
@@ -134,11 +146,19 @@ impl fmt::Debug for Context {
 
 impl Context {
     /// A context with one lane.
+    ///
+    /// # Errors
+    ///
+    /// As [`Context::with_config`].
     pub fn new() -> Result<Context> {
         Self::with_config(&Config::default())
     }
 
     /// A context with the given settings.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if a lane thread or its runtime cannot start.
     pub fn with_config(config: &Config) -> Result<Context> {
         let n = config.io_threads.max(1);
         let mut lanes = Vec::with_capacity(n);

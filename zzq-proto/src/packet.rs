@@ -28,6 +28,11 @@ impl FixedHeader {
 }
 
 /// Parses a fixed header. `Ok(None)` means more bytes are needed.
+///
+/// # Errors
+///
+/// [`DecodeError::Malformed`] if the remaining length is longer than four
+/// bytes.
 #[inline]
 pub fn fixed_header(buf: &[u8]) -> Result<Option<FixedHeader>, DecodeError> {
     let Some(&byte1) = buf.first() else {
@@ -47,10 +52,15 @@ pub fn fixed_header(buf: &[u8]) -> Result<Option<FixedHeader>, DecodeError> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Will<'a> {
+    /// QoS the will is published with.
     pub qos: QoS,
+    /// The will is published as retained.
     pub retain: bool,
+    /// v5 will properties, such as the Will Delay Interval.
     pub properties: Properties<'a>,
+    /// Will topic.
     pub topic: &'a str,
+    /// Will payload.
     pub payload: &'a [u8],
 }
 
@@ -58,13 +68,21 @@ pub struct Will<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Connect<'a> {
+    /// Protocol version the client speaks.
     pub version: Version,
+    /// Clean Start (v5) or Clean Session (v3.1.1).
     pub clean_start: bool,
+    /// Keep alive in seconds, 0 for none.
     pub keep_alive: u16,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
+    /// Client ID, possibly empty.
     pub client_id: &'a str,
+    /// Will message.
     pub will: Option<Will<'a>>,
+    /// User name.
     pub username: Option<&'a str>,
+    /// Password.
     pub password: Option<&'a [u8]>,
 }
 
@@ -72,9 +90,11 @@ pub struct Connect<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ConnAck<'a> {
+    /// The server kept a session for the client.
     pub session_present: bool,
     /// v5 reason code or v3.1.1 return code.
     pub code: u8,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
 }
 
@@ -82,14 +102,19 @@ pub struct ConnAck<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Publish<'a> {
+    /// The packet is a retransmission.
     pub dup: bool,
+    /// Delivery QoS.
     pub qos: QoS,
+    /// The message is retained, or was when the server sends it.
     pub retain: bool,
     /// Empty when a v5 publisher uses a topic alias.
     pub topic: &'a str,
     /// Zero for QoS 0.
     pub pkid: u16,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
+    /// Payload.
     pub payload: &'a [u8],
 }
 
@@ -97,15 +122,20 @@ pub struct Publish<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Ack<'a> {
+    /// Packet ID of the PUBLISH.
     pub pkid: u16,
+    /// v5 reason code, 0 for v3.1.1.
     pub reason: u8,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
 }
 
 /// SUBSCRIBE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Subscribe<'a> {
+    /// Packet ID.
     pub pkid: u16,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
     version: Version,
     raw: &'a [u8],
@@ -125,7 +155,9 @@ impl<'a> Subscribe<'a> {
 /// UNSUBSCRIBE.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unsubscribe<'a> {
+    /// Packet ID.
     pub pkid: u16,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
     raw: &'a [u8],
 }
@@ -171,7 +203,9 @@ impl<'a> Iterator for FilterIter<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SubAck<'a> {
+    /// Packet ID of the SUBSCRIBE or UNSUBSCRIBE.
     pub pkid: u16,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
     /// One reason code per filter. Empty for a v3.1.1 UNSUBACK.
     pub codes: &'a [u8],
@@ -181,27 +215,44 @@ pub struct SubAck<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ReasonOnly<'a> {
+    /// v5 reason code, 0 for v3.1.1.
     pub reason: u8,
+    /// v5 properties, empty for v3.1.1.
     pub properties: Properties<'a>,
 }
 
 /// A decoded packet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Packet<'a> {
+    /// Opens a connection.
     Connect(Connect<'a>),
+    /// Answers CONNECT.
     ConnAck(ConnAck<'a>),
+    /// A message on a topic.
     Publish(Publish<'a>),
+    /// Acks a QoS 1 PUBLISH.
     PubAck(Ack<'a>),
+    /// First QoS 2 ack.
     PubRec(Ack<'a>),
+    /// Second QoS 2 step.
     PubRel(Ack<'a>),
+    /// Last QoS 2 ack.
     PubComp(Ack<'a>),
+    /// Subscribes to filters.
     Subscribe(Subscribe<'a>),
+    /// Answers SUBSCRIBE.
     SubAck(SubAck<'a>),
+    /// Unsubscribes from filters.
     Unsubscribe(Unsubscribe<'a>),
+    /// Answers UNSUBSCRIBE.
     UnsubAck(SubAck<'a>),
+    /// Keep alive request.
     PingReq,
+    /// Keep alive answer.
     PingResp,
+    /// Ends the connection.
     Disconnect(ReasonOnly<'a>),
+    /// v5 extended authentication.
     Auth(ReasonOnly<'a>),
 }
 
@@ -211,6 +262,11 @@ pub enum Packet<'a> {
 /// packet with its wire size otherwise. `version` is the negotiated version;
 /// CONNECT carries its own. Packets larger than `max_size` are rejected as
 /// soon as the fixed header is complete.
+///
+/// # Errors
+///
+/// A [`DecodeError`] if the packet is malformed, breaks a protocol rule,
+/// exceeds `max_size` or names an unsupported protocol version.
 #[inline]
 pub fn decode(
     buf: &[u8],
@@ -235,6 +291,10 @@ pub fn decode(
 const REQUIRED_FLAGS: [u8; 16] = [0xff, 0, 0, 0, 0, 0, 2, 0, 2, 0, 2, 0, 0, 0, 0, 0];
 
 /// Decodes a packet body given its first header byte.
+///
+/// # Errors
+///
+/// As [`decode`].
 pub fn decode_body(byte1: u8, body: &[u8], version: Version) -> Result<Packet<'_>, DecodeError> {
     let flags = byte1 & 0x0f;
     let kind = byte1 >> 4;

@@ -40,8 +40,11 @@ const MAX_BATCH: usize = 1024;
 /// A retained message as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Retained {
+    /// Topic name.
     pub topic: String,
+    /// Payload, never empty: an empty one clears the topic.
     pub payload: Bytes,
+    /// QoS of the message.
     pub qos: QoS,
     /// Raw v5 properties.
     pub properties: Bytes,
@@ -53,6 +56,11 @@ pub struct Retained {
 /// threads and must not block.
 pub trait Persistence: Send + Sync + 'static {
     /// Retained messages stored earlier. Read once when the broker starts.
+    ///
+    /// # Errors
+    ///
+    /// If the store cannot be read. [`crate::Broker::new`] then fails with
+    /// [`crate::Error::Persistence`].
     fn load_retained(&self) -> io::Result<Vec<Retained>>;
 
     /// Stores or replaces the retained message of `msg.topic`.

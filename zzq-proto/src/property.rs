@@ -7,32 +7,59 @@ use crate::cursor::Cursor;
 use crate::encode::Sink;
 use crate::{DecodeError, varint};
 
+/// Payload Format Indicator (`0x01`).
 pub const PAYLOAD_FORMAT_INDICATOR: u8 = 0x01;
+/// Message Expiry Interval (`0x02`).
 pub const MESSAGE_EXPIRY_INTERVAL: u8 = 0x02;
+/// Content Type (`0x03`).
 pub const CONTENT_TYPE: u8 = 0x03;
+/// Response Topic (`0x08`).
 pub const RESPONSE_TOPIC: u8 = 0x08;
+/// Correlation Data (`0x09`).
 pub const CORRELATION_DATA: u8 = 0x09;
+/// Subscription Identifier (`0x0b`).
 pub const SUBSCRIPTION_IDENTIFIER: u8 = 0x0b;
+/// Session Expiry Interval (`0x11`).
 pub const SESSION_EXPIRY_INTERVAL: u8 = 0x11;
+/// Assigned Client Identifier (`0x12`).
 pub const ASSIGNED_CLIENT_IDENTIFIER: u8 = 0x12;
+/// Server Keep Alive (`0x13`).
 pub const SERVER_KEEP_ALIVE: u8 = 0x13;
+/// Authentication Method (`0x15`).
 pub const AUTHENTICATION_METHOD: u8 = 0x15;
+/// Authentication Data (`0x16`).
 pub const AUTHENTICATION_DATA: u8 = 0x16;
+/// Request Problem Information (`0x17`).
 pub const REQUEST_PROBLEM_INFORMATION: u8 = 0x17;
+/// Will Delay Interval (`0x18`).
 pub const WILL_DELAY_INTERVAL: u8 = 0x18;
+/// Request Response Information (`0x19`).
 pub const REQUEST_RESPONSE_INFORMATION: u8 = 0x19;
+/// Response Information (`0x1a`).
 pub const RESPONSE_INFORMATION: u8 = 0x1a;
+/// Server Reference (`0x1c`).
 pub const SERVER_REFERENCE: u8 = 0x1c;
+/// Reason String (`0x1f`).
 pub const REASON_STRING: u8 = 0x1f;
+/// Receive Maximum (`0x21`).
 pub const RECEIVE_MAXIMUM: u8 = 0x21;
+/// Topic Alias Maximum (`0x22`).
 pub const TOPIC_ALIAS_MAXIMUM: u8 = 0x22;
+/// Topic Alias (`0x23`).
 pub const TOPIC_ALIAS: u8 = 0x23;
+/// Maximum QoS (`0x24`).
 pub const MAXIMUM_QOS: u8 = 0x24;
+/// Retain Available (`0x25`).
 pub const RETAIN_AVAILABLE: u8 = 0x25;
+/// User Property (`0x26`).
 pub const USER_PROPERTY: u8 = 0x26;
+/// Maximum Packet Size (`0x27`).
 pub const MAXIMUM_PACKET_SIZE: u8 = 0x27;
+/// Wildcard Subscription Available (`0x28`).
 pub const WILDCARD_SUBSCRIPTION_AVAILABLE: u8 = 0x28;
+/// Subscription Identifier Available (`0x29`).
 pub const SUBSCRIPTION_IDENTIFIER_AVAILABLE: u8 = 0x29;
+/// Shared Subscription Available (`0x2a`).
 pub const SHARED_SUBSCRIPTION_AVAILABLE: u8 = 0x2a;
 
 /// One decoded property.

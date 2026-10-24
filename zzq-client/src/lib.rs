@@ -61,9 +61,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Will message sent by the broker if the connection is lost.
 #[derive(Debug, Clone)]
 pub struct LastWill {
+    /// Will topic.
     pub topic: String,
+    /// Will payload.
     pub payload: Bytes,
+    /// QoS the will is published with.
     pub qos: QoS,
+    /// The will is published as retained.
     pub retain: bool,
     /// v5 Will Delay Interval, seconds.
     pub delay: u32,
@@ -72,15 +76,22 @@ pub struct LastWill {
 /// Connect settings.
 #[derive(Debug, Clone)]
 pub struct ClientOptions {
+    /// Client ID. Empty asks a v5 broker to assign one.
     pub client_id: String,
+    /// Protocol version, v5 by default.
     pub version: Version,
+    /// Start a new session instead of resuming one. A client that resumes
+    /// keeps it on reconnects.
     pub clean_start: bool,
     /// Seconds. 0 disables keep alive.
     pub keep_alive: u16,
     /// v5 Session Expiry Interval, seconds.
     pub session_expiry: u32,
+    /// User name.
     pub username: Option<String>,
+    /// Password.
     pub password: Option<Bytes>,
+    /// Will the broker publishes if the connection is lost.
     pub will: Option<LastWill>,
     /// Messages buffered for [`Client::recv`] before the connection waits.
     /// QoS 1/2 messages are acked when taken, and v5 brokers are asked to
@@ -98,7 +109,9 @@ pub struct ClientOptions {
 /// attempts fail.
 #[derive(Debug, Clone, Copy)]
 pub struct Reconnect {
+    /// First wait after a loss.
     pub min: Duration,
+    /// Longest wait between attempts.
     pub max: Duration,
 }
 
@@ -144,11 +157,16 @@ impl ClientOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Message {
+    /// Topic name.
     pub topic: String,
+    /// Payload.
     pub payload: Bytes,
+    /// Delivery QoS.
     pub qos: QoS,
+    /// The broker sent a retained message, or kept the flag for
+    /// Retain As Published.
     pub retain: bool,
-    /// v5 Subscription Identifiers.
+    /// v5 Subscription Identifiers of the matching subscriptions.
     pub subscription_ids: Vec<u32>,
     /// Packet ID to ack once the application takes the message.
     pub(crate) ack: Option<u16>,
@@ -158,6 +176,7 @@ pub struct Message {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Connected {
+    /// The broker resumed a session.
     pub session_present: bool,
     /// Client ID assigned by a v5 broker, if the client sent none.
     pub assigned_client_id: Option<String>,
@@ -281,6 +300,13 @@ pub struct Client {
 
 impl Client {
     /// Connects to `uri` and waits for CONNACK.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Transport`] if the URI is invalid or the connection or TLS
+    /// fails, [`Error::Refused`] if the broker refuses it, and
+    /// [`Error::InvalidTopic`] or [`Error::TooLong`] for options MQTT cannot
+    /// carry.
     pub async fn connect(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Client> {
         let st = start(ctx, uri, opts)?;
         let connected = st.connack.await.map_err(|_| Error::Closed)??;
@@ -337,7 +363,13 @@ impl Client {
         }
     }
 
-    /// Subscribes to one filter with a maximum QoS. Returns the granted code.
+    /// Subscribes to one filter with a maximum QoS. Returns the granted
+    /// QoS, or the reason the broker refused the filter.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTopic`] for an invalid filter, and [`Error::Closed`]
+    /// once the client is gone.
     pub async fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
         let codes = self
             .subscribe_with(&[(filter, SubscriptionOptions::from(qos))], 0)
@@ -350,6 +382,10 @@ impl Client {
 
     /// Subscribes to several filters, optionally with a v5 Subscription
     /// Identifier. Returns one code per filter.
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
     pub async fn subscribe_with(
         &self,
         filters: &[(&str, SubscriptionOptions)],
@@ -361,6 +397,10 @@ impl Client {
     }
 
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
     pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
         let (cmd, rx) = unsubscribe_cmd(filters)?;
         self.send(cmd)?;

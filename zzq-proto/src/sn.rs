@@ -24,9 +24,12 @@ pub const MAX_LEN: usize = 65_535;
 /// MQTT-SN QoS, which adds QoS -1: publish without a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SnQoS {
+    /// QoS 0.
     #[default]
     AtMostOnce,
+    /// QoS 1.
     AtLeastOnce,
+    /// QoS 2.
     ExactlyOnce,
     /// QoS -1: no connection, predefined or short topics only.
     NoConnection,
@@ -104,10 +107,15 @@ impl Topic<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[expect(clippy::struct_excessive_bools, reason = "mirrors the flags byte")]
 pub struct Flags {
+    /// The message is a retransmission.
     pub dup: bool,
+    /// QoS of a PUBLISH, or the requested or granted QoS.
     pub qos: SnQoS,
+    /// The message is or should be retained.
     pub retain: bool,
+    /// CONNECT: the client sends a will.
     pub will: bool,
+    /// CONNECT: start a new session.
     pub clean_session: bool,
 }
 
@@ -141,114 +149,188 @@ impl Flags {
     }
 }
 
-/// An MQTT-SN message.
+/// An MQTT-SN message. Message IDs match a reply to its request; topic IDs
+/// come from REGISTER or are predefined.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Packet<'a> {
+    /// A gateway announces itself.
     Advertise {
+        /// Gateway ID.
         gw_id: u8,
+        /// Seconds until the next ADVERTISE.
         duration: u16,
     },
+    /// A client looks for a gateway.
     SearchGw {
+        /// Broadcast radius in hops.
         radius: u8,
     },
+    /// A gateway or client answers SEARCHGW.
     GwInfo {
+        /// Gateway ID.
         gw_id: u8,
+        /// Gateway address, empty when a gateway sends it.
         address: &'a [u8],
     },
+    /// A client connects, or wakes up from sleep.
     Connect {
+        /// Will and clean session flags.
         flags: Flags,
+        /// Keep alive in seconds.
         duration: u16,
+        /// Client ID.
         client_id: &'a str,
     },
+    /// The gateway answers CONNECT.
     ConnAck {
+        /// Return code, such as [`ACCEPTED`].
         code: u8,
     },
+    /// The gateway asks for the will topic.
     WillTopicReq,
-    /// `None` flags and an empty topic delete the will.
+    /// The will topic. `None` flags and an empty topic delete the will.
     WillTopic {
+        /// Will QoS and retain flag.
         flags: Option<Flags>,
+        /// Will topic name.
         topic: &'a str,
     },
+    /// The gateway asks for the will message.
     WillMsgReq,
+    /// The will message.
     WillMsg {
+        /// Will payload.
         message: &'a [u8],
     },
+    /// Assigns a topic ID to a topic name.
     Register {
+        /// The topic ID, 0 when a client asks for one.
         topic_id: u16,
+        /// Message ID.
         msg_id: u16,
+        /// Topic name.
         topic: &'a str,
     },
+    /// Answers REGISTER.
     RegAck {
+        /// The assigned topic ID.
         topic_id: u16,
+        /// Message ID of the REGISTER.
         msg_id: u16,
+        /// Return code.
         code: u8,
     },
+    /// A message on a topic.
     Publish {
+        /// DUP, QoS and retain flags.
         flags: Flags,
+        /// The topic.
         topic: Topic<'a>,
+        /// Message ID, 0 for QoS 0 and -1.
         msg_id: u16,
+        /// Payload.
         data: &'a [u8],
     },
+    /// Acks a QoS 1 PUBLISH, or rejects any PUBLISH.
     PubAck {
+        /// Topic ID of the PUBLISH.
         topic_id: u16,
+        /// Message ID of the PUBLISH.
         msg_id: u16,
+        /// Return code.
         code: u8,
     },
+    /// First QoS 2 ack.
     PubRec {
+        /// Message ID of the PUBLISH.
         msg_id: u16,
     },
+    /// Second QoS 2 step.
     PubRel {
+        /// Message ID of the PUBLISH.
         msg_id: u16,
     },
+    /// Last QoS 2 ack.
     PubComp {
+        /// Message ID of the PUBLISH.
         msg_id: u16,
     },
+    /// Subscribes to a topic or filter.
     Subscribe {
+        /// DUP flag, requested QoS and topic ID type.
         flags: Flags,
+        /// Message ID.
         msg_id: u16,
+        /// The topic or filter.
         topic: Topic<'a>,
     },
+    /// Answers SUBSCRIBE.
     SubAck {
+        /// Granted QoS.
         flags: Flags,
+        /// Topic ID for a plain topic name, else 0.
         topic_id: u16,
+        /// Message ID of the SUBSCRIBE.
         msg_id: u16,
+        /// Return code.
         code: u8,
     },
+    /// Unsubscribes from a topic or filter.
     Unsubscribe {
+        /// Topic ID type.
         flags: Flags,
+        /// Message ID.
         msg_id: u16,
+        /// The topic or filter.
         topic: Topic<'a>,
     },
+    /// Answers UNSUBSCRIBE.
     UnsubAck {
+        /// Message ID of the UNSUBSCRIBE.
         msg_id: u16,
     },
-    /// A sleeping client wakes up with its client ID.
+    /// Keep alive. A sleeping client wakes up with its client ID.
     PingReq {
+        /// Client ID of a sleeping client.
         client_id: Option<&'a str>,
     },
+    /// Answers PINGREQ.
     PingResp,
-    /// A duration asks to sleep for that many seconds.
+    /// Ends the connection, or asks to sleep.
     Disconnect {
+        /// Seconds to sleep.
         duration: Option<u16>,
     },
+    /// Changes the will topic.
     WillTopicUpd {
+        /// Will QoS and retain flag.
         flags: Option<Flags>,
+        /// Will topic name.
         topic: &'a str,
     },
+    /// Answers WILLTOPICUPD.
     WillTopicResp {
+        /// Return code.
         code: u8,
     },
+    /// Changes the will message.
     WillMsgUpd {
+        /// Will payload.
         message: &'a [u8],
     },
+    /// Answers WILLMSGUPD.
     WillMsgResp {
+        /// Return code.
         code: u8,
     },
     /// A message relayed by a forwarder.
     Encapsulated {
+        /// Control byte with the broadcast radius.
         ctrl: u8,
+        /// The wireless node ID of the client.
         node_id: &'a [u8],
+        /// The relayed message.
         message: &'a [u8],
     },
 }
@@ -286,6 +368,11 @@ mod kind {
 
 /// Decodes the message at the start of `datagram`. Returns it with its
 /// length.
+///
+/// # Errors
+///
+/// A [`DecodeError`] if the datagram is shorter than its length field, has
+/// an unknown message type, or a field is truncated or not valid UTF-8.
 pub fn decode(datagram: &[u8]) -> Result<(Packet<'_>, usize), DecodeError> {
     let (len, header) = match datagram.first() {
         Some(0x01) => {
