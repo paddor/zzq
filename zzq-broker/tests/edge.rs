@@ -779,3 +779,72 @@ async fn takeover_cancels_a_delayed_will() {
     nothing(&mut watch).await;
     new.disconnect().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[expect(clippy::too_many_lines, reason = "one exchange with a fake broker")]
+async fn client_waits_for_a_free_packet_id() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let uri = format!("tcp://{}", listener.local_addr().unwrap());
+    let ctx = Context::with_config(&Config {
+        io_threads: 1,
+        ..Config::default()
+    })
+    .unwrap();
+    let opts = ClientOptions {
+        version: Version::V311,
+        ..ClientOptions::new("ids")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut broker = Raw {
+        s: listener.accept().await.unwrap().0,
+        buf: Vec::new(),
+        version: Version::V311,
+    };
+    assert_eq!(broker.packet().await.unwrap().0 >> 4, 1, "CONNECT");
+    let mut out = Vec::new();
+    encode::connack(Version::V311, false, 0, &[], &mut out);
+    broker.write(&out).await;
+    let c = std::sync::Arc::new(connecting.await.unwrap());
+    // No Receive Maximum: every packet ID goes to an unacked publish.
+    for _ in 0..u16::MAX {
+        let c = c.clone();
+        tokio::spawn(async move { c.publish("t", "x", QoS::AtLeastOnce, false).await });
+    }
+    for _ in 0..u16::MAX {
+        assert_eq!(broker.packet().await.unwrap().0 >> 4, 3, "PUBLISH");
+    }
+    let sub = tokio::spawn({
+        let c = c.clone();
+        async move { c.subscribe("s", QoS::AtMostOnce).await }
+    });
+    // The SUBSCRIBE waits for an ID.
+    let mut byte = [0u8; 1];
+    let early = timeout(Duration::from_millis(300), broker.s.read(&mut byte)).await;
+    assert!(early.is_err(), "SUBSCRIBE without a free packet ID");
+    let mut puback = Vec::new();
+    encode::ack(
+        &AckFields::new(PacketType::PubAck, 1),
+        Version::V311,
+        &mut puback,
+    );
+    broker.write(&puback).await;
+    let (byte1, packet) = broker.packet().await.expect("SUBSCRIBE");
+    assert_eq!(byte1 >> 4, 8);
+    assert_eq!(&packet[2..4], &[0, 1], "the freed packet ID");
+    let mut suback = Vec::new();
+    encode::suback(
+        &encode::SubAckFields {
+            kind: PacketType::SubAck,
+            pkid: 1,
+            properties: &[],
+            codes: &[0],
+        },
+        Version::V311,
+        &mut suback,
+    );
+    broker.write(&suback).await;
+    assert_eq!(sub.await.unwrap().unwrap(), 0);
+}

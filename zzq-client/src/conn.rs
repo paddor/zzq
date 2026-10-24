@@ -305,7 +305,15 @@ impl Conn<'_> {
                 }
             }
             for (id, filters) in by_id {
-                let pkid = self.pkid();
+                let Some(pkid) = self.pkid() else {
+                    // Every packet ID is taken: send it once one is free.
+                    self.s.waiting.push_front(Cmd::Subscribe {
+                        filters,
+                        sub_id: id,
+                        done: oneshot::channel().0,
+                    });
+                    continue;
+                };
                 let packet = self.subscribe_packet(pkid, &filters, id);
                 self.send_tracked(pkid, packet, Pending::Restore);
             }
@@ -318,11 +326,43 @@ impl Conn<'_> {
         }
     }
 
-    fn pkid(&mut self) -> u16 {
-        loop {
+    /// A free packet ID, if there is one.
+    fn pkid(&mut self) -> Option<u16> {
+        if !self.ids_left() {
+            return None;
+        }
+        for _ in 0..u16::MAX {
             self.s.next_pkid = self.s.next_pkid.wrapping_add(1).max(1);
             if !self.s.pending.contains_key(&self.s.next_pkid) {
-                return self.s.next_pkid;
+                return Some(self.s.next_pkid);
+            }
+        }
+        None
+    }
+
+    fn ids_left(&self) -> bool {
+        self.s.pending.len() < usize::from(u16::MAX)
+    }
+
+    /// Whether `cmd` has to wait: for the broker's Receive Maximum, or for
+    /// a free packet ID.
+    fn blocked(&self, cmd: &Cmd) -> bool {
+        match cmd {
+            Cmd::Publish { qos, .. } if *qos != QoS::AtMostOnce => {
+                self.s.inflight >= self.s.quota || !self.ids_left()
+            }
+            Cmd::Subscribe { .. } | Cmd::Unsubscribe { .. } => !self.ids_left(),
+            _ => false,
+        }
+    }
+
+    /// Sends waiting commands that may go now, in order.
+    fn send_waiting(&mut self) {
+        while let Some(cmd) = self.s.waiting.front()
+            && !self.blocked(cmd)
+        {
+            if let Some(cmd) = self.s.waiting.pop_front() {
+                self.command(cmd);
             }
         }
     }
@@ -353,14 +393,12 @@ impl Conn<'_> {
     }
 
     fn command(&mut self, cmd: Cmd) {
-        if matches!(&cmd, Cmd::Publish { qos, .. } if *qos != QoS::AtMostOnce) {
-            if self.s.inflight >= self.s.quota {
-                self.s.waiting.push_back(cmd);
-                return;
-            }
-            self.s.inflight += 1;
+        if self.blocked(&cmd) {
+            self.s.waiting.push_back(cmd);
+            return;
         }
         let v = self.s.opts.version;
+        // Not blocked, so a packet ID is free.
         match cmd {
             Cmd::Publish {
                 topic,
@@ -368,13 +406,22 @@ impl Conn<'_> {
                 qos,
                 retain,
                 done,
-            } => self.send_publish(&topic, &payload, (qos, retain), done),
+            } => {
+                let pkid = if qos == QoS::AtMostOnce {
+                    0
+                } else {
+                    let Some(pkid) = self.pkid() else { return };
+                    self.s.inflight += 1;
+                    pkid
+                };
+                self.send_publish(&topic, &payload, (qos, retain, pkid), done);
+            }
             Cmd::Subscribe {
                 filters,
                 sub_id,
                 done,
             } => {
-                let pkid = self.pkid();
+                let Some(pkid) = self.pkid() else { return };
                 let packet = self.subscribe_packet(pkid, &filters, sub_id);
                 self.send_tracked(
                     pkid,
@@ -383,7 +430,7 @@ impl Conn<'_> {
                 );
             }
             Cmd::Unsubscribe { filters, done } => {
-                let pkid = self.pkid();
+                let Some(pkid) = self.pkid() else { return };
                 let list: Vec<&str> = filters.iter().map(String::as_str).collect();
                 let mut b = Vec::new();
                 encode::unsubscribe(v, pkid, &[], &list, &mut b);
@@ -398,14 +445,9 @@ impl Conn<'_> {
         &mut self,
         topic: &str,
         payload: &[u8],
-        (qos, retain): (QoS, bool),
+        (qos, retain, pkid): (QoS, bool, u16),
         done: Option<oneshot::Sender<Result<()>>>,
     ) {
-        let pkid = if qos == QoS::AtMostOnce {
-            0
-        } else {
-            self.pkid()
-        };
         let h = PublishHeader {
             version: self.s.opts.version,
             dup: false,
@@ -486,6 +528,7 @@ impl Conn<'_> {
                     }
                     Some(Pending::Restore | Pending::Publish(_)) | None => {}
                 }
+                self.send_waiting();
             }
             Packet::PingResp => {}
             Packet::Disconnect(_) => return Err(Error::Closed),
@@ -523,9 +566,7 @@ impl Conn<'_> {
             });
         }
         self.s.inflight = self.s.inflight.saturating_sub(1);
-        if let Some(next) = self.s.waiting.pop_front() {
-            self.command(next);
-        }
+        self.send_waiting();
     }
 
     fn publish(&mut self, p: &Publish<'_>) -> Option<Message> {
