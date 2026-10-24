@@ -191,7 +191,7 @@ async fn start<R, W>(
     mut buf: BytesMut,
     peer_cert: Option<Vec<u8>>,
     r: &mut R,
-    mut w: W,
+    w: W,
 ) -> Option<(Key, Rc<ConnShared>, Version, BytesMut)>
 where
     R: AsyncRead + Unpin + 'static,
@@ -214,9 +214,7 @@ where
     let mut c = match read {
         Ok(Ok(c)) => c,
         Ok(Err((Some(version), code))) => {
-            let mut out = Vec::new();
-            connack_error(version, code, &mut out);
-            let _ = w.write_all(&out).await;
+            refuse(w, version, code).await;
             return None;
         }
         Ok(Err((None, _))) | Err(_) => return None,
@@ -229,9 +227,7 @@ where
     let key = match establish(lane, &mut c, &conn) {
         Ok(key) => key,
         Err(code) => {
-            let mut out = Vec::new();
-            connack_error(version, code, &mut out);
-            let _ = w.write_all(&out).await;
+            refuse(w, version, code).await;
             return None;
         }
     };
@@ -283,6 +279,15 @@ async fn read_connect<R: AsyncRead + Unpin>(
             Ok(_) => {}
         }
     }
+}
+
+/// Sends a refusing CONNACK and closes. Over QUIC, closing without
+/// `shutdown` would drop the CONNACK.
+async fn refuse<W: AsyncWrite + Unpin>(mut w: W, version: Version, code: u8) {
+    let mut out = Vec::new();
+    connack_error(version, code, &mut out);
+    let _ = w.write_all(&out).await;
+    let _ = w.shutdown().await;
 }
 
 fn connack_error(version: Version, code: u8, out: &mut Vec<u8>) {

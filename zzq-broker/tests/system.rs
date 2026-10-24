@@ -865,6 +865,34 @@ mod mqtt_sn {
     }
 }
 
+#[cfg(feature = "quic")]
+#[tokio::test(flavor = "multi_thread")]
+async fn quic_refusal_reaches_the_client() {
+    let (server_tls, client_tls) = test_tls();
+    let opts = BrokerOptions {
+        transport: server_tls,
+        max_connections: 1,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, _tcp) = setup_with(1, opts).await;
+    let uri = broker.bind("quic://127.0.0.1:0").await.unwrap().to_string();
+    let quic = |id: &str| ClientOptions {
+        transport: client_tls.clone(),
+        ..ClientOptions::new(id)
+    };
+    let _first = Client::connect(&ctx, &uri, quic("one")).await.unwrap();
+    let refused = Client::connect(&ctx, &uri, quic("two")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(zzq_client::Error::Refused(
+                zzq_proto::reason::QUOTA_EXCEEDED
+            ))
+        ),
+        "{refused:?}"
+    );
+}
+
 #[cfg(feature = "tls")]
 #[tokio::test(flavor = "multi_thread")]
 async fn websocket_plain_and_secure() {
