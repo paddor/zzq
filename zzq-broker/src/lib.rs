@@ -34,6 +34,9 @@
 
 mod broker;
 mod conn;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 mod index;
 mod lane;
 mod msg;

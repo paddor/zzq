@@ -6,3 +6,5 @@ Cargo.lock.bak
 .perf_hw
 perf.data*
 /*.log
+/fuzz/afl/seeds/
+/fuzz/afl/out/

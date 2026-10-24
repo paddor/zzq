@@ -30,6 +30,9 @@
 pub mod context;
 pub mod endpoint;
 mod error;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzzing;
 pub mod transport;
 
 pub use context::{Config, Context, LaneHandle};

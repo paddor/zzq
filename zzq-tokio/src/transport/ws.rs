@@ -184,24 +184,41 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+/// The key and subprotocol of a valid upgrade request for `path`.
+fn check_upgrade<'a>(head: &'a str, path: &str) -> Option<(&'a str, &'static str)> {
+    let mut request = head.lines().next().unwrap_or_default().split_whitespace();
+    let (method, target) = (request.next(), request.next());
+    let upgrade = header(head, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
+    let version_ok = header(head, "sec-websocket-version") == Some("13");
+    let offered = header(head, "sec-websocket-protocol").unwrap_or_default();
+    let protocol = SUBPROTOCOLS
+        .into_iter()
+        .find(|p| offered.split(',').any(|o| o.trim() == *p))?;
+    let target_ok = target.is_some_and(|t| t.split('?').next() == Some(path));
+    let ok = method == Some("GET") && target_ok && upgrade && version_ok;
+    ok.then_some((header(head, "sec-websocket-key")?, protocol))
+}
+
+/// Reads a server-side upgrade request and the client frames after it
+/// from `data`, as a lane would from a socket. For the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) async fn fuzz_server(mut data: &[u8]) {
+    let Ok(head) = read_head(&mut data).await else {
+        return;
+    };
+    if let Some((key, _)) = check_upgrade(&head, "/mqtt") {
+        let _ = accept_key(key);
+    }
+    let mut payload = Vec::new();
+    while let Ok(Some(_)) = read_frame(&mut data, true, &mut payload).await {}
+}
+
 async fn upgrade_server<S>(mut s: S, path: &str) -> Result<Stream>
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
     let head = read_head(&mut s).await?;
-    let mut request = head.lines().next().unwrap_or_default().split_whitespace();
-    let (method, target) = (request.next(), request.next());
-    let upgrade = header(&head, "upgrade").is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let key = header(&head, "sec-websocket-key");
-    let version_ok = header(&head, "sec-websocket-version") == Some("13");
-    let offered = header(&head, "sec-websocket-protocol").unwrap_or_default();
-    let protocol = SUBPROTOCOLS
-        .into_iter()
-        .find(|p| offered.split(',').any(|o| o.trim() == *p));
-    let target_ok = target.is_some_and(|t| t.split('?').next() == Some(path));
-    let (Some("GET"), true, true, true, Some(key), Some(protocol)) =
-        (method, target_ok, upgrade, version_ok, key, protocol)
-    else {
+    let Some((key, protocol)) = check_upgrade(&head, path) else {
         let _ = s
             .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
             .await;

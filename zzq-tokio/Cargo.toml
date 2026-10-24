@@ -20,6 +20,8 @@ default = ["tls", "quic"]
 tls = ["dep:rustls", "dep:tokio-rustls"]
 # `quic://` with quinn. Certificates come from the TLS options.
 quic = ["tls", "dep:quinn", "dep:socket2"]
+# Entry points for the fuzz targets in `fuzz/afl`.
+fuzzing = []
 
 [dependencies]
 socket2 = { workspace = true, optional = true, features = ["all"] }

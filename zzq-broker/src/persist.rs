@@ -316,20 +316,23 @@ fn read_log(path: &Path) -> io::Result<HashMap<String, Vec<u8>>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(HashMap::new()),
         Err(e) => return Err(e),
     }
-    let bad = |why: &str| {
+    parse_log(&data).map_err(|why| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("{why}: {}", path.display()),
         )
-    };
+    })
+}
+
+/// The live records of a log, by topic. Stops at the first torn or
+/// corrupt record.
+pub(crate) fn parse_log(data: &[u8]) -> Result<HashMap<String, Vec<u8>>, &'static str> {
     let rest = data
         .strip_prefix(MAGIC.as_slice())
-        .ok_or_else(|| bad("not a zzq retained log"))?;
-    let (version, mut rest) = rest
-        .split_at_checked(2)
-        .ok_or_else(|| bad("short header"))?;
+        .ok_or("not a zzq retained log")?;
+    let (version, mut rest) = rest.split_at_checked(2).ok_or("short header")?;
     if u16::from_be_bytes([version[0], version[1]]) != VERSION {
-        return Err(bad("unsupported retained log version"));
+        return Err("unsupported retained log version");
     }
     let mut live = HashMap::new();
     while let Some((body, next)) = next_record(rest) {

@@ -1,5 +1,6 @@
 [workspace]
 members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client", "zzq-bench"]
+exclude = ["fuzz"]
 default-members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client"]
 resolver = "2"
 

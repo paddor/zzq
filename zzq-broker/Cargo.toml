@@ -18,6 +18,8 @@ workspace = true
 default = ["tls", "quic"]
 tls = ["zzq-tokio/tls"]
 quic = ["tls", "zzq-tokio/quic"]
+# Entry points for the fuzz targets in `fuzz/afl`.
+fuzzing = []
 
 [dependencies]
 zzq-proto = { workspace = true, features = ["std"] }
