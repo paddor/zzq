@@ -20,7 +20,10 @@ pub struct IpcListener {
 impl IpcListener {
     pub(crate) fn bind(name: &str) -> Result<IpcListener> {
         let in_use = |e: io::Error| match e.kind() {
-            io::ErrorKind::AddrInUse => Error::AddressInUse(format!("ipc://{name}")),
+            io::ErrorKind::AddrInUse => Error::AddressInUse {
+                endpoint: format!("ipc://{name}"),
+                source: e,
+            },
             _ => Error::Io(e),
         };
         let (std, file) = if let Some(abs) = name.strip_prefix('@') {
@@ -60,9 +63,10 @@ impl Drop for IpcListener {
 
 pub(crate) async fn connect(name: &str) -> Result<Stream> {
     let refused = |e: io::Error| match e.kind() {
-        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => {
-            Error::Refused(format!("ipc://{name}"))
-        }
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound => Error::Refused {
+            endpoint: format!("ipc://{name}"),
+            source: Some(e.into()),
+        },
         _ => Error::Io(e),
     };
     if let Some(abs) = name.strip_prefix('@') {

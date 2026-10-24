@@ -24,13 +24,18 @@ pub use zzq_proto::{ReasonCode, reason};
 
 /// Client errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    #[error(transparent)]
-    Engine(#[from] zzq_tokio::Error),
+    /// The transport failed: the endpoint, the connection or TLS.
+    #[error("transport failed")]
+    Transport(#[from] zzq_tokio::Error),
+    /// The broker refused the connection.
     #[error("connection refused: {0}")]
     Refused(ReasonCode),
+    /// The broker rejected a request.
     #[error("rejected: {0}")]
     Rejected(ReasonCode),
+    /// The broker broke the protocol.
     #[error("protocol error: {0}")]
     Protocol(&'static str),
     /// A topic name or filter is not valid.
@@ -42,8 +47,10 @@ pub enum Error {
     /// A packet would be larger than MQTT can encode.
     #[error("packet larger than MQTT allows")]
     TooLarge,
+    /// The connection or the client is closed.
     #[error("connection closed")]
     Closed,
+    /// A blocking call ran inside an async runtime.
     #[error("blocking call inside an async runtime")]
     InAsync,
 }

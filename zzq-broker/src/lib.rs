@@ -33,18 +33,23 @@ pub use zzq_tokio::{Config, Context, Endpoint};
 
 /// Broker errors.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
-    #[error(transparent)]
-    Engine(#[from] zzq_tokio::Error),
+    /// The transport failed: the endpoint, a listener or the context.
+    #[error("transport failed")]
+    Transport(#[from] zzq_tokio::Error),
+    /// A topic name is not valid for a publish.
     #[error("invalid topic: {0:?}")]
     InvalidTopic(String),
     /// A message would be larger than MQTT can encode.
     #[error("message larger than MQTT allows")]
     TooLarge,
+    /// The broker is shut down.
     #[error("broker is shut down")]
     Closed,
-    #[error("persistence: {0}")]
-    Persistence(#[from] std::io::Error),
+    /// The persistence backend failed to load retained messages.
+    #[error("loading retained messages failed")]
+    Persistence(#[source] std::io::Error),
 }
 
 /// Broker result.

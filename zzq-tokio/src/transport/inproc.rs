@@ -35,7 +35,10 @@ impl InprocListener {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if names.get(name).is_some_and(|tx| !tx.is_closed()) {
-            return Err(Error::AddressInUse(format!("inproc://{name}")));
+            return Err(Error::AddressInUse {
+                endpoint: format!("inproc://{name}"),
+                source: std::io::ErrorKind::AddrInUse.into(),
+            });
         }
         let (tx, rx) = mpsc::channel(64);
         names.insert(name.to_owned(), tx);
@@ -75,7 +78,10 @@ impl Drop for InprocListener {
 }
 
 pub(crate) async fn connect(ctx: &Context, name: &str) -> Result<Stream> {
-    let refused = || Error::Refused(format!("inproc://{name}"));
+    let refused = || Error::Refused {
+        endpoint: format!("inproc://{name}"),
+        source: None,
+    };
     let tx = {
         let names = ctx
             .inproc()

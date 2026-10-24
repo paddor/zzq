@@ -37,8 +37,12 @@ const HANDSHAKE: Duration = Duration::from_secs(10);
 /// How long shutdown waits for the peer to acknowledge the last bytes.
 const LINGER: Duration = Duration::from_secs(5);
 
-fn bad(why: impl fmt::Display) -> Error {
-    Error::Tls(format!("quic: {why}"))
+/// Maps a quinn error to [`Error::Tls`], with `what` as the step.
+fn failed<E: Into<crate::BoxError>>(what: &'static str) -> impl FnOnce(E) -> Error {
+    move |e| Error::Tls {
+        what,
+        source: Some(e.into()),
+    }
 }
 
 fn transport(server: bool) -> Arc<quinn::TransportConfig> {
@@ -65,7 +69,7 @@ fn server_config(o: &TlsOptions) -> Result<quinn::ServerConfig> {
     let mut tls = tls::server_config(o)?;
     tls.alpn_protocols = alpn(o);
     tls.max_early_data_size = 0;
-    let crypto = QuicServerConfig::try_from(tls).map_err(bad)?;
+    let crypto = QuicServerConfig::try_from(tls).map_err(failed("quic server config"))?;
     let mut config = quinn::ServerConfig::with_crypto(Arc::new(crypto));
     config.transport_config(transport(true)).migration(false);
     Ok(config)
@@ -75,7 +79,7 @@ fn client_config(o: &TlsOptions) -> Result<quinn::ClientConfig> {
     let mut tls = tls::client_config(o)?;
     tls.alpn_protocols = alpn(o);
     tls.enable_early_data = false;
-    let crypto = QuicClientConfig::try_from(tls).map_err(bad)?;
+    let crypto = QuicClientConfig::try_from(tls).map_err(failed("quic client config"))?;
     let mut config = quinn::ClientConfig::new(Arc::new(crypto));
     config.transport_config(transport(false));
     Ok(config)
@@ -211,7 +215,10 @@ impl QuicListener {
         let config = server_config(o)?;
         let addr = resolve(host, port).await?[0];
         let in_use = |e: io::Error| match e.kind() {
-            io::ErrorKind::AddrInUse => Error::AddressInUse(format!("quic://{host}:{port}")),
+            io::ErrorKind::AddrInUse => Error::AddressInUse {
+                endpoint: format!("quic://{host}:{port}"),
+                source: e,
+            },
             _ => Error::Io(e),
         };
         let first = reuse_socket(addr).map_err(in_use)?;
@@ -292,8 +299,8 @@ fn reuse_socket(addr: SocketAddr) -> io::Result<std::net::UdpSocket> {
 /// Completes a server handshake on the current lane and accepts the MQTT
 /// stream.
 async fn handshake(incoming: quinn::Incoming) -> Result<Stream> {
-    let conn = incoming.await.map_err(bad)?;
-    let (send, recv) = conn.accept_bi().await.map_err(bad)?;
+    let conn = incoming.await.map_err(failed("quic handshake"))?;
+    let (send, recv) = conn.accept_bi().await.map_err(failed("quic stream"))?;
     Ok(Stream::Quic(Box::new(QuicStream {
         recv,
         send: QuicWriter {
@@ -312,24 +319,25 @@ pub(crate) async fn connect(host: &str, port: u16, o: &TlsOptions) -> Result<Str
     let mut last = None;
     for addr in resolve(host, port).await? {
         let local: SocketAddr = if addr.is_ipv6() {
-            "[::]:0".parse().map_err(bad)?
+            "[::]:0".parse().map_err(failed("quic local address"))?
         } else {
-            "0.0.0.0:0".parse().map_err(bad)?
+            "0.0.0.0:0".parse().map_err(failed("quic local address"))?
         };
         let endpoint = quinn::Endpoint::client(local)?;
         let attempt = async {
             let conn = endpoint
                 .connect_with(config.clone(), addr, name)
-                .map_err(bad)?
+                .map_err(failed("quic connect"))?
                 .await
                 .map_err(|e| match e {
                     quinn::ConnectionError::ConnectionClosed(_)
-                    | quinn::ConnectionError::TimedOut => {
-                        Error::Refused(format!("quic://{host}:{port}"))
-                    }
-                    other => bad(other),
+                    | quinn::ConnectionError::TimedOut => Error::Refused {
+                        endpoint: format!("quic://{host}:{port}"),
+                        source: Some(e.into()),
+                    },
+                    other => failed("quic handshake")(other),
                 })?;
-            let (send, recv) = conn.open_bi().await.map_err(bad)?;
+            let (send, recv) = conn.open_bi().await.map_err(failed("quic stream"))?;
             Ok::<_, Error>((conn, send, recv))
         };
         match attempt.await {

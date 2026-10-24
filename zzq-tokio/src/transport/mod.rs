@@ -223,20 +223,20 @@ impl Listener {
         match endpoint {
             #[cfg(feature = "tls")]
             Endpoint::Tls { host, port } => {
-                let tls = opts
-                    .tls
-                    .as_ref()
-                    .ok_or(Error::Tls("tls:// needs TransportOptions::tls".to_owned()))?;
+                let tls = opts.tls.as_ref().ok_or(Error::Tls {
+                    what: "tls:// needs TransportOptions::tls",
+                    source: None,
+                })?;
                 Ok(Listener::Tls(
                     tls::TlsListener::bind(host, *port, tls).await?,
                 ))
             }
             #[cfg(feature = "quic")]
             Endpoint::Quic { host, port } => {
-                let tls = opts
-                    .tls
-                    .as_ref()
-                    .ok_or(Error::Tls("quic:// needs TransportOptions::tls".to_owned()))?;
+                let tls = opts.tls.as_ref().ok_or(Error::Tls {
+                    what: "quic:// needs TransportOptions::tls",
+                    source: None,
+                })?;
                 Ok(Listener::Quic(
                     quic::QuicListener::bind(ctx, host, *port, tls).await?,
                 ))

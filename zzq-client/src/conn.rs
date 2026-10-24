@@ -718,7 +718,7 @@ where
     encode::connect(&fields, &mut out);
     w.write_all(&out)
         .await
-        .map_err(|e| Error::Engine(e.into()))?;
+        .map_err(|e| Error::Transport(e.into()))?;
     loop {
         match decode(buf, opts.version, MAX_PACKET) {
             Ok(Some((Packet::ConnAck(c), n))) => {

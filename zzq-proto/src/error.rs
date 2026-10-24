@@ -4,6 +4,7 @@ use crate::reason;
 
 /// Why a packet could not be decoded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DecodeError {
     /// Bytes do not form a valid packet.
     Malformed,
@@ -46,3 +47,49 @@ impl fmt::Display for DecodeError {
 }
 
 impl core::error::Error for DecodeError {}
+
+#[cfg(test)]
+mod tests {
+    use std::string::ToString;
+
+    use super::*;
+
+    #[test]
+    fn every_error_has_a_message_and_a_reason_code() {
+        let cases = [
+            (
+                DecodeError::Malformed,
+                "malformed packet",
+                reason::MALFORMED_PACKET,
+            ),
+            (
+                DecodeError::Protocol,
+                "protocol error",
+                reason::PROTOCOL_ERROR,
+            ),
+            (
+                DecodeError::TooLarge,
+                "packet too large",
+                reason::PACKET_TOO_LARGE,
+            ),
+            (
+                DecodeError::InvalidUtf8,
+                "invalid UTF-8 string",
+                reason::MALFORMED_PACKET,
+            ),
+            (
+                DecodeError::InvalidTopic,
+                "invalid topic",
+                reason::TOPIC_NAME_INVALID,
+            ),
+            (
+                DecodeError::UnsupportedVersion(7),
+                "unsupported protocol level 7",
+                reason::UNSUPPORTED_PROTOCOL_VERSION,
+            ),
+        ];
+        for (e, message, code) in cases {
+            assert_eq!((e.to_string().as_str(), e.reason_code()), (message, code));
+        }
+    }
+}

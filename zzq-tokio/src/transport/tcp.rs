@@ -27,7 +27,10 @@ impl TcpListener {
         let inner = tokio::net::TcpListener::bind(addr)
             .await
             .map_err(|e| match e.kind() {
-                io::ErrorKind::AddrInUse => Error::AddressInUse(format!("tcp://{host}:{port}")),
+                io::ErrorKind::AddrInUse => Error::AddressInUse {
+                    endpoint: format!("tcp://{host}:{port}"),
+                    source: e,
+                },
                 _ => Error::Io(e),
             })?;
         let port = inner.local_addr()?.port();
@@ -56,7 +59,10 @@ pub(crate) async fn connect(host: &str, port: u16) -> Result<Stream> {
     let s = tokio::net::TcpStream::connect((host, port))
         .await
         .map_err(|e| match e.kind() {
-            io::ErrorKind::ConnectionRefused => Error::Refused(format!("tcp://{host}:{port}")),
+            io::ErrorKind::ConnectionRefused => Error::Refused {
+                endpoint: format!("tcp://{host}:{port}"),
+                source: Some(e.into()),
+            },
             _ => Error::Io(e),
         })?;
     s.set_nodelay(true)?;

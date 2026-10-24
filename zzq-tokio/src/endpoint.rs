@@ -45,11 +45,15 @@ pub enum Endpoint {
 impl Endpoint {
     /// Parses an endpoint URI.
     pub fn parse(uri: &str) -> Result<Endpoint> {
-        let bad = |why| Error::InvalidEndpoint(uri.to_owned(), why);
+        let bad = |why| Error::InvalidEndpoint {
+            uri: uri.to_owned(),
+            why,
+        };
         let (scheme, rest) = uri.split_once("://").ok_or_else(|| bad("missing scheme"))?;
         if rest.is_empty() {
             return Err(bad("empty address"));
         }
+        // Host, port and path of a network endpoint.
         let host_port = |default: u16| -> Result<(String, u16, String)> {
             let (authority, path) = match rest.find('/') {
                 Some(i) => (&rest[..i], rest[i..].to_owned()),
@@ -59,22 +63,18 @@ impl Endpoint {
                 split_host_port(authority, default).ok_or_else(|| bad("bad host or port"))?;
             Ok((host, port, path))
         };
-        let no_path = |path: &str| {
-            if path.is_empty() {
-                Ok(())
-            } else {
-                Err(bad("unexpected path"))
-            }
+        // Host and port of a network endpoint without a path.
+        let addr = |default: u16| match host_port(default)? {
+            (host, port, path) if path.is_empty() => Ok((host, port)),
+            _ => Err(bad("unexpected path")),
         };
         Ok(match scheme {
             "tcp" => {
-                let (host, port, path) = host_port(TCP_PORT)?;
-                no_path(&path)?;
+                let (host, port) = addr(TCP_PORT)?;
                 Endpoint::Tcp { host, port }
             }
             "tls" => {
-                let (host, port, path) = host_port(TLS_PORT)?;
-                no_path(&path)?;
+                let (host, port) = addr(TLS_PORT)?;
                 Endpoint::Tls { host, port }
             }
             "ws" | "wss" => {
@@ -92,13 +92,11 @@ impl Endpoint {
                 }
             }
             "quic" => {
-                let (host, port, path) = host_port(QUIC_PORT)?;
-                no_path(&path)?;
+                let (host, port) = addr(QUIC_PORT)?;
                 Endpoint::Quic { host, port }
             }
             "udp" => {
-                let (host, port, path) = host_port(UDP_PORT)?;
-                no_path(&path)?;
+                let (host, port) = addr(UDP_PORT)?;
                 Endpoint::Udp { host, port }
             }
             "ipc" => Endpoint::Ipc(rest.to_owned()),

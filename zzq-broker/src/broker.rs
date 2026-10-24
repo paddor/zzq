@@ -110,7 +110,8 @@ impl Broker {
             });
             receivers.push((ctl_rx, data_rx));
         }
-        let retained = RetainedStore::new(opts.persistence.clone(), opts.max_retained)?;
+        let retained = RetainedStore::new(opts.persistence.clone(), opts.max_retained)
+            .map_err(Error::Persistence)?;
         let shared = Arc::new(Shared {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),

@@ -14,5 +14,5 @@ pub mod transport;
 
 pub use context::{Config, Context, LaneHandle};
 pub use endpoint::Endpoint;
-pub use error::{Error, Result};
+pub use error::{BoxError, Error, Result};
 pub use zzq_proto as proto;

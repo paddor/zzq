@@ -72,10 +72,10 @@ impl WsListener {
         #[cfg(feature = "tls")]
         let acceptor = match tls {
             Some(opts) => {
-                let o = opts
-                    .tls
-                    .as_ref()
-                    .ok_or(Error::Tls("wss:// needs TransportOptions::tls".to_owned()))?;
+                let o = opts.tls.as_ref().ok_or(Error::Tls {
+                    what: "wss:// needs TransportOptions::tls",
+                    source: None,
+                })?;
                 Some(super::tls::acceptor(o)?)
             }
             None => None,

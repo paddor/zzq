@@ -67,14 +67,22 @@ fn provider() -> Arc<CryptoProvider> {
     Arc::new(ring::default_provider())
 }
 
-fn bad(why: &str) -> Error {
-    Error::Tls(why.to_owned())
+fn bad(what: &'static str) -> Error {
+    Error::Tls { what, source: None }
+}
+
+/// Maps a rustls error to [`Error::Tls`], with `what` as the step.
+fn failed<E: Into<crate::BoxError>>(what: &'static str) -> impl FnOnce(E) -> Error {
+    move |e| Error::Tls {
+        what,
+        source: Some(e.into()),
+    }
 }
 
 fn certs(pem: &[u8]) -> Result<Vec<CertificateDer<'static>>> {
     let certs = CertificateDer::pem_slice_iter(pem)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| bad(&format!("certificate PEM: {e}")))?;
+        .map_err(failed("certificate PEM"))?;
     if certs.is_empty() {
         return Err(bad("no certificate in PEM"));
     }
@@ -93,7 +101,7 @@ pub(crate) fn server_config(o: &TlsOptions) -> Result<rustls::ServerConfig> {
         identity(o)?.ok_or_else(|| bad("tls bind needs cert_chain_pem and key_pem"))?;
     let builder = rustls::ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .map_err(|e| bad(&e.to_string()))?;
+        .map_err(failed("protocol versions"))?;
     let builder = match o.client_ca_pem.as_deref() {
         Some(pem) => {
             let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
@@ -101,14 +109,14 @@ pub(crate) fn server_config(o: &TlsOptions) -> Result<rustls::ServerConfig> {
                 provider(),
             )
             .build()
-            .map_err(|e| bad(&e.to_string()))?;
+            .map_err(failed("client CA"))?;
             builder.with_client_cert_verifier(verifier)
         }
         None => builder.with_no_client_auth(),
     };
     let mut config = builder
         .with_single_cert(chain, key)
-        .map_err(|e| bad(&e.to_string()))?;
+        .map_err(failed("certificate and key"))?;
     config.alpn_protocols.clone_from(&o.alpn);
     Ok(config)
 }
@@ -120,14 +128,14 @@ fn identity(
     let (Some(chain), Some(key)) = (o.cert_chain_pem.as_deref(), o.key_pem.as_deref()) else {
         return Ok(None);
     };
-    let key = PrivateKeyDer::from_pem_slice(key).map_err(|e| bad(&format!("key PEM: {e}")))?;
+    let key = PrivateKeyDer::from_pem_slice(key).map_err(failed("key PEM"))?;
     Ok(Some((certs(chain)?, key)))
 }
 
 fn roots(pem: &[u8]) -> Result<rustls::RootCertStore> {
     let mut roots = rustls::RootCertStore::empty();
     for cert in certs(pem)? {
-        roots.add(cert).map_err(|e| bad(&e.to_string()))?;
+        roots.add(cert).map_err(failed("trust anchor"))?;
     }
     Ok(roots)
 }
@@ -141,7 +149,7 @@ fn connector(o: &TlsOptions) -> Result<TlsConnector> {
 pub(crate) fn client_config(o: &TlsOptions) -> Result<rustls::ClientConfig> {
     let builder = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
-        .map_err(|e| bad(&e.to_string()))?;
+        .map_err(failed("protocol versions"))?;
     let builder = if o.danger_accept_invalid_certs {
         builder
             .dangerous()
@@ -156,7 +164,7 @@ pub(crate) fn client_config(o: &TlsOptions) -> Result<rustls::ClientConfig> {
     let mut config = match identity(o)? {
         Some((chain, key)) => builder
             .with_client_auth_cert(chain, key)
-            .map_err(|e| bad(&e.to_string()))?,
+            .map_err(failed("client certificate and key"))?,
         None => builder.with_no_client_auth(),
     };
     config.alpn_protocols.clone_from(&o.alpn);
@@ -238,7 +246,7 @@ where
 {
     let connector = connector(o)?;
     let name = o.server_name.clone().unwrap_or_else(|| host.to_owned());
-    let name = ServerName::try_from(name).map_err(|e| bad(&e.to_string()))?;
+    let name = ServerName::try_from(name).map_err(failed("server name"))?;
     Ok(connector.connect(name, io).await?)
 }
 

@@ -1113,3 +1113,37 @@ async fn client_and_broker_refuse_what_mqtt_cannot_encode() {
         .await
         .unwrap();
 }
+
+/// A store whose disk is gone.
+#[derive(Debug)]
+struct Unreadable;
+
+impl zzq_broker::Persistence for Unreadable {
+    fn load_retained(&self) -> std::io::Result<Vec<zzq_broker::Retained>> {
+        Err(std::io::Error::other("disk gone"))
+    }
+
+    fn set_retained(&self, _: &zzq_broker::Retained) {}
+
+    fn remove_retained(&self, _: &str) {}
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn errors_say_what_failed_and_keep_the_cause() {
+    use std::error::Error as _;
+    let ctx = Context::new().unwrap();
+    let e = Client::connect(&ctx, "mqtt://x", ClientOptions::new("c"))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, zzq_client::Error::Transport(_)), "{e:?}");
+    assert_eq!(e.to_string(), "transport failed");
+    assert!(e.source().unwrap().to_string().contains("unknown scheme"));
+    let opts = BrokerOptions {
+        persistence: Some(std::sync::Arc::new(Unreadable)),
+        ..BrokerOptions::default()
+    };
+    let e = Broker::new(&ctx, opts).await.unwrap_err();
+    assert!(matches!(e, zzq_broker::Error::Persistence(_)), "{e:?}");
+    assert_eq!(e.to_string(), "loading retained messages failed");
+    assert_eq!(e.source().unwrap().to_string(), "disk gone");
+}
