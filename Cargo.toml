@@ -10,6 +10,7 @@ rust-version = "1.93"
 license = "ISC"
 authors = ["Patrik Wenger <paddor@gmail.com>"]
 repository = "https://github.com/paddor/zzq.rs"
+readme = "README.md"
 
 [workspace.lints.rust]
 missing_debug_implementations = "deny"

@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "Sans-I/O MQTT 3.1.1 and 5.0 codec, topic matching and topic trie."
 keywords = ["mqtt", "no-std", "codec", "iot"]
 categories = ["network-programming", "no-std", "embedded"]

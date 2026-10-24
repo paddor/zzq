@@ -6,6 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
+readme.workspace = true
 description = "MQTT 3.1.1 and 5.0 broker on zzq IO lanes."
 keywords = ["mqtt", "broker", "iot", "tokio"]
 categories = ["network-programming", "asynchronous"]
