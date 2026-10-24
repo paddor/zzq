@@ -43,7 +43,7 @@ pub mod v311 {
     pub const NOT_AUTHORIZED: u8 = 5;
 
     /// Maps a v5 CONNACK reason code to the closest v3.1.1 return code.
-    pub fn from_v5(code: u8) -> u8 {
+    pub const fn from_v5(code: u8) -> u8 {
         match code {
             super::SUCCESS => ACCEPTED,
             super::UNSUPPORTED_PROTOCOL_VERSION => UNACCEPTABLE_PROTOCOL_VERSION,

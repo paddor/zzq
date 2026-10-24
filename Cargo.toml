@@ -31,6 +31,7 @@ cast_precision_loss = "allow"
 unwrap_used = "warn"
 expect_used = "warn"
 panic = "warn"
+missing_const_for_fn = "warn"
 
 [workspace.dependencies]
 zzq-proto = { path = "zzq-proto", version = "0.1.0", default-features = false }

@@ -32,11 +32,11 @@ pub(crate) struct SubRef {
 pub(crate) struct SubIds([u32; 4]);
 
 impl SubIds {
-    pub(crate) fn one(id: u32) -> SubIds {
+    pub(crate) const fn one(id: u32) -> SubIds {
         SubIds([id, 0, 0, 0])
     }
 
-    pub(crate) fn is_empty(self) -> bool {
+    pub(crate) const fn is_empty(self) -> bool {
         self.0[0] == 0
     }
 
@@ -190,13 +190,13 @@ impl SubIndex {
         (self.scratch.clone(), false)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.trie.len()
     }
 
     /// Changes with every add or remove.
     #[inline]
-    pub(crate) fn generation(&self) -> u64 {
+    pub(crate) const fn generation(&self) -> u64 {
         self.generation
     }
 }

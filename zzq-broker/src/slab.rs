@@ -84,7 +84,7 @@ impl<T> Slab<T> {
         Some(v)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.len
     }
 

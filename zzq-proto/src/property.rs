@@ -56,7 +56,7 @@ pub enum Property<'a> {
 
 impl Property<'_> {
     /// The property identifier.
-    pub fn id(&self) -> u8 {
+    pub const fn id(&self) -> u8 {
         match *self {
             Property::Byte(id, _)
             | Property::U16(id, _)
@@ -69,7 +69,7 @@ impl Property<'_> {
     }
 
     /// Encoded size in bytes, identifier included.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         1 + match *self {
             Property::Byte(..) => 1,
             Property::U16(..) => 2,
@@ -82,7 +82,7 @@ impl Property<'_> {
     }
 
     /// Always false: a property has at least an identifier.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         false
     }
 
@@ -125,18 +125,18 @@ impl<'a> Properties<'a> {
 
     /// The raw property bytes, without the length prefix.
     #[inline]
-    pub fn raw(&self) -> &'a [u8] {
+    pub const fn raw(&self) -> &'a [u8] {
         self.raw
     }
 
     /// Whether there are no properties.
     #[inline]
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.raw.is_empty()
     }
 
     /// Iterates over the properties.
-    pub fn iter(&self) -> PropertyIter<'a> {
+    pub const fn iter(&self) -> PropertyIter<'a> {
         PropertyIter {
             cursor: Cursor::new(self.raw),
         }

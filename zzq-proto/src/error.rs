@@ -21,7 +21,7 @@ pub enum DecodeError {
 
 impl DecodeError {
     /// The MQTT v5 reason code to report this error with.
-    pub fn reason_code(self) -> u8 {
+    pub const fn reason_code(self) -> u8 {
         match self {
             DecodeError::Malformed | DecodeError::InvalidUtf8 => reason::MALFORMED_PACKET,
             DecodeError::Protocol => reason::PROTOCOL_ERROR,

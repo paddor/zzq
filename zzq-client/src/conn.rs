@@ -757,7 +757,7 @@ fn connack(c: &ConnAck<'_>) -> Result<(Connected, u16)> {
 
 /// Refusals worth another attempt: the broker is busy or full, not
 /// rejecting the client.
-fn retryable(code: u8) -> bool {
+const fn retryable(code: u8) -> bool {
     // v5 Server unavailable, Server busy, Quota exceeded, Connection rate
     // exceeded; v3.1.1 Server unavailable.
     matches!(code, 0x88 | 0x89 | 0x97 | 0x9f | 3)

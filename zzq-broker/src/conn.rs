@@ -63,7 +63,7 @@ impl ConnShared {
         self.wake.notify_one();
     }
 
-    fn is_closed(&self) -> bool {
+    const fn is_closed(&self) -> bool {
         self.closed.get()
     }
 }

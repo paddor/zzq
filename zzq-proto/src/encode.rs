@@ -76,7 +76,7 @@ pub struct SliceSink<'a> {
 
 impl<'a> SliceSink<'a> {
     /// Wraps an empty buffer.
-    pub fn new(buf: &'a mut [u8]) -> Self {
+    pub const fn new(buf: &'a mut [u8]) -> Self {
         SliceSink {
             buf,
             len: 0,
@@ -108,13 +108,13 @@ impl Sink for SliceSink<'_> {
 
 /// Wire size of a property block with its length prefix.
 #[inline]
-fn props_block(len: usize) -> usize {
+const fn props_block(len: usize) -> usize {
     varint::len(len) + len
 }
 
 /// Wire size of a whole packet with `remaining` body bytes.
 #[inline]
-pub fn packet_len(remaining: usize) -> usize {
+pub const fn packet_len(remaining: usize) -> usize {
     1 + varint::len(remaining) + remaining
 }
 
@@ -134,7 +134,7 @@ pub struct PublishHeader<'a> {
 impl PublishHeader<'_> {
     /// First header byte.
     #[inline]
-    pub fn byte1(&self) -> u8 {
+    pub const fn byte1(&self) -> u8 {
         let mut b = 0x30 | ((self.qos as u8) << 1);
         if self.dup {
             b |= 0x08;
@@ -193,7 +193,7 @@ pub struct AckFields<'a> {
 impl AckFields<'_> {
     /// A success ack without properties.
     #[inline]
-    pub fn new(kind: PacketType, pkid: u16) -> Self {
+    pub const fn new(kind: PacketType, pkid: u16) -> Self {
         AckFields {
             kind,
             pkid,

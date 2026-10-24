@@ -189,7 +189,7 @@ impl Lane {
         }
     }
 
-    pub(crate) fn next_conn_id(&mut self) -> u64 {
+    pub(crate) const fn next_conn_id(&mut self) -> u64 {
         self.next_conn_id += 1;
         self.next_conn_id
     }
@@ -208,7 +208,7 @@ impl Lane {
         }
     }
 
-    fn sub_ref(&self, key: Key) -> SubRef {
+    const fn sub_ref(&self, key: Key) -> SubRef {
         SubRef { lane: self.id, key }
     }
 

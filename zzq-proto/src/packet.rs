@@ -21,7 +21,7 @@ pub struct FixedHeader {
 impl FixedHeader {
     /// Size of the whole packet.
     #[inline]
-    pub fn packet_len(&self) -> usize {
+    pub const fn packet_len(&self) -> usize {
         self.header_len + self.remaining
     }
 }
@@ -107,7 +107,7 @@ pub struct Subscribe<'a> {
 
 impl<'a> Subscribe<'a> {
     /// The topic filters with their options.
-    pub fn filters(&self) -> FilterIter<'a> {
+    pub const fn filters(&self) -> FilterIter<'a> {
         FilterIter {
             cursor: Cursor::new(self.raw),
             version: self.version,

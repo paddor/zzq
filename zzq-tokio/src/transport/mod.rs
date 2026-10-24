@@ -318,7 +318,7 @@ pub async fn connect(
     }
 }
 
-fn unsupported(endpoint: &Endpoint) -> Error {
+const fn unsupported(endpoint: &Endpoint) -> Error {
     Error::Unsupported(match endpoint {
         Endpoint::Tls { .. } => "tls",
         Endpoint::Ws { .. } => "ws",

@@ -242,7 +242,7 @@ impl Writer {
     }
 }
 
-fn record_len(body: &[u8]) -> u64 {
+const fn record_len(body: &[u8]) -> u64 {
     8 + body.len() as u64
 }
 

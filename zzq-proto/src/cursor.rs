@@ -8,17 +8,17 @@ pub(crate) struct Cursor<'a> {
 
 impl<'a> Cursor<'a> {
     #[inline]
-    pub(crate) fn new(buf: &'a [u8]) -> Self {
+    pub(crate) const fn new(buf: &'a [u8]) -> Self {
         Cursor { buf }
     }
 
     #[inline]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(crate) const fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }
 
     #[inline]
-    pub(crate) fn remaining(&self) -> usize {
+    pub(crate) const fn remaining(&self) -> usize {
         self.buf.len()
     }
 
@@ -28,7 +28,7 @@ impl<'a> Cursor<'a> {
     }
 
     #[inline]
-    pub(crate) fn bytes(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    pub(crate) const fn bytes(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         if self.buf.len() < n {
             return Err(DecodeError::Malformed);
         }

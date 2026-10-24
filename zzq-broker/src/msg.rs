@@ -174,7 +174,7 @@ impl Publication<'_> {
 
 /// Whether two versions share the PUBLISH encoding.
 #[inline]
-pub(crate) fn same_family(a: Version, b: Version) -> bool {
+pub(crate) const fn same_family(a: Version, b: Version) -> bool {
     a.is_v5() == b.is_v5()
 }
 

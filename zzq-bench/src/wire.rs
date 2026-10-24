@@ -109,7 +109,7 @@ pub fn publish(out: &mut Vec<u8>, head: Head<'_>, payload: &[u8]) {
     encode::publish(&h, payload, out);
 }
 
-fn version(v5: bool) -> Version {
+const fn version(v5: bool) -> Version {
     if v5 { Version::V5 } else { Version::V311 }
 }
 

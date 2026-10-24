@@ -40,7 +40,7 @@ pub const fn len(value: usize) -> usize {
 
 /// Encodes `value` into `out` and returns the number of bytes written.
 #[inline]
-pub fn encode(mut value: usize, out: &mut [u8; 4]) -> usize {
+pub const fn encode(mut value: usize, out: &mut [u8; 4]) -> usize {
     let mut i = 0;
     loop {
         let mut b = (value & 0x7f) as u8;

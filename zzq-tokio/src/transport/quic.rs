@@ -104,7 +104,7 @@ impl fmt::Debug for QuicStream {
 }
 
 impl QuicStream {
-    pub(crate) fn recv_mut(&mut self) -> &mut quinn::RecvStream {
+    pub(crate) const fn recv_mut(&mut self) -> &mut quinn::RecvStream {
         &mut self.recv
     }
 

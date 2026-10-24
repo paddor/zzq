@@ -51,7 +51,7 @@ impl fmt::Debug for LaneHandle {
 
 impl LaneHandle {
     /// Lane index within its context.
-    pub fn index(&self) -> usize {
+    pub const fn index(&self) -> usize {
         self.index
     }
 

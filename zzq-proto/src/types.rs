@@ -16,7 +16,7 @@ pub enum QoS {
 impl QoS {
     /// Converts a wire value.
     #[inline]
-    pub fn from_u8(v: u8) -> Result<QoS, DecodeError> {
+    pub const fn from_u8(v: u8) -> Result<QoS, DecodeError> {
         match v {
             0 => Ok(QoS::AtMostOnce),
             1 => Ok(QoS::AtLeastOnce),
@@ -40,12 +40,12 @@ pub enum Version {
 impl Version {
     /// Whether this version carries properties and reason codes.
     #[inline]
-    pub fn is_v5(self) -> bool {
+    pub const fn is_v5(self) -> bool {
         matches!(self, Version::V5)
     }
 
     /// The CONNECT protocol level.
-    pub fn level(self) -> u8 {
+    pub const fn level(self) -> u8 {
         match self {
             Version::V31 => 3,
             Version::V311 => 4,
@@ -92,7 +92,7 @@ pub enum PacketType {
 
 impl PacketType {
     /// First header byte for this type with its mandatory flags.
-    pub fn header_byte(self) -> u8 {
+    pub const fn header_byte(self) -> u8 {
         let flags = match self {
             PacketType::PubRel | PacketType::Subscribe | PacketType::Unsubscribe => 0x02,
             _ => 0,
@@ -144,7 +144,7 @@ impl SubscriptionOptions {
     }
 
     /// Encodes the options byte.
-    pub fn to_byte(self, version: Version) -> u8 {
+    pub const fn to_byte(self, version: Version) -> u8 {
         let mut b = self.qos as u8;
         if version.is_v5() {
             if self.no_local {

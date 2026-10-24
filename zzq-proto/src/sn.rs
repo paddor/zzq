@@ -31,7 +31,7 @@ pub enum SnQoS {
 
 impl SnQoS {
     /// The MQTT QoS a gateway uses for this level.
-    pub fn mqtt(self) -> QoS {
+    pub const fn mqtt(self) -> QoS {
         match self {
             SnQoS::AtMostOnce | SnQoS::NoConnection => QoS::AtMostOnce,
             SnQoS::AtLeastOnce => QoS::AtLeastOnce,
@@ -39,7 +39,7 @@ impl SnQoS {
         }
     }
 
-    fn bits(self) -> u8 {
+    const fn bits(self) -> u8 {
         match self {
             SnQoS::AtMostOnce => 0,
             SnQoS::AtLeastOnce => 1,
@@ -48,7 +48,7 @@ impl SnQoS {
         }
     }
 
-    fn from_bits(b: u8) -> SnQoS {
+    const fn from_bits(b: u8) -> SnQoS {
         match b & 0x03 {
             0 => SnQoS::AtMostOnce,
             1 => SnQoS::AtLeastOnce,
@@ -72,7 +72,7 @@ pub enum Topic<'a> {
 }
 
 impl Topic<'_> {
-    fn id_type(&self) -> u8 {
+    const fn id_type(&self) -> u8 {
         match self {
             Topic::Id(_) | Topic::Name(_) => 0,
             Topic::Predefined(_) => 1,
@@ -80,7 +80,7 @@ impl Topic<'_> {
         }
     }
 
-    fn encoded_len(&self) -> usize {
+    const fn encoded_len(&self) -> usize {
         match self {
             Topic::Name(n) => n.len(),
             _ => 2,
@@ -108,7 +108,7 @@ pub struct Flags {
 }
 
 impl Flags {
-    fn byte(self, topic_id_type: u8) -> u8 {
+    const fn byte(self, topic_id_type: u8) -> u8 {
         let mut b = (self.qos.bits() << 5) | (topic_id_type & 0x03);
         if self.dup {
             b |= 0x80;
@@ -125,7 +125,7 @@ impl Flags {
         b
     }
 
-    fn parse(b: u8) -> (Flags, u8) {
+    const fn parse(b: u8) -> (Flags, u8) {
         let f = Flags {
             dup: b & 0x80 != 0,
             qos: SnQoS::from_bits(b >> 5),
@@ -626,7 +626,7 @@ pub fn encode<S: Sink + ?Sized>(p: &Packet<'_>, out: &mut S) {
     }
 }
 
-fn kind_of(p: &Packet<'_>) -> u8 {
+const fn kind_of(p: &Packet<'_>) -> u8 {
     match p {
         Packet::Advertise { .. } => kind::ADVERTISE,
         Packet::SearchGw { .. } => kind::SEARCHGW,

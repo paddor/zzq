@@ -57,12 +57,12 @@ impl<T> TopicTrie<T> {
     }
 
     /// Number of stored values.
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         self.len
     }
 
     /// Whether no values are stored.
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.len == 0
     }
 

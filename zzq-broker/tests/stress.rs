@@ -17,18 +17,18 @@ use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 struct Rng(u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    const fn next(&mut self) -> u64 {
         self.0 ^= self.0 >> 12;
         self.0 ^= self.0 << 25;
         self.0 ^= self.0 >> 27;
         self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 
-    fn below(&mut self, n: usize) -> usize {
+    const fn below(&mut self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 
-    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+    const fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len())]
     }
 }
@@ -49,7 +49,7 @@ const FILTERS: &[&str] = &[
 ];
 const VERSIONS: &[Version] = &[Version::V5, Version::V311, Version::V31];
 
-fn qos(r: &mut Rng) -> QoS {
+const fn qos(r: &mut Rng) -> QoS {
     *r.pick(&[QoS::AtMostOnce, QoS::AtLeastOnce, QoS::ExactlyOnce])
 }
 

@@ -261,7 +261,7 @@ impl Client {
     }
 
     /// CONNACK details.
-    pub fn connected(&self) -> &Connected {
+    pub const fn connected(&self) -> &Connected {
         &self.connected
     }
 
