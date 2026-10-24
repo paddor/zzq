@@ -111,6 +111,10 @@ pub struct BrokerOptions {
     pub sn_retries: u8,
     /// Datagrams held for a sleeping MQTT-SN client; the oldest is dropped.
     pub sn_sleep_buffer: usize,
+    /// Topic IDs per MQTT-SN client, registered by it or assigned by the
+    /// gateway. More REGISTERs get Rejected: congestion, and messages on
+    /// further topics are dropped.
+    pub sn_max_topics: usize,
 }
 
 impl Default for BrokerOptions {
@@ -140,6 +144,7 @@ impl Default for BrokerOptions {
             sn_retry: Duration::from_secs(10),
             sn_retries: 5,
             sn_sleep_buffer: 1000,
+            sn_max_topics: 4096,
         }
     }
 }
@@ -171,6 +176,7 @@ impl fmt::Debug for BrokerOptions {
             .field("sn_retry", &self.sn_retry)
             .field("sn_retries", &self.sn_retries)
             .field("sn_sleep_buffer", &self.sn_sleep_buffer)
+            .field("sn_max_topics", &self.sn_max_topics)
             .finish()
     }
 }

@@ -863,6 +863,83 @@ mod mqtt_sn {
         .await;
         quiet(&s).await;
     }
+
+    async fn bind_sn(opts: BrokerOptions) -> (Context, Broker, String, String) {
+        let (ctx, broker, uri) = setup_with(1, opts).await;
+        let addr = broker
+            .bind("udp://127.0.0.1:0")
+            .await
+            .unwrap()
+            .socket_addr_string()
+            .unwrap();
+        (ctx, broker, uri, addr)
+    }
+
+    async fn register(s: &UdpSocket, msg_id: u16, topic: &str) -> (u16, u8) {
+        send(
+            s,
+            &Packet::Register {
+                topic_id: 0,
+                msg_id,
+                topic,
+            },
+        )
+        .await;
+        let ack = recv(s).await;
+        let Packet::RegAck { topic_id, code, .. } = sn::decode(&ack).unwrap().0 else {
+            panic!("expected REGACK");
+        };
+        (topic_id, code)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn topic_ids_run_out_without_stalling() {
+        let opts = BrokerOptions {
+            sn_max_topics: 2,
+            max_inflight: 1,
+            ..BrokerOptions::default()
+        };
+        let (ctx, _broker, uri, addr) = bind_sn(opts).await;
+        let s = sn_client(&addr, "few").await;
+        let (id1, code) = register(&s, 1, "a/1").await;
+        assert_eq!(code, sn::ACCEPTED);
+        assert_eq!(register(&s, 2, "a/2").await.1, sn::ACCEPTED);
+        assert_eq!(register(&s, 3, "a/3").await, (0, sn::REJECTED_CONGESTION));
+        send(
+            &s,
+            &Packet::Subscribe {
+                flags: qos(SnQoS::ExactlyOnce),
+                msg_id: 4,
+                topic: Topic::Name("a/#"),
+            },
+        )
+        .await;
+        assert!(matches!(
+            sn::decode(&recv(&s).await).unwrap().0,
+            Packet::SubAck {
+                code: sn::ACCEPTED,
+                ..
+            }
+        ));
+        // No ID left for a/3: dropped, but acked, so the one-message window
+        // lets a/1 through.
+        let publ = client(&ctx, &uri, "p", Version::V5).await;
+        for topic in ["a/3", "a/1"] {
+            publ.publish(topic, topic, QoS::ExactlyOnce, false)
+                .await
+                .unwrap();
+        }
+        let got = recv(&s).await;
+        let Packet::Publish {
+            topic: Topic::Id(id),
+            data: b"a/1",
+            ..
+        } = sn::decode(&got).unwrap().0
+        else {
+            panic!("expected PUBLISH on a/1");
+        };
+        assert_eq!(id, id1);
+    }
 }
 
 #[cfg(feature = "quic")]

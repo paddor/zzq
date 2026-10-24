@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::{Buf, BytesMut};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
@@ -137,6 +137,11 @@ struct Client {
     buffered: VecDeque<Vec<u8>>,
     /// Datagrams waiting for an ack, by message type and ID.
     unacked: FxHashMap<(u8, u16), Retry>,
+    /// MQTT packets the gateway itself sends to the broker.
+    to_broker: Vec<u8>,
+    /// Packet IDs of QoS 2 messages dropped for lack of a topic ID, waiting
+    /// for PUBREL.
+    dropped: FxHashSet<u16>,
 }
 
 impl Client {
@@ -145,6 +150,8 @@ impl Client {
             shared: shared.clone(),
             socket,
             addr,
+            to_broker: Vec::new(),
+            dropped: FxHashSet::default(),
             topics: FxHashMap::default(),
             ids: FxHashMap::default(),
             next_topic_id: 0,
@@ -297,16 +304,8 @@ impl Client {
                         self.send(&sn::Packet::Disconnect { duration: None }).await;
                         return;
                     }
-                    while let Ok(Some((packet, n))) = decode(&buf, Version::V311, usize::MAX) {
-                        let datagrams = if self.asleep.is_some() && matches!(packet, Packet::PingResp) {
-                            Vec::new()
-                        } else {
-                            self.outbound(&packet)
-                        };
-                        buf.advance(n);
-                        for d in datagrams {
-                            self.deliver(d).await;
-                        }
+                    if !self.relay(&mut buf, pipe).await {
+                        return;
                     }
                 }
                 _ = tick.tick() => {
@@ -316,6 +315,28 @@ impl Client {
                 }
             }
         }
+    }
+
+    /// Translates the MQTT packets in `buf` for the client, then writes the
+    /// gateway's own packets to the broker. Returns false once the pipe is
+    /// gone.
+    async fn relay(&mut self, buf: &mut BytesMut, pipe: &mut DuplexStream) -> bool {
+        while let Ok(Some((packet, n))) = decode(buf, Version::V311, usize::MAX) {
+            let datagrams = if self.asleep.is_some() && matches!(packet, Packet::PingResp) {
+                Vec::new()
+            } else {
+                self.outbound(&packet)
+            };
+            buf.advance(n);
+            for d in datagrams {
+                self.deliver(d).await;
+            }
+        }
+        if self.to_broker.is_empty() {
+            return true;
+        }
+        let packets = std::mem::take(&mut self.to_broker);
+        pipe.write_all(&packets).await.is_ok()
     }
 
     /// Sends a datagram, or buffers it while the client sleeps. QoS 1/2
@@ -420,19 +441,25 @@ impl Client {
         }
     }
 
-    fn topic_id_for(&mut self, name: &str) -> u16 {
+    /// The topic ID of `name`, assigning one if needed. `None` once the
+    /// client has `sn_max_topics` of them, or no ID is free.
+    fn topic_id_for(&mut self, name: &str) -> Option<u16> {
         if let Some(&id) = self.ids.get(name) {
-            return id;
+            return Some(id);
         }
-        loop {
+        if self.topics.len() >= self.shared.opts.sn_max_topics {
+            return None;
+        }
+        for _ in 0..u16::MAX {
             self.next_topic_id = self.next_topic_id.wrapping_add(1).max(1);
             let id = self.next_topic_id;
             if !self.topics.contains_key(&id) && predefined(&self.shared, id).is_none() {
                 self.topics.insert(id, name.to_owned());
                 self.ids.insert(name.to_owned(), id);
-                return id;
+                return Some(id);
             }
         }
+        None
     }
 
     fn msg_id(&mut self) -> u16 {
@@ -494,10 +521,12 @@ impl Client {
 
     /// REGISTER from the client: assigns a topic ID.
     async fn register(&mut self, msg_id: u16, topic: &str) {
-        let (topic_id, code) = if zzq_proto::topic::validate_name(topic).is_ok() {
-            (self.topic_id_for(topic), sn::ACCEPTED)
-        } else {
+        let (topic_id, code) = if zzq_proto::topic::validate_name(topic).is_err() {
             (0, sn::REJECTED_INVALID_TOPIC_ID)
+        } else if let Some(id) = self.topic_id_for(topic) {
+            (id, sn::ACCEPTED)
+        } else {
+            (0, sn::REJECTED_CONGESTION)
         };
         self.send(&sn::Packet::RegAck {
             topic_id,
@@ -562,8 +591,14 @@ impl Client {
         topic: Topic<'_>,
         out: &mut Vec<u8>,
     ) {
-        let Some(filter) = self.topic_name(topic) else {
-            let code = sn::REJECTED_INVALID_TOPIC_ID;
+        let filter = self.topic_name(topic);
+        // A plain filter gets its topic ID now, so SUBACK has one.
+        let code = match &filter {
+            None => sn::REJECTED_INVALID_TOPIC_ID,
+            Some(f) if plain(f) && self.topic_id_for(f).is_none() => sn::REJECTED_CONGESTION,
+            Some(_) => sn::ACCEPTED,
+        };
+        let Some(filter) = filter.filter(|_| code == sn::ACCEPTED) else {
             self.send(&sn::Packet::SubAck {
                 flags,
                 topic_id: 0,
@@ -583,9 +618,8 @@ impl Client {
     fn suback(&mut self, pkid: u16, mqtt_code: u8) -> (Flags, u16, u8) {
         let granted = mqtt_code < 0x80;
         let filter = self.sub_filter.remove(&pkid).unwrap_or_default();
-        let plain = !filter.contains(['+', '#']) && filter.len() != 2 && !filter.is_empty();
-        let topic_id = if granted && plain {
-            self.topic_id_for(&filter)
+        let topic_id = if granted && plain(&filter) {
+            self.ids.get(&filter).copied().unwrap_or(0)
         } else {
             0
         };
@@ -636,6 +670,9 @@ impl Client {
                 });
             }
             Packet::PubRec(a) => push(&sn::Packet::PubRec { msg_id: a.pkid }),
+            Packet::PubRel(a) if self.dropped.remove(&a.pkid) => {
+                ack(&mut self.to_broker, PacketType::PubComp, a.pkid);
+            }
             Packet::PubRel(a) => push(&sn::Packet::PubRel { msg_id: a.pkid }),
             Packet::PubComp(a) => push(&sn::Packet::PubComp { msg_id: a.pkid }),
             Packet::SubAck(s) => {
@@ -685,8 +722,7 @@ impl Client {
         } else if let Some(&id) = self.ids.get(p.topic) {
             let pending = self.registering.values().any(|&t| t == id).then_some(id);
             (Topic::Id(id), pending)
-        } else {
-            let id = self.topic_id_for(p.topic);
+        } else if let Some(id) = self.topic_id_for(p.topic) {
             let msg_id = self.msg_id();
             self.registering.insert(msg_id, id);
             let reg = sn::Packet::Register {
@@ -698,6 +734,9 @@ impl Client {
             sn::encode(&reg, &mut d);
             out.push(d);
             (Topic::Id(id), Some(id))
+        } else {
+            self.drop_publish(p);
+            return out;
         };
         let publish = sn::Packet::Publish {
             flags,
@@ -713,6 +752,25 @@ impl Client {
         }
         out
     }
+
+    /// Drops a broker PUBLISH the client has no topic ID for, and acks it
+    /// so the session's window moves on.
+    fn drop_publish(&mut self, p: &zzq_proto::packet::Publish<'_>) {
+        match p.qos {
+            QoS::AtMostOnce => {}
+            QoS::AtLeastOnce => ack(&mut self.to_broker, PacketType::PubAck, p.pkid),
+            QoS::ExactlyOnce => {
+                self.dropped.insert(p.pkid);
+                ack(&mut self.to_broker, PacketType::PubRec, p.pkid);
+            }
+        }
+    }
+}
+
+/// Whether a SUBSCRIBE filter names one normal topic, which gets a topic
+/// ID in SUBACK.
+fn plain(filter: &str) -> bool {
+    !filter.contains(['+', '#']) && filter.len() != 2 && !filter.is_empty()
 }
 
 enum Inbound {
