@@ -103,7 +103,8 @@ pub(crate) enum Control {
     /// A session on another lane crossed its queue watermark.
     Congested(SubRef, bool),
     Stats(oneshot::Sender<LaneStats>),
-    Shutdown,
+    /// Close every connection and stop, then answer.
+    Shutdown(Option<oneshot::Sender<()>>),
 }
 
 /// A congested session a QoS 1/2 publish was routed to.
@@ -1169,7 +1170,12 @@ impl Lane {
                     .sum::<u64>();
                 let _ = reply.send(stats);
             }
-            Control::Shutdown => self.shutdown(),
+            Control::Shutdown(done) => {
+                self.shutdown();
+                if let Some(done) = done {
+                    let _ = done.send(());
+                }
+            }
         }
         self.flush();
     }

@@ -1329,7 +1329,8 @@ async fn client_reconnects_and_restores_subscriptions() {
     };
     let c = Client::connect(&client_ctx, &uri, opts).await.unwrap();
     c.subscribe("rc/#", QoS::AtLeastOnce).await.unwrap();
-    drop(broker1);
+    // Once shut down, the old broker acks nothing more.
+    broker1.shutdown().await;
     drop(ctx1);
     // Published while the broker is down: waits, then goes out. Retained,
     // so the watcher gets it even if the client reconnects first.

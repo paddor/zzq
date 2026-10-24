@@ -194,6 +194,35 @@ impl Broker {
     pub async fn stats(&self) -> Result<Stats> {
         collect(&self.shared).await
     }
+
+    /// Stops the broker and waits until every lane has closed its
+    /// listeners and connections. Dropping the broker stops it too, but
+    /// without waiting.
+    pub async fn shutdown(self) {
+        self.abort_tasks();
+        let mut done = Vec::with_capacity(self.shared.lanes.len());
+        for lane in &self.shared.lanes {
+            let (tx, rx) = oneshot::channel();
+            if lane.control.send(Control::Shutdown(Some(tx))).is_ok() {
+                done.push(rx);
+            }
+        }
+        for rx in done {
+            let _ = rx.await;
+        }
+    }
+
+    fn abort_tasks(&self) {
+        for a in self
+            .shared
+            .tasks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain(..)
+        {
+            a.abort();
+        }
+    }
 }
 
 /// Counters of all lanes.
@@ -238,17 +267,9 @@ pub(crate) fn publish(shared: &Shared, msg: Msg) -> Result<()> {
 
 impl Drop for Broker {
     fn drop(&mut self) {
-        for a in self
-            .shared
-            .tasks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .drain(..)
-        {
-            a.abort();
-        }
+        self.abort_tasks();
         for lane in &self.shared.lanes {
-            let _ = lane.control.send(Control::Shutdown);
+            let _ = lane.control.send(Control::Shutdown(None));
         }
     }
 }
@@ -270,7 +291,7 @@ fn install(
     let stop = stopped.clone();
     tokio::task::spawn_local(async move {
         while let Some(c) = ctl_rx.recv().await {
-            let last = matches!(c, Control::Shutdown);
+            let last = matches!(c, Control::Shutdown(_));
             l.borrow_mut().control(c);
             ship(&l).await;
             if last {
