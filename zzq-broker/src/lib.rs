@@ -6,6 +6,31 @@
 //! bounded batches, and deliver to their own sessions.
 //! WebSocket and MQTT-SN clients reach the broker through in-memory MQTT
 //! connections.
+//!
+//! # Examples
+//!
+//! A retained message reaches a client that subscribes later:
+//!
+//! ```
+//! use zzq_broker::{Broker, BrokerOptions, Context, QoS};
+//! use zzq_client::{Client, ClientOptions};
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let ctx = Context::new()?;
+//! let broker = Broker::new(&ctx, BrokerOptions::default()).await?;
+//! let endpoint = broker.bind("tcp://127.0.0.1:0").await?;
+//! broker.publish_retained("status", "up", QoS::AtLeastOnce)?;
+//!
+//! let opts = ClientOptions::new("late");
+//! let mut client = Client::connect(&ctx, &endpoint.to_string(), opts).await?;
+//! client.subscribe("status", QoS::AtLeastOnce).await?;
+//! let message = client.recv().await.expect("the retained message");
+//! assert!(message.retain);
+//! assert_eq!(message.payload, "up");
+//! # Ok(())
+//! # }
+//! ```
 
 mod broker;
 mod conn;

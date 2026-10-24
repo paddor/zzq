@@ -2,6 +2,20 @@
 //!
 //! For threads without an async runtime. Calls made inside one return
 //! [`Error::InAsync`] instead of blocking it.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! use zzq_client::blocking::Client;
+//! use zzq_client::{ClientOptions, Context, QoS};
+//!
+//! let ctx = Context::new()?;
+//! let opts = ClientOptions::new("sensor");
+//! let client = Client::connect(&ctx, "tcp://localhost:1883", opts)?;
+//! client.publish("sensors/temp", "21.5", QoS::AtLeastOnce)?;
+//! client.disconnect();
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
 
 use bytes::Bytes;
 use tokio::sync::mpsc;

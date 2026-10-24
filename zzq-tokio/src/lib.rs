@@ -8,6 +8,22 @@
 //! Applications use [`Context`], [`Config`], [`Endpoint`] and the transport
 //! options. Hidden items are the engine API that zzq-client and zzq-broker
 //! share; they are not covered by semver.
+//!
+//! # Examples
+//!
+//! ```
+//! use zzq_tokio::{Config, Context, Endpoint};
+//!
+//! let ctx = Context::with_config(&Config {
+//!     io_threads: 2,
+//!     ..Config::default()
+//! })?;
+//! assert_eq!(ctx.lanes(), 2);
+//!
+//! let endpoint: Endpoint = "tcp://localhost".parse()?;
+//! assert_eq!(endpoint.to_string(), "tcp://localhost:1883");
+//! # Ok::<(), zzq_tokio::Error>(())
+//! ```
 
 #![forbid(unsafe_code)]
 

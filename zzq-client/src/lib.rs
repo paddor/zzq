@@ -2,7 +2,34 @@
 //!
 //! The connection runs on an IO lane of a [`zzq_tokio::Context`]. The
 //! [`Client`] handle talks to it through channels and can be used from any
-//! runtime.
+//! runtime. [`blocking::Client`] does the same for threads without one.
+//!
+//! # Examples
+//!
+//! A broker and a client in one context, over `inproc://`:
+//!
+//! ```
+//! use zzq_broker::{Broker, BrokerOptions, Context};
+//! use zzq_client::{Client, ClientOptions, QoS};
+//!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let ctx = Context::new()?;
+//! let broker = Broker::new(&ctx, BrokerOptions::default()).await?;
+//! broker.bind("inproc://docs").await?;
+//!
+//! let opts = ClientOptions::new("reader");
+//! let mut client = Client::connect(&ctx, "inproc://docs", opts).await?;
+//! client.subscribe("sensors/#", QoS::AtLeastOnce).await?;
+//! client.publish("sensors/temp", "21.5", QoS::AtLeastOnce).await?;
+//!
+//! let message = client.recv().await.expect("a message");
+//! assert_eq!(message.topic, "sensors/temp");
+//! assert_eq!(message.payload, "21.5");
+//! client.disconnect().await;
+//! # Ok(())
+//! # }
+//! ```
 
 #![forbid(unsafe_code)]
 
@@ -14,13 +41,12 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
-use zzq_proto::{QoS, SubscriptionOptions, Version};
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]
 pub use zzq_tokio::transport::tls::TlsOptions;
-use zzq_tokio::{Context, Endpoint};
+pub use zzq_tokio::{Config, Context, Endpoint};
 
-pub use zzq_proto::{ReasonCode, reason};
+pub use zzq_proto::{QoS, ReasonCode, SubscriptionOptions, Version, reason};
 
 /// Client errors.
 #[derive(Debug, thiserror::Error)]
