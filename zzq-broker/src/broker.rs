@@ -417,6 +417,7 @@ async fn bind_udp(
 
 /// The lane that owns sessions of `client_id`. Every connection of a client
 /// ID runs there, so a session never moves between lanes.
+#[doc(hidden)]
 pub fn lane_for(client_id: &str, lanes: usize) -> usize {
     use std::hash::{BuildHasher, BuildHasherDefault};
     let hash = BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(client_id.as_bytes());

@@ -4,15 +4,21 @@
 //! socket that can move to any lane. A lane turns it into async read and
 //! write halves with [`Stream::drive`], which keeps static dispatch.
 
+#[doc(hidden)]
 pub mod inproc;
 #[cfg(unix)]
+#[doc(hidden)]
 pub mod ipc;
 #[cfg(feature = "quic")]
+#[doc(hidden)]
 pub mod quic;
+#[doc(hidden)]
 pub mod tcp;
 #[cfg(feature = "tls")]
 pub mod tls;
+#[doc(hidden)]
 pub mod udp;
+#[doc(hidden)]
 pub mod ws;
 
 use bytes::BytesMut;
@@ -29,6 +35,7 @@ pub struct TransportOptions {
 }
 
 /// An established connection, not yet bound to a lane.
+#[doc(hidden)]
 pub enum Stream {
     Tcp(std::net::TcpStream),
     #[cfg(unix)]
@@ -65,6 +72,7 @@ impl std::fmt::Debug for Stream {
 }
 
 /// Consumes the read and write halves of a [`Stream`] on a lane.
+#[doc(hidden)]
 pub trait Driver {
     type Output;
 
@@ -200,6 +208,7 @@ async fn fill<S: AsyncRead + Unpin>(
 
 /// A bound endpoint.
 #[derive(Debug)]
+#[doc(hidden)]
 pub enum Listener {
     Tcp(tcp::TcpListener),
     #[cfg(unix)]
@@ -291,6 +300,7 @@ impl Listener {
 }
 
 /// Connects to `endpoint`.
+#[doc(hidden)]
 pub async fn connect(
     ctx: &Context,
     endpoint: &Endpoint,

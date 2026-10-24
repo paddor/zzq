@@ -36,6 +36,7 @@ impl Default for Config {
 
 /// Handle to run work on one lane.
 #[derive(Clone)]
+#[doc(hidden)]
 pub struct LaneHandle {
     index: usize,
     tx: mpsc::UnboundedSender<Job>,
@@ -172,11 +173,13 @@ impl Context {
     }
 
     /// The lane with the given index, wrapping around.
+    #[doc(hidden)]
     pub fn lane(&self, index: usize) -> &LaneHandle {
         &self.inner.lanes[index % self.inner.lanes.len()].handle
     }
 
     /// The next lane in round-robin order.
+    #[doc(hidden)]
     pub fn next_lane(&self) -> &LaneHandle {
         self.lane(self.inner.next.fetch_add(1, Ordering::Relaxed))
     }

@@ -172,6 +172,7 @@ pub(crate) fn client_config(o: &TlsOptions) -> Result<rustls::ClientConfig> {
 }
 
 /// A bound TLS endpoint.
+#[doc(hidden)]
 pub struct TlsListener {
     tcp: tcp::TcpListener,
     acceptor: TlsAcceptor,

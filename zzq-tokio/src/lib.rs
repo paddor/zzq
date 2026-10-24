@@ -4,6 +4,10 @@
 //! current-thread Tokio runtime and a local task set. Connections are
 //! assigned to one lane and stay there. Transports produce plain sockets
 //! that can move between lanes; the lane wraps them for async IO.
+//!
+//! Applications use [`Context`], [`Config`], [`Endpoint`] and the transport
+//! options. Hidden items are the engine API that zzq-client and zzq-broker
+//! share; they are not covered by semver.
 
 #![forbid(unsafe_code)]
 
