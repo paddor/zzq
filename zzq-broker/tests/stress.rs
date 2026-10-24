@@ -96,7 +96,7 @@ fn packet(r: &mut Rng, v: Version, out: &mut Vec<u8>) {
                 dup: r.below(4) == 0,
                 qos: q,
                 retain: r.below(4) == 0,
-                topic: r.pick(TOPICS),
+                topic: r.pick::<&str>(TOPICS),
                 pkid: if q == QoS::AtMostOnce { 0 } else { pkid },
                 properties: &[],
             };
@@ -105,9 +105,9 @@ fn packet(r: &mut Rng, v: Version, out: &mut Vec<u8>) {
         }
         4 | 5 => {
             let opts = SubscriptionOptions::qos(qos(r));
-            encode::subscribe(v, pkid, &[], &[(r.pick(FILTERS), opts)], out);
+            encode::subscribe(v, pkid, &[], &[(*r.pick(FILTERS), opts)], out);
         }
-        6 => encode::unsubscribe(v, pkid, &[], &[r.pick(FILTERS)], out),
+        6 => encode::unsubscribe(v, pkid, &[], &[*r.pick(FILTERS)], out),
         7 => {
             let kind = *r.pick(&[
                 PacketType::PubAck,
