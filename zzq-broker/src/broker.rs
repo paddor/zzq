@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::oneshot;
 use zzq_proto::QoS;
 use zzq_proto::topic::validate_name;
 use zzq_tokio::transport::Listener;
@@ -16,6 +16,7 @@ use zzq_tokio::{Context, Endpoint};
 
 use crate::conn::ConnDriver;
 use crate::lane::{Control, Lane, LaneRef, LaneStats, Remote};
+use crate::mailbox::{self, Mailbox};
 use crate::msg::Msg;
 use crate::options::BrokerOptions;
 use crate::retain::RetainedStore;
@@ -35,11 +36,19 @@ thread_local! {
 /// Sends batches for other lanes collected on `lane`. Waits while a target
 /// lane is full, which slows the caller down instead of dropping.
 pub(crate) async fn ship(lane: &LaneRef) {
-    let (shared, remote) = {
-        let mut l = lane.borrow_mut();
-        (l.shared.clone(), l.take_remote())
+    let (shared, shipping) = {
+        let l = lane.borrow();
+        if !l.has_remote() {
+            return;
+        }
+        (l.shared.clone(), l.shipping.clone())
     };
-    for (target, batch) in remote {
+    let _turn = shipping.lock().await;
+    loop {
+        let next = lane.borrow_mut().next_remote();
+        let Some((target, batch)) = next else {
+            return;
+        };
         let _ = shared.lanes[target].data.send(batch).await;
     }
 }
@@ -51,8 +60,10 @@ pub(crate) fn lane_ref(id: u64) -> Option<LaneRef> {
 
 #[derive(Debug)]
 pub(crate) struct LaneTx {
-    pub(crate) control: mpsc::UnboundedSender<Control>,
-    pub(crate) data: mpsc::Sender<Vec<Remote>>,
+    /// Requests; pushed without waiting.
+    pub(crate) control: Mailbox<Control>,
+    /// Deliveries routed on other lanes.
+    pub(crate) data: Mailbox<Vec<Remote>>,
 }
 
 /// State shared by all lanes of one broker.
@@ -117,8 +128,8 @@ impl Broker {
         let mut lanes = Vec::with_capacity(n);
         let mut receivers = Vec::with_capacity(n);
         for _ in 0..n {
-            let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-            let (data_tx, data_rx) = mpsc::channel(DATA_BATCHES);
+            let (ctl_tx, ctl_rx) = mailbox::mailbox(usize::MAX);
+            let (data_tx, data_rx) = mailbox::mailbox(DATA_BATCHES);
             lanes.push(LaneTx {
                 control: ctl_tx,
                 data: data_tx,
@@ -252,7 +263,7 @@ impl Broker {
         let mut done = Vec::with_capacity(self.shared.lanes.len());
         for lane in &self.shared.lanes {
             let (tx, rx) = oneshot::channel();
-            if lane.control.send(Control::Shutdown(Some(tx))).is_ok() {
+            if lane.control.push(Control::Shutdown(Some(tx))).is_ok() {
                 done.push(rx);
             }
         }
@@ -280,7 +291,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
     for lane in &shared.lanes {
         let (tx, rx) = oneshot::channel();
         lane.control
-            .send(Control::Stats(tx))
+            .push(Control::Stats(tx))
             .map_err(|_| Error::Closed)?;
         let s: LaneStats = rx.await.map_err(|_| Error::Closed)?;
         total.connections += s.connections;
@@ -310,7 +321,7 @@ pub(crate) fn publish(shared: &Shared, msg: Msg) -> Result<()> {
     let lane = shared.ctx.next_lane().index();
     shared.lanes[lane]
         .control
-        .send(Control::Publish(msg))
+        .push(Control::Publish(msg))
         .map_err(|_| Error::Closed)
 }
 
@@ -318,7 +329,7 @@ impl Drop for Broker {
     fn drop(&mut self) {
         self.abort_tasks();
         for lane in &self.shared.lanes {
-            let _ = lane.control.send(Control::Shutdown(None));
+            let _ = lane.control.push(Control::Shutdown(None));
         }
     }
 }
@@ -326,27 +337,28 @@ impl Drop for Broker {
 fn install(
     id: u16,
     shared: Arc<Shared>,
-    mut ctl_rx: mpsc::UnboundedReceiver<Control>,
-    mut data_rx: mpsc::Receiver<Vec<Remote>>,
+    ctl_rx: mailbox::Receiver<Control>,
+    data_rx: mailbox::Receiver<Vec<Remote>>,
 ) {
     let broker = shared.id;
-    let lane: LaneRef = Rc::new(RefCell::new(Lane::new(id, shared)));
+    let lane: LaneRef = Rc::new(RefCell::new(Lane::new(id, shared.clone())));
     LANES.with(|l| l.borrow_mut().insert(broker, lane.clone()));
 
-    // Ends the data loop, which would otherwise keep the lane alive through
-    // the senders in `Shared`.
-    let stopped = Rc::new(Notify::new());
     let l = lane.clone();
-    let stop = stopped.clone();
     tokio::task::spawn_local(async move {
-        while let Some(c) = ctl_rx.recv().await {
-            let last = matches!(c, Control::Shutdown(_));
-            l.borrow_mut().control(c);
-            ship(&l).await;
-            if last {
-                LANES.with(|lanes| lanes.borrow_mut().remove(&broker));
-                stop.notify_one();
-                break;
+        let mut controls = Vec::new();
+        while ctl_rx.recv_all(&mut controls).await {
+            for c in controls.drain(..) {
+                let last = matches!(c, Control::Shutdown(_));
+                l.borrow_mut().control(c);
+                ship(&l).await;
+                if last {
+                    LANES.with(|lanes| lanes.borrow_mut().remove(&broker));
+                    // Ends the data loop, which would otherwise keep the
+                    // lane alive through the senders in `Shared`.
+                    shared.lanes[usize::from(id)].data.close();
+                    return;
+                }
             }
         }
     });
@@ -354,14 +366,7 @@ fn install(
     let l = lane.clone();
     tokio::task::spawn_local(async move {
         let mut batches = Vec::new();
-        loop {
-            let n = tokio::select! {
-                n = data_rx.recv_many(&mut batches, 64) => n,
-                () = stopped.notified() => break,
-            };
-            if n == 0 {
-                break;
-            }
+        while data_rx.recv_all(&mut batches).await {
             {
                 let mut lane = l.borrow_mut();
                 if lane.shut_down {

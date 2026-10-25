@@ -39,12 +39,14 @@ mod check;
 mod conn;
 mod inbox;
 mod submit;
+mod topic;
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::oneshot;
+pub use topic::Topic;
 use zzq_proto::encode::PublishHeader;
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]
@@ -126,7 +128,8 @@ pub struct ClientOptions {
     pub will: Option<LastWill>,
     /// Messages queued for [`Client::recv`] before the connection waits.
     /// `recv` takes the queue in batches, so up to twice this many can be
-    /// in memory. QoS 1/2 messages are acked when taken, and v5 brokers are
+    /// in memory. QoS 1/2 messages are acked once taken: in groups while
+    /// `recv` has more at hand, right away once it runs out. v5 brokers are
     /// asked to keep at most this many unacked.
     pub inbox: usize,
     /// Transport settings, such as trust anchors for `tls://`.
@@ -189,8 +192,8 @@ impl ClientOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Message {
-    /// Topic name.
-    pub topic: String,
+    /// Topic name, sharing the buffer the message was read into.
+    pub topic: Topic,
     /// Payload.
     pub payload: Bytes,
     /// Delivery QoS.

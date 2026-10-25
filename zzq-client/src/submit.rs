@@ -3,15 +3,16 @@
 //! The handle encodes publishes itself, into a buffer it shares with the
 //! session, and queues other requests between them in order. The session
 //! takes the whole queue at once, so a burst of publishes costs a lock per
-//! message but a wake per batch. Publishes wait while the queue holds
-//! [`QUEUED`] bytes.
+//! message but a wake per batch, through a [`DataSignal`]. Publishes wait
+//! while the queue holds [`QUEUED`] bytes.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
 use zzq_proto::QoS;
 use zzq_proto::encode::{self, PublishHeader};
+use zzq_tokio::signal::{DataSignal, StateSignal};
 
 use crate::{Cmd, Error, Result};
 
@@ -54,12 +55,10 @@ impl Batch {
 
 struct Shared {
     state: Mutex<State>,
-    /// Wakes the session once the queue is no longer empty or the handle
-    /// is gone.
-    ready: Notify,
-    /// Wakes waiting publishes once the session took a full queue or is
-    /// gone.
-    room: Notify,
+    /// For the session: requests queued, or the handle is gone.
+    ready: DataSignal,
+    /// For waiting publishes: the session took a full queue or is gone.
+    room: StateSignal,
 }
 
 #[derive(Default)]
@@ -80,8 +79,8 @@ impl Shared {
 pub(crate) fn channel() -> (Sender, Receiver) {
     let shared = Arc::new(Shared {
         state: Mutex::default(),
-        ready: Notify::new(),
-        room: Notify::new(),
+        ready: DataSignal::new(),
+        room: StateSignal::new(),
     });
     (
         Sender {
@@ -112,14 +111,13 @@ impl Sender {
         slot: usize,
     ) -> Result<()> {
         while !self.try_publish(h, payload, slot)? {
-            // Look again once registered, so the wake cannot slip past.
-            let room = self.shared.room.notified();
-            tokio::pin!(room);
-            room.as_mut().enable();
+            // Look again after reading the generation, so a change cannot
+            // slip past.
+            let seen = self.shared.room.generation();
             if self.try_publish(h, payload, slot)? {
                 break;
             }
-            room.await;
+            self.shared.room.changed_after(seen).await;
         }
         Ok(())
     }
@@ -150,8 +148,10 @@ impl Sender {
             }),
         }
         drop(st);
+        // The lock orders pushes and takes, so only the push into an empty
+        // queue needs to wake the session.
         if wake {
-            self.shared.ready.notify_one();
+            self.shared.ready.mark();
         }
         Ok(true)
     }
@@ -167,7 +167,7 @@ impl Sender {
         st.batch.ops.push_back(Op::Cmd(cmd));
         drop(st);
         if wake {
-            self.shared.ready.notify_one();
+            self.shared.ready.mark();
         }
         Ok(())
     }
@@ -176,7 +176,7 @@ impl Sender {
 impl Drop for Sender {
     fn drop(&mut self) {
         self.shared.lock().dropped = true;
-        self.shared.ready.notify_one();
+        self.shared.ready.mark();
     }
 }
 
@@ -194,18 +194,20 @@ impl std::fmt::Debug for Receiver {
 impl Receiver {
     /// Waits until there may be requests, or the handle may be gone.
     pub(crate) async fn ready(&self) {
-        self.shared.ready.notified().await;
+        self.shared.ready.ready().await;
     }
 
     /// Swaps the queued requests into `batch`, which should be empty.
     /// Returns whether the handle is gone, so no more will come.
     pub(crate) fn take(&self, batch: &mut Batch) -> bool {
+        self.shared.ready.begin_drain();
         let mut st = self.shared.lock();
         std::mem::swap(&mut st.batch, batch);
         let dropped = st.dropped;
         drop(st);
+        self.shared.ready.clear_after(true);
         if batch.bytes.len() >= QUEUED {
-            self.shared.room.notify_waiters();
+            self.shared.room.notify_changed();
         }
         dropped
     }
@@ -215,9 +217,18 @@ impl Receiver {
         self.shared.lock().dropped
     }
 
-    /// Takes a queued DISCONNECT out of the queue.
+    /// Takes a queued DISCONNECT out of the queue. The other requests stay
+    /// for the next connection and wake no one until it takes them.
     pub(crate) fn take_disconnect(&self) -> Option<oneshot::Sender<()>> {
+        self.shared.ready.begin_drain();
         let mut st = self.shared.lock();
+        let done = Self::remove_disconnect(&mut st);
+        drop(st);
+        self.shared.ready.clear_after(true);
+        done
+    }
+
+    fn remove_disconnect(st: &mut State) -> Option<oneshot::Sender<()>> {
         let ops = &mut st.batch.ops;
         let at = ops
             .iter()
@@ -234,7 +245,7 @@ impl Receiver {
         st.ended = true;
         let batch = std::mem::take(&mut st.batch);
         drop(st);
-        self.shared.room.notify_waiters();
+        self.shared.room.notify_changed();
         batch
     }
 }

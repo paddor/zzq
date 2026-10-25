@@ -12,7 +12,7 @@ use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 
 use crate::conn::ConnShared;
 use crate::index::{Matches, SubIds};
-use crate::msg::{Msg, Publication, expired, same_family};
+use crate::msg::{Arena, Msg, Publication, expired, same_family};
 use crate::slab::Key;
 
 /// Empty write buffers above this size are freed by the lane sweep.
@@ -114,6 +114,8 @@ pub(crate) struct Session {
     pub(crate) waiters: Vec<Waiter>,
     /// Packet IDs in use, allocated on first QoS 1/2 delivery.
     in_use: Option<Box<[u64; 1024]>>,
+    /// Copies of messages held long.
+    pub(crate) arena: Arena,
 }
 
 impl Session {
@@ -144,6 +146,7 @@ impl Session {
             congested: false,
             waiters: Vec::new(),
             in_use: None,
+            arena: Arena::default(),
         }
     }
 

@@ -39,6 +39,7 @@ mod conn;
 pub mod fuzzing;
 mod index;
 mod lane;
+mod mailbox;
 mod msg;
 mod options;
 mod persist;

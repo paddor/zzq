@@ -24,7 +24,7 @@ use zzq_tokio::{Context, Endpoint};
 
 use crate::acks::Acks;
 use crate::submit::{self, Batch, Op};
-use crate::{ClientOptions, Cmd, Connected, Error, Message, Result, inbox};
+use crate::{ClientOptions, Cmd, Connected, Error, Message, Result, Topic, inbox};
 
 /// Largest packet accepted from the broker.
 const MAX_PACKET: usize = 256 << 20;
@@ -571,6 +571,8 @@ impl Conn<'_> {
             return Ok(());
         }
         let chunk = buf.split_to(n).freeze();
+        // Acks the handle gathered go out without a wake of their own.
+        self.ack_taken();
         let res = self.packets(&chunk).await;
         self.finish_acks();
         // Messages before a bad packet still go out.
@@ -588,7 +590,7 @@ impl Conn<'_> {
             at += n;
             if let Some(m) = self.packet(packet, chunk)? {
                 self.s.inbox.push(m);
-                if self.s.inbox.full() {
+                if self.s.inbox.hand_off() {
                     self.deliver().await?;
                 }
             }
@@ -705,7 +707,7 @@ impl Conn<'_> {
             })
             .collect();
         Some(Message {
-            topic: p.topic.to_owned(),
+            topic: Topic::slice_of(chunk, p.topic),
             payload: chunk.slice_ref(p.payload),
             qos: p.qos,
             retain: p.retain,

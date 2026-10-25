@@ -123,7 +123,7 @@ async fn wildcards_and_unsubscribe() {
         publ.publish(t, t, QoS::AtMostOnce).await.unwrap();
     }
     publ.publish("end", "", QoS::AtMostOnce).await.unwrap();
-    let got: Vec<String> = [
+    let got: Vec<_> = [
         next(&mut sub).await,
         next(&mut sub).await,
         next(&mut sub).await,

@@ -397,14 +397,16 @@ async fn read_loop<R: AsyncRead + Unpin>(
     let max = lane.borrow().shared.opts.max_packet_size;
     let mut chunk = MIN_CHUNK;
     loop {
-        if buf.capacity() - buf.len() < chunk / 4 {
-            buf.reserve(chunk);
-        }
         let (complete, partial) = match complete_len(&buf, max) {
             Ok(n) => n,
             Err(e) => return Close::Protocol(e.reason_code()),
         };
         if complete == 0 {
+            // Grow only now, when the buffer holds at most a partial packet:
+            // a new buffer copies what is left in the old one.
+            if buf.capacity() - buf.len() < chunk / 4 {
+                buf.reserve(chunk);
+            }
             // Room for a large packet in one allocation.
             if partial > buf.capacity() {
                 buf.reserve(partial - buf.len());

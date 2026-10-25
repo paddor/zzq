@@ -25,7 +25,7 @@ fuzzing = []
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-tokio = { workspace = true, default-features = false }
 bytes = { workspace = true, features = ["std"] }
-bytestring = "1.4"
+bytestring.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }

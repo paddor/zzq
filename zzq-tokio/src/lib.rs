@@ -33,6 +33,8 @@ mod error;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
+#[doc(hidden)]
+pub mod signal;
 pub mod transport;
 
 pub use context::{Config, Context, LaneHandle};

@@ -148,7 +148,7 @@ fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, d
     }
     let msg = Msg::new(&name, data, &[], QoS::AtMostOnce, retain);
     let lane = shared.ctx.next_lane().index();
-    let _ = shared.lanes[lane].control.send(Control::Publish(msg));
+    let _ = shared.lanes[lane].control.push(Control::Publish(msg));
 }
 
 /// One MQTT-SN client and its MQTT connection.

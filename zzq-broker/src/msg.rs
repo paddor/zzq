@@ -102,6 +102,56 @@ impl Msg {
     }
 }
 
+/// Copies of messages a session holds long, so they do not pin the read
+/// buffers they were sliced from. Copies share blocks, which grow while the
+/// session keeps copying, so a busy session allocates per block, not per
+/// message.
+#[derive(Debug, Default)]
+pub(crate) struct Arena {
+    block: BytesMut,
+    /// Size of the next block.
+    next: usize,
+}
+
+/// First and largest arena block.
+const ARENA_MIN: usize = 1 << 10;
+const ARENA_MAX: usize = 64 << 10;
+
+impl Arena {
+    /// The `len` bytes `fill` appends, in the current block.
+    pub(crate) fn put(&mut self, len: usize, fill: impl FnOnce(&mut BytesMut)) -> Bytes {
+        if self.block.capacity() - self.block.len() < len {
+            self.next = (self.next * 2).clamp(ARENA_MIN, ARENA_MAX);
+            self.block = BytesMut::with_capacity(self.next.max(len));
+        }
+        fill(&mut self.block);
+        self.block.split().freeze()
+    }
+
+    /// A copy of `msg` in the current block.
+    pub(crate) fn copy(&mut self, msg: &Msg) -> Msg {
+        Msg {
+            buf: self.put(msg.buf.len(), |b| b.extend_from_slice(&msg.buf)),
+            topic: msg.topic,
+            props: msg.props,
+            payload: msg.payload,
+            qos: msg.qos,
+            retain: msg.retain,
+            expires_at: msg.expires_at,
+        }
+    }
+}
+
+/// Encodes into an arena block.
+pub(crate) struct Block<'a>(pub(crate) &'a mut BytesMut);
+
+impl zzq_proto::encode::Sink for Block<'_> {
+    #[inline]
+    fn put(&mut self, bytes: &[u8]) {
+        self.0.extend_from_slice(bytes);
+    }
+}
+
 /// One incoming publish while it is routed.
 #[derive(Debug)]
 pub(crate) struct Publication<'a> {
@@ -111,10 +161,16 @@ pub(crate) struct Publication<'a> {
     pub(crate) qos: QoS,
     pub(crate) retain: bool,
     /// The publisher's whole packet, if subscribers on the same protocol
-    /// family may get it byte for byte.
+    /// family may get it byte for byte: QoS 0 and unchanged.
     pub(crate) raw: Option<(&'a [u8], Version)>,
+    /// The publisher's whole packet, if another lane may route it as it
+    /// is: no topic alias to resolve and no property to drop.
+    pub(crate) packet: Option<(&'a [u8], Version)>,
     /// Buffer the borrowed fields point into, to make owned slices.
     pub(crate) chunk: Option<&'a Bytes>,
+    /// Slices of `chunk` pin a read buffer, so a message held long gets a
+    /// copy instead.
+    pub(crate) pins: bool,
     /// Deadline of a stored message. `None` for a live publish, whose
     /// Message Expiry Interval in `props` starts now.
     pub(crate) expires_at: Option<Instant>,
@@ -130,7 +186,9 @@ impl Publication<'_> {
             qos: msg.qos,
             retain: msg.retain,
             raw: None,
+            packet: None,
             chunk: None,
+            pins: false,
             expires_at: msg.expires_at,
         }
     }

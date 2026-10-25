@@ -36,3 +36,4 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread"] }
 rcgen = "0.14"
+loom = "0.7"

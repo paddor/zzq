@@ -20,7 +20,7 @@ use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 use crate::broker::Shared;
 use crate::conn::{ConnShared, OwnedConnect};
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
-use crate::msg::{Msg, Publication};
+use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
 use crate::session::{Outcome, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
@@ -49,13 +49,23 @@ pub(crate) enum Remote {
     /// as offset and length into one shared buffer.
     Forward {
         chunk: Bytes,
-        packets: Vec<(u32, u32)>,
-        version: Version,
-        /// The publisher, for No Local.
-        from: Option<SubRef>,
+        first: (u32, u32),
+        more: Vec<(u32, u32)>,
+        origin: Origin,
     },
     /// A delivery to one session, chosen for a shared subscription.
     Deliver { key: Key, item: Queued },
+}
+
+/// How forwarded packets were sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Origin {
+    version: Version,
+    /// The publisher, for No Local.
+    from: Option<SubRef>,
+    /// The chunk is the publisher's read buffer, which long-held messages
+    /// must not pin, not a copy made for these packets.
+    pins: bool,
 }
 
 /// Counts the lanes that still have to apply a subscription change.
@@ -153,11 +163,16 @@ pub(crate) struct Lane {
     index: SubIndex,
     dirty: Vec<Key>,
     remote: Box<[Vec<Remote>]>,
+    /// One task ships at a time, in arrival order, so batches for a lane
+    /// leave in the order they were collected, also while it is full.
+    pub(crate) shipping: Rc<tokio::sync::Mutex<()>>,
     held: Vec<Held>,
     /// First congested target of the publish being routed.
     hit: Option<Hit>,
     /// Congested sessions on other lanes.
     remote_congested: FxHashSet<SubRef>,
+    /// Copies of QoS 1/2 publishes for congested sessions on other lanes.
+    fwd: Arena,
     /// Acks of local publishers held for congested remote sessions.
     remote_waiters: FxHashMap<SubRef, Vec<Waiter>>,
     pub(crate) stats: LaneStats,
@@ -178,9 +193,11 @@ impl Lane {
             index: SubIndex::default(),
             dirty: Vec::new(),
             remote: (0..lanes).map(|_| Vec::new()).collect(),
+            shipping: Rc::default(),
             held: Vec::new(),
             hit: None,
             remote_congested: FxHashSet::default(),
+            fwd: Arena::default(),
             remote_waiters: FxHashMap::default(),
             stats: LaneStats::default(),
             next_conn_id: 0,
@@ -244,21 +261,27 @@ impl Lane {
         }
     }
 
-    /// Batches for other lanes collected since the last call.
-    pub(crate) fn take_remote(&mut self) -> Vec<(usize, Vec<Remote>)> {
-        let mut out = Vec::new();
-        for (lane, batch) in self.remote.iter_mut().enumerate() {
-            if !batch.is_empty() {
-                out.push((lane, std::mem::take(batch)));
-            }
-        }
-        out
+    /// Whether batches for other lanes are waiting.
+    pub(crate) fn has_remote(&self) -> bool {
+        self.remote.iter().any(|b| !b.is_empty())
+    }
+
+    /// The next batch for another lane, and its lane. Its place gets a
+    /// vector of the same size, so the next batch does not grow from empty.
+    pub(crate) fn next_remote(&mut self) -> Option<(usize, Vec<Remote>)> {
+        let (lane, batch) = self
+            .remote
+            .iter_mut()
+            .enumerate()
+            .find(|(_, b)| !b.is_empty())?;
+        let len = batch.len();
+        Some((lane, std::mem::replace(batch, Vec::with_capacity(len))))
     }
 
     fn broadcast(&self, make: &impl Fn() -> Control) {
         for (i, lane) in self.shared.lanes.iter().enumerate() {
             if i != usize::from(self.id) {
-                let _ = lane.control.send(make());
+                let _ = lane.control.push(make());
             }
         }
     }
@@ -666,16 +689,17 @@ impl Lane {
             Self::mark_in(&mut self.dirty, s, key);
             return Ok(());
         }
-        let version = s.version;
-        let plain = filtered_props.is_none() && p.qos == QoS::AtMostOnce;
+        let packet = filtered_props.is_none().then_some((raw, s.version));
         let publication = Publication {
             topic,
             payload: p.payload,
             props: filtered_props.as_deref().unwrap_or(p.properties.raw()),
             qos: p.qos,
             retain: p.retain,
-            raw: plain.then_some((raw, version)),
+            raw: packet.filter(|_| p.qos == QoS::AtMostOnce),
+            packet,
             chunk: Some(chunk),
+            pins: true,
             expires_at: None,
         };
         let mut owned = None;
@@ -801,6 +825,7 @@ impl Lane {
     ) {
         self.stats.publishes += 1;
         let mut remote_lanes = 0u64;
+        let mut remote_hot = false;
         let n = m.direct.len();
         for (i, e) in m.direct.iter().enumerate() {
             if e.sub.lane == self.id {
@@ -815,6 +840,7 @@ impl Lane {
                     && self.remote_congested.contains(&e.sub)
                 {
                     self.hit.get_or_insert(Hit::Remote(e.sub));
+                    remote_hot = true;
                 }
             }
         }
@@ -838,24 +864,27 @@ impl Lane {
             }
         }
         if remote_lanes != 0 {
-            let (chunk, at, version) = forward_packet(p);
-            let from = from.map(|k| self.sub_ref(k));
+            let (chunk, at, version, pins) = forward_packet(p, remote_hot, &mut self.fwd);
+            let origin = Origin {
+                version,
+                from: from.map(|k| self.sub_ref(k)),
+                pins,
+            };
             for (lane, batch) in self.remote.iter_mut().enumerate() {
                 if remote_lanes & (1 << (lane & 63)) != 0 && lane != usize::from(self.id) {
-                    push_forward(batch, &chunk, at, version, from);
+                    push_forward(batch, &chunk, at, origin);
                 }
             }
         }
     }
 
     /// Routes a publish forwarded by another lane to this lane's sessions.
-    fn route_forwarded(
-        &mut self,
-        chunk: &Bytes,
-        at: (u32, u32),
-        version: Version,
-        from: Option<SubRef>,
-    ) {
+    fn route_forwarded(&mut self, chunk: &Bytes, at: (u32, u32), origin: Origin) {
+        let Origin {
+            version,
+            from,
+            pins,
+        } = origin;
         let Some(packet) = chunk.get(at.0 as usize..(at.0 + at.1) as usize) else {
             return;
         };
@@ -869,7 +898,9 @@ impl Lane {
             qos: p.qos,
             retain: p.retain,
             raw: (p.qos == QoS::AtMostOnce).then_some((&packet[..n], version)),
+            packet: None,
             chunk: Some(chunk),
+            pins,
             expires_at: None,
         };
         let from = from.filter(|f| f.lane == self.id).map(|f| f.key);
@@ -921,8 +952,8 @@ impl Lane {
             let msg = owned.get_or_insert_with(|| p.to_msg());
             // A slow or offline session may hold a message long; do not let
             // it pin read buffers.
-            if s.holds_long() && p.chunk.is_some_and(|c| msg.pins(c)) {
-                *msg = msg.compact();
+            if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
+                *msg = s.arena.copy(msg);
             }
             let msg = if last { owned.take() } else { owned.clone() }.unwrap_or_else(|| p.to_msg());
             s.deliver_qos12(
@@ -970,12 +1001,13 @@ impl Lane {
         match r {
             Remote::Forward {
                 chunk,
-                packets,
-                version,
-                from,
+                first,
+                more,
+                origin,
             } => {
-                for at in packets {
-                    self.route_forwarded(chunk, *at, *version, *from);
+                self.route_forwarded(chunk, *first, *origin);
+                for at in more {
+                    self.route_forwarded(chunk, *at, *origin);
                 }
             }
             Remote::Deliver { key, item } => {
@@ -1269,14 +1301,25 @@ fn resolve_alias(
 }
 
 /// The publication as one PUBLISH packet another lane can decode, as a
-/// buffer and the packet's offset and length in it: the publisher's own
-/// bytes when possible, a v5 encoding otherwise.
-fn forward_packet(p: &Publication<'_>) -> (Bytes, (u32, u32), Version) {
-    if let (Some((raw, version)), Some(chunk)) = (p.raw, p.chunk)
+/// buffer, the packet's offset and length in it, and whether the buffer is
+/// the publisher's read buffer. That is the publisher's own bytes, unless a
+/// congested subscriber there (`hot`) will hold the message long: then a
+/// copy in `arena`, so the copy is made here and not on that busy lane. A
+/// packet that must change becomes a v5 encoding in `arena`.
+fn forward_packet(
+    p: &Publication<'_>,
+    hot: bool,
+    arena: &mut Arena,
+) -> (Bytes, (u32, u32), Version, bool) {
+    if let (Some((raw, version)), Some(chunk)) = (p.packet, p.chunk)
         && crate::msg::within(chunk, raw)
     {
-        let at = raw.as_ptr() as usize - chunk.as_ptr() as usize;
-        return (chunk.clone(), (at as u32, raw.len() as u32), version);
+        if !hot {
+            let at = raw.as_ptr() as usize - chunk.as_ptr() as usize;
+            return (chunk.clone(), (at as u32, raw.len() as u32), version, true);
+        }
+        let copy = arena.put(raw.len(), |b| b.extend_from_slice(raw));
+        return (copy, (0, raw.len() as u32), version, false);
     }
     let h = encode::PublishHeader {
         version: Version::V5,
@@ -1287,40 +1330,36 @@ fn forward_packet(p: &Publication<'_>) -> (Bytes, (u32, u32), Version) {
         pkid: u16::from(p.qos != QoS::AtMostOnce),
         properties: p.props,
     };
-    let mut out = Vec::with_capacity(encode::packet_len(h.remaining(p.payload.len())));
-    encode::publish(&h, p.payload, &mut out);
-    let len = out.len() as u32;
-    (Bytes::from(out), (0, len), Version::V5)
+    let len = encode::packet_len(h.remaining(p.payload.len()));
+    let out = arena.put(len, |b| encode::publish(&h, p.payload, &mut Block(b)));
+    let at = (0, out.len() as u32);
+    (out, at, Version::V5, false)
 }
 
 /// Appends a forwarded packet, sharing the last batch entry when it uses
 /// the same buffer.
-fn push_forward(
-    batch: &mut Vec<Remote>,
-    chunk: &Bytes,
-    at: (u32, u32),
-    version: Version,
-    from: Option<SubRef>,
-) {
+fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: Origin) {
     if let Some(Remote::Forward {
         chunk: c,
-        packets,
-        version: v,
-        from: f,
+        more,
+        origin: o,
+        ..
     }) = batch.last_mut()
         && c.as_ptr() == chunk.as_ptr()
         && c.len() == chunk.len()
-        && *v == version
-        && *f == from
+        && *o == origin
     {
-        packets.push(at);
+        more.push(at);
         return;
     }
+    // Packets of one read are mostly alike, so size the rest from this one;
+    // a copy made for one packet gets no vector.
+    let more = (chunk.len() / (at.1 as usize).max(1)).saturating_sub(1);
     batch.push(Remote::Forward {
         chunk: chunk.clone(),
-        packets: vec![at],
-        version,
-        from,
+        first: at,
+        more: Vec::with_capacity(more),
+        origin,
     });
 }
 
