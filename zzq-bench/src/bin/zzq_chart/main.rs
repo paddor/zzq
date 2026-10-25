@@ -158,11 +158,15 @@ fn brokers() -> Result {
         impls: BROKERS,
         versions: versions(rows.values().map(|r| (&r.impl_name, &r.run_id, &r.version))),
         rows: broker_rows(&rows),
-        notes: [
+        notes: &[
             "Tuned configs. Broker on CPUs 0-3, load generator (zzq_brokerbench, raw sockets) \
-             on CPUs 4-5. 1 s warmup, then 5 s.",
-            "Throughput is delivered messages. rumqttd speaks MQTT 3.1.1, the rest 5.0. \
-             Round trips at QoS 0 and 1 only.",
+             on CPUs 4-5. 1 s warmup (rumqttd 5 s, while its message log grows), then 5 s.",
+            "Throughput is delivered messages. QoS 1/2 publishers keep 100 in flight; QoS 0 \
+             has no flow control, so it can trail QoS 1 at large sizes.",
+            "Fan-in: rivals drop what the subscriber's queue cannot hold, and at QoS 0 EMQX \
+             closes the subscriber (mailbox overflow).",
+            "zzq on 2 IO lanes: the single pair and the round trip cross lanes. rumqttd speaks \
+             MQTT 3.1.1, the rest 5.0. Round trips at QoS 0 and 1 only.",
         ],
     };
     write(&chart)
@@ -256,11 +260,12 @@ fn clients() -> Result {
         impls: CLIENTS,
         versions,
         rows: chart_rows,
-        notes: [
-            "Against zzq_fakebroker: it counts what a publishing client sends; a subscribing \
-             client counts what it receives.",
-            "rumqttc speaks MQTT 3.1.1, the rest 5.0. emqtt publishes QoS 1 and 2 from 100 \
-             processes.",
+        notes: &[
+            "Against zzq_fakebroker, 100 QoS 1/2 messages in flight: it counts what a \
+             publishing client sends; a subscribing client counts what it receives.",
+            "zzq-client acks a QoS 1/2 message once the application took it; rumqttc acks on \
+             read. rumqttc speaks MQTT 3.1.1, the rest 5.0.",
+            "emqtt publishes QoS 1 and 2 from 100 processes.",
         ],
     };
     write(&chart)

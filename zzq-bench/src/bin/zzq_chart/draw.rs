@@ -99,7 +99,7 @@ pub(crate) struct Chart<'a> {
     /// Version per impl key, from its newest run.
     pub(crate) versions: BTreeMap<&'static str, String>,
     pub(crate) rows: Vec<Row>,
-    pub(crate) notes: [&'a str; 2],
+    pub(crate) notes: &'a [&'a str],
 }
 
 type Area<'a> = DrawingArea<SVGBackend<'a>, Shift>;
@@ -144,7 +144,7 @@ impl Ranged for SizeAxis {
 /// Draws the chart and writes it to `chart.out`.
 pub(crate) fn draw(chart: &Chart<'_>) -> Result {
     let n_rows = u32::try_from(chart.rows.len())?;
-    let legend_h = legend_height(chart.impls.len());
+    let legend_h = legend_height(chart.impls.len(), chart.notes.len());
     let body_h = TOP + n_rows * PANEL_H + n_rows.saturating_sub(1) * ROW_GAP;
     let height = body_h + legend_h;
     if let Some(dir) = chart.out.parent() {
@@ -388,10 +388,11 @@ fn clip_label(
     Ok(())
 }
 
-/// Header row, one row per impl, then two notes.
-fn legend_height(impls: usize) -> u32 {
+/// Header row, one row per impl, then the notes.
+fn legend_height(impls: usize, notes: usize) -> u32 {
     let rows = u32::try_from(impls).unwrap_or(u32::MAX);
-    24 + rows.saturating_mul(16) + 40
+    let notes = u32::try_from(notes).unwrap_or(u32::MAX);
+    24 + rows.saturating_mul(16) + 14 + notes.saturating_mul(13)
 }
 
 /// Impl swatches with versions and where each runs, a key for the line
@@ -423,7 +424,7 @@ fn legend(area: &Area<'_>, chart: &Chart<'_>) -> Result {
     swatch(area, (col_key, 42), TEXT)?;
     area.draw_text("GB/s (right axis)", &value, (col_key + 24, 36))?;
 
-    for (i, text) in (0..).zip(chart.notes) {
+    for (i, text) in (0..).zip(chart.notes.iter()) {
         area.draw_text(text, &note, (col_swatch, y + 8 + i * 13))?;
     }
     Ok(())
