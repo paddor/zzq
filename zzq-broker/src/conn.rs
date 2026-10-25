@@ -575,10 +575,7 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             let buf = {
                 let mut l = lane.borrow_mut();
                 match l.sessions.get_mut(key) {
-                    Some(s) if s.has_conn(conn.id) && !s.out.is_empty() => {
-                        let spare = std::mem::take(&mut s.spare);
-                        std::mem::replace(&mut s.out, spare)
-                    }
+                    Some(s) if s.has_conn(conn.id) && !s.out.is_empty() => s.take_out(),
                     _ => break,
                 }
             };

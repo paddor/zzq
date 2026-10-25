@@ -15,7 +15,7 @@ use crate::index::{Matches, SubIds};
 use crate::msg::{Arena, Msg, Publication, expired, same_family};
 use crate::slab::Key;
 
-/// Empty write buffers above this size are freed by the lane sweep.
+/// Write buffers above this size are freed once their session goes idle.
 const IDLE_BUFFER: usize = 64 << 10;
 /// Unacked messages beyond which a session counts as slow: new messages
 /// for it get their own copy instead of pinning read buffers.
@@ -89,6 +89,8 @@ pub(crate) struct Session {
     pub(crate) out: Vec<u8>,
     /// The writer's second buffer, swapped with `out` on each write.
     pub(crate) spare: Vec<u8>,
+    /// The writer took `out` since the last sweep.
+    wrote: bool,
     pub(crate) dirty: bool,
     /// Inflight window towards the client.
     pub(crate) window: u16,
@@ -134,6 +136,7 @@ impl Session {
             delayed_will: None,
             out: Vec::new(),
             spare: Vec::new(),
+            wrote: false,
             dirty: false,
             window: u16::MAX,
             max_packet: usize::MAX,
@@ -158,14 +161,26 @@ impl Session {
         self.queue.len()
     }
 
-    /// Frees large write buffers that are empty. The lane calls this once a
-    /// second, so idle sessions do not keep a past burst's memory.
+    /// Hands the writer the encoded packets, in exchange for its spare
+    /// buffer.
+    pub(crate) fn take_out(&mut self) -> Vec<u8> {
+        self.wrote = true;
+        let spare = std::mem::take(&mut self.spare);
+        std::mem::replace(&mut self.out, spare)
+    }
+
+    /// Frees large write buffers that are empty, unless the writer used them
+    /// since the last call. The lane calls this once a second, so idle
+    /// sessions do not keep a past burst's memory, and busy ones do not
+    /// grow theirs again.
     pub(crate) fn trim_buffers(&mut self) {
-        if self.out.is_empty() && self.out.capacity() > IDLE_BUFFER {
-            self.out = Vec::new();
-        }
-        if self.spare.capacity() > IDLE_BUFFER {
-            self.spare = Vec::new();
+        if !std::mem::take(&mut self.wrote) {
+            if self.out.is_empty() && self.out.capacity() > IDLE_BUFFER {
+                self.out = Vec::new();
+            }
+            if self.spare.capacity() > IDLE_BUFFER {
+                self.spare = Vec::new();
+            }
         }
         if self.inflight.is_empty() {
             self.in_use = None;
@@ -500,5 +515,20 @@ mod tests {
         s.send_inflight(item());
         let v = ids(&s);
         assert_eq!(v[1], v[0].wrapping_add(1).max(1));
+    }
+
+    /// A large write buffer outlives a sweep after a write, and is freed by
+    /// the next sweep without one.
+    #[test]
+    fn trim_frees_buffers_of_idle_sessions_only() {
+        let mut s = Session::new("c".into(), Version::V5);
+        s.out.reserve(2 * IDLE_BUFFER);
+        let mut buf = s.take_out();
+        buf.clear();
+        s.spare = buf;
+        s.trim_buffers();
+        assert!(s.spare.capacity() > IDLE_BUFFER);
+        s.trim_buffers();
+        assert_eq!(s.spare.capacity(), 0);
     }
 }
