@@ -1,5 +1,7 @@
 name: ci
 
+# Formatting and clippy run first. Tests run only once they pass.
+
 on:
   push:
     branches: [main]
@@ -14,10 +16,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  rust:
-    name: rust
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -32,17 +35,11 @@ jobs:
         run: cargo fmt --all --check
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test
-        run: cargo test --workspace
 
-  ruby:
-    name: ruby ${{ matrix.ruby }}
+  ruby-lint:
+    name: ruby fmt + clippy
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        ruby: ['3.3', '4.0']
     steps:
       - uses: actions/checkout@v7
         with:
@@ -55,7 +52,7 @@ jobs:
           workspaces: bindings/ruby
       - uses: ruby/setup-ruby@v1
         with:
-          ruby-version: ${{ matrix.ruby }}
+          ruby-version: '4.0'
           bundler-cache: true
           working-directory: bindings/ruby
       - name: cargo fmt
@@ -68,6 +65,71 @@ jobs:
           find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -cw
           ruby -cw Rakefile
           ruby -cw zzq.gemspec
+
+  test:
+    name: cargo test
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  msrv:
+    name: cargo test (1.93)
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  ruby-test:
+    name: ruby ${{ matrix.ruby }}
+    needs: [lint, ruby-lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        ruby: ['3.4', '4.0']
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/ruby
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          working-directory: bindings/ruby
       - name: rake
         working-directory: bindings/ruby
         run: bundle exec rake
+
+  ci-success:
+    name: CI success
+    needs: [lint, ruby-lint, test, msrv, ruby-test]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: check all jobs passed
+        run: |
+          if [[ '${{ toJSON(needs.*.result) }}' =~ (failure|cancelled|skipped) ]]; then
+            exit 1
+          fi
