@@ -2,13 +2,15 @@
 
 require_relative "test_helper"
 
-class LifecycleTest < Minitest::Test
+class LifecycleTest < Minitest::Spec
+  FD_DIR = "/proc/self/fd"
+
   def fds
-    Dir.children("/proc/self/fd").size
+    Dir.children(FD_DIR).size
   end
 
-  def test_closed_clients_release_their_fds
-    skip "needs /proc" unless File.directory?("/proc/self/fd")
+  it "releases the fds of closed clients" do
+    skip "needs /proc" unless File.directory?(FD_DIR)
     endpoint = tcp_endpoint
     client(endpoint).close
     GC.start
@@ -24,14 +26,12 @@ class LifecycleTest < Minitest::Test
     assert_operator fds, :<=, before + 2
   end
 
-  def test_a_forked_child_starts_its_own_lanes
+  it "starts new lanes in a forked child" do
     skip "needs fork" unless Process.respond_to?(:fork)
-    endpoint = tcp_endpoint
-    client(endpoint).publish("warm", "up")
+    client(tcp_endpoint).publish("warm", "up")
     pid = fork do
       b = ZZQ::Broker.new(sys_interval: nil)
-      child_endpoint = b.bind("tcp://127.0.0.1:0")
-      c = ZZQ::Client.connect(child_endpoint)
+      c = ZZQ::Client.connect(b.bind("tcp://127.0.0.1:0"))
       c.subscribe("t")
       c.publish("t", "child")
       exit!(c.receive(timeout: 2)&.payload == "child" ? 0 : 1)
@@ -40,7 +40,7 @@ class LifecycleTest < Minitest::Test
     assert_predicate status, :success?
   end
 
-  def test_io_threads_are_set_before_first_use
+  it "takes io_threads only before first use" do
     client(tcp_endpoint)
     assert_raises(ZZQ::Error) { ZZQ.io_threads = 2 }
   end

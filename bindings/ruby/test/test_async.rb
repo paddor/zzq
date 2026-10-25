@@ -3,8 +3,10 @@
 require_relative "test_helper"
 require "async"
 
-class AsyncTest < Minitest::Test
-  def test_a_waiting_receive_lets_other_fibers_run
+class AsyncTest < Minitest::Spec
+  WAIT = 2
+
+  it "lets other fibers run while a receive waits" do
     endpoint = tcp_endpoint
     Async do |task|
       sub = client(endpoint)
@@ -16,12 +18,12 @@ class AsyncTest < Minitest::Test
         ran = true
         pub.publish("t", "from a fiber")
       end
-      assert_equal "from a fiber", sub.receive(timeout: 2).payload
+      assert_equal "from a fiber", sub.receive(timeout: WAIT).payload
       assert ran
     end.wait
   end
 
-  def test_many_fibers_wait_for_acks_at_once
+  it "lets many fibers wait for acks at once" do
     endpoint = tcp_endpoint
     Async do |task|
       sub = client(endpoint)
@@ -36,7 +38,7 @@ class AsyncTest < Minitest::Test
     assert_operator ZZQ::Waiting::WAKES.size, :<=, ZZQ::Waiting::KEEP
   end
 
-  def test_a_timeout_cancels_only_the_waiting_fiber
+  it "times out only the waiting fiber" do
     endpoint = tcp_endpoint
     Async do |task|
       c = client(endpoint)
@@ -44,7 +46,7 @@ class AsyncTest < Minitest::Test
       waiting = task.async { c.receive(timeout: 0.05) }
       assert_raises(IO::TimeoutError) { waiting.wait }
       c.publish("t", "after")
-      assert_equal "after", c.receive(timeout: 2).payload
+      assert_equal "after", c.receive(timeout: WAIT).payload
     end.wait
   end
 end

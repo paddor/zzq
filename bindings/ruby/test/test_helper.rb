@@ -28,6 +28,6 @@ module ZZQTestHelpers
   end
 end
 
-class Minitest::Test
+class Minitest::Spec
   include ZZQTestHelpers
 end
