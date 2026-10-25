@@ -233,3 +233,35 @@ async fn a_publish_waiting_for_its_ack_fails_once_the_connection_is_lost() {
         Err(zzq_client::Error::Closed)
     ));
 }
+
+#[tokio::test]
+async fn a_dropped_ack_wait_keeps_its_publish() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("dropped"))
+                .await
+                .unwrap()
+        }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let h = connecting.await.unwrap().handle();
+    let pkid = |packet: &[u8]| match decode(packet, Version::V5, usize::MAX) {
+        Ok(Some((Packet::Publish(p), _))) => p.pkid,
+        other => panic!("expected PUBLISH, got {other:?}"),
+    };
+    drop(h.enqueue("t", "x", QoS::AtLeastOnce, false).await.unwrap());
+    let (_, first) = peer.packet().await;
+    peer.ack(PacketType::PubAck, pkid(&first)).await;
+    let next = tokio::spawn({
+        let h = h.clone();
+        async move { h.publish("t", "y", QoS::AtLeastOnce).await }
+    });
+    let (_, second) = peer.packet().await;
+    peer.ack(PacketType::PubAck, pkid(&second)).await;
+    timeout(WAIT, next).await.unwrap().unwrap().unwrap();
+    let acked = h.enqueue("t", "z", QoS::AtMostOnce, false).await.unwrap();
+    acked.await.unwrap();
+}

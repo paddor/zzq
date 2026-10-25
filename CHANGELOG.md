@@ -29,3 +29,7 @@ Notable changes to zzq. The format follows
 - `zzq-client`, `zzq-broker`: `publish` and `publish_retained` take any
   `AsRef<[u8]>` payload, so a borrowed or reused buffer needs no
   allocation.
+- `zzq-client`: `Client::handle` returns a cloneable `Handle` that publishes
+  and subscribes from other tasks while the client receives, and
+  `Handle::enqueue` queues a publish and returns its ack as a separate
+  `Acked` future.

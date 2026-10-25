@@ -2,7 +2,8 @@
 //!
 //! The connection runs on an IO lane of a [`zzq_tokio::Context`]. The
 //! [`Client`] handle talks to it through channels and can be used from any
-//! runtime. [`blocking::Client`] does the same for threads without one.
+//! runtime. [`blocking::Client`] does the same for threads without one. A
+//! [`Handle`] publishes and subscribes from other tasks while one receives.
 //!
 //! # Examples
 //!
@@ -41,7 +42,9 @@ mod inbox;
 mod submit;
 mod topic;
 
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -340,10 +343,123 @@ fn unsubscribe_cmd(filters: &[&str]) -> Result<(Cmd, Ack<Vec<ReasonCode>>)> {
     Ok((cmd, rx))
 }
 
+/// Publishes and subscribes for a [`Client`] from other tasks or threads.
+/// Clones share the connection.
+#[derive(Debug, Clone)]
+pub struct Handle {
+    link: Arc<Link>,
+}
+
+impl Handle {
+    /// As [`Client::publish`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::publish`].
+    pub async fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
+        self.enqueue(topic, payload, qos, false).await?.await
+    }
+
+    /// As [`Client::publish_retained`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::publish`].
+    pub async fn publish_retained(
+        &self,
+        topic: &str,
+        payload: impl AsRef<[u8]>,
+        qos: QoS,
+    ) -> Result<()> {
+        self.enqueue(topic, payload, qos, true).await?.await
+    }
+
+    /// Queues a publish, waiting only while the queue is full, and returns
+    /// the wait for its ack. A future dropped before it completes queues
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidTopic`] or [`Error::TooLarge`] for a message MQTT
+    /// cannot carry, and [`Error::Closed`] once the client is gone.
+    pub async fn enqueue(
+        &self,
+        topic: &str,
+        payload: impl AsRef<[u8]>,
+        qos: QoS,
+        retain: bool,
+    ) -> Result<Acked> {
+        let wait = self
+            .link
+            .publish(topic, payload.as_ref(), qos, retain)
+            .await?;
+        Ok(Acked(wait))
+    }
+
+    /// As [`Client::subscribe`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
+    pub async fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
+        let codes = self
+            .subscribe_with(&[(filter, SubscriptionOptions::from(qos))], 0)
+            .await?;
+        Ok(codes
+            .first()
+            .copied()
+            .unwrap_or(ReasonCode::UNSPECIFIED_ERROR))
+    }
+
+    /// As [`Client::subscribe_with`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
+    pub async fn subscribe_with(
+        &self,
+        filters: &[(&str, SubscriptionOptions)],
+        sub_id: u32,
+    ) -> Result<Vec<ReasonCode>> {
+        let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
+        self.link.send(cmd)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+
+    /// As [`Client::unsubscribe`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Client::subscribe`].
+    pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
+        let (cmd, rx) = unsubscribe_cmd(filters)?;
+        self.link.send(cmd)?;
+        rx.await.map_err(|_| Error::Closed)?
+    }
+}
+
+/// The ack of a publish from [`Handle::enqueue`]: ready at once for QoS 0,
+/// and once the broker acked it for QoS 1 and 2. Dropping it gives up the
+/// wait, not the publish.
+#[derive(Debug)]
+#[must_use = "a QoS 1 or 2 publish may still fail; await or drop the ack"]
+pub struct Acked(Option<acks::AckWait>);
+
+impl Future for Acked {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Result<()>> {
+        match &mut self.0 {
+            Some(wait) => Pin::new(wait).poll(cx),
+            None => Poll::Ready(Ok(())),
+        }
+    }
+}
+
 /// A connected client.
 #[derive(Debug)]
 pub struct Client {
-    link: Link,
+    handle: Handle,
     inbox: inbox::Receiver,
     connected: Connected,
 }
@@ -361,7 +477,9 @@ impl Client {
         let st = start(ctx, uri, opts)?;
         let connected = st.connack.await.map_err(|_| Error::Closed)??;
         Ok(Client {
-            link: st.link,
+            handle: Handle {
+                link: Arc::new(st.link),
+            },
             inbox: st.inbox,
             connected,
         })
@@ -370,6 +488,14 @@ impl Client {
     /// CONNACK details.
     pub const fn connected(&self) -> &Connected {
         &self.connected
+    }
+
+    /// A handle to publish and subscribe from other tasks or threads while
+    /// this client receives. The connection stays up while the client or a
+    /// handle lives, but a message that arrives once the client is gone
+    /// ends it.
+    pub fn handle(&self) -> Handle {
+        self.handle.clone()
     }
 
     /// Publishes. QoS 0 returns once queued, waiting while about 1 MiB is
@@ -382,7 +508,7 @@ impl Client {
     /// cannot carry, [`Error::Rejected`] if the broker refuses it, and
     /// [`Error::Closed`] once the client is gone.
     pub async fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, payload.as_ref(), qos, false).await
+        self.handle.publish(topic, payload, qos).await
     }
 
     /// Publishes a retained message: the broker keeps it for later
@@ -397,20 +523,7 @@ impl Client {
         payload: impl AsRef<[u8]>,
         qos: QoS,
     ) -> Result<()> {
-        self.send_publish(topic, payload.as_ref(), qos, true).await
-    }
-
-    async fn send_publish(
-        &self,
-        topic: &str,
-        payload: &[u8],
-        qos: QoS,
-        retain: bool,
-    ) -> Result<()> {
-        match self.link.publish(topic, payload, qos, retain).await? {
-            Some(wait) => wait.await,
-            None => Ok(()),
-        }
+        self.handle.publish_retained(topic, payload, qos).await
     }
 
     /// Subscribes to one filter with a maximum QoS. Returns the granted
@@ -421,13 +534,7 @@ impl Client {
     /// [`Error::InvalidTopic`] for an invalid filter, and [`Error::Closed`]
     /// once the client is gone.
     pub async fn subscribe(&self, filter: &str, qos: QoS) -> Result<ReasonCode> {
-        let codes = self
-            .subscribe_with(&[(filter, SubscriptionOptions::from(qos))], 0)
-            .await?;
-        Ok(codes
-            .first()
-            .copied()
-            .unwrap_or(ReasonCode::UNSPECIFIED_ERROR))
+        self.handle.subscribe(filter, qos).await
     }
 
     /// Subscribes to several filters, optionally with a v5 Subscription
@@ -441,9 +548,7 @@ impl Client {
         filters: &[(&str, SubscriptionOptions)],
         sub_id: u32,
     ) -> Result<Vec<ReasonCode>> {
-        let (cmd, rx) = subscribe_cmd(filters, sub_id)?;
-        self.link.send(cmd)?;
-        rx.await.map_err(|_| Error::Closed)?
+        self.handle.subscribe_with(filters, sub_id).await
     }
 
     /// Unsubscribes. Returns one code per filter (empty for v3.1.1).
@@ -452,9 +557,7 @@ impl Client {
     ///
     /// As [`Client::subscribe`].
     pub async fn unsubscribe(&self, filters: &[&str]) -> Result<Vec<ReasonCode>> {
-        let (cmd, rx) = unsubscribe_cmd(filters)?;
-        self.link.send(cmd)?;
-        rx.await.map_err(|_| Error::Closed)?
+        self.handle.unsubscribe(filters).await
     }
 
     /// Next received message. `None` once the client is gone for good:
@@ -467,7 +570,12 @@ impl Client {
     /// asks a v5 broker for the will.
     pub async fn disconnect_with(self, reason: ReasonCode) {
         let (tx, rx) = oneshot::channel();
-        if self.link.send(Cmd::Disconnect { reason, done: tx }).is_ok() {
+        if self
+            .handle
+            .link
+            .send(Cmd::Disconnect { reason, done: tx })
+            .is_ok()
+        {
             let _ = rx.await;
         }
     }
