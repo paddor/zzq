@@ -399,6 +399,8 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
         }
         // A takeover frees the old connection's slot for the new one.
         let takeover = l.is_connected(&c.client_id);
+        // `try_update`, the new name, needs Rust 1.99.
+        #[allow(deprecated)]
         let reserved = takeover
             || l.shared
                 .connections

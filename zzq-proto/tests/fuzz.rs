@@ -86,7 +86,7 @@ fn check(buf: &[u8]) {
             assert!(n <= buf.len());
             if let Packet::Subscribe(s) = packet {
                 for (f, _) in s.filters() {
-                    assert!(!f.is_empty());
+                    assert_ne!(f, "");
                 }
             }
             if let Packet::Publish(p) = packet {

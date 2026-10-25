@@ -499,7 +499,7 @@ mod tests {
         let _ = fs::remove_file(&path);
         {
             let p = FilePersistence::open(&path).unwrap();
-            assert!(p.load_retained().unwrap().is_empty());
+            assert_eq!(p.load_retained().unwrap(), []);
             p.set_retained(&msg("a", "1"));
             p.set_retained(&msg("b", "2"));
             p.set_retained(&msg("a", "3"));
