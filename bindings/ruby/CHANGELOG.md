@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+- zzq is now a binding to the zzq Rust crates, built as a native
+  extension with rb-sys. It needs Rust 1.93 to install and Ruby 3.3.
+- Calls no longer need an Async task: they wait under any fiber
+  scheduler, and release the GVL in plain threads.
+- `Client#receive` and `Client#each` take messages from one inbox per
+  client. `#subscribe` returns the granted QoS; `Subscription`,
+  `Message#ack!`, message properties and `#monitor` are gone.
+- New: reconnect with session resume, will delay, `#unsubscribe`,
+  `#disconnect(reason:)`, and `IO::TimeoutError` from `receive(timeout:)`.
+- `session_expiry_interval:` is now `session_expiry:` and `recv_hwm:` is
+  `inbox:`. `linger:`, `send_hwm:`, `receive_maximum:`, `max_packet_size:`
+  and `topic_alias_maximum:` are gone from the client.
+- `ZZQ::Broker` gets `#publish`, `#stats`, the limits of zzq-broker and
+  an MQTT-SN gateway on `udp://`. `persistence:` takes the path of a log
+  file instead of a store object. `#ingest`, `#<<` and `#session_count`
+  are gone.
+- `ws://`, `wss://`, `quic://` and `inproc://` are built in; the
+  zzq-websocket gem is no longer needed.
+
 ## v0.1.1 — 2026-04-20
 
 - `Engine#handle_accepted` and `Engine#handle_connected` now return the

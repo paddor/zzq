@@ -1,6 +1,6 @@
 [workspace]
 members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client", "zzq-bench"]
-exclude = ["fuzz"]
+exclude = ["fuzz", "bindings"]
 default-members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client"]
 resolver = "2"
 
@@ -10,7 +10,7 @@ edition = "2024"
 rust-version = "1.93"
 license = "ISC"
 authors = ["Patrik Wenger <paddor@gmail.com>"]
-repository = "https://github.com/paddor/zzq.rs"
+repository = "https://github.com/paddor/zzq"
 readme = "README.md"
 
 [workspace.lints.rust]

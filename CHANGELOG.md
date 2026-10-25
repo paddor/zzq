@@ -35,3 +35,5 @@ Notable changes to zzq. The format follows
   `Acked` future.
 - `zzq-client`: `Handle::disconnect` closes the connection while the client
   waits in `recv`, which then returns `None`.
+- Ruby binding: the `zzq` gem in `bindings/ruby`, with the client and the
+  broker.

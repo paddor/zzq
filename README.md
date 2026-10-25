@@ -14,6 +14,9 @@ connection never moves between threads.
 | `zzq-client` | `Client`, async and blocking, with reconnect and session resume |
 | `zzq-bench` | Load generator and local performance gates |
 
+The Ruby gem `zzq` in [`bindings/ruby`](bindings/ruby) binds the client and
+the broker.
+
 ## Example
 
 ```rust

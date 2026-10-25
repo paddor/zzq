@@ -1,0 +1,14 @@
+[workspace]
+members = ["ext/zzq_native"]
+resolver = "3"
+
+[profile.release]
+debug = "line-tables-only"
+
+# Development builds use the crates in this repository. An installed gem
+# builds against crates.io.
+[patch.crates-io]
+zzq-proto = { path = "../../zzq-proto" }
+zzq-tokio = { path = "../../zzq-tokio" }
+zzq-broker = { path = "../../zzq-broker" }
+zzq-client = { path = "../../zzq-client" }
