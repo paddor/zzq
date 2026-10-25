@@ -1,0 +1,38 @@
+[package]
+name = "zzq-broker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "MQTT 3.1.1 and 5.0 broker on zzq IO lanes."
+keywords = ["mqtt", "broker", "iot", "tokio"]
+categories = ["network-programming", "asynchronous"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["tls", "quic"]
+tls = ["zzq-tokio/tls"]
+quic = ["tls", "zzq-tokio/quic"]
+# Entry points for the fuzz targets in `fuzz/afl`.
+fuzzing = []
+
+[dependencies]
+zzq-proto = { workspace = true, features = ["std"] }
+zzq-tokio = { workspace = true, default-features = false }
+bytes = { workspace = true, features = ["std"] }
+bytestring.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+
+[dev-dependencies]
+rcgen = "0.14"
+zzq-client.workspace = true
+zzq-proto = { workspace = true, features = ["std"] }
+
+tokio = { workspace = true, features = ["rt-multi-thread"] }

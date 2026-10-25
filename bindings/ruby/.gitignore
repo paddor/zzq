@@ -1,0 +1,7 @@
+/.bundle/
+/pkg/
+/tmp/
+/target/
+/lib/zzq/*.bundle
+/lib/zzq/*.dylib
+/lib/zzq/*.so

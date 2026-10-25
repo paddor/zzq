@@ -1,19 +1,135 @@
-name: CI
+name: ci
 
-on: [push, pull_request]
+# Formatting and clippy run first. Tests run only once they pass.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  test:
-    name: Ruby ${{ matrix.ruby }}
+  lint:
+    name: fmt + clippy
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  ruby-lint:
+    name: ruby fmt + clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/ruby
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '4.0'
+          bundler-cache: true
+          working-directory: bindings/ruby
+      - name: cargo fmt
+        run: cargo fmt --manifest-path bindings/ruby/Cargo.toml --all --check
+      - name: cargo clippy
+        run: cargo clippy --manifest-path bindings/ruby/Cargo.toml --all-targets -- -D warnings
+      - name: ruby syntax
+        working-directory: bindings/ruby
+        run: |
+          find lib test -name '*.rb' -print0 | xargs -0 -n1 ruby -cw
+          ruby -cw Rakefile
+          ruby -cw zzq.gemspec
+
+  test:
+    name: cargo test
+    needs: [lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  msrv:
+    name: cargo test (1.93)
+    needs: [test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.93"
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test
+        run: cargo test --workspace
+
+  ruby-test:
+    name: ruby ${{ matrix.ruby }}
+    needs: [lint, ruby-lint]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        ruby: ['4.0']
+        ruby: ['3.4', '4.0']
     steps:
-    - uses: actions/checkout@v4
-    - uses: ruby/setup-ruby@v1
-      with:
-        ruby-version: ${{ matrix.ruby }}
-        bundler-cache: true
-    - run: bundle exec rake
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: bindings/ruby
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+          working-directory: bindings/ruby
+      - name: rake
+        working-directory: bindings/ruby
+        run: bundle exec rake
+
+  ci-success:
+    name: CI success
+    needs: [lint, ruby-lint, test, msrv, ruby-test]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: check all jobs passed
+        run: |
+          if [[ '${{ toJSON(needs.*.result) }}' =~ (failure|cancelled|skipped) ]]; then
+            exit 1
+          fi

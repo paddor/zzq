@@ -1,0 +1,98 @@
+name: extended
+
+# Long runs that would dominate PR CI. `ci.yml` runs the stress test for
+# 3 s and the codec fuzz tests with fixed iteration counts.
+
+on:
+  schedule:
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+    inputs:
+      stress_secs:
+        description: seconds of random traffic against the broker
+        default: "3600"
+      fuzz_secs:
+        description: seconds of AFL fuzzing per target
+        default: "1800"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+concurrency:
+  group: extended
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: broker stress
+    if: github.repository == 'paddor/zzq'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test (stress)
+        env:
+          ZZQ_STRESS_SECS: ${{ inputs.stress_secs || '3600' }}
+        run: cargo test --release -p zzq-broker --test stress -- --nocapture
+
+  fuzz:
+    name: fuzz (${{ matrix.target }})
+    if: github.repository == 'paddor/zzq'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [mqtt, mqtt_sn, websocket, retained_log, endpoint, topics]
+    defaults:
+      run:
+        working-directory: fuzz/afl
+    env:
+      AFL_NO_UI: "1"
+      AFL_SKIP_CPUFREQ: "1"
+      AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz/afl
+      - name: install cargo-afl
+        run: |
+          cargo install cargo-afl --locked --version 0.18.2
+          cargo afl config --build
+      - name: build targets and seeds
+        run: |
+          cargo afl build --release
+          target/release/seeds
+      - name: replay seeds and regressions
+        run: cargo afl test --release
+      - name: cargo afl fuzz
+        run: |
+          mkdir -p out
+          cargo afl fuzz -V "${{ inputs.fuzz_secs || '1800' }}" \
+            -i seeds/${{ matrix.target }} -o out/${{ matrix.target }} \
+            target/release/${{ matrix.target }}
+      - name: fail on crashes or hangs
+        run: |
+          found=$(find out/${{ matrix.target }}/default/crashes out/${{ matrix.target }}/default/hangs \
+            -type f ! -name README.txt | wc -l)
+          echo "crashes and hangs: $found"
+          test "$found" -eq 0
+      - name: upload findings
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}
+          path: fuzz/afl/out/${{ matrix.target }}/default
+          if-no-files-found: ignore

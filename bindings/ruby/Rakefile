@@ -1,0 +1,26 @@
+# frozen_string_literal: true
+
+require "bundler/gem_helper"
+require "minitest/test_task"
+require "rake/clean"
+require "rb_sys/extensiontask"
+
+gem_helper = Bundler::GemHelper.new
+gem_helper.tag_prefix = "ruby-"
+gem_helper.install
+
+gemspec = Gem::Specification.load("zzq.gemspec") || abort("Could not load zzq.gemspec")
+
+RbSys::ExtensionTask.new("zzq_native", gemspec) do |ext|
+  ext.lib_dir = "lib/zzq"
+end
+
+Minitest::TestTask.create(:test) do |task|
+  task.libs << "lib" << "test"
+  task.test_globs = ["test/test_*.rb"]
+end
+
+CLOBBER.include("pkg", "tmp", "lib/zzq/*.so", "lib/zzq/*.bundle", "lib/zzq/*.dylib")
+
+task test: :compile
+task default: :test

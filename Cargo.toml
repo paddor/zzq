@@ -1,0 +1,58 @@
+[workspace]
+members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client", "zzq-bench"]
+exclude = ["fuzz", "bindings"]
+default-members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.93"
+license = "ISC"
+authors = ["Patrik Wenger <paddor@gmail.com>"]
+repository = "https://github.com/paddor/zzq"
+readme = "README.md"
+
+[workspace.lints.rust]
+missing_debug_implementations = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+unreachable_pub = "warn"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+missing_const_for_fn = "warn"
+
+[workspace.dependencies]
+zzq-proto = { path = "zzq-proto", version = "0.1.0", default-features = false }
+zzq-tokio = { path = "zzq-tokio", version = "0.1.0", default-features = false }
+zzq-broker = { path = "zzq-broker", version = "0.1.0" }
+zzq-client = { path = "zzq-client", version = "0.1.0" }
+bytes = { version = "1.12", default-features = false }
+bytestring = "1.4"
+plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series"] }
+rustc-hash = "2.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+socket2 = "0.6"
+thiserror = "2.0"
+tokio = { version = "1.53", default-features = false }
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+debug = "line-tables-only"

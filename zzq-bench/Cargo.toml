@@ -1,0 +1,25 @@
+[package]
+name = "zzq-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+publish = false
+description = "Load generator and local performance gates for zzq."
+
+[lints]
+workspace = true
+
+[dependencies]
+zzq-proto = { workspace = true, features = ["std"] }
+zzq-broker.workspace = true
+plotters.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
