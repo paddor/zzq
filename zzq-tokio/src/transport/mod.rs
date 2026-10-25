@@ -198,7 +198,9 @@ impl Stream {
             #[cfg(feature = "quic")]
             Stream::Quic(s) => {
                 let (r, w) = s.into_split();
-                Ok(driver.run(r, w).await)
+                // Boxed: QUIC halves are larger, and would size the future
+                // of every connection.
+                Ok(Box::pin(driver.run(r, w)).await)
             }
             Stream::WsAccept(s, server) => {
                 Box::pin(async move { ws::accept(s, &server).await?.drive(driver).await }).await

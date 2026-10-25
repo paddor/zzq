@@ -18,7 +18,7 @@ use zzq_proto::topic::is_shared;
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 
 use crate::broker::Shared;
-use crate::conn::{ConnShared, OwnedConnect};
+use crate::conn::{ConnShared, OwnedConnect, ReadBlocks};
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
@@ -26,6 +26,9 @@ use crate::session::{Outcome, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
+
+/// Calls of [`Lane::sweep`] that cover all sessions once.
+pub(crate) const SWEEP_PARTS: u32 = 20;
 
 /// Lane counters, summed by `Broker::stats`.
 #[derive(Debug, Default, Clone, Copy)]
@@ -176,6 +179,11 @@ pub(crate) struct Lane {
     /// Acks of local publishers held for congested remote sessions.
     remote_waiters: FxHashMap<SubRef, Vec<Waiter>>,
     pub(crate) stats: LaneStats,
+    /// What connections without a buffer of their own read into.
+    pub(crate) read_blocks: ReadBlocks,
+    /// Calls of [`Lane::sweep`] so far, and the session slot it goes on at.
+    sweeps: u32,
+    sweep_at: u32,
     next_conn_id: u64,
     next_client_no: u64,
     next_will_id: u64,
@@ -200,6 +208,9 @@ impl Lane {
             fwd: Arena::default(),
             remote_waiters: FxHashMap::default(),
             stats: LaneStats::default(),
+            read_blocks: ReadBlocks::default(),
+            sweeps: 0,
+            sweep_at: 0,
             next_conn_id: 0,
             next_client_no: 0,
             next_will_id: 0,
@@ -276,6 +287,12 @@ impl Lane {
             .find(|(_, b)| !b.is_empty())?;
         let len = batch.len();
         Some((lane, std::mem::replace(batch, Vec::with_capacity(len))))
+    }
+
+    /// Puts back a batch [`Lane::next_remote`] took, which could not leave
+    /// yet. Nothing was collected for its lane since.
+    pub(crate) fn unship(&mut self, lane: usize, batch: Vec<Remote>) {
+        self.remote[lane] = batch;
     }
 
     fn broadcast(&self, make: &impl Fn() -> Control) {
@@ -1212,18 +1229,28 @@ impl Lane {
         self.flush();
     }
 
-    /// Keep alive timeouts and session expiry.
+    /// Keep alive timeouts and session expiry, for the next of
+    /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
-        // The retained store is shared; one lane is enough.
-        if self.id == 0 {
+        // The retained store is shared; one lane, once a round, is enough.
+        if self.id == 0 && self.sweeps.is_multiple_of(SWEEP_PARTS) {
             self.shared
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .sweep(now);
         }
-        let keys: Vec<Key> = self.sessions.keys().collect();
-        for key in keys {
+        self.sweeps = self.sweeps.wrapping_add(1);
+        let slots = self.sessions.slots();
+        if self.sweep_at >= slots {
+            self.sweep_at = 0;
+        }
+        let end = (self.sweep_at + slots.div_ceil(SWEEP_PARTS)).min(slots);
+        let from = std::mem::replace(&mut self.sweep_at, end);
+        for slot in from..end {
+            let Some(key) = self.sessions.key_at(slot) else {
+                continue;
+            };
             let Some(s) = self.sessions.get_mut(key) else {
                 continue;
             };

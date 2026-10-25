@@ -112,7 +112,9 @@ pub(crate) struct Session {
     pub(crate) congested: bool,
     /// Publisher acks held until this session drains.
     pub(crate) waiters: Vec<Waiter>,
-    /// Packet IDs in use, allocated on first QoS 1/2 delivery.
+    /// Packet IDs in use. IDs go out in order, so the inflight window holds
+    /// them in order and the next ID is free unless it wraps around to the
+    /// oldest. Only then is this built, until the window empties.
     in_use: Option<Box<[u64; 1024]>>,
     /// Copies of messages held long.
     pub(crate) arena: Arena,
@@ -164,6 +166,9 @@ impl Session {
         }
         if self.spare.capacity() > IDLE_BUFFER {
             self.spare = Vec::new();
+        }
+        if self.inflight.is_empty() {
+            self.in_use = None;
         }
     }
 
@@ -258,7 +263,21 @@ impl Session {
     }
 
     fn alloc_pkid(&mut self) -> u16 {
-        let bits = self.in_use.get_or_insert_with(|| Box::new([0; 1024]));
+        if self.in_use.is_none() {
+            let id = self.next_pkid.wrapping_add(1).max(1);
+            if self.inflight.front().is_none_or(|f| f.pkid != id) {
+                self.next_pkid = id;
+                return id;
+            }
+        }
+        let inflight = &self.inflight;
+        let bits = self.in_use.get_or_insert_with(|| {
+            let mut bits = Box::new([0; 1024]);
+            for f in inflight {
+                bits[usize::from(f.pkid >> 6)] |= 1u64 << (f.pkid & 63);
+            }
+            bits
+        });
         loop {
             self.next_pkid = self.next_pkid.wrapping_add(1).max(1);
             let id = self.next_pkid;
@@ -435,5 +454,51 @@ impl<'a> Fields<'a> {
             sub_id: item.sub_id,
             expires_at: item.msg.expires_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item() -> Queued {
+        Queued {
+            msg: Msg::new("t", b"x", &[], QoS::AtLeastOnce, false),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            sub_id: SubIds::default(),
+        }
+    }
+
+    fn ids(s: &Session) -> Vec<u16> {
+        s.inflight.iter().map(|f| f.pkid).collect()
+    }
+
+    /// One message stays unacked while others pass by more than all IDs:
+    /// IDs stay unique, and in order again once the window empties.
+    #[test]
+    fn pkids_skip_unacked_after_wrapping() {
+        let mut s = Session::new("c".into(), Version::V5);
+        s.send_inflight(item());
+        let stuck = s.inflight[0].pkid;
+        for n in 0..140_000 {
+            s.send_inflight(item());
+            s.send_inflight(item());
+            let mut v = ids(&s);
+            v.sort_unstable();
+            v.dedup();
+            assert_eq!(v.len(), s.inflight.len(), "after {n}");
+            // Ack the older of the two new ones, out of order.
+            s.on_puback(s.inflight[1].pkid);
+            s.on_puback(s.inflight[1].pkid);
+        }
+        assert!(s.in_use.is_some());
+        s.on_puback(stuck);
+        s.trim_buffers();
+        assert!(s.in_use.is_none());
+        s.send_inflight(item());
+        s.send_inflight(item());
+        let v = ids(&s);
+        assert_eq!(v[1], v[0].wrapping_add(1).max(1));
     }
 }

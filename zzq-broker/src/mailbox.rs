@@ -129,6 +129,25 @@ impl<T> Mailbox<T> {
             .await
     }
 
+    /// Queues `item` if there is room. Hands it back while the mailbox is
+    /// full; drops it once closed.
+    pub(crate) fn try_send(&self, item: T) -> Result<(), T> {
+        let mut st = self.shared.lock();
+        if st.closed {
+            return Ok(());
+        }
+        if st.items.len() >= self.shared.cap {
+            return Err(item);
+        }
+        let wake = st.items.is_empty();
+        st.items.push(item);
+        drop(st);
+        if wake {
+            self.shared.ready.mark();
+        }
+        Ok(())
+    }
+
     /// Refuses further items. The lane still gets those queued.
     pub(crate) fn close(&self) {
         self.shared.close();

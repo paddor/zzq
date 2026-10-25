@@ -88,6 +88,20 @@ impl<T> Slab<T> {
         self.len
     }
 
+    /// Slots used so far; keys name only slots below this.
+    pub(crate) const fn slots(&self) -> u32 {
+        self.slots.len() as u32
+    }
+
+    /// The key of the entry in `slot`, if any.
+    pub(crate) fn key_at(&self, slot: u32) -> Option<Key> {
+        let s = self.slots.get(slot as usize)?;
+        s.value.as_ref().map(|_| Key {
+            slot,
+            generation: s.generation,
+        })
+    }
+
     pub(crate) fn keys(&self) -> impl Iterator<Item = Key> + '_ {
         self.slots.iter().enumerate().filter_map(|(i, s)| {
             s.value.as_ref().map(|_| Key {

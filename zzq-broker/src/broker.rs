@@ -24,8 +24,9 @@ use crate::{Error, Result};
 
 /// Batches in flight to one lane before senders wait.
 const DATA_BATCHES: usize = 64;
-/// Interval of keep alive and session expiry checks.
-const SWEEP: Duration = Duration::from_secs(1);
+/// Interval of keep alive and session expiry checks, each over a part of
+/// the sessions, so a lane with many does not stall for one long sweep.
+const SWEEP: Duration = Duration::from_millis(1000 / crate::lane::SWEEP_PARTS as u64);
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -36,6 +37,34 @@ thread_local! {
 /// Sends batches for other lanes collected on `lane`. Waits while a target
 /// lane is full, which slows the caller down instead of dropping.
 pub(crate) async fn ship(lane: &LaneRef) {
+    if !try_ship(lane) {
+        // Boxed, so the rare wait does not size every connection's future.
+        Box::pin(ship_waiting(lane)).await;
+    }
+}
+
+/// Ships what goes without waiting. False if a batch is left that must
+/// wait: its lane is full, or another task waits to ship.
+fn try_ship(lane: &LaneRef) -> bool {
+    let mut l = lane.borrow_mut();
+    if !l.has_remote() {
+        return true;
+    }
+    let shipping = l.shipping.clone();
+    let Ok(_turn) = shipping.try_lock() else {
+        return false;
+    };
+    let shared = l.shared.clone();
+    while let Some((target, batch)) = l.next_remote() {
+        if let Err(batch) = shared.lanes[target].data.try_send(batch) {
+            l.unship(target, batch);
+            return false;
+        }
+    }
+    true
+}
+
+async fn ship_waiting(lane: &LaneRef) {
     let (shared, shipping) = {
         let l = lane.borrow();
         if !l.has_remote() {
