@@ -26,3 +26,6 @@ Notable changes to zzq. The format follows
 - `zzq-bench`: `zzq_chart` shows broker and client CPU under each panel,
   and `zzq_chart fixed` draws latency, CPU and memory of brokers at fixed
   load with many connections.
+- `zzq-client`, `zzq-broker`: `publish` and `publish_retained` take any
+  `AsRef<[u8]>` payload, so a borrowed or reused buffer needs no
+  allocation.

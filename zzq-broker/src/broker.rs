@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use tokio::sync::oneshot;
 use zzq_proto::QoS;
 use zzq_proto::topic::validate_name;
@@ -240,8 +239,8 @@ impl Broker {
     ///
     /// [`Error::InvalidTopic`] for a topic clients could not publish to, and
     /// [`Error::TooLarge`] for a message MQTT cannot carry.
-    pub fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, &payload.into(), qos, false)
+    pub fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.as_ref(), qos, false)
     }
 
     /// Publishes a retained message as the broker itself. An empty payload
@@ -250,11 +249,11 @@ impl Broker {
     /// # Errors
     ///
     /// As [`Broker::publish`].
-    pub fn publish_retained(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, &payload.into(), qos, true)
+    pub fn publish_retained(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.as_ref(), qos, true)
     }
 
-    fn send_publish(&self, topic: &str, payload: &Bytes, qos: QoS, retain: bool) -> Result<()> {
+    fn send_publish(&self, topic: &str, payload: &[u8], qos: QoS, retain: bool) -> Result<()> {
         validate_name(topic).map_err(|_| Error::InvalidTopic(topic.to_owned()))?;
         if crate::msg::too_deep(topic, self.shared.opts.max_topic_levels) {
             return Err(Error::InvalidTopic(topic.to_owned()));

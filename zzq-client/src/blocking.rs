@@ -21,7 +21,6 @@ use std::pin::pin;
 use std::sync::Arc;
 use std::task::{self, Poll, Wake, Waker};
 
-use bytes::Bytes;
 use zzq_proto::{QoS, SubscriptionOptions};
 use zzq_tokio::Context;
 
@@ -110,8 +109,8 @@ impl Client {
     ///
     /// As [`crate::Client::publish`], and [`Error::InAsync`] inside an async
     /// runtime.
-    pub fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, &payload.into(), qos, false)
+    pub fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.as_ref(), qos, false)
     }
 
     /// Publishes a retained message: the broker keeps it for later
@@ -120,8 +119,8 @@ impl Client {
     /// # Errors
     ///
     /// As [`Client::publish`].
-    pub fn publish_retained(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, &payload.into(), qos, true)
+    pub fn publish_retained(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.as_ref(), qos, true)
     }
 
     fn send_publish(&self, topic: &str, payload: &[u8], qos: QoS, retain: bool) -> Result<()> {

@@ -373,15 +373,16 @@ impl Client {
     }
 
     /// Publishes. QoS 0 returns once queued, waiting while about 1 MiB is
-    /// queued already; QoS 1 and 2 wait for the ack.
+    /// queued already; QoS 1 and 2 wait for the ack. The payload is copied
+    /// into the queue, so a borrowed or reused buffer works.
     ///
     /// # Errors
     ///
     /// [`Error::InvalidTopic`] or [`Error::TooLarge`] for a message MQTT
     /// cannot carry, [`Error::Rejected`] if the broker refuses it, and
     /// [`Error::Closed`] once the client is gone.
-    pub async fn publish(&self, topic: &str, payload: impl Into<Bytes>, qos: QoS) -> Result<()> {
-        self.send_publish(topic, payload.into(), qos, false).await
+    pub async fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
+        self.send_publish(topic, payload.as_ref(), qos, false).await
     }
 
     /// Publishes a retained message: the broker keeps it for later
@@ -393,20 +394,20 @@ impl Client {
     pub async fn publish_retained(
         &self,
         topic: &str,
-        payload: impl Into<Bytes>,
+        payload: impl AsRef<[u8]>,
         qos: QoS,
     ) -> Result<()> {
-        self.send_publish(topic, payload.into(), qos, true).await
+        self.send_publish(topic, payload.as_ref(), qos, true).await
     }
 
     async fn send_publish(
         &self,
         topic: &str,
-        payload: Bytes,
+        payload: &[u8],
         qos: QoS,
         retain: bool,
     ) -> Result<()> {
-        match self.link.publish(topic, &payload, qos, retain).await? {
+        match self.link.publish(topic, payload, qos, retain).await? {
             Some(wait) => wait.await,
             None => Ok(()),
         }
