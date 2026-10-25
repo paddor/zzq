@@ -52,3 +52,20 @@ async fn a_handle_keeps_publishing_once_the_client_is_dropped() {
     let m = timeout(WAIT, reader.recv()).await.unwrap().unwrap();
     assert_eq!(m.payload, "still here");
 }
+
+#[tokio::test]
+async fn a_handle_disconnects_a_receiving_client() {
+    let (ctx, _broker, uri) = setup("handle-close").await;
+    let mut c = Client::connect(&ctx, &uri, ClientOptions::new("closing"))
+        .await
+        .unwrap();
+    let h = c.handle();
+    let receiving = tokio::spawn(async move { c.recv().await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    timeout(WAIT, h.disconnect()).await.unwrap();
+    assert!(timeout(WAIT, receiving).await.unwrap().unwrap().is_none());
+    assert!(matches!(
+        h.publish("t", "x", QoS::AtMostOnce).await,
+        Err(zzq_client::Error::Closed)
+    ));
+}

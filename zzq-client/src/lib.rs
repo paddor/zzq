@@ -436,6 +436,21 @@ impl Handle {
         self.link.send(cmd)?;
         rx.await.map_err(|_| Error::Closed)?
     }
+
+    /// As [`Client::disconnect_with`], while the client may be receiving
+    /// elsewhere: its [`Client::recv`] then returns `None`.
+    pub async fn disconnect_with(&self, reason: ReasonCode) {
+        let (tx, rx) = oneshot::channel();
+        if self.link.send(Cmd::Disconnect { reason, done: tx }).is_ok() {
+            let _ = rx.await;
+        }
+    }
+
+    /// As [`Client::disconnect`], while the client may be receiving
+    /// elsewhere.
+    pub async fn disconnect(&self) {
+        self.disconnect_with(ReasonCode::SUCCESS).await;
+    }
 }
 
 /// The ack of a publish from [`Handle::enqueue`]: ready at once for QoS 0,
@@ -569,15 +584,7 @@ impl Client {
     /// Sends DISCONNECT and closes. [`ReasonCode::DISCONNECT_WITH_WILL`]
     /// asks a v5 broker for the will.
     pub async fn disconnect_with(self, reason: ReasonCode) {
-        let (tx, rx) = oneshot::channel();
-        if self
-            .handle
-            .link
-            .send(Cmd::Disconnect { reason, done: tx })
-            .is_ok()
-        {
-            let _ = rx.await;
-        }
+        self.handle.disconnect_with(reason).await;
     }
 
     /// Sends DISCONNECT and closes.

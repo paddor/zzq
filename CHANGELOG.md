@@ -33,3 +33,5 @@ Notable changes to zzq. The format follows
   and subscribes from other tasks while the client receives, and
   `Handle::enqueue` queues a publish and returns its ack as a separate
   `Acked` future.
+- `zzq-client`: `Handle::disconnect` closes the connection while the client
+  waits in `recv`, which then returns `None`.
