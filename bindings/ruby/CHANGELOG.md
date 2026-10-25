@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 - zzq is now a binding to the zzq Rust crates, built as a native
-  extension with rb-sys. It needs Rust 1.93 to install and Ruby 3.3.
+  extension with rb-sys. It needs Rust 1.93 to install and Ruby 3.4.
 - Calls no longer need an Async task: they wait under any fiber
   scheduler, and release the GVL in plain threads.
 - `Client#receive` and `Client#each` take messages from one inbox per
