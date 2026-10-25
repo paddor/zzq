@@ -123,7 +123,12 @@ impl Sender {
     }
 
     /// Queues a publish unless the queue is full.
-    fn try_publish(&self, h: &PublishHeader<'_>, payload: &[u8], slot: usize) -> Result<bool> {
+    pub(crate) fn try_publish(
+        &self,
+        h: &PublishHeader<'_>,
+        payload: &[u8],
+        slot: usize,
+    ) -> Result<bool> {
         let mut st = self.shared.lock();
         if st.ended {
             return Err(Error::Closed);

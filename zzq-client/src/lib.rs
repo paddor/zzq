@@ -265,14 +265,17 @@ impl Link {
             pkid: 0,
             properties: &[],
         };
-        if qos == QoS::AtMostOnce {
-            self.submit.publish(&h, payload, 0).await?;
-            return Ok(None);
+        let mut wait = (qos != QoS::AtMostOnce).then(|| acks::AckWait::new(&self.acks));
+        let slot = wait.as_ref().map_or(0, acks::AckWait::slot);
+        // Most publishes find room. The wait for room is boxed, so their
+        // future stays small: the caller moves it on every publish.
+        if !self.submit.try_publish(&h, payload, slot)? {
+            Box::pin(self.submit.publish(&h, payload, slot)).await?;
         }
-        let mut wait = acks::AckWait::new(&self.acks);
-        self.submit.publish(&h, payload, wait.slot()).await?;
-        wait.queued();
-        Ok(Some(wait))
+        if let Some(wait) = &mut wait {
+            wait.queued();
+        }
+        Ok(wait)
     }
 
     fn send(&self, cmd: Cmd) -> Result<()> {
