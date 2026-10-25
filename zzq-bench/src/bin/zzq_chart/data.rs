@@ -55,6 +55,8 @@ pub(crate) struct BrokerRow {
     pub(crate) p50_us: Option<f64>,
     pub(crate) p99_us: Option<f64>,
     pub(crate) p999_us: Option<f64>,
+    /// Broker CPU over the measurement, in percent of one core.
+    pub(crate) cpu_pct: Option<f64>,
 }
 
 /// One client result.
@@ -69,6 +71,32 @@ pub(crate) struct ClientRow {
     pub(crate) qos: u8,
     pub(crate) msg_size: u64,
     pub(crate) msgs_s: f64,
+    /// Client CPU over its run, in percent of one core.
+    pub(crate) cpu_pct: Option<f64>,
+}
+
+/// One step of a fixed-load run.
+#[derive(Debug, Deserialize)]
+pub(crate) struct FixedRow {
+    pub(crate) run_id: String,
+    #[serde(rename = "impl")]
+    pub(crate) impl_name: String,
+    pub(crate) version: Option<String>,
+    pub(crate) config: String,
+    pub(crate) scenario: String,
+    /// Offered deliveries per second.
+    pub(crate) offered_s: u64,
+    /// Delivered messages per second.
+    pub(crate) msgs_s: f64,
+    pub(crate) p50_us: f64,
+    pub(crate) p99_us: f64,
+    pub(crate) p999_us: f64,
+    pub(crate) cpu_pct: Option<f64>,
+    pub(crate) rss_mib: Option<f64>,
+    /// Connections the broker closed, or that never connected.
+    #[serde(default)]
+    pub(crate) closed: u64,
+    pub(crate) failed: bool,
 }
 
 /// Keeps the row of the newest run per key. A tie goes to the later row.

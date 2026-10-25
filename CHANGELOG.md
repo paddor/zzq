@@ -23,3 +23,6 @@ Notable changes to zzq. The format follows
   `~/.cache/zzq`.
 - `zzq-tokio`: `Config::spin`, how long a lane keeps polling after work
   before it sleeps, 40 µs by default. `zzq_broker --spin-us` sets it.
+- `zzq-bench`: `zzq_chart` shows broker and client CPU under each panel,
+  and `zzq_chart fixed` draws latency, CPU and memory of brokers at fixed
+  load with many connections.
