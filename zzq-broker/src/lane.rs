@@ -2,6 +2,7 @@
 //! index, and the packet handling for its connections.
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -181,9 +182,8 @@ pub(crate) struct Lane {
     pub(crate) stats: LaneStats,
     /// What connections without a buffer of their own read into.
     pub(crate) read_blocks: ReadBlocks,
-    /// Calls of [`Lane::sweep`] so far, and the session slot it goes on at.
+    /// Calls of [`Lane::sweep`] so far.
     sweeps: u32,
-    sweep_at: u32,
     next_conn_id: u64,
     next_client_no: u64,
     next_will_id: u64,
@@ -210,7 +210,6 @@ impl Lane {
             stats: LaneStats::default(),
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
-            sweep_at: 0,
             next_conn_id: 0,
             next_client_no: 0,
             next_will_id: 0,
@@ -1232,22 +1231,17 @@ impl Lane {
     /// Keep alive timeouts and session expiry, for the next of
     /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
+        let part = self.sweeps % SWEEP_PARTS;
+        self.sweeps = self.sweeps.wrapping_add(1);
         // The retained store is shared; one lane, once a round, is enough.
-        if self.id == 0 && self.sweeps.is_multiple_of(SWEEP_PARTS) {
+        if self.id == 0 && part == 0 {
             self.shared
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .sweep(now);
         }
-        self.sweeps = self.sweeps.wrapping_add(1);
-        let slots = self.sessions.slots();
-        if self.sweep_at >= slots {
-            self.sweep_at = 0;
-        }
-        let end = (self.sweep_at + slots.div_ceil(SWEEP_PARTS)).min(slots);
-        let from = std::mem::replace(&mut self.sweep_at, end);
-        for slot in from..end {
+        for slot in sweep_part(part, self.sessions.slots()) {
             let Some(key) = self.sessions.key_at(slot) else {
                 continue;
             };
@@ -1475,4 +1469,30 @@ fn may_subscribe(acl: Option<&dyn Authorizer>, s: &Session, filter: &str) -> boo
 /// Retain Handling. Shared subscriptions never do.
 fn retained_wanted(filter: &str, opts: SubscriptionOptions, existed: bool) -> bool {
     !is_shared(filter) && (opts.retain_handling == 0 || (opts.retain_handling == 1 && !existed))
+}
+
+/// The session slots that sweep `part` of a round covers: its share of
+/// `slots`, so each slot is swept once a round, however few there are.
+fn sweep_part(part: u32, slots: u32) -> Range<u32> {
+    let step = slots.div_ceil(SWEEP_PARTS);
+    let from = part.saturating_mul(step).min(slots);
+    from..from.saturating_add(step).min(slots)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweep_parts_cover_each_slot_once_a_round() {
+        for slots in [0, 1, 2, 19, 20, 21, 41, 1000, 20_001] {
+            let mut swept = vec![0u8; slots as usize];
+            for part in 0..SWEEP_PARTS {
+                for slot in sweep_part(part, slots) {
+                    swept[slot as usize] += 1;
+                }
+            }
+            assert!(swept.iter().all(|&n| n == 1), "{slots} slots");
+        }
+    }
 }
