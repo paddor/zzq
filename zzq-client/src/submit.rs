@@ -110,16 +110,13 @@ impl Sender {
         payload: &[u8],
         slot: usize,
     ) -> Result<()> {
-        while !self.try_publish(h, payload, slot)? {
-            // Look again after reading the generation, so a change cannot
-            // slip past.
-            let seen = self.shared.room.generation();
-            if self.try_publish(h, payload, slot)? {
-                break;
-            }
-            self.shared.room.changed_after(seen).await;
-        }
-        Ok(())
+        self.shared
+            .room
+            .until(|| match self.try_publish(h, payload, slot) {
+                Ok(false) => None,
+                done => Some(done.map(drop)),
+            })
+            .await
     }
 
     /// Queues a publish unless the queue is full.
@@ -205,12 +202,10 @@ impl Receiver {
     /// Swaps the queued requests into `batch`, which should be empty.
     /// Returns whether the handle is gone, so no more will come.
     pub(crate) fn take(&self, batch: &mut Batch) -> bool {
-        self.shared.ready.begin_drain();
         let mut st = self.shared.lock();
         std::mem::swap(&mut st.batch, batch);
         let dropped = st.dropped;
         drop(st);
-        self.shared.ready.clear_after(true);
         if batch.bytes.len() >= QUEUED {
             self.shared.room.notify_changed();
         }
@@ -225,12 +220,7 @@ impl Receiver {
     /// Takes a queued DISCONNECT out of the queue. The other requests stay
     /// for the next connection and wake no one until it takes them.
     pub(crate) fn take_disconnect(&self) -> Option<oneshot::Sender<()>> {
-        self.shared.ready.begin_drain();
-        let mut st = self.shared.lock();
-        let done = Self::remove_disconnect(&mut st);
-        drop(st);
-        self.shared.ready.clear_after(true);
-        done
+        Self::remove_disconnect(&mut self.shared.lock())
     }
 
     fn remove_disconnect(st: &mut State) -> Option<oneshot::Sender<()>> {

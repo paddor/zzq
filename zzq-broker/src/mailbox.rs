@@ -92,27 +92,27 @@ impl<T> Mailbox<T> {
     /// Queues `item`, waiting while the mailbox is full. Hands it back once
     /// the mailbox is closed.
     pub(crate) async fn send(&self, item: T) -> Result<(), T> {
-        loop {
-            // Read before looking, so room made in between is not missed.
-            let seen = self.shared.room.generation();
-            {
+        let mut item = Some(item);
+        self.shared
+            .room
+            .until(|| {
                 let mut st = self.shared.lock();
                 if st.closed {
-                    return Err(item);
+                    return item.take().map(Err);
                 }
                 if st.items.len() < self.shared.cap {
                     let wake = st.items.is_empty();
-                    st.items.push(item);
+                    st.items.extend(item.take());
                     drop(st);
                     if wake {
                         self.shared.ready.mark();
                     }
-                    return Ok(());
+                    return Some(Ok(()));
                 }
                 st.full = true;
-            }
-            self.shared.room.changed_after(seen).await;
-        }
+                None
+            })
+            .await
     }
 
     /// Refuses further items. The lane still gets those queued.
@@ -140,14 +140,12 @@ impl<T> Receiver<T> {
     /// empty.
     pub(crate) async fn recv_all(&self, out: &mut Vec<T>) -> bool {
         loop {
-            self.shared.ready.begin_drain();
             let (full, closed) = {
                 let mut st = self.shared.lock();
                 // Swapping hands the emptied vector back for reuse.
                 std::mem::swap(&mut st.items, out);
                 (std::mem::take(&mut st.full), st.closed)
             };
-            self.shared.ready.clear_after(true);
             if full {
                 self.shared.room.notify_changed();
             }

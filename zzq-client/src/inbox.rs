@@ -122,7 +122,6 @@ impl Sender {
     /// Queues the batch, waiting for room as needed.
     pub(crate) async fn flush(&mut self) -> Result<(), Dropped> {
         while !self.batch.is_empty() {
-            self.shared.room.begin_drain();
             let (filled, waiting) = {
                 let mut st = self.shared.lock();
                 if st.dropped {
@@ -143,7 +142,6 @@ impl Sender {
                 st.waiting = !self.batch.is_empty();
                 (filled, st.waiting)
             };
-            self.shared.room.clear_after(true);
             // The lock orders pushes and takes, so only the push into an
             // empty queue needs to wake the handle.
             if filled {
@@ -164,9 +162,7 @@ impl Sender {
 
     /// Swaps the acks to send into `acks`, which should be empty.
     pub(crate) fn take_acks(&self, acks: &mut Vec<(u16, QoS)>) {
-        self.shared.acked.begin_drain();
         std::mem::swap(&mut self.shared.lock().acks, acks);
-        self.shared.acked.clear_after(true);
     }
 }
 
@@ -211,14 +207,12 @@ impl Receiver {
                 }
                 return Some(m);
             }
-            self.shared.ready.begin_drain();
             let (room, closed) = {
                 let mut st = self.shared.lock();
                 std::mem::swap(&mut st.queue, &mut self.batch);
                 let room = !self.batch.is_empty() && std::mem::take(&mut st.waiting);
                 (room, st.closed)
             };
-            self.shared.ready.clear_after(true);
             if room {
                 self.shared.room.mark();
             }
