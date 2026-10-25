@@ -514,6 +514,7 @@ fn broker_child(lanes: usize, busy: bool) -> ExitCode {
             io_threads: lanes,
             name: "zzq-perf".to_owned(),
             busy_poll: busy,
+            ..zzq_broker::Config::default()
         };
         let Ok(ctx) = zzq_broker::Context::with_config(&cfg) else {
             return ExitCode::FAILURE;

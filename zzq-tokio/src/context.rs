@@ -1,9 +1,12 @@
 //! IO lanes.
 
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::pin::{Pin, pin};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::task::{self, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, ThreadId};
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -22,6 +25,10 @@ pub struct Config {
     /// Lanes poll for IO without sleeping: lower latency, at the cost of
     /// one busy core per lane.
     pub busy_poll: bool,
+    /// After its tasks ran, a lane polls on for this long before it sleeps,
+    /// so a wake from another thread finds it awake. Costs CPU while
+    /// traffic is sparse. Zero sleeps at once.
+    pub spin: Duration,
 }
 
 impl Default for Config {
@@ -30,6 +37,7 @@ impl Default for Config {
             io_threads: 1,
             name: "zzq".to_owned(),
             busy_poll: false,
+            spin: Duration::from_micros(40),
         }
     }
 }
@@ -167,10 +175,10 @@ impl Context {
             let (tx, rx) = mpsc::unbounded_channel();
             let stop = Arc::new(Notify::new());
             let stop2 = stop.clone();
-            let busy = config.busy_poll;
+            let (busy, spin) = (config.busy_poll, config.spin);
             let handle = thread::Builder::new()
                 .name(format!("{}-io-{index}", config.name))
-                .spawn(move || lane_main(rx, &stop2, busy))?;
+                .spawn(move || lane_main(rx, &stop2, busy, spin))?;
             threads.push((handle.thread().id(), handle));
             lanes.push(Lane {
                 handle: LaneHandle { index, tx },
@@ -209,7 +217,7 @@ impl Context {
     }
 }
 
-fn lane_main(mut rx: mpsc::UnboundedReceiver<Job>, stop: &Notify, busy: bool) {
+fn lane_main(mut rx: mpsc::UnboundedReceiver<Job>, stop: &Notify, busy: bool, spin: Duration) {
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder.enable_all();
     if busy {
@@ -219,7 +227,7 @@ fn lane_main(mut rx: mpsc::UnboundedReceiver<Job>, stop: &Notify, busy: bool) {
         return;
     };
     let local = tokio::task::LocalSet::new();
-    local.block_on(&rt, async move {
+    let lane = pin!(local.run_until(async move {
         if busy {
             // Always runnable, so the runtime polls IO without parking.
             tokio::task::spawn_local(async {
@@ -238,7 +246,78 @@ fn lane_main(mut rx: mpsc::UnboundedReceiver<Job>, stop: &Notify, busy: bool) {
                 },
             }
         }
-    });
+    }));
+    if busy || spin.is_zero() {
+        rt.block_on(lane);
+    } else {
+        rt.block_on(Spin {
+            lane,
+            window: spin,
+            until: Instant::now(),
+            activity: None,
+        });
+    }
+}
+
+/// Runs a lane, polling on for `window` after its tasks last ran instead of
+/// sleeping at once.
+struct Spin<'a, F> {
+    lane: Pin<&'a mut F>,
+    window: Duration,
+    until: Instant,
+    /// Wraps the runtime's waker. Built on the first poll.
+    activity: Option<(Arc<Activity>, Waker)>,
+}
+
+/// Notes that the lane's tasks were woken, then wakes the runtime.
+struct Activity {
+    woken: AtomicBool,
+    runtime: Waker,
+}
+
+impl Wake for Activity {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.woken.store(true, Ordering::Relaxed);
+        self.runtime.wake_by_ref();
+    }
+}
+
+impl<F: Future> Future for Spin<'_, F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<F::Output> {
+        let this = &mut *self;
+        // The runtime's waker stays the same for the whole `block_on`.
+        let (activity, waker) = this.activity.get_or_insert_with(|| {
+            let a = Arc::new(Activity {
+                woken: AtomicBool::new(false),
+                runtime: cx.waker().clone(),
+            });
+            (a.clone(), Waker::from(a))
+        });
+        let woken = activity.woken.swap(false, Ordering::Relaxed);
+        if let Poll::Ready(out) = this
+            .lane
+            .as_mut()
+            .poll(&mut task::Context::from_waker(waker))
+        {
+            return Poll::Ready(out);
+        }
+        let now = Instant::now();
+        if woken {
+            this.until = now + this.window;
+        }
+        if now < this.until {
+            // Stays runnable, so the runtime polls IO without sleeping. A
+            // wake from within the runtime costs no syscall.
+            cx.waker().wake_by_ref();
+        }
+        Poll::Pending
+    }
 }
 
 #[cfg(test)]
@@ -290,5 +369,34 @@ mod tests {
             .unwrap();
         rx.await.unwrap();
         drop(ctx);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_spinning_lane_sleeps_once_idle() {
+        // CPU time of a thread, in clock ticks.
+        fn cpu(task: &str) -> u64 {
+            let stat = std::fs::read_to_string(format!("/proc/self/task/{task}/stat")).unwrap();
+            let fields: Vec<&str> = stat.rsplit_once(") ").unwrap().1.split(' ').collect();
+            fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
+        }
+
+        let ctx = Context::with_config(&Config {
+            spin: Duration::from_millis(50),
+            ..Config::default()
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        // Wakes the parked lane, which then spins.
+        let task = ctx
+            .lane(0)
+            .call(|| std::fs::read_link("/proc/thread-self").unwrap())
+            .await
+            .unwrap();
+        let task = task.file_name().unwrap().to_str().unwrap().to_owned();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let before = cpu(&task);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(cpu(&task) - before <= 3, "idle lane still spins");
     }
 }

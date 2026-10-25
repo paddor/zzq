@@ -1,14 +1,16 @@
 //! Standalone broker.
 //!
 //! Usage: `zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM]
-//! [--client-ca PEM] [--retained-file PATH] [--busy-poll]`
+//! [--client-ca PEM] [--retained-file PATH] [--busy-poll] [--spin-us N]`
 //!
 //! `--cert` and `--key` enable `tls://`, `wss://` and `quic://` binds.
 //! `--client-ca` makes them require client certificates. `--retained-file`
-//! keeps retained messages across restarts. Prints each bound endpoint on
+//! keeps retained messages across restarts. `--spin-us` sets how long a lane
+//! polls on after work before it sleeps. Prints each bound endpoint on
 //! its own line, then runs until killed.
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use zzq_broker::{Broker, BrokerOptions, Config, Context};
 
@@ -20,6 +22,7 @@ struct Args {
     client_ca: Option<String>,
     retained_file: Option<String>,
     busy_poll: bool,
+    spin: Duration,
 }
 
 fn parse() -> Option<Args> {
@@ -31,6 +34,7 @@ fn parse() -> Option<Args> {
         client_ca: None,
         retained_file: None,
         busy_poll: false,
+        spin: Config::default().spin,
     };
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -46,6 +50,7 @@ fn parse() -> Option<Args> {
             "--key" => a.key = Some(value),
             "--client-ca" => a.client_ca = Some(value),
             "--retained-file" => a.retained_file = Some(value),
+            "--spin-us" => a.spin = Duration::from_micros(value.parse().ok()?),
             _ => return None,
         }
     }
@@ -104,6 +109,7 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
         io_threads: a.lanes,
         name: "zzq".to_owned(),
         busy_poll: a.busy_poll,
+        spin: a.spin,
     };
     let ctx = Context::with_config(&config).map_err(|e| format!("context: {}", chain(&e)))?;
     let broker = Broker::new(&ctx, opts)
@@ -124,7 +130,7 @@ fn main() -> ExitCode {
     let Some(args) = parse() else {
         eprintln!(
             "usage: zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM] \
-             [--client-ca PEM] [--retained-file PATH] [--busy-poll]"
+             [--client-ca PEM] [--retained-file PATH] [--busy-poll] [--spin-us N]"
         );
         return ExitCode::FAILURE;
     };

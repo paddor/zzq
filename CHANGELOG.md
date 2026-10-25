@@ -21,3 +21,5 @@ Notable changes to zzq. The format follows
 - `zzq-bench`: load generator, local performance gates, and `zzq_chart`,
   which draws broker and client comparison charts from the result cache in
   `~/.cache/zzq`.
+- `zzq-tokio`: `Config::spin`, how long a lane keeps polling after work
+  before it sleeps, 40 µs by default. `zzq_broker --spin-us` sets it.
