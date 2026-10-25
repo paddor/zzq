@@ -9,10 +9,24 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use zzq_tokio::signal::{DataSignal, StateSignal};
 
+/// Keeps a value on cache lines of its own. x86 fetches lines in pairs.
+#[repr(align(128))]
+struct Line<T>(T);
+
+impl<T> std::ops::Deref for Line<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+/// The lock and the wake, which both lanes touch for every batch, each get
+/// their own lines.
 struct Shared<T> {
-    state: Mutex<State<T>>,
+    state: Line<Mutex<State<T>>>,
     /// For the lane: items queued, or the mailbox closed.
-    ready: DataSignal,
+    ready: Line<DataSignal>,
     /// For waiting senders: the lane took a full queue, or it closed.
     room: StateSignal,
     cap: usize,
@@ -42,12 +56,12 @@ impl<T> Shared<T> {
 /// queued.
 pub(crate) fn mailbox<T>(cap: usize) -> (Mailbox<T>, Receiver<T>) {
     let shared = Arc::new(Shared {
-        state: Mutex::new(State {
+        state: Line(Mutex::new(State {
             items: Vec::new(),
             full: false,
             closed: false,
-        }),
-        ready: DataSignal::new(),
+        })),
+        ready: Line(DataSignal::new()),
         room: StateSignal::new(),
         cap: cap.max(1),
     });
