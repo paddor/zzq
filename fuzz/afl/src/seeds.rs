@@ -17,6 +17,7 @@ pub fn for_target(name: &str) -> Vec<Vec<u8>> {
         "mqtt_sn" => mqtt_sn(),
         "websocket" => websocket(),
         "retained_log" => retained_log(),
+        "state_image" => zzq_broker::fuzzing::state_image_seeds(),
         "endpoint" => text(&[
             "tcp://localhost",
             "tls://[::1]:8883",

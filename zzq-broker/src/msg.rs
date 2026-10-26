@@ -62,6 +62,12 @@ impl Msg {
         unsafe { std::str::from_utf8_unchecked(b) }
     }
 
+    /// Bytes of topic, properties and payload.
+    #[inline]
+    pub(crate) const fn size(&self) -> usize {
+        (self.topic.1 + self.props.1 + self.payload.1) as usize
+    }
+
     #[inline]
     pub(crate) fn payload(&self) -> &[u8] {
         self.payload.get(&self.buf)
@@ -96,6 +102,11 @@ impl Msg {
         m
     }
 
+    /// Whether another handle shares the buffer.
+    pub(crate) fn is_shared(&self) -> bool {
+        !self.buf.is_unique()
+    }
+
     /// Whether the message shares `chunk`.
     pub(crate) fn pins(&self, chunk: &Bytes) -> bool {
         !self.buf.is_empty() && within(chunk, &self.buf)
@@ -126,6 +137,12 @@ impl Arena {
         }
         fill(&mut self.block);
         self.block.split().freeze()
+    }
+
+    /// Bytes left in the current block, which stays allocated while the
+    /// arena has room in it.
+    pub(crate) fn room(&self) -> usize {
+        self.block.capacity()
     }
 
     /// A copy of `msg` in the current block.

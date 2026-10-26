@@ -1,3 +1,4 @@
+use crate::property::Rules;
 use crate::{DecodeError, Properties, varint};
 
 /// Reads fields from a packet body that is already complete.
@@ -75,14 +76,15 @@ impl<'a> Cursor<'a> {
         utf8(b)
     }
 
-    /// v5 property block: varint length, then the properties.
+    /// v5 property block: varint length, then the properties, checked
+    /// against the packet's `rules`.
     #[inline]
-    pub(crate) fn properties(&mut self) -> Result<Properties<'a>, DecodeError> {
+    pub(crate) fn properties(&mut self, rules: Rules) -> Result<Properties<'a>, DecodeError> {
         let n = self.varint()?;
         if n == 0 {
             return Ok(Properties::EMPTY);
         }
-        Properties::try_from(self.bytes(n)?)
+        Properties::parse(self.bytes(n)?, rules)
     }
 }
 

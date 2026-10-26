@@ -92,6 +92,9 @@ pub(crate) struct LaneTx {
     pub(crate) control: Mailbox<Control>,
     /// Deliveries routed on other lanes.
     pub(crate) data: Mailbox<Vec<Remote>>,
+    /// Bytes the lane's sessions counted against `max_state_bytes` at its
+    /// last sweep.
+    pub(crate) state: AtomicUsize,
 }
 
 /// State shared by all lanes of one broker.
@@ -134,8 +137,17 @@ pub struct Stats {
     pub dropped_too_large: u64,
     /// Queued messages whose Message Expiry Interval ran out.
     pub dropped_expired: u64,
-    /// Retained messages not stored because `max_retained` was reached.
+    /// QoS 1/2 messages a session still held, queued or unacked, when it
+    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
+    pub dropped_session_ended: u64,
+    /// QoS 1/2 messages dropped instead of queued because
+    /// `max_state_bytes` was reached.
+    pub dropped_state_full: u64,
+    /// Retained messages not stored because `max_retained` or
+    /// `max_state_bytes` was reached.
     pub retained_rejected: u64,
+    /// Approximate bytes of state counted against `max_state_bytes`.
+    pub state_bytes: u64,
 }
 
 /// An MQTT broker. Dropping it stops listening and closes all connections.
@@ -150,7 +162,8 @@ impl Broker {
     /// # Errors
     ///
     /// [`Error::Persistence`] if stored retained messages cannot be loaded,
-    /// and [`Error::Transport`] if the lanes have stopped.
+    /// [`Error::State`] if the state file cannot be read, and
+    /// [`Error::Transport`] if the lanes have stopped.
     pub async fn new(ctx: &Context, opts: BrokerOptions) -> Result<Broker> {
         let n = ctx.lanes();
         let mut lanes = Vec::with_capacity(n);
@@ -161,6 +174,7 @@ impl Broker {
             lanes.push(LaneTx {
                 control: ctl_tx,
                 data: data_tx,
+                state: AtomicUsize::new(0),
             });
             receivers.push((ctl_rx, data_rx));
         }
@@ -175,11 +189,18 @@ impl Broker {
             connections: AtomicUsize::new(0),
             tasks: Mutex::default(),
         });
+        // Stops the lanes again when a later step fails.
+        let broker = Broker {
+            shared: shared.clone(),
+        };
         for (i, (ctl_rx, data_rx)) in receivers.into_iter().enumerate() {
             let s = shared.clone();
             ctx.lane(i)
                 .call(move || install(i as u16, s, ctl_rx, data_rx))
                 .await?;
+        }
+        if let Some(path) = &shared.opts.state_file {
+            crate::dump::load(&shared, path).await?;
         }
         if let Some(every) = shared.opts.sys_interval {
             let s = shared.clone();
@@ -193,7 +214,7 @@ impl Broker {
                 })
                 .await?;
         }
-        Ok(Broker { shared })
+        Ok(broker)
     }
 
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
@@ -284,10 +305,21 @@ impl Broker {
     }
 
     /// Stops the broker and waits until every lane has closed its
-    /// listeners and connections. Dropping the broker stops it too, but
-    /// without waiting.
-    pub async fn shutdown(self) {
+    /// listeners and connections. With [`BrokerOptions::state_file`], it
+    /// first closes every connection as lost, so wills go out as usual,
+    /// and writes the sessions there. Dropping the broker stops it too,
+    /// without waiting or writing state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the state file could not be written. The
+    /// broker stops anyway.
+    pub async fn shutdown(self) -> Result<()> {
         self.abort_tasks();
+        let saved = match &self.shared.opts.state_file {
+            Some(path) => crate::dump::save(&self.shared, path).await,
+            None => Ok(()),
+        };
         let mut done = Vec::with_capacity(self.shared.lanes.len());
         for lane in &self.shared.lanes {
             let (tx, rx) = oneshot::channel();
@@ -298,6 +330,7 @@ impl Broker {
         for rx in done {
             let _ = rx.await;
         }
+        saved
     }
 
     fn abort_tasks(&self) {
@@ -332,6 +365,9 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
         total.dropped_queue_full += s.dropped_queue_full;
         total.dropped_too_large += s.dropped_too_large;
         total.dropped_expired += s.dropped_expired;
+        total.dropped_session_ended += s.dropped_session_ended;
+        total.dropped_state_full += s.dropped_state_full;
+        total.state_bytes += s.state_bytes;
     }
     {
         let r = shared
@@ -340,6 +376,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
             .unwrap_or_else(PoisonError::into_inner);
         total.retained = r.len() as u64;
         total.retained_rejected = r.rejected;
+        total.state_bytes += r.bytes() as u64;
     }
     Ok(total)
 }
@@ -485,7 +522,12 @@ pub fn lane_for(client_id: &str, lanes: usize) -> usize {
 pub(crate) async fn admit(shared: Arc<Shared>, stream: zzq_tokio::transport::Stream) {
     let max = shared.opts.max_packet_size;
     let mut buf = bytes::BytesMut::new();
-    let done = |b: &[u8]| !matches!(zzq_proto::decode(b, zzq_proto::Version::V5, max), Ok(None));
+    // Stops at a whole CONNECT, a decode error, or a first byte that is not
+    // CONNECT, which the connection refuses without its body.
+    let done = |b: &[u8]| {
+        b.first().is_some_and(|&x| x >> 4 != 1)
+            || !matches!(zzq_proto::decode(b, zzq_proto::Version::V5, max), Ok(None))
+    };
     let read =
         tokio::time::timeout(shared.opts.connect_timeout, stream.prefetch(&mut buf, done)).await;
     let Ok(Ok(stream)) = read else {

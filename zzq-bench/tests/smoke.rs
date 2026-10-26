@@ -89,6 +89,39 @@ async fn the_load_generator_runs_from_the_command_line() {
 }
 
 #[test]
+fn the_ram_probe_measures_every_step() {
+    let exe = env!("CARGO_BIN_EXE_zzq_ramprobe");
+    let out = Command::new(exe)
+        .args([
+            "sessions=20",
+            "per=2",
+            "fanout=1",
+            "retained=30",
+            "sizes=100",
+        ])
+        .arg("sys=0.05")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    for (step, items) in [
+        ("offline session", 20),
+        ("queued 100 B", 40),
+        ("fanned-out entry 100 B", 20),
+        ("retained 100 B", 30),
+    ] {
+        let line = stdout.lines().find(|l| l.starts_with(step));
+        let shown = line.and_then(|l| l.split(" x ").next()?.split_whitespace().last());
+        assert_eq!(shown, Some(items.to_string().as_str()), "{stdout}");
+    }
+    assert_eq!(stdout.matches("estimate/RSS").count(), 4, "{stdout}");
+    for args in [&["nope"][..], &["sessions=1", "--", "true"]] {
+        let out = Command::new(exe).args(args).output().unwrap();
+        assert!(!out.status.success(), "{args:?}");
+    }
+}
+
+#[test]
 fn the_perf_gate_runs_one_case() {
     // The gate pins the broker and the load to separate CPUs.
     if std::thread::available_parallelism().map_or(1, usize::from) < 2 {

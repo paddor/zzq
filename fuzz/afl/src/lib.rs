@@ -11,11 +11,12 @@ use zzq_proto::{Packet, Version, decode, sn, topic};
 pub type Target = fn(&[u8]);
 
 /// Every target, by name.
-pub const TARGETS: [(&str, Target); 6] = [
+pub const TARGETS: [(&str, Target); 7] = [
     ("mqtt", mqtt),
     ("mqtt_sn", mqtt_sn),
     ("websocket", websocket),
     ("retained_log", retained_log),
+    ("state_image", state_image),
     ("endpoint", endpoint),
     ("topics", topics),
 ];
@@ -77,6 +78,16 @@ pub fn websocket(data: &[u8]) {
 /// A retained message log, as the broker replays it on start.
 pub fn retained_log(data: &[u8]) {
     zzq_broker::fuzzing::retained_log(data);
+}
+
+/// A state image, as the broker loads a dump. Restored sessions encode
+/// back to an image that decodes.
+///
+/// # Panics
+///
+/// When it finds a bug.
+pub fn state_image(data: &[u8]) {
+    zzq_broker::fuzzing::state_image(data);
 }
 
 /// An endpoint URI that parses prints back to one that parses the same.

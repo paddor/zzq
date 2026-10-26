@@ -257,6 +257,240 @@ async fn offline_queue_drops_oldest() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn offline_queue_drops_oldest_beyond_its_bytes() {
+    // Topic "q" and a one-byte payload.
+    let opts = BrokerOptions {
+        max_queued_bytes: 3 * 2,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let durable = ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        ..ClientOptions::new("d")
+    };
+    let c = Client::connect(&ctx, &uri, durable.clone()).await.unwrap();
+    c.subscribe("q", QoS::AtLeastOnce).await.unwrap();
+    c.disconnect().await;
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("p"))
+        .await
+        .unwrap();
+    for i in 0..5 {
+        p.publish("q", format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    // Larger than the whole queue may hold.
+    p.publish("q", "toolong", QoS::AtLeastOnce).await.unwrap();
+    let mut c = Client::connect(&ctx, &uri, durable).await.unwrap();
+    for i in 2..5 {
+        assert_eq!(next(&mut c).await.payload, format!("{i}"));
+    }
+    nothing(&mut c).await;
+    assert_eq!(broker.stats().await.unwrap().dropped_queue_full, 3);
+}
+
+/// Connects new sessions that outlive their connection until the state
+/// budget refuses one, then gives every lane time to see it full.
+async fn fill_state(ctx: &Context, uri: &str) {
+    for i in 0..100 {
+        let opts = ClientOptions {
+            session_expiry: 60,
+            ..ClientOptions::new(format!("fill{i}"))
+        };
+        match Client::connect(ctx, uri, opts).await {
+            Ok(c) => {
+                c.subscribe("fill", QoS::AtLeastOnce).await.unwrap();
+                c.disconnect().await;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(e) => {
+                assert!(
+                    matches!(e, zzq_client::Error::Refused(ReasonCode::QUOTA_EXCEEDED)),
+                    "{e:?}"
+                );
+                // Lanes check the budget 20 times a second.
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return;
+            }
+        }
+    }
+    unreachable!("the state budget never filled");
+}
+
+/// Polls the stats until `done` holds.
+async fn stats_until(broker: &Broker, done: impl Fn(&zzq_broker::Stats) -> bool) {
+    let polled = timeout(WAIT, async {
+        while !done(&broker.stats().await.unwrap()) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    assert!(polled.is_ok(), "{:?}", broker.stats().await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_state_budget_stops_growth_not_traffic() {
+    let opts = BrokerOptions {
+        max_state_bytes: 1,
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(2, opts).await;
+    let durable = ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        ..ClientOptions::new("d")
+    };
+    let d = Client::connect(&ctx, &uri, durable.clone()).await.unwrap();
+    d.subscribe("q", QoS::AtLeastOnce).await.unwrap();
+    d.disconnect().await;
+    fill_state(&ctx, &uri).await;
+    // Clean sessions still connect, and live QoS 1 still flows.
+    let mut live = Client::connect(&ctx, &uri, ClientOptions::new("live"))
+        .await
+        .unwrap();
+    live.subscribe("live", QoS::AtLeastOnce).await.unwrap();
+    live.publish("live", "x", QoS::AtLeastOnce).await.unwrap();
+    assert_eq!(next(&mut live).await.payload, "x");
+    // A message for the offline session would queue, so it is dropped.
+    live.publish("q", "dropped", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    // A retained message for a new topic is delivered, not stored.
+    live.publish_retained("live", "kept?", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    assert_eq!(next(&mut live).await.payload, "kept?");
+    stats_until(&broker, |s| {
+        s.dropped_state_full == 1 && (s.retained, s.retained_rejected) == (0, 1)
+    })
+    .await;
+    // Existing sessions resume.
+    let mut d = Client::connect(&ctx, &uri, durable).await.unwrap();
+    assert!(d.connected().session_present);
+    nothing(&mut d).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fanned_out_message_counts_once() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let durable = |i: usize| ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        ..ClientOptions::new(format!("s{i}"))
+    };
+    let n = 20;
+    for i in 0..n {
+        let c = Client::connect(&ctx, &uri, durable(i)).await.unwrap();
+        c.subscribe("all", QoS::AtLeastOnce).await.unwrap();
+        c.disconnect().await;
+    }
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("p"))
+        .await
+        .unwrap();
+    let before = broker.stats().await.unwrap().state_bytes;
+    let size = 4096;
+    p.publish("all", "x".repeat(size), QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let grown = broker.stats().await.unwrap().state_bytes - before;
+    // The bytes once, and a queue slot for each session.
+    assert!(
+        grown > size as u64 && grown < (n * size / 4) as u64,
+        "{grown}"
+    );
+    p.disconnect().await;
+    for i in 0..n {
+        let ended = ClientOptions {
+            clean_start: true,
+            session_expiry: 0,
+            ..durable(i)
+        };
+        Client::connect(&ctx, &uri, ended)
+            .await
+            .unwrap()
+            .disconnect()
+            .await;
+    }
+    // The last session to go takes the bytes back.
+    stats_until(&broker, |s| s.sessions == 0).await;
+    assert_eq!(broker.stats().await.unwrap().state_bytes, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retained_message_sent_on_subscribe_counts_once() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("p"))
+        .await
+        .unwrap();
+    let size = 8192;
+    p.publish_retained("r", "x".repeat(size), QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    // A subscriber that never acks holds the message in its window.
+    let mut s = Raw::connect(&uri, "s", Version::V311, 0).await;
+    let before = broker.stats().await.unwrap().state_bytes;
+    s.subscribe("r", QoS::AtLeastOnce).await;
+    let (byte1, _) = s.packet().await.expect("PUBLISH");
+    assert_eq!(byte1 >> 4, 3);
+    let grown = broker.stats().await.unwrap().state_bytes - before;
+    // The subscription and a slot; the store counts the bytes.
+    assert!(grown < (size / 4) as u64, "{grown}");
+    // Cleared from the store, the bytes count while the session holds them.
+    p.publish_retained("r", "", QoS::AtLeastOnce).await.unwrap();
+    let held = broker.stats().await.unwrap().state_bytes;
+    assert!(held > size as u64, "{held}");
+    drop(s);
+    p.disconnect().await;
+    // A sweep takes the bytes back once no session holds them.
+    stats_until(&broker, |s| s.sessions == 0 && s.state_bytes == 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn state_bytes_return_to_zero() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(2, opts).await;
+    let short = ClientOptions {
+        clean_start: false,
+        session_expiry: 1,
+        ..ClientOptions::new("short")
+    };
+    let c = Client::connect(&ctx, &uri, short).await.unwrap();
+    c.subscribe("q/#", QoS::AtLeastOnce).await.unwrap();
+    c.disconnect().await;
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("p"))
+        .await
+        .unwrap();
+    for i in 0..10 {
+        p.publish("q/x", format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    p.publish_retained("r", "kept", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let held = broker.stats().await.unwrap().state_bytes;
+    p.publish_retained("r", "", QoS::AtLeastOnce).await.unwrap();
+    p.disconnect().await;
+    assert!(held > 0);
+    // Once the session expired and the publisher left, nothing is held.
+    stats_until(&broker, |s| s.sessions == 0).await;
+    assert_eq!(broker.stats().await.unwrap().state_bytes, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unsuback_means_unsubscribed_on_every_lane() {
     let (ctx, _broker, uri) = setup(4, BrokerOptions::default()).await;
     let mut publishers = Vec::new();

@@ -2,16 +2,18 @@
 //!
 //! Thresholds are read from `.perf_hw`, which is intentionally ignored.
 //! Without that file, this command runs a smaller smoke gate. The broker and
-//! the load run in separate pinned child processes.
+//! the load run in separate pinned child processes. State memory cases each
+//! get a fresh broker child, as memory freed earlier hides what state costs.
 //!
 //! Env: `ZZQ_PERF_MEASURE_MS` (default 3000), `ZZQ_PERF_WARMUP_MS` (1000).
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::Duration;
 
+use zzq_bench::child;
 use zzq_bench::load::{self, Load, Scenario};
+use zzq_bench::ram::{self, Probe};
 use zzq_bench::wire;
 
 /// One measured case.
@@ -41,7 +43,23 @@ enum Kind {
     IdleMemory {
         conns: usize,
     },
+    /// Broker RSS per piece of state, bytes.
+    StateMemory(State),
 }
+
+/// State added to a fresh broker.
+#[derive(Clone, Copy)]
+enum State {
+    /// Offline sessions with two subscriptions each.
+    Session,
+    /// QoS 1 messages of 100 B, 10 for each of the offline sessions.
+    Queued,
+    /// Retained messages of 100 B.
+    Retained,
+}
+
+/// Offline sessions for the state memory cases.
+const SESSIONS: usize = 20_000;
 
 const fn pairs(qos: u8, size: usize, pubs: usize) -> Kind {
     Kind::Throughput {
@@ -97,6 +115,18 @@ const ONE_LANE: &[Case] = &[
     Case {
         key: "idle_conn_kib",
         kind: Kind::IdleMemory { conns: 20_000 },
+    },
+    Case {
+        key: "offline_session_bytes",
+        kind: Kind::StateMemory(State::Session),
+    },
+    Case {
+        key: "queued_100b_bytes",
+        kind: Kind::StateMemory(State::Queued),
+    },
+    Case {
+        key: "retained_100b_bytes",
+        kind: Kind::StateMemory(State::Retained),
     },
     Case {
         key: "qos0_16b_msgs_s",
@@ -214,6 +244,8 @@ fn smoke(key: &str) -> f64 {
         1000.0
     } else if key.ends_with("_kib") {
         64.0
+    } else if key.ends_with("_bytes") {
+        4096.0
     } else {
         100_000.0
     }
@@ -273,6 +305,7 @@ fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io:
         };
         let line = match case.kind {
             Kind::IdleMemory { conns } => idle_memory(&addr, conns, broker.id()),
+            Kind::StateMemory(state) => state_memory(&broker_cpus, sec, state),
             kind => run_load(&load_cpus, &addr, lanes, kind),
         };
         let Some(value) = line.as_ref().ok().and_then(|l| result_value(l, case.kind)) else {
@@ -284,7 +317,9 @@ fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io:
             failed += 1;
             continue;
         };
-        let lower_better = case.key.ends_with("_us") || case.key.ends_with("_kib");
+        let lower_better = ["_us", "_kib", "_bytes"]
+            .iter()
+            .any(|unit| case.key.ends_with(unit));
         let ok = if lower_better {
             value <= limit
         } else {
@@ -338,22 +373,11 @@ fn pinned(cpus: &str) -> Command {
 }
 
 fn spawn_broker(cpus: &str, lanes: usize, busy: bool) -> std::io::Result<(Child, String)> {
-    let mut child = pinned(cpus)
-        .arg("--broker-child")
+    let mut cmd = pinned(cpus);
+    cmd.arg("--broker-child")
         .arg(lanes.to_string())
-        .arg(if busy { "busy" } else { "idle" })
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let mut line = String::new();
-    if let Some(out) = child.stdout.take() {
-        BufReader::new(out).read_line(&mut line)?;
-    }
-    let addr = line.trim().trim_start_matches("tcp://").to_owned();
-    if addr.is_empty() {
-        let _ = child.kill();
-        return Err(std::io::Error::other("broker child printed no endpoint"));
-    }
-    Ok((child, addr))
+        .arg(if busy { "busy" } else { "idle" });
+    child::spawn(cmd)
 }
 
 fn run_load(cpus: &str, addr: &str, lanes: usize, kind: Kind) -> Result<String, String> {
@@ -387,7 +411,9 @@ fn run_load(cpus: &str, addr: &str, lanes: usize, kind: Kind) -> Result<String, 
         Kind::LatencyP50 { qos, size } => {
             c.args(["rtt", &qos.to_string(), &size.to_string(), "0", "0", "1"]);
         }
-        Kind::IdleMemory { .. } => return Err("measured in process".to_owned()),
+        Kind::IdleMemory { .. } | Kind::StateMemory(_) => {
+            return Err("measured in process".to_owned());
+        }
     }
     let out = c.output().map_err(|e| e.to_string())?;
     let text = String::from_utf8_lossy(&out.stdout).trim().to_owned();
@@ -402,13 +428,9 @@ fn run_load(cpus: &str, addr: &str, lanes: usize, kind: Kind) -> Result<String, 
 /// topic, and reports how much the broker's RSS grew per connection.
 fn idle_memory(addr: &str, conns: usize, broker: u32) -> Result<String, String> {
     let rss = || -> Result<f64, String> {
-        let status = std::fs::read_to_string(format!("/proc/{broker}/status"))
-            .map_err(|e| format!("broker status: {e}"))?;
-        status
-            .lines()
-            .find_map(|l| l.strip_prefix("VmRSS:"))
-            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
-            .ok_or_else(|| "no VmRSS".to_owned())
+        ram::rss(broker)
+            .map(|b| b as f64 / 1024.0)
+            .map_err(|e| format!("broker RSS: {e}"))
     };
     let before = rss()?;
     let mut open = Vec::with_capacity(conns);
@@ -428,11 +450,33 @@ fn idle_memory(addr: &str, conns: usize, broker: u32) -> Result<String, String> 
     ))
 }
 
+/// Adds state to a fresh broker child and reports how much its RSS grew
+/// per item.
+fn state_memory(cpus: &str, sec: &Section, state: State) -> Result<String, String> {
+    let (mut broker, addr) = spawn_broker(cpus, sec.lanes, sec.busy).map_err(|e| e.to_string())?;
+    let grown = Probe::new(&addr, broker.id(), true, None).and_then(|mut probe| match state {
+        State::Session => probe.sessions(SESSIONS),
+        State::Queued => probe.sessions(SESSIONS).and_then(|_| probe.queued(10, 100)),
+        State::Retained => probe.retained(100_000, 100),
+    });
+    let _ = broker.kill();
+    let _ = broker.wait();
+    let g = grown.map_err(|e| e.to_string())?;
+    Ok(format!(
+        "items={} rss_before_kib={} rss_after_kib={} bytes_each={:.1}",
+        g.items,
+        g.rss_before >> 10,
+        g.rss_after >> 10,
+        g.per_item()
+    ))
+}
+
 fn result_value(line: &str, kind: Kind) -> Option<f64> {
     let key = match kind {
         Kind::Throughput { .. } => "delivered=",
         Kind::LatencyP50 { .. } => "p50=",
         Kind::IdleMemory { .. } => "kib_per_conn=",
+        Kind::StateMemory(_) => "bytes_each=",
     };
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key))
@@ -503,33 +547,13 @@ fn load_child(args: &[String]) -> ExitCode {
 }
 
 fn broker_child(lanes: usize, busy: bool) -> ExitCode {
-    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-    else {
-        return ExitCode::FAILURE;
+    let cfg = zzq_broker::Config {
+        io_threads: lanes,
+        name: "zzq-perf".to_owned(),
+        busy_poll: busy,
+        ..zzq_broker::Config::default()
     };
-    rt.block_on(async {
-        let cfg = zzq_broker::Config {
-            io_threads: lanes,
-            name: "zzq-perf".to_owned(),
-            busy_poll: busy,
-            ..zzq_broker::Config::default()
-        };
-        let Ok(ctx) = zzq_broker::Context::with_config(&cfg) else {
-            return ExitCode::FAILURE;
-        };
-        let Ok(broker) = zzq_broker::Broker::new(&ctx, zzq_broker::BrokerOptions::default()).await
-        else {
-            return ExitCode::FAILURE;
-        };
-        let Ok(ep) = broker.bind("tcp://127.0.0.1:0").await else {
-            return ExitCode::FAILURE;
-        };
-        println!("{ep}");
-        std::future::pending::<()>().await;
-        ExitCode::SUCCESS
-    })
+    child::serve(&cfg, zzq_broker::BrokerOptions::default())
 }
 
 fn parse_ini(text: &str) -> HashMap<String, HashMap<String, f64>> {

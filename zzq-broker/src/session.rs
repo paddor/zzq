@@ -1,7 +1,10 @@
 //! Per-client session state and outgoing QoS flows.
 
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bytestring::ByteString;
@@ -10,10 +13,12 @@ use zzq_proto::encode::{self, AckFields, PublishHeader};
 use zzq_proto::property::{MESSAGE_EXPIRY_INTERVAL, Property, SUBSCRIPTION_IDENTIFIER};
 use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 
+use crate::budget::{self, Charge, LaneTotal};
 use crate::conn::ConnShared;
 use crate::index::{Matches, SubIds};
 use crate::msg::{Arena, Msg, Publication, expired, same_family};
 use crate::slab::Key;
+use crate::state::SessionState;
 
 /// Write buffers above this size are freed once their session goes idle.
 const IDLE_BUFFER: usize = 64 << 10;
@@ -29,6 +34,15 @@ pub(crate) struct Will {
     pub(crate) delay: u32,
 }
 
+/// The will of a lost connection, waiting for its delay.
+#[derive(Debug)]
+pub(crate) struct DelayedWill {
+    /// ID of the timer that publishes it.
+    pub(crate) timer: u64,
+    pub(crate) due: Instant,
+    pub(crate) msg: Msg,
+}
+
 /// A message waiting for the inflight window.
 #[derive(Debug, Clone)]
 pub(crate) struct Queued {
@@ -38,10 +52,25 @@ pub(crate) struct Queued {
     pub(crate) sub_id: SubIds,
 }
 
+/// A QoS 1/2 message a session keeps. With `share`, other sessions of the
+/// lane hold the same message, and the share counts its bytes once for all.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    pub(crate) item: Queued,
+    pub(crate) share: Option<Rc<Charge>>,
+}
+
+impl Kept {
+    /// A message no other session shares.
+    pub(crate) const fn own(item: Queued) -> Kept {
+        Kept { item, share: None }
+    }
+}
+
 #[derive(Debug)]
 struct Inflight {
     pkid: u16,
-    item: Queued,
+    held: Kept,
     /// PUBREC received, PUBREL sent, waiting for PUBCOMP.
     released: bool,
 }
@@ -59,14 +88,29 @@ pub(crate) struct Waiter {
 pub(crate) enum Outcome {
     Sent,
     Queued,
-    /// The queue was full; the oldest queued message was dropped.
-    QueueFull,
+    /// The queue was full: this many messages were dropped, the oldest
+    /// queued ones, or the new one if it alone is over the byte limit.
+    QueueFull(u32),
+    /// The state budget was full, so the message was dropped instead of
+    /// queued.
+    StateFull,
     /// The connection's write buffer was over its limit.
     BufferFull,
     /// The session is offline and the message is QoS 0.
     Offline,
     /// Larger than the client's Maximum Packet Size.
     TooLarge,
+}
+
+/// What a session may queue beyond its inflight window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueLimit {
+    /// Messages.
+    pub(crate) count: usize,
+    /// Bytes of topics, properties and payloads.
+    pub(crate) bytes: usize,
+    /// The state budget is used up: nothing more may be queued.
+    pub(crate) state_full: bool,
 }
 
 #[derive(Debug)]
@@ -82,9 +126,7 @@ pub(crate) struct Session {
     pub(crate) expiry: u32,
     pub(crate) expires_at: Option<Instant>,
     pub(crate) will: Option<Will>,
-    /// Will of a lost connection waiting for its delay, and the ID of its
-    /// timer.
-    pub(crate) delayed_will: Option<(u64, Msg)>,
+    pub(crate) delayed_will: Option<DelayedWill>,
     /// Encoded packets waiting for the writer.
     pub(crate) out: Vec<u8>,
     /// The writer's second buffer, swapped with `out` on each write.
@@ -106,7 +148,12 @@ pub(crate) struct Session {
     /// Last topic the authorizer was asked about, and its answer.
     pub(crate) last_allowed: Option<(Box<str>, bool)>,
     inflight: VecDeque<Inflight>,
-    queue: VecDeque<Queued>,
+    /// Entries at the back of `inflight` not resent on this connection yet:
+    /// a resumed client may allow fewer in flight than before.
+    unsent: usize,
+    queue: VecDeque<Kept>,
+    /// Bytes of the messages in `queue`, for `max_queued_bytes`.
+    queued_bytes: usize,
     next_pkid: u16,
     /// Queued messages dropped because they expired.
     pub(crate) expired: u64,
@@ -119,11 +166,20 @@ pub(crate) struct Session {
     /// oldest. Only then is this built, until the window empties.
     in_use: Option<Box<[u64; 1024]>>,
     /// Copies of messages held long.
-    pub(crate) arena: Arena,
+    arena: Arena,
+    /// A connection is attached. Shared subscription entries on every lane
+    /// read it to prefer connected members.
+    pub(crate) online: Arc<AtomicBool>,
+    /// What the session counts against `max_state_bytes`.
+    charge: Charge,
+    /// Bytes charged for the slots `queue` and `inflight` have room for, and
+    /// the room left in the arena block.
+    room: usize,
 }
 
 impl Session {
-    pub(crate) fn new(client_id: Box<str>, version: Version) -> Session {
+    pub(crate) fn new(client_id: Box<str>, version: Version, total: LaneTotal) -> Session {
+        let charge = Charge::new(total, budget::session(&client_id));
         Session {
             client_id,
             username: None,
@@ -145,20 +201,67 @@ impl Session {
             last_topic: None,
             last_allowed: None,
             inflight: VecDeque::new(),
+            unsent: 0,
             queue: VecDeque::new(),
+            queued_bytes: 0,
             next_pkid: 0,
             expired: 0,
             congested: false,
             waiters: Vec::new(),
             in_use: None,
             arena: Arena::default(),
+            online: Arc::default(),
+            charge,
+            room: 0,
         }
+    }
+
+    /// Adds or replaces a subscription. Returns whether it existed.
+    pub(crate) fn subscribe(
+        &mut self,
+        filter: &str,
+        opts: SubscriptionOptions,
+        sub_id: u32,
+        lanes: usize,
+    ) -> bool {
+        let existed = self.subs.insert(filter.into(), (opts, sub_id)).is_some();
+        if !existed {
+            self.charge.add(budget::subscription(filter, lanes));
+        }
+        existed
+    }
+
+    /// Removes a subscription. Returns whether it existed.
+    pub(crate) fn unsubscribe(&mut self, filter: &str, lanes: usize) -> bool {
+        let existed = self.subs.remove(filter).is_some();
+        if existed {
+            self.charge.sub(budget::subscription(filter, lanes));
+        }
+        existed
     }
 
     /// QoS 1/2 messages waiting for the inflight window.
     #[inline]
     pub(crate) fn queued(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Attaches a connection.
+    pub(crate) fn bind(&mut self, conn: Rc<ConnShared>) {
+        self.conn = Some(conn);
+        self.online.store(true, Ordering::Relaxed);
+    }
+
+    /// Detaches the connection.
+    pub(crate) fn unbind(&mut self) {
+        self.conn = None;
+        self.online.store(false, Ordering::Relaxed);
+    }
+
+    /// QoS 1/2 messages not delivered yet: queued, or sent and not acked.
+    /// PUBREC means the client has the message.
+    pub(crate) fn held(&self) -> u64 {
+        (self.queue.len() + self.inflight.iter().filter(|f| !f.released).count()) as u64
     }
 
     /// Hands the writer the encoded packets, in exchange for its spare
@@ -233,18 +336,42 @@ impl Session {
     }
 
     /// Delivers a QoS 1 or 2 message: sends it if the window allows, queues
-    /// it otherwise.
-    pub(crate) fn deliver_qos12(&mut self, item: Queued, max_queued: usize) -> Outcome {
+    /// it otherwise. The oldest queued messages make room for it.
+    pub(crate) fn deliver_qos12(&mut self, h: Kept, limit: QueueLimit) -> Outcome {
         if !self.would_queue() {
-            return self.send_inflight(item);
+            self.charge.add(budget::held(&h));
+            return self.send_inflight(h);
         }
-        let mut outcome = Outcome::Queued;
-        if self.queue.len() >= max_queued {
-            self.queue.pop_front();
-            outcome = Outcome::QueueFull;
+        if limit.state_full {
+            return Outcome::StateFull;
         }
-        self.queue.push_back(item);
-        outcome
+        let size = h.item.msg.size();
+        if size > limit.bytes {
+            return Outcome::QueueFull(1);
+        }
+        let mut dropped = 0;
+        while self.queue.len() >= limit.count || self.queued_bytes + size > limit.bytes {
+            let Some(old) = self.pop_queued() else {
+                break;
+            };
+            self.charge.sub(budget::held(&old));
+            dropped += 1;
+        }
+        self.charge.add(budget::held(&h));
+        self.queued_bytes += size;
+        self.queue.push_back(h);
+        self.charge_room();
+        if dropped == 0 {
+            Outcome::Queued
+        } else {
+            Outcome::QueueFull(dropped)
+        }
+    }
+
+    fn pop_queued(&mut self) -> Option<Kept> {
+        let h = self.queue.pop_front()?;
+        self.queued_bytes -= h.item.msg.size();
+        Some(h)
     }
 
     /// Whether a QoS 1/2 delivery now would wait in the queue.
@@ -262,19 +389,45 @@ impl Session {
         self.would_queue() || self.inflight.len() >= SLOW_INFLIGHT
     }
 
-    fn send_inflight(&mut self, item: Queued) -> Outcome {
+    /// Sends a message the session is charged for, and keeps it until the
+    /// client acks it.
+    fn send_inflight(&mut self, h: Kept) -> Outcome {
         let pkid = self.alloc_pkid();
-        let ok = self.encode(&Fields::of(&item, pkid, false));
+        let ok = self.encode(&Fields::of(&h.item, pkid, false));
         if !ok {
             self.free_pkid(pkid);
+            self.charge.sub(budget::held(&h));
             return Outcome::TooLarge;
         }
         self.inflight.push_back(Inflight {
             pkid,
-            item,
+            held: h,
             released: false,
         });
+        self.charge_room();
         Outcome::Sent
+    }
+
+    /// A copy of `msg` in the arena, so a message held long does not pin a
+    /// read buffer.
+    pub(crate) fn copy(&mut self, msg: &Msg) -> Msg {
+        let copy = self.arena.copy(msg);
+        self.charge_room();
+        copy
+    }
+
+    /// Charges the slots the queue and window have room for, which they
+    /// keep as they empty, and the room left in the arena block.
+    fn charge_room(&mut self) {
+        let room = self.queue.capacity() * size_of::<Kept>()
+            + self.inflight.capacity() * size_of::<Inflight>()
+            + self.arena.room();
+        if room > self.room {
+            self.charge.add(room - self.room);
+        } else {
+            self.charge.sub(self.room - room);
+        }
+        self.room = room;
     }
 
     fn alloc_pkid(&mut self) -> u16 {
@@ -314,18 +467,24 @@ impl Session {
     /// written.
     pub(crate) fn pump(&mut self) -> bool {
         let mut wrote = false;
+        if self.unsent > 0 {
+            wrote = self.resend_unsent();
+            if self.unsent > 0 {
+                return wrote;
+            }
+        }
         let mut now = None;
         while self.conn.is_some() && self.inflight.len() < usize::from(self.window) {
-            let Some(item) = self.queue.pop_front() else {
+            let Some(h) = self.pop_queued() else {
                 break;
             };
-            if item.msg.expires_at.is_some()
-                && expired(item.msg.expires_at, *now.get_or_insert_with(Instant::now))
-            {
+            let expires_at = h.item.msg.expires_at;
+            if expires_at.is_some() && expired(expires_at, *now.get_or_insert_with(Instant::now)) {
                 self.expired += 1;
+                self.charge.sub(budget::held(&h));
                 continue;
             }
-            wrote |= self.send_inflight(item) == Outcome::Sent;
+            wrote |= self.send_inflight(h) == Outcome::Sent;
         }
         wrote
     }
@@ -335,58 +494,97 @@ impl Session {
             .inflight
             .iter()
             .position(|f| f.pkid == pkid && f.released == released)?;
+        if i >= self.inflight.len() - self.unsent {
+            self.unsent -= 1;
+        }
         let f = self.inflight.remove(i)?;
         self.free_pkid(pkid);
+        self.charge.sub(budget::held(&f.held));
         Some(f)
     }
 
-    /// PUBACK from the client.
-    pub(crate) fn on_puback(&mut self, pkid: u16) -> bool {
-        if self
-            .take_inflight(pkid, false)
-            .is_some_and(|f| f.item.qos == QoS::AtLeastOnce)
-        {
-            return self.pump();
-        }
-        false
+    /// QoS of the delivery in flight under `pkid`, and whether PUBREC
+    /// released it.
+    fn inflight_state(&self, pkid: u16) -> Option<(QoS, bool)> {
+        self.inflight
+            .iter()
+            .find(|f| f.pkid == pkid)
+            .map(|f| (f.held.item.qos, f.released))
     }
 
-    /// PUBREC from the client. Answers with PUBREL.
-    pub(crate) fn on_pubrec(&mut self, pkid: u16, reason: u8) -> bool {
+    /// PUBACK from the client. `Err` with a reason code if it acks a QoS 2
+    /// delivery.
+    pub(crate) fn on_puback(&mut self, pkid: u16) -> Result<bool, u8> {
+        match self.inflight_state(pkid) {
+            None => Ok(false),
+            Some((QoS::AtLeastOnce, _)) => {
+                self.take_inflight(pkid, false);
+                Ok(self.pump())
+            }
+            Some(_) => Err(zzq_proto::reason::PROTOCOL_ERROR),
+        }
+    }
+
+    /// PUBREC from the client. Answers with PUBREL. `Err` with a reason
+    /// code if it acks a QoS 1 delivery.
+    pub(crate) fn on_pubrec(&mut self, pkid: u16, reason: u8) -> Result<bool, u8> {
         let Some(f) = self.inflight.iter_mut().find(|f| f.pkid == pkid) else {
             self.ack(
                 PacketType::PubRel,
                 pkid,
                 zzq_proto::reason::PACKET_IDENTIFIER_NOT_FOUND,
             );
-            return true;
+            return Ok(true);
         };
+        if f.held.item.qos != QoS::ExactlyOnce {
+            return Err(zzq_proto::reason::PROTOCOL_ERROR);
+        }
         if reason >= 0x80 {
             self.take_inflight(pkid, false);
-            return self.pump();
+            return Ok(self.pump());
         }
         f.released = true;
         self.ack(PacketType::PubRel, pkid, 0);
-        true
+        Ok(true)
     }
 
-    /// PUBCOMP from the client.
-    pub(crate) fn on_pubcomp(&mut self, pkid: u16) -> bool {
-        self.take_inflight(pkid, true).is_some() && self.pump()
+    /// PUBCOMP from the client. `Err` with a reason code if it comes before
+    /// PUBREC, or for a QoS 1 delivery.
+    pub(crate) fn on_pubcomp(&mut self, pkid: u16) -> Result<bool, u8> {
+        match self.inflight_state(pkid) {
+            None => Ok(false),
+            Some((_, true)) => {
+                self.take_inflight(pkid, true);
+                Ok(self.pump())
+            }
+            Some(_) => Err(zzq_proto::reason::PROTOCOL_ERROR),
+        }
     }
 
-    /// Resends the inflight window after a reconnect.
+    /// Resends the inflight window after a reconnect, as far as the
+    /// client's Receive Maximum allows [MQTT-3.3.4-9]. Acks send the rest.
     pub(crate) fn resend(&mut self) {
+        self.unsent = self.inflight.len();
+        self.pump();
+    }
+
+    /// Resends held back inflight messages while the window has room.
+    fn resend_unsent(&mut self) -> bool {
+        let window = usize::from(self.window);
         let inflight = std::mem::take(&mut self.inflight);
-        for f in &inflight {
+        let mut wrote = false;
+        while self.unsent > 0 && self.conn.is_some() && inflight.len() - self.unsent < window {
+            let f = &inflight[inflight.len() - self.unsent];
             if f.released {
                 self.ack(PacketType::PubRel, f.pkid, 0);
             } else {
-                self.encode(&Fields::of(&f.item, f.pkid, true));
+                self.encode(&Fields::of(&f.held.item, f.pkid, true));
             }
+            self.unsent -= 1;
+            wrote = true;
         }
         self.inflight = inflight;
-        self.pump();
+        wrote
     }
 
     /// Writes an ack.
@@ -444,6 +642,71 @@ impl Session {
     }
 }
 
+impl Session {
+    /// Messages sent and not acked: packet ID, message, and whether PUBREC
+    /// released it.
+    pub(crate) fn inflight(&self) -> impl ExactSizeIterator<Item = (u16, &Queued, bool)> {
+        self.inflight
+            .iter()
+            .map(|f| (f.pkid, &f.held.item, f.released))
+    }
+
+    /// Messages waiting for the inflight window, oldest first.
+    pub(crate) fn queue(&self) -> impl ExactSizeIterator<Item = &Queued> {
+        self.queue.iter().map(|h| &h.item)
+    }
+
+    /// The last packet ID sent.
+    pub(crate) const fn next_pkid(&self) -> u16 {
+        self.next_pkid
+    }
+
+    /// The offline session `st` describes, charging `total`. A delayed will
+    /// comes back apart, for the lane to time it.
+    pub(crate) fn restore(
+        st: SessionState,
+        total: LaneTotal,
+        lanes: usize,
+    ) -> (Session, Option<(Instant, Msg)>) {
+        let mut s = Session::new(st.client_id, st.version, total);
+        s.username = st.username;
+        s.expiry = st.expiry;
+        s.expires_at = st.expires_at;
+        s.will = st.will;
+        s.next_pkid = st.next_pkid;
+        for (filter, opts, sub_id) in &st.subs {
+            s.subscribe(filter, *opts, *sub_id, lanes);
+        }
+        s.awaiting_rel.extend(st.awaiting_rel);
+        for (pkid, item, released) in st.inflight {
+            let held = Kept::own(item);
+            s.charge.add(budget::held(&held));
+            s.inflight.push_back(Inflight {
+                pkid,
+                held,
+                released,
+            });
+        }
+        if !s.inflight.is_empty() {
+            // The window may hold IDs out of order since a wrap; the bitmap
+            // finds free ones in any order.
+            let mut bits = Box::new([0; 1024]);
+            for f in &s.inflight {
+                bits[usize::from(f.pkid >> 6)] |= 1u64 << (f.pkid & 63);
+            }
+            s.in_use = Some(bits);
+        }
+        for item in st.queue {
+            let h = Kept::own(item);
+            s.charge.add(budget::held(&h));
+            s.queued_bytes += h.item.msg.size();
+            s.queue.push_back(h);
+        }
+        s.charge_room();
+        (s, st.delayed_will)
+    }
+}
+
 struct Fields<'a> {
     topic: &'a str,
     payload: &'a [u8],
@@ -485,6 +748,148 @@ mod tests {
         }
     }
 
+    fn held() -> Kept {
+        Kept::own(item())
+    }
+
+    const fn limit(count: usize, bytes: usize) -> QueueLimit {
+        QueueLimit {
+            count,
+            bytes,
+            state_full: false,
+        }
+    }
+
+    /// The queue makes room by bytes, oldest first, and the lane total
+    /// follows every charge back to zero.
+    #[test]
+    fn queue_bytes_and_charges() {
+        let total = LaneTotal::default();
+        let mut s = Session::new("c".into(), Version::V5, total.clone());
+        let base = total.get();
+        assert!(base > 0);
+        let opts = SubscriptionOptions::default();
+        assert!(!s.subscribe("a/#", opts, 0, 2));
+        assert!(s.subscribe("a/#", opts, 0, 2));
+        let subscribed = total.get();
+        assert!(subscribed > base);
+        let size = item().msg.size();
+        let room = limit(usize::MAX, 3 * size);
+        for _ in 0..3 {
+            assert_eq!(s.deliver_qos12(held(), room), Outcome::Queued);
+        }
+        assert_eq!(s.deliver_qos12(held(), room), Outcome::QueueFull(1));
+        assert_eq!(s.queued(), 3);
+        // Larger than the limit alone, or no room left in the budget.
+        let small = limit(usize::MAX, size - 1);
+        assert_eq!(s.deliver_qos12(held(), small), Outcome::QueueFull(1));
+        let full = QueueLimit {
+            state_full: true,
+            ..room
+        };
+        assert_eq!(s.deliver_qos12(held(), full), Outcome::StateFull);
+        assert!(s.room >= 3 * size_of::<Kept>());
+        assert_eq!(total.get(), subscribed + 3 * budget::held(&held()) + s.room);
+        assert_eq!(s.charge.get(), total.get());
+        assert!(s.unsubscribe("a/#", 2));
+        drop(s);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// Sessions that share a message count its bytes once, until the last
+    /// of them lets go.
+    #[test]
+    fn a_shared_message_counts_once() {
+        let total = LaneTotal::default();
+        let mut sessions = ["a", "b"].map(|id| Session::new(id.into(), Version::V5, total.clone()));
+        // Both sessions alike.
+        let base = total.get();
+        let bytes = budget::shared(&item().msg);
+        let share = Rc::new(Charge::new(total.clone(), bytes));
+        let shared = || Kept {
+            item: item(),
+            share: Some(share.clone()),
+        };
+        assert_eq!(budget::held(&shared()), 0);
+        for s in &mut sessions {
+            assert_eq!(s.deliver_qos12(shared(), limit(10, 10)), Outcome::Queued);
+        }
+        drop(share);
+        // Each queue has room for a few slots.
+        let room = sessions[0].room;
+        assert!(room >= size_of::<Kept>());
+        assert_eq!(total.get(), base + bytes + 2 * room);
+        let [a, b] = sessions;
+        drop(a);
+        assert_eq!(total.get(), base / 2 + bytes + room);
+        drop(b);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// A session pays for the slots its queue grew to and the room left in
+    /// its arena block, which outlast the messages.
+    #[test]
+    fn slots_and_arena_room_stay_charged() {
+        let total = LaneTotal::default();
+        let mut s = Session::new("c".into(), Version::V5, total.clone());
+        let base = total.get();
+        let msg = s.copy(&item().msg);
+        let room = s.room;
+        assert!(room > 0 && room == s.arena.room());
+        let copied = Kept::own(Queued { msg, ..item() });
+        let bytes = budget::held(&copied);
+        assert_eq!(
+            s.deliver_qos12(copied, limit(10, usize::MAX)),
+            Outcome::Queued
+        );
+        assert_eq!(total.get(), base + bytes + s.room);
+        assert_eq!(s.room, room + s.queue.capacity() * size_of::<Kept>());
+        let h = s.pop_queued().unwrap();
+        s.charge.sub(budget::held(&h));
+        drop(h);
+        // The queue keeps its slots and the arena its block.
+        assert_eq!(total.get(), base + s.room);
+        drop(s);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// A restored window may hold IDs out of order since a wrap: new IDs
+    /// skip them. The charges go with the session.
+    #[test]
+    fn restored_session_skips_ids_in_use() {
+        let total = LaneTotal::default();
+        let st = SessionState {
+            client_id: "c".into(),
+            username: None,
+            version: Version::V5,
+            expiry: 60,
+            expires_at: None,
+            will: None,
+            delayed_will: None,
+            next_pkid: 7,
+            subs: vec![("a/#".into(), SubscriptionOptions::default(), 0)],
+            awaiting_rel: Vec::new(),
+            inflight: vec![
+                (65535, item(), false),
+                (8, item(), false),
+                (7, item(), false),
+            ],
+            queue: vec![item()],
+        };
+        let (mut s, _) = Session::restore(st, total.clone(), 1);
+        assert_eq!((s.queued(), s.inflight.len()), (1, 3));
+        assert_eq!(s.alloc_pkid(), 9);
+        drop(s);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// Sends a message the session is charged for.
+    fn send(s: &mut Session) -> Outcome {
+        let h = held();
+        s.charge.add(budget::held(&h));
+        s.send_inflight(h)
+    }
+
     fn ids(s: &Session) -> Vec<u16> {
         s.inflight.iter().map(|f| f.pkid).collect()
     }
@@ -493,26 +898,26 @@ mod tests {
     /// IDs stay unique, and in order again once the window empties.
     #[test]
     fn pkids_skip_unacked_after_wrapping() {
-        let mut s = Session::new("c".into(), Version::V5);
-        s.send_inflight(item());
+        let mut s = Session::new("c".into(), Version::V5, LaneTotal::default());
+        send(&mut s);
         let stuck = s.inflight[0].pkid;
         for n in 0..140_000 {
-            s.send_inflight(item());
-            s.send_inflight(item());
+            send(&mut s);
+            send(&mut s);
             let mut v = ids(&s);
             v.sort_unstable();
             v.dedup();
             assert_eq!(v.len(), s.inflight.len(), "after {n}");
             // Ack the older of the two new ones, out of order.
-            s.on_puback(s.inflight[1].pkid);
-            s.on_puback(s.inflight[1].pkid);
+            assert_eq!(s.on_puback(s.inflight[1].pkid), Ok(false));
+            assert_eq!(s.on_puback(s.inflight[1].pkid), Ok(false));
         }
         assert!(s.in_use.is_some());
-        s.on_puback(stuck);
+        assert_eq!(s.on_puback(stuck), Ok(false));
         s.trim_buffers();
         assert!(s.in_use.is_none());
-        s.send_inflight(item());
-        s.send_inflight(item());
+        send(&mut s);
+        send(&mut s);
         let v = ids(&s);
         assert_eq!(v[1], v[0].wrapping_add(1).max(1));
     }
@@ -521,7 +926,7 @@ mod tests {
     /// the next sweep without one.
     #[test]
     fn trim_frees_buffers_of_idle_sessions_only() {
-        let mut s = Session::new("c".into(), Version::V5);
+        let mut s = Session::new("c".into(), Version::V5, LaneTotal::default());
         s.out.reserve(2 * IDLE_BUFFER);
         let mut buf = s.take_out();
         buf.clear();

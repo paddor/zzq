@@ -5,6 +5,7 @@ use std::cell::Cell;
 use std::hash::BuildHasher;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_hash::FxHashMap;
 use zzq_proto::SubscriptionOptions;
@@ -53,6 +54,11 @@ impl SubIds {
     pub(crate) fn iter(self) -> impl Iterator<Item = u32> {
         self.0.into_iter().take_while(|&id| id != 0)
     }
+
+    /// All four slots, free ones as 0.
+    pub(crate) const fn slots(self) -> [u32; 4] {
+        self.0
+    }
 }
 
 /// One subscription of one session.
@@ -64,6 +70,17 @@ pub(crate) struct Entry {
     pub(crate) sub_id: SubIds,
     /// The whole `$share/...` filter for shared subscriptions.
     pub(crate) share: Option<Arc<str>>,
+    /// Whether a shared subscriber's session has a connection. `None` for
+    /// unshared subscriptions.
+    pub(crate) online: Option<Arc<AtomicBool>>,
+}
+
+impl Entry {
+    fn is_online(&self) -> bool {
+        self.online
+            .as_ref()
+            .is_none_or(|o| o.load(Ordering::Relaxed))
+    }
 }
 
 /// Members of one shared subscription. Each message goes to one of them.
@@ -76,11 +93,18 @@ pub(crate) struct Group {
 }
 
 impl Group {
-    /// Next member in round-robin order.
+    /// Next member in round-robin order. Members without a connection are
+    /// skipped while any member has one (4.8.2), so messages do not wait
+    /// at an offline member.
     pub(crate) fn pick(&self) -> &Entry {
-        let i = self.next.get();
-        self.next.set(i.wrapping_add(1));
-        &self.members[i % self.members.len()]
+        let n = self.members.len();
+        let start = self.next.get();
+        let at = |j: usize| start.wrapping_add(j) % n;
+        let offset = (0..n)
+            .find(|&j| self.members[at(j)].is_online())
+            .unwrap_or(0);
+        self.next.set(start.wrapping_add(offset + 1));
+        &self.members[at(offset)]
     }
 }
 
@@ -271,6 +295,7 @@ mod tests {
             opts: SubscriptionOptions::from(qos),
             sub_id: SubIds::default(),
             share: share.map(Arc::from),
+            online: None,
         }
     }
 

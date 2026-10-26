@@ -9,6 +9,7 @@ the workspace, so AFL's instrumentation stays out of normal builds.
 | `mqtt_sn` | One MQTT-SN datagram | no panic, encode round trip |
 | `websocket` | Upgrade request and client frames | no panic |
 | `retained_log` | A retained message log | no panic |
+| `state_image` | A state image | no panic, restored sessions encode and decode again |
 | `endpoint` | An endpoint URI | no panic, print and parse round trip |
 | `topics` | A filter and a topic, one per line | trie and `topic::matches` agree |
 

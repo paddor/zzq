@@ -150,7 +150,141 @@ impl<'a> TryFrom<&'a [u8]> for Properties<'a> {
     }
 }
 
+/// The properties one packet may carry, and those it may repeat.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Rules {
+    allowed: u64,
+    repeat: u64,
+}
+
+const fn bits(ids: &[u8]) -> u64 {
+    let mut b = 0;
+    let mut i = 0;
+    while i < ids.len() {
+        b |= 1 << ids[i];
+        i += 1;
+    }
+    b
+}
+
+impl Rules {
+    const fn new(allowed: &[u8], repeat: &[u8]) -> Rules {
+        Rules {
+            allowed: bits(allowed) | bits(&[USER_PROPERTY]),
+            repeat: bits(repeat) | bits(&[USER_PROPERTY]),
+        }
+    }
+
+    pub(crate) const CONNECT: Rules = Rules::new(
+        &[
+            SESSION_EXPIRY_INTERVAL,
+            AUTHENTICATION_METHOD,
+            AUTHENTICATION_DATA,
+            REQUEST_PROBLEM_INFORMATION,
+            REQUEST_RESPONSE_INFORMATION,
+            RECEIVE_MAXIMUM,
+            TOPIC_ALIAS_MAXIMUM,
+            MAXIMUM_PACKET_SIZE,
+        ],
+        &[],
+    );
+    pub(crate) const WILL: Rules = Rules::new(
+        &[
+            PAYLOAD_FORMAT_INDICATOR,
+            MESSAGE_EXPIRY_INTERVAL,
+            CONTENT_TYPE,
+            RESPONSE_TOPIC,
+            CORRELATION_DATA,
+            WILL_DELAY_INTERVAL,
+        ],
+        &[],
+    );
+    pub(crate) const CONNACK: Rules = Rules::new(
+        &[
+            SESSION_EXPIRY_INTERVAL,
+            ASSIGNED_CLIENT_IDENTIFIER,
+            SERVER_KEEP_ALIVE,
+            AUTHENTICATION_METHOD,
+            AUTHENTICATION_DATA,
+            RESPONSE_INFORMATION,
+            SERVER_REFERENCE,
+            REASON_STRING,
+            RECEIVE_MAXIMUM,
+            TOPIC_ALIAS_MAXIMUM,
+            MAXIMUM_QOS,
+            RETAIN_AVAILABLE,
+            MAXIMUM_PACKET_SIZE,
+            WILDCARD_SUBSCRIPTION_AVAILABLE,
+            SUBSCRIPTION_IDENTIFIER_AVAILABLE,
+            SHARED_SUBSCRIPTION_AVAILABLE,
+        ],
+        &[],
+    );
+    /// A PUBLISH from the server carries one Subscription Identifier per
+    /// matching subscription.
+    pub(crate) const PUBLISH: Rules = Rules::new(
+        &[
+            PAYLOAD_FORMAT_INDICATOR,
+            MESSAGE_EXPIRY_INTERVAL,
+            CONTENT_TYPE,
+            RESPONSE_TOPIC,
+            CORRELATION_DATA,
+            SUBSCRIPTION_IDENTIFIER,
+            TOPIC_ALIAS,
+        ],
+        &[SUBSCRIPTION_IDENTIFIER],
+    );
+    /// PUBACK, PUBREC, PUBREL, PUBCOMP, SUBACK and UNSUBACK.
+    pub(crate) const ACK: Rules = Rules::new(&[REASON_STRING], &[]);
+    pub(crate) const SUBSCRIBE: Rules = Rules::new(&[SUBSCRIPTION_IDENTIFIER], &[]);
+    pub(crate) const UNSUBSCRIBE: Rules = Rules::new(&[], &[]);
+    pub(crate) const DISCONNECT: Rules = Rules::new(
+        &[SESSION_EXPIRY_INTERVAL, REASON_STRING, SERVER_REFERENCE],
+        &[],
+    );
+    pub(crate) const AUTH: Rules = Rules::new(
+        &[AUTHENTICATION_METHOD, AUTHENTICATION_DATA, REASON_STRING],
+        &[],
+    );
+}
+
 impl<'a> Properties<'a> {
+    /// Validates raw property bytes for a packet with `rules`: an identifier
+    /// the packet does not allow is malformed; a repeat, an out-of-range
+    /// value, a Response Topic with wildcards or Authentication Data
+    /// without a method breaks a protocol rule.
+    pub(crate) fn parse(raw: &'a [u8], rules: Rules) -> Result<Self, DecodeError> {
+        let mut seen = 0u64;
+        let mut c = Cursor::new(raw);
+        while !c.is_empty() {
+            let p = read_one(&mut c)?;
+            let bit = 1u64 << p.id();
+            if rules.allowed & bit == 0 {
+                return Err(DecodeError::Malformed);
+            }
+            if seen & bit & !rules.repeat != 0 {
+                return Err(DecodeError::Protocol);
+            }
+            seen |= bit;
+            let valid = match p {
+                // Every one-byte property is 0 or 1.
+                Property::Byte(_, v) => v <= 1,
+                Property::U16(RECEIVE_MAXIMUM, 0) | Property::U32(MAXIMUM_PACKET_SIZE, 0) => false,
+                Property::Str(RESPONSE_TOPIC, s) => !s.contains(['+', '#']),
+                _ => true,
+            };
+            if !valid {
+                return Err(DecodeError::Protocol);
+            }
+        }
+        if seen & bits(&[AUTHENTICATION_DATA, AUTHENTICATION_METHOD])
+            == bits(&[AUTHENTICATION_DATA])
+        {
+            return Err(DecodeError::Protocol);
+        }
+        Ok(Properties { raw })
+    }
+
     /// No properties.
     pub const EMPTY: Properties<'static> = Properties { raw: &[] };
 

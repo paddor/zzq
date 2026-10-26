@@ -2,6 +2,7 @@
 //! index, and the packet handling for its connections.
 
 use std::cell::RefCell;
+use std::io;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,16 +16,19 @@ use tokio::sync::{Notify, oneshot};
 use zzq_proto::encode::{self, SubAckFields};
 use zzq_proto::packet::{Ack, Publish, Subscribe, Unsubscribe, decode};
 use zzq_proto::property::{self, Property};
-use zzq_proto::topic::is_shared;
+use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 
 use crate::broker::Shared;
+use crate::budget::{self, Charge, LaneTotal};
 use crate::conn::{ConnShared, OwnedConnect, ReadBlocks};
+use crate::dump::Part;
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
-use crate::session::{Outcome, Queued, Session, Waiter};
+use crate::session::{DelayedWill, Kept, Outcome, QueueLimit, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
+use crate::state::SessionState;
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
 
@@ -44,6 +48,10 @@ pub(crate) struct LaneStats {
     pub(crate) dropped_queue_full: u64,
     pub(crate) dropped_too_large: u64,
     pub(crate) dropped_expired: u64,
+    pub(crate) dropped_session_ended: u64,
+    pub(crate) dropped_state_full: u64,
+    /// Bytes the lane's sessions count against `max_state_bytes`.
+    pub(crate) state_bytes: u64,
 }
 
 /// A delivery for a session on another lane.
@@ -59,6 +67,8 @@ pub(crate) enum Remote {
     },
     /// A delivery to one session, chosen for a shared subscription.
     Deliver { key: Key, item: Queued },
+    /// The last batch the sending lane ships before a state dump.
+    Drained(Arc<SyncAck>),
 }
 
 /// How forwarded packets were sent.
@@ -80,7 +90,7 @@ pub(crate) struct SyncAck {
 }
 
 impl SyncAck {
-    fn expect(&self, n: usize) {
+    pub(crate) fn expect(&self, n: usize) {
         self.remaining.fetch_add(n, Ordering::AcqRel);
     }
 
@@ -104,7 +114,13 @@ pub(crate) struct Held {
     pub(crate) key: Key,
     pub(crate) sync: Arc<SyncAck>,
     pub(crate) packet: Vec<u8>,
+    /// New subscriptions that get retained messages after the ack.
+    pub(crate) retained: Vec<Wanted>,
 }
+
+/// A subscription that gets the retained messages it matches: filter,
+/// granted QoS and Subscription Identifier.
+type Wanted = (Box<str>, QoS, u32);
 
 /// Work sent to a lane by other lanes or the broker handle.
 #[derive(Debug)]
@@ -119,6 +135,22 @@ pub(crate) enum Control {
     Stats(oneshot::Sender<LaneStats>),
     /// Close every connection and stop, then answer.
     Shutdown(Option<oneshot::Sender<()>>),
+    /// Close every connection as lost and refuse new ones, then answer.
+    Quiesce(oneshot::Sender<()>),
+    /// Ship what is waiting for other lanes, then a marker to each.
+    Drain(Arc<SyncAck>),
+    /// Write the sessions that outlive their connection, then answer.
+    Dump(Box<Dump>),
+    /// Add sessions from a state file, then answer. Their subscriptions
+    /// count down the ack on the other lanes.
+    Restore(Vec<SessionState>, Arc<SyncAck>, oneshot::Sender<()>),
+}
+
+/// A lane's share of the state file being written.
+#[derive(Debug)]
+pub(crate) struct Dump {
+    pub(crate) part: Part,
+    pub(crate) reply: oneshot::Sender<io::Result<()>>,
 }
 
 /// A congested session a QoS 1/2 publish was routed to.
@@ -126,6 +158,23 @@ pub(crate) enum Control {
 enum Hit {
     Local(Key),
     Remote(SubRef),
+}
+
+/// The message of one publish once a session holds it, and the charge for
+/// its bytes once more than one session of the lane may hold it.
+#[derive(Debug, Default)]
+struct Owned {
+    msg: Option<Msg>,
+    share: Option<Rc<Charge>>,
+}
+
+impl Owned {
+    const fn of(msg: Msg) -> Owned {
+        Owned {
+            msg: Some(msg),
+            share: None,
+        }
+    }
 }
 
 /// QoS, retain flag and Subscription Identifier of one delivery.
@@ -137,6 +186,9 @@ struct Grant {
     /// The last delivery of this publish: it may take the owned message
     /// instead of cloning it.
     last: bool,
+    /// A retained message sent on subscribe. `max_retained` bounds those,
+    /// so `max_queued` does not drop them.
+    on_subscribe: bool,
 }
 
 /// Why a connection's read loop ended.
@@ -180,6 +232,13 @@ pub(crate) struct Lane {
     /// Acks of local publishers held for congested remote sessions.
     remote_waiters: FxHashMap<SubRef, Vec<Waiter>>,
     pub(crate) stats: LaneStats,
+    /// Bytes the sessions charge against `max_state_bytes`.
+    state: LaneTotal,
+    /// The share of retained messages sent on subscribe, which the store
+    /// counts.
+    retained_share: Rc<Charge>,
+    /// The state budget was reached at the last check.
+    pub(crate) state_full: bool,
     /// What connections without a buffer of their own read into.
     pub(crate) read_blocks: ReadBlocks,
     /// Calls of [`Lane::sweep`] so far.
@@ -188,11 +247,14 @@ pub(crate) struct Lane {
     next_client_no: u64,
     next_will_id: u64,
     pub(crate) shut_down: bool,
+    /// Closing for a state dump: no new connections, no wills on timers.
+    pub(crate) closing: bool,
 }
 
 impl Lane {
     pub(crate) fn new(id: u16, shared: Arc<Shared>) -> Lane {
         let lanes = shared.lanes.len();
+        let state = LaneTotal::default();
         Lane {
             id,
             shared,
@@ -208,12 +270,16 @@ impl Lane {
             fwd: Arena::default(),
             remote_waiters: FxHashMap::default(),
             stats: LaneStats::default(),
+            retained_share: Rc::new(Charge::new(state.clone(), 0)),
+            state,
+            state_full: false,
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
             next_conn_id: 0,
             next_client_no: 0,
             next_will_id: 0,
             shut_down: false,
+            closing: false,
         }
     }
 
@@ -332,6 +398,9 @@ impl Lane {
             opts,
             sub_id: SubIds::one(sub_id),
             share: is_shared(filter).then(|| Arc::from(filter)),
+            online: is_shared(filter)
+                .then(|| self.sessions.get(key).map(|s| s.online.clone()))
+                .flatten(),
         }
     }
 
@@ -339,13 +408,14 @@ impl Lane {
     /// out now.
     fn remove_session(&mut self, key: Key) {
         if let Some(s) = self.sessions.get_mut(key) {
-            s.conn = None;
+            s.unbind();
         }
         self.release_waiters(key);
         let Some(mut s) = self.sessions.remove(key) else {
             return;
         };
         self.stats.dropped_expired += s.expired;
+        self.stats.dropped_session_ended += s.held();
         let sub = self.sub_ref(key);
         for filter in s.subs.keys() {
             self.unsubscribe_entry(filter, sub, None);
@@ -354,8 +424,8 @@ impl Lane {
         if self.by_client.get(&s.client_id) == Some(&key) {
             self.by_client.remove(&s.client_id);
         }
-        if let Some((_, will)) = s.delayed_will.take() {
-            self.publish_will(will);
+        if let Some(will) = s.delayed_will.take() {
+            self.publish_will(will.msg);
         }
     }
 
@@ -367,8 +437,11 @@ impl Lane {
         conn.close(bye);
     }
 
-    /// Binds a connection to its session, creating or resuming it, and
-    /// queues CONNACK.
+    /// Whether `client_id` has a session on this lane.
+    pub(crate) fn has_session(&self, client_id: &str) -> bool {
+        self.by_client.contains_key(client_id)
+    }
+
     /// Whether `client_id` has a live connection on this lane.
     pub(crate) fn is_connected(&self, client_id: &str) -> bool {
         self.by_client
@@ -377,6 +450,8 @@ impl Lane {
             .is_some_and(|s| s.conn.is_some())
     }
 
+    /// Binds a connection to its session, creating or resuming it, and
+    /// queues CONNACK.
     pub(crate) fn attach(&mut self, c: &OwnedConnect, conn: Rc<ConnShared>) -> Attached {
         let max_expiry = self.shared.opts.max_session_expiry;
         let mut present = false;
@@ -392,7 +467,7 @@ impl Lane {
             // new connection came first and cancels it. So does a will of
             // an earlier connection that waits for its delay.
             let old = s.conn.take();
-            let delayed = s.delayed_will.take().map(|(_, m)| m);
+            let delayed = s.delayed_will.take().map(|w| w.msg);
             let will = match s.will.take() {
                 Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
                 _ => delayed.filter(|_| ends),
@@ -401,7 +476,13 @@ impl Lane {
             // one; the inflight window is resent below.
             s.out.clear();
             if let Some(old) = old {
-                Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
+                // Before its CONNACK, a connection just closes: CONNACK comes
+                // before any other packet [MQTT-3.2.0-1].
+                if old.connacked.get() {
+                    Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
+                } else {
+                    old.close(Vec::new());
+                }
                 self.stats.connections -= 1;
             }
             if let Some(will) = will {
@@ -415,9 +496,8 @@ impl Lane {
             }
         }
         let key = key.unwrap_or_else(|| {
-            let k = self
-                .sessions
-                .insert(Session::new(c.client_id.as_str().into(), c.version));
+            let session = Session::new(c.client_id.as_str().into(), c.version, self.state.clone());
+            let k = self.sessions.insert(session);
             self.by_client.insert(c.client_id.as_str().into(), k);
             k
         });
@@ -429,7 +509,7 @@ impl Lane {
         s.version = c.version;
         s.username = c.username.as_deref().map(Box::from);
         s.last_allowed = None;
-        s.conn = Some(conn);
+        s.bind(conn);
         s.expiry = c.session_expiry.min(max_expiry);
         s.expires_at = None;
         s.will.clone_from(&c.will);
@@ -487,7 +567,7 @@ impl Lane {
         if !s.has_conn(conn_id) {
             return;
         }
-        s.conn = None;
+        s.unbind();
         s.out.clear();
         s.aliases.clear();
         self.stats.connections -= 1;
@@ -523,19 +603,27 @@ impl Lane {
         };
         self.next_will_id += 1;
         let id = self.next_will_id;
-        s.delayed_will = Some((id, msg));
+        s.delayed_will = Some(DelayedWill {
+            timer: id,
+            due: Instant::now() + delay,
+            msg,
+        });
         tokio::task::spawn_local(async move {
             tokio::time::sleep(delay).await;
             {
                 let mut l = lane.borrow_mut();
-                let Some((_, msg)) = l
+                // A state dump keeps the will with its due time.
+                if l.closing {
+                    return;
+                }
+                let Some(will) = l
                     .sessions
                     .get_mut(key)
-                    .and_then(|s| s.delayed_will.take_if(|(i, _)| *i == id))
+                    .and_then(|s| s.delayed_will.take_if(|w| w.timer == id))
                 else {
                     return;
                 };
-                l.publish_will(msg);
+                l.publish_will(will.msg);
                 l.flush();
             }
             crate::broker::ship(&lane).await;
@@ -555,10 +643,10 @@ impl Lane {
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set(msg);
+                .set(msg, self.state_full);
         }
         let p = Publication::of(msg);
-        let mut owned = Some(msg.clone());
+        let mut owned = Owned::of(msg.clone());
         self.route(None, &p, &mut owned);
     }
 
@@ -593,22 +681,13 @@ impl Lane {
     ) -> Result<(), Close> {
         match packet {
             Packet::Publish(p) => self.on_publish(key, &p, raw, chunk),
-            Packet::PubAck(a) => {
-                self.on_ack(key, |s| s.on_puback(a.pkid));
-                Ok(())
-            }
-            Packet::PubRec(a) => {
-                self.on_ack(key, |s| s.on_pubrec(a.pkid, a.reason));
-                Ok(())
-            }
+            Packet::PubAck(a) => self.on_ack(key, |s| s.on_puback(a.pkid)),
+            Packet::PubRec(a) => self.on_ack(key, |s| s.on_pubrec(a.pkid, a.reason)),
             Packet::PubRel(a) => {
                 self.on_pubrel(key, &a);
                 Ok(())
             }
-            Packet::PubComp(a) => {
-                self.on_ack(key, |s| s.on_pubcomp(a.pkid));
-                Ok(())
-            }
+            Packet::PubComp(a) => self.on_ack(key, |s| s.on_pubcomp(a.pkid)),
             Packet::Subscribe(s) => {
                 self.on_subscribe(key, &s);
                 Ok(())
@@ -640,13 +719,23 @@ impl Lane {
         }
     }
 
-    fn on_ack(&mut self, key: Key, f: impl FnOnce(&mut Session) -> bool) {
-        if let Some(s) = self.sessions.get_mut(key)
-            && f(s)
-        {
-            self.mark(key);
+    /// Applies an ack. `f` says whether the session has output, or the
+    /// reason the ack breaks the protocol.
+    fn on_ack(
+        &mut self,
+        key: Key,
+        f: impl FnOnce(&mut Session) -> Result<bool, u8>,
+    ) -> Result<(), Close> {
+        let mut result = Ok(());
+        if let Some(s) = self.sessions.get_mut(key) {
+            match f(s) {
+                Ok(true) => self.mark(key),
+                Ok(false) => {}
+                Err(code) => result = Err(Close::Protocol(code)),
+            }
         }
         self.release_waiters(key);
+        result
     }
 
     fn on_pubrel(&mut self, key: Key, a: &Ack<'_>) {
@@ -719,15 +808,15 @@ impl Lane {
             pins: true,
             expires_at: None,
         };
-        let mut owned = None;
+        let mut owned = Owned::default();
         if p.retain {
             let msg = publication.to_msg();
             self.shared
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set(&msg);
-            owned = Some(msg);
+                .set(&msg, self.state_full);
+            owned.msg = Some(msg);
         }
         let m = self.publisher_matches(key, topic);
         self.hit = None;
@@ -821,12 +910,7 @@ impl Lane {
 
     /// Delivers a publication to every matching subscription.
     #[inline]
-    pub(crate) fn route(
-        &mut self,
-        from: Option<Key>,
-        p: &Publication<'_>,
-        owned: &mut Option<Msg>,
-    ) {
+    fn route(&mut self, from: Option<Key>, p: &Publication<'_>, owned: &mut Owned) {
         let (m, _) = self.index.lookup(p.topic);
         self.route_matches(from, &m, p, owned);
     }
@@ -838,7 +922,7 @@ impl Lane {
         from: Option<Key>,
         m: &Matches,
         p: &Publication<'_>,
-        owned: &mut Option<Msg>,
+        owned: &mut Owned,
     ) {
         self.stats.publishes += 1;
         let mut remote_lanes = 0u64;
@@ -868,7 +952,7 @@ impl Lane {
                     self.deliver(e.sub.key, p, owned, g);
                 }
             } else {
-                let msg = owned.get_or_insert_with(|| p.to_msg()).clone();
+                let msg = owned.msg.get_or_insert_with(|| p.to_msg()).clone();
                 self.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
                     key: e.sub.key,
                     item: Queued {
@@ -922,10 +1006,11 @@ impl Lane {
         };
         let from = from.filter(|f| f.lane == self.id).map(|f| f.key);
         let (m, _) = self.index.lookup(p.topic);
-        let mut owned = None;
-        for e in &m.direct {
+        let mut owned = Owned::default();
+        let n = m.direct.len();
+        for (i, e) in m.direct.iter().enumerate() {
             if e.sub.lane == self.id
-                && let Some(g) = Self::grant(from, e, &publication, false)
+                && let Some(g) = Self::grant(from, e, &publication, i + 1 == n)
             {
                 self.deliver(e.sub.key, &publication, &mut owned, g);
             }
@@ -943,19 +1028,34 @@ impl Lane {
             retain: e.opts.retain_as_published && p.retain,
             sub_id: e.sub_id,
             last,
+            on_subscribe: false,
         })
     }
 
     #[inline]
-    fn deliver(&mut self, key: Key, p: &Publication<'_>, owned: &mut Option<Msg>, g: Grant) {
+    fn deliver(&mut self, key: Key, p: &Publication<'_>, owned: &mut Owned, g: Grant) {
         let Grant {
             qos,
             retain,
             sub_id,
-            last,
+            on_subscribe,
+            ..
         } = g;
-        let max_out = self.shared.opts.max_out_bytes;
-        let max_queued = self.shared.opts.max_queued;
+        let o = &self.shared.opts;
+        let max_out = o.max_out_bytes;
+        let limit = if on_subscribe {
+            QueueLimit {
+                count: usize::MAX,
+                bytes: usize::MAX,
+                state_full: self.state_full,
+            }
+        } else {
+            QueueLimit {
+                count: o.max_queued,
+                bytes: o.max_queued_bytes,
+                state_full: self.state_full,
+            }
+        };
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -966,24 +1066,10 @@ impl Lane {
                 s.deliver_qos0(p, retain, sub_id, max_out)
             }
         } else {
-            let msg = owned.get_or_insert_with(|| p.to_msg());
-            // A slow or offline session may hold a message long; do not let
-            // it pin read buffers.
-            if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
-                *msg = s.arena.copy(msg);
-            }
-            let msg = if last { owned.take() } else { owned.clone() }.unwrap_or_else(|| p.to_msg());
-            s.deliver_qos12(
-                Queued {
-                    msg,
-                    qos,
-                    retain,
-                    sub_id,
-                },
-                max_queued,
-            )
+            let kept = keep(s, p, owned, &self.state, g);
+            s.deliver_qos12(kept, limit)
         };
-        if matches!(outcome, Outcome::Queued | Outcome::QueueFull)
+        if matches!(outcome, Outcome::Queued | Outcome::QueueFull(_))
             && s.conn.is_some()
             && s.queued() >= self.shared.opts.qos_queue_high
         {
@@ -1006,7 +1092,8 @@ impl Lane {
                 self.mark(key);
             }
             Outcome::Queued => {}
-            Outcome::QueueFull => self.stats.dropped_queue_full += 1,
+            Outcome::QueueFull(n) => self.stats.dropped_queue_full += u64::from(n),
+            Outcome::StateFull => self.stats.dropped_state_full += 1,
             Outcome::BufferFull => self.stats.dropped_buffer_full += 1,
             Outcome::Offline => self.stats.dropped_offline += 1,
             Outcome::TooLarge => self.stats.dropped_too_large += 1,
@@ -1027,14 +1114,16 @@ impl Lane {
                     self.route_forwarded(chunk, *at, *origin);
                 }
             }
+            Remote::Drained(sync) => sync.done(),
             Remote::Deliver { key, item } => {
                 let p = Publication::of(&item.msg);
-                let mut owned = Some(item.msg.clone());
+                let mut owned = Owned::of(item.msg.clone());
                 let g = Grant {
                     qos: item.qos,
                     retain: item.retain,
                     sub_id: item.sub_id,
                     last: true,
+                    on_subscribe: false,
                 };
                 self.deliver(*key, &p, &mut owned, g);
             }
@@ -1046,8 +1135,9 @@ impl Lane {
             .properties
             .get_int(property::SUBSCRIPTION_IDENTIFIER)
             .unwrap_or(0);
+        let lanes = self.shared.lanes.len();
         let mut codes = Vec::new();
-        let mut retained = Vec::new();
+        let mut wanted = Vec::new();
         let sync = self.sync();
         for (filter, opts) in sub.filters() {
             let Some(s) = self.sessions.get_mut(key) else {
@@ -1057,22 +1147,12 @@ impl Lane {
                 codes.push(code);
                 continue;
             }
-            let existed = s.subs.insert(filter.into(), (opts, sub_id)).is_some();
+            let existed = s.subscribe(filter, opts, sub_id, lanes);
             let entry = self.entry_for(key, filter, opts, sub_id);
             self.subscribe_entry(filter, &entry, sync.as_ref());
             codes.push(opts.qos as u8);
             if retained_wanted(filter, opts, existed) {
-                let store = self
-                    .shared
-                    .retained
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                retained.extend(
-                    store
-                        .matching(filter)
-                        .into_iter()
-                        .map(|m| (m, opts.qos, sub_id)),
-                );
+                wanted.push((filter.into(), opts.qos, sub_id));
             }
         }
         self.stats.subscriptions = self.index.len() as u64;
@@ -1086,7 +1166,32 @@ impl Lane {
             codes: &codes,
         };
         let version = s.version;
-        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out));
+        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out), wanted);
+    }
+
+    /// Sends the retained messages `wanted` subscriptions match. Read only
+    /// once every lane has the subscriptions: a publish on another lane then
+    /// either updated the store already, or is routed to them live.
+    fn send_retained(&mut self, key: Key, wanted: &[Wanted]) {
+        if wanted.is_empty() {
+            return;
+        }
+        let mut retained = Vec::new();
+        {
+            let store = self
+                .shared
+                .retained
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (filter, qos, sub_id) in wanted {
+                retained.extend(
+                    store
+                        .matching(filter)
+                        .into_iter()
+                        .map(|m| (m, *qos, *sub_id)),
+                );
+            }
+        }
         self.deliver_retained(key, retained);
     }
 
@@ -1102,10 +1207,14 @@ impl Lane {
                 retain: true,
                 sub_id: SubIds::one(sub_id),
                 last: true,
+                on_subscribe: true,
             };
             let mut retained = msg.clone();
             retained.retain = true;
-            let mut owned = Some(retained);
+            let mut owned = Owned {
+                msg: Some(retained),
+                share: Some(self.retained_share.clone()),
+            };
             self.deliver(key, &p, &mut owned, g);
         }
     }
@@ -1121,16 +1230,23 @@ impl Lane {
         key: Key,
         sync: Option<Arc<SyncAck>>,
         encode: impl FnOnce(&mut Vec<u8>),
+        retained: Vec<Wanted>,
     ) {
         if let Some(sync) = sync {
             let mut packet = Vec::new();
             encode(&mut packet);
-            self.held.push(Held { key, sync, packet });
+            self.held.push(Held {
+                key,
+                sync,
+                packet,
+                retained,
+            });
         } else {
             if let Some(s) = self.sessions.get_mut(key) {
                 encode(&mut s.out);
             }
             self.mark(key);
+            self.send_retained(key, &retained);
         }
     }
 
@@ -1145,6 +1261,7 @@ impl Lane {
             s.out.extend_from_slice(&h.packet);
         }
         self.mark(h.key);
+        self.send_retained(h.key, &h.retained);
         self.flush();
     }
 
@@ -1152,11 +1269,12 @@ impl Lane {
         let mut codes = Vec::new();
         let sub = self.sub_ref(key);
         let sync = self.sync();
+        let lanes = self.shared.lanes.len();
         for filter in u.filters() {
             let existed = self
                 .sessions
                 .get_mut(key)
-                .is_some_and(|s| s.subs.remove(filter).is_some());
+                .is_some_and(|s| s.unsubscribe(filter, lanes));
             if existed {
                 self.unsubscribe_entry(filter, sub, sync.as_ref());
             }
@@ -1177,7 +1295,12 @@ impl Lane {
             codes: &codes,
         };
         let version = s.version;
-        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out));
+        self.ack_after_sync(
+            key,
+            sync,
+            |out| encode::suback(&a, version, out),
+            Vec::new(),
+        );
     }
 
     /// Handles a control message.
@@ -1210,6 +1333,7 @@ impl Lane {
             Control::Stats(reply) => {
                 let mut stats = self.stats;
                 stats.sessions = self.sessions.len() as u64;
+                stats.state_bytes = self.state.get() as u64;
                 // Removed sessions added theirs to `self.stats`.
                 stats.dropped_expired += self
                     .sessions
@@ -1218,6 +1342,22 @@ impl Lane {
                     .map(|s| s.expired)
                     .sum::<u64>();
                 let _ = reply.send(stats);
+            }
+            Control::Quiesce(done) => {
+                self.quiesce();
+                let _ = done.send(());
+            }
+            Control::Drain(sync) => self.drain(&sync),
+            Control::Dump(d) => {
+                let Dump { mut part, reply } = *d;
+                let written = self.dump(&mut part);
+                // Let go of the file before answering, so it closes.
+                drop(part);
+                let _ = reply.send(written);
+            }
+            Control::Restore(states, sync, done) => {
+                self.restore(states, &sync);
+                let _ = done.send(());
             }
             Control::Shutdown(done) => {
                 self.shutdown();
@@ -1232,6 +1372,7 @@ impl Lane {
     /// Keep alive timeouts and session expiry, for the next of
     /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
+        self.check_state();
         let part = self.sweeps % SWEEP_PARTS;
         self.sweeps = self.sweeps.wrapping_add(1);
         // The retained store is shared; one lane, once a round, is enough.
@@ -1262,6 +1403,98 @@ impl Lane {
                 self.remove_session(key);
             }
         }
+    }
+
+    /// Publishes this lane's state bytes, and checks `max_state_bytes`
+    /// against those of all lanes and the retained store.
+    fn check_state(&mut self) {
+        let max = self.shared.opts.max_state_bytes;
+        if max == usize::MAX {
+            return;
+        }
+        self.shared.lanes[usize::from(self.id)]
+            .state
+            .store(self.state.get(), Ordering::Relaxed);
+        let retained = self
+            .shared
+            .retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bytes();
+        let lanes: usize = self
+            .shared
+            .lanes
+            .iter()
+            .map(|l| l.state.load(Ordering::Relaxed))
+            .sum();
+        self.state_full = lanes + retained >= max;
+    }
+
+    /// Closes every connection as lost, so wills and session expiry run
+    /// as usual, and refuses new ones.
+    fn quiesce(&mut self) {
+        self.closing = true;
+        let connected: Vec<(Key, Rc<ConnShared>)> = self
+            .sessions
+            .keys()
+            .filter_map(|k| Some((k, self.sessions.get(k)?.conn.clone()?)))
+            .collect();
+        for (key, conn) in connected {
+            if let Some(s) = self.sessions.get(key) {
+                Self::kick(&conn, s.version, reason::SERVER_SHUTTING_DOWN);
+            }
+            self.detach(key, conn.id, Close::Kicked);
+        }
+    }
+
+    /// Queues a marker for every other lane behind what waits for it.
+    fn drain(&mut self, sync: &Arc<SyncAck>) {
+        for (lane, batch) in self.remote.iter_mut().enumerate() {
+            if lane != usize::from(self.id) {
+                batch.push(Remote::Drained(sync.clone()));
+            }
+        }
+    }
+
+    /// Writes the sessions that outlive their connection.
+    fn dump(&self, part: &mut Part) -> io::Result<()> {
+        for key in self.sessions.keys() {
+            if let Some(s) = self.sessions.get(key)
+                && s.expiry != 0
+            {
+                part.session(s)?;
+            }
+        }
+        part.flush()
+    }
+
+    /// Adds sessions from a state file, with their subscriptions on every
+    /// lane and their delayed wills timed.
+    fn restore(&mut self, states: Vec<SessionState>, sync: &Arc<SyncAck>) {
+        let lanes = self.shared.lanes.len();
+        let now = Instant::now();
+        for st in states {
+            if self.by_client.contains_key(&st.client_id) {
+                continue;
+            }
+            let (session, will) = Session::restore(st, self.state.clone(), lanes);
+            let subs: Vec<(Box<str>, SubscriptionOptions, u32)> = session
+                .subs
+                .iter()
+                .map(|(f, (opts, id))| (f.clone(), *opts, *id))
+                .collect();
+            let client_id = session.client_id.clone();
+            let key = self.sessions.insert(session);
+            self.by_client.insert(client_id, key);
+            for (filter, opts, sub_id) in subs {
+                let entry = self.entry_for(key, &filter, opts, sub_id);
+                self.subscribe_entry(&filter, &entry, Some(sync));
+            }
+            if let Some((due, msg)) = will {
+                self.schedule_will(key, msg, due.saturating_duration_since(now));
+            }
+        }
+        self.stats.subscriptions = self.index.len() as u64;
     }
 
     fn shutdown(&mut self) {
@@ -1356,6 +1589,44 @@ fn forward_packet(
     let out = arena.put(len, |b| encode::publish(&h, p.payload, &mut Block(b)));
     let at = (0, out.len() as u32);
     (out, at, Version::V5, false)
+}
+
+/// What session `s` keeps of `p` at QoS 1/2: the message, copied if it would
+/// pin a read buffer long, and a share of its bytes when more sessions of
+/// the lane may get it.
+fn keep(
+    s: &mut Session,
+    p: &Publication<'_>,
+    owned: &mut Owned,
+    total: &LaneTotal,
+    g: Grant,
+) -> Kept {
+    let msg = owned.msg.get_or_insert_with(|| p.to_msg());
+    // A slow or offline session may hold a message long; do not let it pin
+    // read buffers.
+    if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
+        *msg = s.copy(msg);
+    }
+    let share = if g.last && owned.share.is_none() {
+        None
+    } else {
+        let share = owned
+            .share
+            .get_or_insert_with(|| Rc::new(Charge::new(total.clone(), budget::shared(msg))));
+        Some(share.clone())
+    };
+    let msg = if g.last {
+        owned.msg.take()
+    } else {
+        owned.msg.clone()
+    };
+    let item = Queued {
+        msg: msg.unwrap_or_else(|| p.to_msg()),
+        qos: g.qos,
+        retain: g.retain,
+        sub_id: g.sub_id,
+    };
+    Kept { item, share }
 }
 
 /// Appends a forwarded packet, sharing the last batch entry when it uses
@@ -1462,7 +1733,10 @@ fn may_subscribe(acl: Option<&dyn Authorizer>, s: &Session, filter: &str) -> boo
             client_id: &s.client_id,
             username: s.username.as_deref(),
         };
-        acl.may_subscribe(&client, filter)
+        match SharedFilter::try_from(filter) {
+            Ok(shared) => acl.may_subscribe_shared(&client, shared.group, shared.filter),
+            Err(_) => acl.may_subscribe(&client, filter),
+        }
     })
 }
 

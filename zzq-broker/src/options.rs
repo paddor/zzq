@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -56,8 +57,17 @@ pub trait Authorizer: Send + Sync + 'static {
     /// client's publishes changes.
     fn may_publish(&self, client: &ClientInfo<'_>, topic: &str) -> bool;
 
-    /// Whether the client may subscribe to `filter`.
+    /// Whether the client may subscribe to `filter`. Shared subscriptions
+    /// ask [`Authorizer::may_subscribe_shared`] instead.
     fn may_subscribe(&self, client: &ClientInfo<'_>, filter: &str) -> bool;
+
+    /// Whether the client may join the share group `group` on `filter`,
+    /// the filter after `$share/{group}/`. By default the rule of
+    /// [`Authorizer::may_subscribe`] for `filter`.
+    fn may_subscribe_shared(&self, client: &ClientInfo<'_>, group: &str, filter: &str) -> bool {
+        let _ = group;
+        self.may_subscribe(client, filter)
+    }
 }
 
 /// Broker settings.
@@ -71,6 +81,11 @@ pub struct BrokerOptions {
     /// QoS 1/2 messages queued per session beyond the inflight window. The
     /// oldest is dropped and counted when full.
     pub max_queued: usize,
+    /// Bytes of topics, properties and payloads of the QoS 1/2 messages
+    /// queued per session beyond the inflight window. The oldest are
+    /// dropped and counted when full; a message larger than this is
+    /// dropped.
+    pub max_queued_bytes: usize,
     /// QoS 1/2 messages queued for a connected session before publishers that
     /// feed it get their acks held back. Acks resume at half of this.
     pub qos_queue_high: usize,
@@ -86,6 +101,15 @@ pub struct BrokerOptions {
     /// Retained topics stored. Retained messages for new topics beyond it
     /// are delivered but not stored, and counted.
     pub max_retained: usize,
+    /// Approximate bytes of broker state: sessions, their subscriptions and
+    /// the QoS 1/2 messages they hold, and retained messages. A message that
+    /// sessions of one lane share counts once, and so does a retained
+    /// message sessions got on subscribe. Lanes check it 20 times a second.
+    /// While it is reached, new sessions that would outlive their connection
+    /// get CONNACK Quota Exceeded, messages that would wait in a session
+    /// queue are dropped and counted, and retained messages for new topics
+    /// are not stored.
+    pub max_state_bytes: usize,
     /// Levels a topic name or filter may have. Deeper ones are rejected,
     /// which bounds the work and stack depth of matching.
     pub max_topic_levels: usize,
@@ -108,6 +132,15 @@ pub struct BrokerOptions {
     /// Durable storage for retained messages. `None` keeps them in memory
     /// only.
     pub persistence: Option<Arc<dyn crate::Persistence>>,
+    /// File that keeps sessions over a restart: [`Broker::shutdown`]
+    /// closes every connection and writes it, and [`Broker::new`] loads it
+    /// and renames it to `<name>.loaded`. It holds the retained messages
+    /// too, unless `persistence` keeps them. Sessions that end with their
+    /// connection are left out. The file is compressed with Zstandard.
+    ///
+    /// [`Broker::shutdown`]: crate::Broker::shutdown
+    /// [`Broker::new`]: crate::Broker::new
+    pub state_file: Option<PathBuf>,
     /// Interval of the retained `$SYS/broker/...` status messages. `None`
     /// turns them off.
     pub sys_interval: Option<Duration>,
@@ -135,11 +168,13 @@ impl Default for BrokerOptions {
             max_packet_size: 16 << 20,
             max_inflight: 1024,
             max_queued: 100_000,
+            max_queued_bytes: usize::MAX,
             qos_queue_high: 1024,
             max_out_bytes: 64 << 20,
             receive_maximum: 65_535,
             max_subscriptions: usize::MAX,
             max_retained: usize::MAX,
+            max_state_bytes: usize::MAX,
             max_topic_levels: 128,
             topic_alias_maximum: 1024,
             max_session_expiry: u32::MAX,
@@ -149,6 +184,7 @@ impl Default for BrokerOptions {
             authenticator: None,
             authorizer: None,
             persistence: None,
+            state_file: None,
             sys_interval: Some(Duration::from_secs(10)),
             transport: TransportOptions::default(),
             sn_gateway_id: 1,
@@ -167,11 +203,13 @@ impl fmt::Debug for BrokerOptions {
             .field("max_packet_size", &self.max_packet_size)
             .field("max_inflight", &self.max_inflight)
             .field("max_queued", &self.max_queued)
+            .field("max_queued_bytes", &self.max_queued_bytes)
             .field("qos_queue_high", &self.qos_queue_high)
             .field("max_out_bytes", &self.max_out_bytes)
             .field("receive_maximum", &self.receive_maximum)
             .field("max_subscriptions", &self.max_subscriptions)
             .field("max_retained", &self.max_retained)
+            .field("max_state_bytes", &self.max_state_bytes)
             .field("max_topic_levels", &self.max_topic_levels)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
             .field("max_session_expiry", &self.max_session_expiry)
@@ -181,6 +219,7 @@ impl fmt::Debug for BrokerOptions {
             .field("authenticator", &self.authenticator.is_some())
             .field("authorizer", &self.authorizer.is_some())
             .field("persistence", &self.persistence.is_some())
+            .field("state_file", &self.state_file)
             .field("sys_interval", &self.sys_interval)
             .field("transport", &self.transport)
             .field("sn_gateway_id", &self.sn_gateway_id)

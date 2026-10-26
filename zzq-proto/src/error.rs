@@ -14,8 +14,10 @@ pub enum DecodeError {
     TooLarge,
     /// A string is not valid UTF-8 or contains U+0000.
     InvalidUtf8,
-    /// A topic name or filter is invalid.
+    /// A topic name is invalid.
     InvalidTopic,
+    /// A topic filter is invalid.
+    InvalidFilter,
     /// The CONNECT protocol level is not supported.
     UnsupportedVersion(u8),
 }
@@ -28,6 +30,7 @@ impl DecodeError {
             DecodeError::Protocol => reason::PROTOCOL_ERROR,
             DecodeError::TooLarge => reason::PACKET_TOO_LARGE,
             DecodeError::InvalidTopic => reason::TOPIC_NAME_INVALID,
+            DecodeError::InvalidFilter => reason::TOPIC_FILTER_INVALID,
             DecodeError::UnsupportedVersion(_) => reason::UNSUPPORTED_PROTOCOL_VERSION,
         }
     }
@@ -41,6 +44,7 @@ impl fmt::Display for DecodeError {
             DecodeError::TooLarge => f.write_str("packet too large"),
             DecodeError::InvalidUtf8 => f.write_str("invalid UTF-8 string"),
             DecodeError::InvalidTopic => f.write_str("invalid topic"),
+            DecodeError::InvalidFilter => f.write_str("invalid topic filter"),
             DecodeError::UnsupportedVersion(v) => write!(f, "unsupported protocol level {v}"),
         }
     }
@@ -81,6 +85,11 @@ mod tests {
                 DecodeError::InvalidTopic,
                 "invalid topic",
                 reason::TOPIC_NAME_INVALID,
+            ),
+            (
+                DecodeError::InvalidFilter,
+                "invalid topic filter",
+                reason::TOPIC_FILTER_INVALID,
             ),
             (
                 DecodeError::UnsupportedVersion(7),
