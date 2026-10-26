@@ -2,8 +2,7 @@
 //! index, and the packet handling for its connections.
 
 use std::cell::RefCell;
-use std::fs::File;
-use std::io::{self, BufWriter};
+use std::io;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -23,12 +22,13 @@ use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 use crate::broker::Shared;
 use crate::budget::LaneTotal;
 use crate::conn::{ConnShared, OwnedConnect, ReadBlocks};
+use crate::dump::Part;
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
 use crate::session::{DelayedWill, Outcome, QueueLimit, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
-use crate::state::{ImageWriter, SessionState};
+use crate::state::SessionState;
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
 
@@ -139,20 +139,18 @@ pub(crate) enum Control {
     Quiesce(oneshot::Sender<()>),
     /// Ship what is waiting for other lanes, then a marker to each.
     Drain(Arc<SyncAck>),
-    /// Write the sessions that outlive their connection.
+    /// Write the sessions that outlive their connection, then answer.
     Dump(Box<Dump>),
     /// Add sessions from a state file, then answer. Their subscriptions
     /// count down the ack on the other lanes.
     Restore(Vec<SessionState>, Arc<SyncAck>, oneshot::Sender<()>),
 }
 
-pub(crate) type StateWriter = ImageWriter<BufWriter<File>>;
-
-/// A state file being written, passed from lane to lane.
+/// A lane's share of the state file being written.
 #[derive(Debug)]
 pub(crate) struct Dump {
-    pub(crate) writer: StateWriter,
-    pub(crate) reply: oneshot::Sender<io::Result<StateWriter>>,
+    pub(crate) part: Part,
+    pub(crate) reply: oneshot::Sender<io::Result<()>>,
 }
 
 /// A congested session a QoS 1/2 publish was routed to.
@@ -1344,8 +1342,11 @@ impl Lane {
             }
             Control::Drain(sync) => self.drain(&sync),
             Control::Dump(d) => {
-                let Dump { mut writer, reply } = *d;
-                let _ = reply.send(self.dump(&mut writer).map(|()| writer));
+                let Dump { mut part, reply } = *d;
+                let written = self.dump(&mut part);
+                // Let go of the file before answering, so it closes.
+                drop(part);
+                let _ = reply.send(written);
             }
             Control::Restore(states, sync, done) => {
                 self.restore(states, &sync);
@@ -1449,15 +1450,15 @@ impl Lane {
     }
 
     /// Writes the sessions that outlive their connection.
-    fn dump(&self, w: &mut StateWriter) -> io::Result<()> {
+    fn dump(&self, part: &mut Part) -> io::Result<()> {
         for key in self.sessions.keys() {
             if let Some(s) = self.sessions.get(key)
                 && s.expiry != 0
             {
-                w.session(s)?;
+                part.session(s)?;
             }
         }
-        Ok(())
+        part.flush()
     }
 
     /// Adds sessions from a state file, with their subscriptions on every

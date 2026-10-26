@@ -143,11 +143,21 @@ impl<W: Write> ImageWriter<W> {
     pub(crate) fn new(mut w: W, clock: Clock) -> io::Result<ImageWriter<W>> {
         w.write_all(MAGIC)?;
         w.write_all(&VERSION.to_be_bytes())?;
-        Ok(ImageWriter {
+        Ok(ImageWriter::part(w, clock))
+    }
+
+    /// Writes records of an image another writer started and ends.
+    pub(crate) const fn part(w: W, clock: Clock) -> ImageWriter<W> {
+        ImageWriter {
             w,
             clock,
             body: Vec::new(),
-        })
+        }
+    }
+
+    /// The bytes written so far, for a writer that moves them on.
+    pub(crate) const fn get_mut(&mut self) -> &mut W {
+        &mut self.w
     }
 
     pub(crate) fn session(&mut self, s: &Session) -> io::Result<()> {
@@ -165,11 +175,17 @@ impl<W: Write> ImageWriter<W> {
     }
 
     /// Writes the end record, which tells a complete image from a torn
-    /// one, and returns the writer.
-    pub(crate) fn finish(mut self) -> io::Result<W> {
+    /// one.
+    pub(crate) fn end(&mut self) -> io::Result<()> {
         self.body.clear();
         self.body.push(END);
-        self.record()?;
+        self.record()
+    }
+
+    /// Writes the end record and returns the writer.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn finish(mut self) -> io::Result<W> {
+        self.end()?;
         Ok(self.w)
     }
 

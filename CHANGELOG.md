@@ -26,8 +26,9 @@ Notable changes to zzq. The format follows
   `Broker::shutdown` closes every connection as lost, so wills go out, and
   writes the sessions with their subscriptions, queues, unacked messages
   and delayed wills, plus the retained messages unless `persistence` keeps
-  them. `Broker::new` loads the file and renames it to `<name>.loaded`.
-  `zzq_broker --state-file` writes it on SIGTERM or SIGINT.
+  them, compressed with Zstandard. `Broker::new` loads the file and
+  renames it to `<name>.loaded`. `zzq_broker --state-file` writes it on
+  SIGTERM or SIGINT.
 
 ### Changed
 

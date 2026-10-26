@@ -49,6 +49,7 @@ socket2 = "0.6"
 thiserror = "2.0"
 tokio = { version = "1.53", default-features = false }
 xxhash-rust = { version = "0.8.18", features = ["xxh3"] }
+zrip = { version = "0.8.13", default-features = false, features = ["std", "simd"] }
 
 [profile.release]
 debug = "line-tables-only"

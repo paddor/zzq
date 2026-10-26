@@ -169,8 +169,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "fearless_simd"
+version = "1.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "629c9d6b6f30b5604089e0980f4d924a013aacb1654a6cdf5d3d852224f68651"
 
 [[package]]
 name = "find-msvc-tools"
@@ -1030,6 +1036,43 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
+name = "zrip"
+version = "0.8.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dff69edf26b825690006f592f896f99a6d5b7f17292fdce184e0f1929126a9c7"
+dependencies = [
+ "zrip-core",
+ "zrip-decode",
+ "zrip-encode",
+]
+
+[[package]]
+name = "zrip-core"
+version = "0.11.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80f6de2d9ed313cfb14a113e6da994e6ddd7891c3c6af2eed5ccb887e40178ec"
+
+[[package]]
+name = "zrip-decode"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "54a8b5fdab562e69236b85c659721d371ed1306aa42b57aa84917e9ae18ce6c7"
+dependencies = [
+ "fearless_simd",
+ "zrip-core",
+]
+
+[[package]]
+name = "zrip-encode"
+version = "0.9.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d74fda9e0e68c79e37bce1fcdd6c4d37637d74aeac3c0a627f9f0474dbe32e10"
+dependencies = [
+ "fearless_simd",
+ "zrip-core",
+]
+
+[[package]]
 name = "zzq-bench"
 version = "0.1.1"
 dependencies = [
@@ -1052,6 +1095,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "xxhash-rust",
+ "zrip",
  "zzq-client",
  "zzq-proto",
  "zzq-tokio",

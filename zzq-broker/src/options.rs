@@ -134,7 +134,7 @@ pub struct BrokerOptions {
     /// closes every connection and writes it, and [`Broker::new`] loads it
     /// and renames it to `<name>.loaded`. It holds the retained messages
     /// too, unless `persistence` keeps them. Sessions that end with their
-    /// connection are left out.
+    /// connection are left out. The file is compressed with Zstandard.
     ///
     /// [`Broker::shutdown`]: crate::Broker::shutdown
     /// [`Broker::new`]: crate::Broker::new

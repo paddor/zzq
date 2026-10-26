@@ -256,6 +256,61 @@ async fn messages_acked_before_shutdown_are_kept() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn sessions_of_many_frames_on_every_lane_survive() {
+    let d = dir("frames");
+    let file = d.join("state");
+    let ctx = lanes(4);
+    let (broker, uri) = start(&ctx, opts(&file)).await;
+    let ids: Vec<String> = (0..40).map(|i| format!("s{i}")).collect();
+    for id in &ids {
+        let s = Client::connect(&ctx, &uri, durable(id)).await.unwrap();
+        s.subscribe("big", QoS::AtLeastOnce).await.unwrap();
+        s.disconnect().await;
+    }
+    let p = client(&ctx, &uri, "p", Version::V5).await;
+    let payload = |i: usize| format!("{i:04}").repeat(256);
+    for i in 0..20 {
+        p.publish("big", payload(i), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    broker.shutdown().await.unwrap();
+    // Zstandard, and much smaller than the 800 KiB of payloads held.
+    let image = std::fs::read(&file).unwrap();
+    assert!(image.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]));
+    assert!(image.len() < 100 << 10, "{} bytes", image.len());
+
+    let (_broker, uri) = start(&ctx, opts(&file)).await;
+    for id in &ids {
+        let mut s = Client::connect(&ctx, &uri, durable(id)).await.unwrap();
+        for i in 0..20 {
+            assert_eq!(next(&mut s).await.payload, payload(i), "{id}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_torn_state_file_stops_the_start_and_stays() {
+    let d = dir("torn");
+    let file = d.join("state");
+    let ctx = lanes(1);
+    let (broker, uri) = start(&ctx, opts(&file)).await;
+    let s = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
+    s.subscribe("q", QoS::AtLeastOnce).await.unwrap();
+    s.disconnect().await;
+    broker.shutdown().await.unwrap();
+    let image = std::fs::read(&file).unwrap();
+    for cut in [1, image.len() / 2] {
+        std::fs::write(&file, &image[..image.len() - cut]).unwrap();
+        let err = Broker::new(&ctx, opts(&file)).await.unwrap_err();
+        assert!(matches!(err, Error::State(_)), "{err:?}");
+        assert!(file.exists());
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_damaged_state_file_stops_the_start_and_stays() {
     let d = dir("damaged");
     let file = d.join("state");

@@ -30,6 +30,7 @@ rustc-hash.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros", "signal"] }
 xxhash-rust.workspace = true
+zrip.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"
