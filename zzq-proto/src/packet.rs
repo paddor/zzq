@@ -4,6 +4,7 @@
 //! Every view borrows from that buffer.
 
 use crate::cursor::Cursor;
+use crate::property::Rules;
 use crate::topic::{validate_filter, validate_name};
 use crate::{DecodeError, Properties, QoS, SubscriptionOptions, Version, varint};
 
@@ -318,8 +319,8 @@ pub fn decode_body(byte1: u8, body: &[u8], version: Version) -> Result<Packet<'_
         11 => Packet::UnsubAck(suback(body, v5)?),
         12 if body.is_empty() => Packet::PingReq,
         13 if body.is_empty() => Packet::PingResp,
-        14 => Packet::Disconnect(reason_only(body, v5)?),
-        15 if v5 => Packet::Auth(reason_only(body, v5)?),
+        14 => Packet::Disconnect(reason_only(body, v5, Rules::DISCONNECT)?),
+        15 if v5 => Packet::Auth(reason_only(body, v5, Rules::AUTH)?),
         _ => return Err(DecodeError::Malformed),
     })
 }
@@ -365,13 +366,13 @@ fn publish(flags: u8, body: &[u8], v5: bool) -> Result<Publish<'_>, DecodeError>
         id
     };
     let properties = if v5 {
-        c.properties()?
+        c.properties(Rules::PUBLISH)?
     } else {
         Properties::EMPTY
     };
     let topic = topic_name(topic_raw)?;
     if topic.is_empty() && (!v5 || properties.get(crate::property::TOPIC_ALIAS).is_none()) {
-        return Err(DecodeError::InvalidTopic);
+        return Err(DecodeError::Protocol);
     }
     Ok(Publish {
         dup,
@@ -396,12 +397,14 @@ fn connect(body: &[u8]) -> Result<Connect<'_>, DecodeError> {
         _ => return Err(DecodeError::Protocol),
     };
     let flags = c.u8()?;
-    if flags & 0x01 != 0 {
+    // The reserved flag [MQTT-3.1.2-3], and before 5.0 a password without a
+    // user name [MQTT-3.1.2-22].
+    if flags & 0x01 != 0 || (!version.is_v5() && flags & 0xc0 == 0x40) {
         return Err(DecodeError::Malformed);
     }
     let keep_alive = c.u16()?;
     let properties = if version.is_v5() {
-        c.properties()?
+        c.properties(Rules::CONNECT)?
     } else {
         Properties::EMPTY
     };
@@ -440,7 +443,7 @@ fn will<'a>(c: &mut Cursor<'a>, flags: u8, v5: bool) -> Result<Option<Will<'a>>,
         return Ok(None);
     }
     let properties = if v5 {
-        c.properties()?
+        c.properties(Rules::WILL)?
     } else {
         Properties::EMPTY
     };
@@ -463,7 +466,7 @@ fn connack(body: &[u8], v5: bool) -> Result<ConnAck<'_>, DecodeError> {
     }
     let code = c.u8()?;
     let properties = if v5 && !c.is_empty() {
-        c.properties()?
+        c.properties(Rules::CONNACK)?
     } else {
         Properties::EMPTY
     };
@@ -485,7 +488,7 @@ fn ack(body: &[u8], v5: bool) -> Result<Ack<'_>, DecodeError> {
             reason = c.u8()?;
         }
         if !c.is_empty() {
-            properties = c.properties()?;
+            properties = c.properties(Rules::ACK)?;
         }
     }
     if !c.is_empty() {
@@ -509,7 +512,7 @@ fn subscribe(body: &[u8], version: Version) -> Result<Subscribe<'_>, DecodeError
     let mut c = Cursor::new(body);
     let pkid = packet_id(&mut c)?;
     let properties = if version.is_v5() {
-        c.properties()?
+        c.properties(Rules::SUBSCRIBE)?
     } else {
         Properties::EMPTY
     };
@@ -519,8 +522,13 @@ fn subscribe(body: &[u8], version: Version) -> Result<Subscribe<'_>, DecodeError
         return Err(DecodeError::Protocol);
     }
     while !check.is_empty() {
-        validate_filter(check.string()?)?;
-        SubscriptionOptions::from_byte(check.u8()?, version)?;
+        let filter = check.string()?;
+        validate_filter(filter)?;
+        let opts = SubscriptionOptions::from_byte(check.u8()?, version)?;
+        // No Local on a shared subscription [MQTT-3.8.3-4].
+        if opts.no_local && filter.starts_with("$share/") {
+            return Err(DecodeError::Protocol);
+        }
     }
     Ok(Subscribe {
         pkid,
@@ -534,7 +542,7 @@ fn unsubscribe(body: &[u8], v5: bool) -> Result<Unsubscribe<'_>, DecodeError> {
     let mut c = Cursor::new(body);
     let pkid = packet_id(&mut c)?;
     let properties = if v5 {
-        c.properties()?
+        c.properties(Rules::UNSUBSCRIBE)?
     } else {
         Properties::EMPTY
     };
@@ -557,7 +565,7 @@ fn suback(body: &[u8], v5: bool) -> Result<SubAck<'_>, DecodeError> {
     let mut c = Cursor::new(body);
     let pkid = c.u16()?;
     let properties = if v5 {
-        c.properties()?
+        c.properties(Rules::ACK)?
     } else {
         Properties::EMPTY
     };
@@ -568,7 +576,7 @@ fn suback(body: &[u8], v5: bool) -> Result<SubAck<'_>, DecodeError> {
     })
 }
 
-fn reason_only(body: &[u8], v5: bool) -> Result<ReasonOnly<'_>, DecodeError> {
+fn reason_only(body: &[u8], v5: bool, rules: Rules) -> Result<ReasonOnly<'_>, DecodeError> {
     let mut c = Cursor::new(body);
     if !v5 {
         if !c.is_empty() {
@@ -581,7 +589,7 @@ fn reason_only(body: &[u8], v5: bool) -> Result<ReasonOnly<'_>, DecodeError> {
     }
     let reason = if c.is_empty() { 0 } else { c.u8()? };
     let properties = if c.remaining() > 0 {
-        c.properties()?
+        c.properties(rules)?
     } else {
         Properties::EMPTY
     };

@@ -20,11 +20,11 @@ pub fn validate_name(topic: &str) -> Result<(), DecodeError> {
 ///
 /// # Errors
 ///
-/// [`DecodeError::InvalidTopic`] if the filter is empty, too long, uses a
+/// [`DecodeError::InvalidFilter`] if the filter is empty, too long, uses a
 /// wildcard inside a level, or is a malformed `$share/` filter.
 pub fn validate_filter(filter: &str) -> Result<(), DecodeError> {
     if filter.is_empty() || filter.len() > 65_535 {
-        return Err(DecodeError::InvalidTopic);
+        return Err(DecodeError::InvalidFilter);
     }
     let body = if is_shared(filter) {
         SharedFilter::try_from(filter)?.filter
@@ -37,7 +37,7 @@ pub fn validate_filter(filter: &str) -> Result<(), DecodeError> {
         match level {
             "+" => {}
             "#" if last => {}
-            _ if level.contains(['+', '#']) => return Err(DecodeError::InvalidTopic),
+            _ if level.contains(['+', '#']) => return Err(DecodeError::InvalidFilter),
             _ => {}
         }
     }
@@ -85,10 +85,10 @@ impl<'a> TryFrom<&'a str> for SharedFilter<'a> {
     fn try_from(filter: &'a str) -> Result<Self, DecodeError> {
         let rest = filter
             .strip_prefix("$share/")
-            .ok_or(DecodeError::InvalidTopic)?;
-        let (group, inner) = rest.split_once('/').ok_or(DecodeError::InvalidTopic)?;
+            .ok_or(DecodeError::InvalidFilter)?;
+        let (group, inner) = rest.split_once('/').ok_or(DecodeError::InvalidFilter)?;
         if group.is_empty() || group.contains(['+', '#']) || inner.is_empty() {
-            return Err(DecodeError::InvalidTopic);
+            return Err(DecodeError::InvalidFilter);
         }
         Ok(SharedFilter {
             group,

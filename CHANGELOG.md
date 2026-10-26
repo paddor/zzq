@@ -5,6 +5,21 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- `zzq-proto`: invalid topic filters fail with the new
+  `DecodeError::InvalidFilter`, reason code "topic filter invalid", instead
+  of `InvalidTopic`.
+
+### Fixed
+
+- `zzq-proto`: a property the packet type does not allow is malformed. A
+  repeated property, an out-of-range value, a Response Topic with wildcards
+  and Authentication Data without a method are protocol errors.
+- `zzq-proto`: a 3.1.1 CONNECT with a password but no user name, and No
+  Local on a shared subscription, are refused. An empty topic name without
+  a topic alias is a protocol error.
+
 ## [0.1.1] - 2026-10-26
 
 ### Fixed
