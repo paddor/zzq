@@ -91,6 +91,10 @@ Notable changes to zzq. The format follows
   another's held acks. A publisher that reconnected while its PUBACK was
   held for a congested subscriber got the ack twice. Held acks now go only
   to the connection they answer.
+- `zzq-broker`: the acks held for a publisher while a subscriber was congested
+  had no limit, so a v3.1.1 client flooding QoS 1 grew them without bound. A
+  publisher now gets at most `receive_maximum` held acks: a v5 one past it
+  breaks the protocol and is disconnected, a v3.1.1 one gets the rest at once.
 
 ## [0.1.1] - 2026-10-26
 

@@ -189,8 +189,7 @@ impl Lane {
         let m = self.publisher_matches(key, topic);
         self.congestion.hit = None;
         self.route_matches(Some(key), &m, &publication, &mut owned);
-        self.ack_or_hold(key, p);
-        Ok(())
+        self.ack_or_hold(key, p)
     }
 }
 

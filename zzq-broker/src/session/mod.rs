@@ -164,6 +164,9 @@ pub(crate) struct Inbound {
     pub(crate) last_topic: Option<(String, u64, Rc<Matches>)>,
     /// Last topic the authorizer was asked about, and its answer.
     pub(crate) last_allowed: Option<(Box<str>, bool)>,
+    /// Acks of the current connection's publishes held for congested
+    /// subscribers.
+    pub(crate) held_acks: u32,
 }
 
 /// QoS 1/2 messages towards the client.

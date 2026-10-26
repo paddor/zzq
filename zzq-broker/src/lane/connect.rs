@@ -100,6 +100,7 @@ impl Lane {
         s.version = c.version;
         s.username = c.username.as_deref().map(Box::from);
         s.inbound.last_allowed = None;
+        s.inbound.held_acks = 0;
         s.bind(conn);
         s.expiry = c.session_expiry.min(max_expiry);
         s.expires_at = None;

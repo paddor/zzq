@@ -250,3 +250,62 @@ async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
     assert!(matches!(got, Got::Ack { pkid: 3, .. }), "{got:?}");
     again.quiet(300).await;
 }
+
+/// A subscriber that never acks and is congested from its third message,
+/// and the options that make it so, with a Receive Maximum of 10.
+async fn congested_subscriber() -> (Context, Broker, String, support::Raw) {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        qos_queue_high: 2,
+        receive_maximum: 10,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let mut sub = support::Raw::connect(&uri, "sub", Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    (ctx, broker, uri, sub)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn held_acks_of_a_v311_publisher_stop_at_the_receive_maximum() {
+    use zzq_proto::Version;
+
+    let (_ctx, _broker, uri, _sub) = congested_subscriber().await;
+    let mut publisher = support::Raw::connect(&uri, "pub", Version::V311, 0).await;
+    for pkid in 1..=30 {
+        publisher.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+    }
+    // 1 and 2 before the congestion, then 10 held, then the rest at once.
+    let mut acked = Vec::new();
+    while let Some(Some(support::Got::Ack { pkid, .. })) =
+        publisher.try_next_within(Duration::from_millis(300)).await
+    {
+        acked.push(pkid);
+    }
+    let want: Vec<u16> = [1, 2].into_iter().chain(13..=30).collect();
+    assert_eq!(acked, want);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_v5_publisher_past_the_receive_maximum_is_disconnected() {
+    use zzq_proto::{Version, reason};
+
+    let (_ctx, _broker, uri, _sub) = congested_subscriber().await;
+    let mut publisher = support::Raw::connect(&uri, "pub", Version::V5, 0).await;
+    for pkid in 1..=13 {
+        publisher.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+    }
+    for pkid in 1..=2 {
+        let got = publisher.next().await;
+        assert!(
+            matches!(got, support::Got::Ack { pkid: p, .. } if p == pkid),
+            "{got:?}"
+        );
+    }
+    publisher
+        .disconnected(&[reason::RECEIVE_MAXIMUM_EXCEEDED])
+        .await;
+}
