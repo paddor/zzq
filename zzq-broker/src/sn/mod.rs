@@ -84,7 +84,7 @@ pub(crate) async fn gateway(shared: Arc<Shared>, socket: UdpSocket) {
             }
             sn::Packet::SearchGw { .. } => {
                 let reply = sn::Packet::GwInfo {
-                    gw_id: shared.opts.sn_gateway_id,
+                    gw_id: shared.opts.sn.gateway_id,
                     address: &[],
                 };
                 send(&socket, addr, &reply).await;
@@ -113,7 +113,8 @@ async fn send(socket: &UdpSocket, addr: SocketAddr, p: &sn::Packet<'_>) {
 fn predefined(shared: &Shared, id: u16) -> Option<&str> {
     shared
         .opts
-        .sn_predefined
+        .sn
+        .predefined
         .iter()
         .find(|(i, _)| *i == id)
         .map(|(_, t)| t.as_str())
@@ -371,7 +372,7 @@ impl Client {
     ) -> Option<Vec<u8>> {
         let mut buf = BytesMut::with_capacity(64 << 10);
         let mut out = Vec::new();
-        let mut tick = tokio::time::interval(TICK.min(self.shared.opts.sn_retry));
+        let mut tick = tokio::time::interval(TICK.min(self.shared.opts.sn.retry));
         loop {
             tokio::select! {
                 datagram = rx.recv() => {

@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 use zzq_broker::{
-    AuthDecision, Authenticator, Broker, BrokerOptions, Config, ConnectInfo, Context,
+    AuthDecision, Authenticator, Broker, BrokerOptions, Config, ConnectInfo, Context, SnOptions,
 };
 use zzq_client::{Client, ClientOptions, LastWill, Message};
 use zzq_proto::{QoS, ReasonCode, SubscriptionOptions, Version};
@@ -356,7 +356,7 @@ async fn cross_lane_fan_out() {
     let stats = broker.stats().await.unwrap();
     assert_eq!(stats.deliveries, 400);
     assert_eq!(
-        stats.dropped_offline + stats.dropped_queue_full + stats.dropped_buffer_full,
+        stats.dropped.offline + stats.dropped.queue_full + stats.dropped.buffer_full,
         0
     );
 }
@@ -875,7 +875,10 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn unacked_publish_is_resent_with_dup() {
         let opts = BrokerOptions {
-            sn_retry: Duration::from_millis(200),
+            sn: SnOptions {
+                retry: Duration::from_millis(200),
+                ..SnOptions::default()
+            },
             ..BrokerOptions::default()
         };
         let (ctx, broker, uri) = setup_with(1, opts).await;
@@ -950,7 +953,10 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn topic_ids_run_out_without_stalling() {
         let opts = BrokerOptions {
-            sn_max_topics: 2,
+            sn: SnOptions {
+                max_topics: 2,
+                ..SnOptions::default()
+            },
             max_inflight: 1,
             ..BrokerOptions::default()
         };
@@ -1011,11 +1017,14 @@ mod mqtt_sn {
     async fn connectionless_publishes_are_authorized() {
         let opts = BrokerOptions {
             authorizer: Some(Arc::new(NoValve)),
-            sn_predefined: vec![
-                (5, "plant/valve".to_owned()),
-                (6, "$SYS/x".to_owned()),
-                (7, "plant/ok".to_owned()),
-            ],
+            sn: SnOptions {
+                predefined: vec![
+                    (5, "plant/valve".to_owned()),
+                    (6, "$SYS/x".to_owned()),
+                    (7, "plant/ok".to_owned()),
+                ],
+                ..SnOptions::default()
+            },
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
@@ -1053,7 +1062,10 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_after_register_is_retransmitted() {
         let opts = BrokerOptions {
-            sn_retry: Duration::from_millis(200),
+            sn: SnOptions {
+                retry: Duration::from_millis(200),
+                ..SnOptions::default()
+            },
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
@@ -1138,7 +1150,10 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn predefined_topics_and_publishes_held_for_register() {
         let opts = BrokerOptions {
-            sn_predefined: vec![(9, "pre/t".to_owned())],
+            sn: SnOptions {
+                predefined: vec![(9, "pre/t".to_owned())],
+                ..SnOptions::default()
+            },
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;

@@ -783,5 +783,5 @@ async fn retained_set_larger_than_the_window_arrives_whole() {
         seen.insert(p.topic);
     }
     assert_eq!(seen.len(), 1000);
-    assert_eq!(broker.stats().await.unwrap().dropped_queue_full, 0);
+    assert_eq!(broker.stats().await.unwrap().dropped.queue_full, 0);
 }

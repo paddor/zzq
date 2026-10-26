@@ -16,12 +16,12 @@ impl Client {
     }
 
     /// The topic ID of `name`, assigning one if needed. `None` once the
-    /// client has `sn_max_topics` of them, or no ID is free.
+    /// client has `SnOptions::max_topics` of them, or no ID is free.
     pub(super) fn topic_id_for(&mut self, name: &str) -> Option<u16> {
         if let Some(&id) = self.topics.ids.get(name) {
             return Some(id);
         }
-        if self.topics.by_id.len() >= self.shared.opts.sn_max_topics {
+        if self.topics.by_id.len() >= self.shared.opts.sn.max_topics {
             return None;
         }
         for _ in 0..u16::MAX {
@@ -44,7 +44,7 @@ impl Client {
         topic: &str,
         out: &mut Vec<Vec<u8>>,
     ) -> Option<(Topic<'static>, Option<u16>)> {
-        let predefined = &self.shared.opts.sn_predefined;
+        let predefined = &self.shared.opts.sn.predefined;
         if let Some((id, _)) = predefined.iter().find(|(_, t)| t == topic) {
             return Some((Topic::Predefined(*id), None));
         }

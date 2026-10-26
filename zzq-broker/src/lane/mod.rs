@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::broker::Shared;
+use crate::broker::{Dropped, Shared};
 use crate::budget::{Charge, LaneTotal};
 use crate::conn::ReadBlocks;
 use crate::index::{SubIndex, SubRef};
@@ -41,13 +41,7 @@ pub(crate) struct LaneStats {
     pub(crate) subscriptions: u64,
     pub(crate) publishes: u64,
     pub(crate) deliveries: u64,
-    pub(crate) dropped_buffer_full: u64,
-    pub(crate) dropped_offline: u64,
-    pub(crate) dropped_queue_full: u64,
-    pub(crate) dropped_too_large: u64,
-    pub(crate) dropped_expired: u64,
-    pub(crate) dropped_session_ended: u64,
-    pub(crate) dropped_state_full: u64,
+    pub(crate) dropped: Dropped,
     /// Bytes the lane's sessions count against `max_state_bytes`.
     pub(crate) state_bytes: u64,
 }

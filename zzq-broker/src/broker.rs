@@ -127,27 +127,60 @@ pub struct Stats {
     pub publishes: u64,
     /// Messages written to subscribers.
     pub deliveries: u64,
-    /// QoS 0 messages dropped because a connection's write buffer was full.
-    pub dropped_buffer_full: u64,
-    /// QoS 0 messages for offline sessions.
-    pub dropped_offline: u64,
-    /// QoS 1/2 messages dropped from a full session queue.
-    pub dropped_queue_full: u64,
-    /// Messages larger than the subscriber's Maximum Packet Size.
-    pub dropped_too_large: u64,
-    /// Queued messages whose Message Expiry Interval ran out.
-    pub dropped_expired: u64,
-    /// QoS 1/2 messages a session still held, queued or unacked, when it
-    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
-    pub dropped_session_ended: u64,
-    /// QoS 1/2 messages dropped instead of queued because
-    /// `max_state_bytes` was reached.
-    pub dropped_state_full: u64,
+    /// Messages dropped, by reason.
+    pub dropped: Dropped,
     /// Retained messages not stored because `max_retained` or
     /// `max_state_bytes` was reached.
     pub retained_rejected: u64,
     /// Approximate bytes of state counted against `max_state_bytes`.
     pub state_bytes: u64,
+}
+
+/// Messages the broker dropped, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Dropped {
+    /// QoS 0 messages dropped because a connection's write buffer was full.
+    pub buffer_full: u64,
+    /// QoS 0 messages for offline sessions.
+    pub offline: u64,
+    /// QoS 1/2 messages dropped from a full session queue.
+    pub queue_full: u64,
+    /// Messages larger than the subscriber's Maximum Packet Size.
+    pub too_large: u64,
+    /// Queued messages whose Message Expiry Interval ran out.
+    pub expired: u64,
+    /// QoS 1/2 messages a session still held, queued or unacked, when it
+    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
+    pub session_ended: u64,
+    /// QoS 1/2 messages dropped instead of queued because
+    /// `max_state_bytes` was reached.
+    pub state_full: u64,
+}
+
+impl Dropped {
+    /// All dropped messages.
+    pub const fn total(&self) -> u64 {
+        self.buffer_full
+            + self.offline
+            + self.queue_full
+            + self.too_large
+            + self.expired
+            + self.session_ended
+            + self.state_full
+    }
+}
+
+impl std::ops::AddAssign for Dropped {
+    fn add_assign(&mut self, o: Dropped) {
+        self.buffer_full += o.buffer_full;
+        self.offline += o.offline;
+        self.queue_full += o.queue_full;
+        self.too_large += o.too_large;
+        self.expired += o.expired;
+        self.session_ended += o.session_ended;
+        self.state_full += o.state_full;
+    }
 }
 
 /// An MQTT broker. Dropping it stops listening and closes all connections.
@@ -360,13 +393,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
         total.subscriptions = total.subscriptions.max(s.subscriptions);
         total.publishes += s.publishes;
         total.deliveries += s.deliveries;
-        total.dropped_buffer_full += s.dropped_buffer_full;
-        total.dropped_offline += s.dropped_offline;
-        total.dropped_queue_full += s.dropped_queue_full;
-        total.dropped_too_large += s.dropped_too_large;
-        total.dropped_expired += s.dropped_expired;
-        total.dropped_session_ended += s.dropped_session_ended;
-        total.dropped_state_full += s.dropped_state_full;
+        total.dropped += s.dropped;
         total.state_bytes += s.state_bytes;
     }
     {

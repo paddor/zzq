@@ -52,9 +52,9 @@ mod sn;
 mod state;
 mod sys;
 
-pub use broker::{Broker, Stats, lane_for};
+pub use broker::{Broker, Dropped, Stats, lane_for};
 pub use options::{
-    AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo,
+    AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo, SnOptions,
 };
 pub use persist::{FilePersistence, Persistence, Retained};
 pub use zzq_proto::{QoS, ReasonCode};

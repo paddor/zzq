@@ -327,11 +327,11 @@ impl Lane {
                 self.mark(key);
             }
             Outcome::Queued => {}
-            Outcome::QueueFull(n) => self.stats.dropped_queue_full += u64::from(n),
-            Outcome::StateFull => self.stats.dropped_state_full += 1,
-            Outcome::BufferFull => self.stats.dropped_buffer_full += 1,
-            Outcome::Offline => self.stats.dropped_offline += 1,
-            Outcome::TooLarge => self.stats.dropped_too_large += 1,
+            Outcome::QueueFull(n) => self.stats.dropped.queue_full += u64::from(n),
+            Outcome::StateFull => self.stats.dropped.state_full += 1,
+            Outcome::BufferFull => self.stats.dropped.buffer_full += 1,
+            Outcome::Offline => self.stats.dropped.offline += 1,
+            Outcome::TooLarge => self.stats.dropped.too_large += 1,
         }
     }
 

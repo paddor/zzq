@@ -7,7 +7,7 @@ Notable changes to zzq. The format follows
 
 ### Added
 
-- `zzq-broker`: `Stats::dropped_session_ended` counts the QoS 1/2 messages
+- `zzq-broker`: `Dropped::session_ended` counts the QoS 1/2 messages
   a session still held, queued or unacked, when it ended.
   `$SYS/broker/messages/dropped` includes them.
 - `zzq-broker`: `Authorizer::may_subscribe_shared` decides on shared
@@ -20,7 +20,7 @@ Notable changes to zzq. The format follows
   message that sessions of one lane share counts once, and so does a
   retained message sessions got on subscribe. While it is reached, new
   sessions that outlive their connection are refused, messages that would
-  queue are dropped and counted in `Stats::dropped_state_full`, and retained
+  queue are dropped and counted in `Dropped::state_full`, and retained
   messages for new topics are not stored. `Stats::state_bytes` and
   `$SYS/broker/state/bytes` show the estimate, and
   `zzq_broker --max-state-mib` sets the limit.
@@ -46,6 +46,9 @@ Notable changes to zzq. The format follows
   could not write.
 - `zzq-broker`: `zzq_broker` shuts down on SIGTERM or SIGINT, telling v5
   clients "server shutting down", instead of dying with the signal.
+- `zzq-broker`: the `dropped_*` counters of `Stats` moved to
+  `Stats::dropped`, a `Dropped` with `total()`, and the `sn_*` fields of
+  `BrokerOptions` to `BrokerOptions::sn`, an `SnOptions`.
 
 ### Fixed
 

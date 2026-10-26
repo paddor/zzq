@@ -111,7 +111,7 @@ impl Lane {
                 stats.sessions = self.sessions.len() as u64;
                 stats.state_bytes = self.budget.total.get() as u64;
                 // Removed sessions added theirs to `self.stats`.
-                stats.dropped_expired += self
+                stats.dropped.expired += self
                     .sessions
                     .keys()
                     .filter_map(|k| self.sessions.get(k))

@@ -27,7 +27,7 @@ impl Client {
     /// publishes, PUBREL and REGISTER are kept for retransmission.
     pub(super) async fn deliver(&mut self, datagram: Vec<u8>) {
         if let Some(key) = retry_key(&datagram) {
-            let next = Instant::now() + self.shared.opts.sn_retry;
+            let next = Instant::now() + self.shared.opts.sn.retry;
             self.retry.unacked.insert(
                 key,
                 Retry {
@@ -38,7 +38,7 @@ impl Client {
             );
         }
         if self.asleep.is_some() {
-            if self.buffered.len() >= self.shared.opts.sn_sleep_buffer {
+            if self.buffered.len() >= self.shared.opts.sn.sleep_buffer {
                 self.buffered.pop_front();
             }
             self.buffered.push_back(datagram);
@@ -100,8 +100,8 @@ impl Client {
             encode::pingreq(&mut ping);
             return pipe.write_all(&ping).await.is_ok();
         }
-        let retry = self.shared.opts.sn_retry;
-        let max = self.shared.opts.sn_retries;
+        let retry = self.shared.opts.sn.retry;
+        let max = self.shared.opts.sn.retries;
         let mut give_up = false;
         for r in self.retry.unacked.values_mut().filter(|r| r.next <= now) {
             if r.tries >= max {

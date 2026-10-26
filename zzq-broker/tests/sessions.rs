@@ -374,7 +374,7 @@ async fn oversized_qos1_delivery_is_skipped_cleanly() {
         .unwrap();
     publ.publish("big", "ok", QoS::AtLeastOnce).await.unwrap();
     assert_eq!(raw.publish().await.payload, b"ok");
-    stats_until(&broker, |s| s.dropped_too_large == 1).await;
+    stats_until(&broker, |s| s.dropped.too_large == 1).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -414,7 +414,7 @@ async fn qos0_publisher_keeps_flowing_past_a_stopped_subscriber() {
         .unwrap();
     // The stopped subscriber's QoS 0 messages were dropped and counted, and
     // it stays connected.
-    let stats = stats_until(&broker, |s| s.dropped_buffer_full > 0).await;
+    let stats = stats_until(&broker, |s| s.dropped.buffer_full > 0).await;
     assert_eq!(stats.connections, 3);
     assert!(matches!(stopped.next().await, Got::Publish(_)));
 }
@@ -458,7 +458,7 @@ async fn slow_subscriber_slows_qos2_and_v311_publishers() {
             t.await.unwrap();
         }
         let stats = broker.stats().await.unwrap();
-        assert_eq!(stats.dropped_queue_full, 0, "lanes={lanes}");
+        assert_eq!(stats.dropped.queue_full, 0, "lanes={lanes}");
         nothing(&mut sub).await;
     }
 }
@@ -832,7 +832,7 @@ async fn ended_session_counts_the_messages_it_held() {
     }
     let (_clean, present) = connect(&uri, &fresh("queued", &[])).await;
     assert!(!present);
-    stats_until(&broker, |s| s.dropped_session_ended == 50).await;
+    stats_until(&broker, |s| s.dropped.session_ended == 50).await;
     // Sent and not acked, then ended by DISCONNECT with expiry 0.
     let (mut raw, _) = connect(&uri, &fresh("unacked", &keep)).await;
     raw.subscribe("held/u", QoS::AtLeastOnce.into()).await;
@@ -845,7 +845,7 @@ async fn ended_session_counts_the_messages_it_held() {
     raw.disconnect(0, &[Property::U32(SESSION_EXPIRY_INTERVAL, 0)])
         .await;
     raw.closed().await;
-    stats_until(&broker, |s| s.dropped_session_ended == 53).await;
+    stats_until(&broker, |s| s.dropped.session_ended == 53).await;
     // Ended by expiry.
     let one = [Property::U32(SESSION_EXPIRY_INTERVAL, 1)];
     let (mut raw, _) = connect(&uri, &fresh("expires", &one)).await;
@@ -857,5 +857,5 @@ async fn ended_session_counts_the_messages_it_held() {
             .await
             .unwrap();
     }
-    stats_until(&broker, |s| s.dropped_session_ended == 60).await;
+    stats_until(&broker, |s| s.dropped.session_ended == 60).await;
 }

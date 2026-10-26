@@ -146,20 +146,8 @@ pub struct BrokerOptions {
     pub sys_interval: Option<Duration>,
     /// Transport settings, such as certificates for `tls://`.
     pub transport: TransportOptions,
-    /// MQTT-SN gateway ID, sent in GWINFO.
-    pub sn_gateway_id: u8,
-    /// MQTT-SN predefined topic IDs and their names.
-    pub sn_predefined: Vec<(u16, String)>,
-    /// MQTT-SN retransmission interval for unacked messages to a client.
-    pub sn_retry: Duration,
-    /// MQTT-SN retransmissions before the gateway gives up on a client.
-    pub sn_retries: u8,
-    /// Datagrams held for a sleeping MQTT-SN client; the oldest is dropped.
-    pub sn_sleep_buffer: usize,
-    /// Topic IDs per MQTT-SN client, registered by it or assigned by the
-    /// gateway. More REGISTERs get Rejected: congestion, and messages on
-    /// further topics are dropped.
-    pub sn_max_topics: usize,
+    /// The MQTT-SN gateway on `udp://` listeners.
+    pub sn: SnOptions,
 }
 
 impl Default for BrokerOptions {
@@ -187,12 +175,7 @@ impl Default for BrokerOptions {
             state_file: None,
             sys_interval: Some(Duration::from_secs(10)),
             transport: TransportOptions::default(),
-            sn_gateway_id: 1,
-            sn_predefined: Vec::new(),
-            sn_retry: Duration::from_secs(10),
-            sn_retries: 5,
-            sn_sleep_buffer: 1000,
-            sn_max_topics: 4096,
+            sn: SnOptions::default(),
         }
     }
 }
@@ -222,12 +205,39 @@ impl fmt::Debug for BrokerOptions {
             .field("state_file", &self.state_file)
             .field("sys_interval", &self.sys_interval)
             .field("transport", &self.transport)
-            .field("sn_gateway_id", &self.sn_gateway_id)
-            .field("sn_predefined", &self.sn_predefined)
-            .field("sn_retry", &self.sn_retry)
-            .field("sn_retries", &self.sn_retries)
-            .field("sn_sleep_buffer", &self.sn_sleep_buffer)
-            .field("sn_max_topics", &self.sn_max_topics)
+            .field("sn", &self.sn)
             .finish()
+    }
+}
+
+/// MQTT-SN gateway settings.
+#[derive(Debug, Clone)]
+pub struct SnOptions {
+    /// Gateway ID, sent in GWINFO.
+    pub gateway_id: u8,
+    /// Predefined topic IDs and their names.
+    pub predefined: Vec<(u16, String)>,
+    /// Retransmission interval for unacked messages to a client.
+    pub retry: Duration,
+    /// Retransmissions before the gateway gives up on a client.
+    pub retries: u8,
+    /// Datagrams held for a sleeping client; the oldest is dropped.
+    pub sleep_buffer: usize,
+    /// Topic IDs per client, registered by it or assigned by the gateway.
+    /// More REGISTERs get Rejected: congestion, and messages on further
+    /// topics are dropped.
+    pub max_topics: usize,
+}
+
+impl Default for SnOptions {
+    fn default() -> Self {
+        SnOptions {
+            gateway_id: 1,
+            predefined: Vec::new(),
+            retry: Duration::from_secs(10),
+            retries: 5,
+            sleep_buffer: 1000,
+            max_topics: 4096,
+        }
     }
 }

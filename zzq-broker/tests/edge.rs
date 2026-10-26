@@ -253,7 +253,7 @@ async fn offline_queue_drops_oldest() {
         assert_eq!(next(&mut c).await.payload, format!("{i}"));
     }
     nothing(&mut c).await;
-    assert_eq!(broker.stats().await.unwrap().dropped_queue_full, 2);
+    assert_eq!(broker.stats().await.unwrap().dropped.queue_full, 2);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -287,7 +287,7 @@ async fn offline_queue_drops_oldest_beyond_its_bytes() {
         assert_eq!(next(&mut c).await.payload, format!("{i}"));
     }
     nothing(&mut c).await;
-    assert_eq!(broker.stats().await.unwrap().dropped_queue_full, 3);
+    assert_eq!(broker.stats().await.unwrap().dropped.queue_full, 3);
 }
 
 /// Connects new sessions that outlive their connection until the state
@@ -363,7 +363,7 @@ async fn full_state_budget_stops_growth_not_traffic() {
         .unwrap();
     assert_eq!(next(&mut live).await.payload, "kept?");
     stats_until(&broker, |s| {
-        s.dropped_state_full == 1 && (s.retained, s.retained_rejected) == (0, 1)
+        s.dropped.state_full == 1 && (s.retained, s.retained_rejected) == (0, 1)
     })
     .await;
     // Existing sessions resume.
@@ -649,7 +649,7 @@ async fn queued_messages_expire() {
     let mut c = Client::connect(&ctx, &uri, durable.clone()).await.unwrap();
     assert_eq!(next(&mut c).await.payload, "long");
     nothing(&mut c).await;
-    assert_eq!(broker.stats().await.unwrap().dropped_expired, 1);
+    assert_eq!(broker.stats().await.unwrap().dropped.expired, 1);
     // The count outlives the session.
     c.disconnect().await;
     let clean = ClientOptions {
@@ -657,7 +657,7 @@ async fn queued_messages_expire() {
         ..durable
     };
     Client::connect(&ctx, &uri, clean).await.unwrap();
-    assert_eq!(broker.stats().await.unwrap().dropped_expired, 1);
+    assert_eq!(broker.stats().await.unwrap().dropped.expired, 1);
 }
 
 struct OwnTree;
@@ -795,7 +795,7 @@ async fn slow_subscriber_slows_qos1_publishers_instead_of_dropping() {
             t.await.unwrap();
         }
         let stats = broker.stats().await.unwrap();
-        assert_eq!(stats.dropped_queue_full, 0, "lanes={lanes}");
+        assert_eq!(stats.dropped.queue_full, 0, "lanes={lanes}");
         nothing(&mut sub).await;
     }
 }
@@ -1463,7 +1463,7 @@ async fn messages_over_the_client_maximum_packet_size_are_dropped() {
         panic!("expected PUBLISH");
     };
     assert_eq!(p.topic, "mps/fits");
-    assert_eq!(broker.stats().await.unwrap().dropped_too_large, 1);
+    assert_eq!(broker.stats().await.unwrap().dropped.too_large, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
