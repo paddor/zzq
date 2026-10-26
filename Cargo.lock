@@ -1004,7 +1004,7 @@ checksum = "29666d0abbfad1e3dc4dcf6144730dd3a3ab225bbbdac83319345b1b44ccfc1b"
 
 [[package]]
 name = "zzq-bench"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "plotters",
  "serde",
@@ -1016,7 +1016,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-broker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "bytestring",
@@ -1031,7 +1031,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "bytestring",
@@ -1045,11 +1045,11 @@ dependencies = [
 
 [[package]]
 name = "zzq-proto"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "zzq-tokio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "quinn",
