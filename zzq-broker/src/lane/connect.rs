@@ -1,0 +1,274 @@
+//! Connections attaching to and leaving sessions, and wills.
+
+use std::rc::Rc;
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+use zzq_proto::encode;
+use zzq_proto::property::{self, Property};
+use zzq_proto::{PacketType, Version, reason};
+
+use crate::conn::{ConnShared, OwnedConnect};
+use crate::msg::Msg;
+use crate::session::{DelayedWill, Session};
+use crate::slab::Key;
+
+use super::{Attached, Close, Lane};
+
+impl Lane {
+    /// A client ID for a client that sent none.
+    /// A fresh client ID that `lane_for` maps to this lane, so the client
+    /// finds its session here when it reconnects.
+    pub(crate) fn assign_client_id(&mut self) -> String {
+        let lanes = self.shared.lanes.len();
+        loop {
+            self.next_client_no += 1;
+            let id = format!("zzq-{}-{}-{}", self.shared.id, self.id, self.next_client_no);
+            if crate::broker::lane_for(&id, lanes) == usize::from(self.id) {
+                return id;
+            }
+        }
+    }
+
+    /// Ends a session for good. A will still waiting for its delay goes
+    /// out now.
+    pub(super) fn remove_session(&mut self, key: Key) {
+        if let Some(s) = self.sessions.get_mut(key) {
+            s.unbind();
+        }
+        self.release_waiters(key);
+        let Some(mut s) = self.sessions.remove(key) else {
+            return;
+        };
+        self.stats.dropped_expired += s.expired;
+        self.stats.dropped_session_ended += s.held();
+        let sub = self.sub_ref(key);
+        for filter in s.subs.keys() {
+            self.unsubscribe_entry(filter, sub, None);
+        }
+        self.stats.subscriptions = self.index.len() as u64;
+        if self.by_client.get(&s.client_id) == Some(&key) {
+            self.by_client.remove(&s.client_id);
+        }
+        if let Some(will) = s.delayed_will.take() {
+            self.publish_will(will.msg);
+        }
+    }
+
+    pub(super) fn kick(conn: &ConnShared, version: Version, code: u8) {
+        let mut bye = Vec::new();
+        if version.is_v5() {
+            encode::reason_only(PacketType::Disconnect, version, code, &[], &mut bye);
+        }
+        conn.close(bye);
+    }
+
+    /// Whether `client_id` has a session on this lane.
+    pub(crate) fn has_session(&self, client_id: &str) -> bool {
+        self.by_client.contains_key(client_id)
+    }
+
+    /// Whether `client_id` has a live connection on this lane.
+    pub(crate) fn is_connected(&self, client_id: &str) -> bool {
+        self.by_client
+            .get(client_id)
+            .and_then(|k| self.sessions.get(*k))
+            .is_some_and(|s| s.conn.is_some())
+    }
+
+    /// Binds a connection to its session, creating or resuming it, and
+    /// queues CONNACK.
+    pub(crate) fn attach(&mut self, c: &OwnedConnect, conn: Rc<ConnShared>) -> Attached {
+        let max_expiry = self.shared.opts.max_session_expiry;
+        let mut present = false;
+        let mut key = self.by_client.get(c.client_id.as_str()).copied();
+        if let Some(k) = key
+            && let Some(s) = self.sessions.get_mut(k)
+        {
+            // The old session ends if the new connection starts clean or the
+            // old one kept no session.
+            let ends = c.clean_start || s.expiry == 0;
+            // The old connection ends without DISCONNECT, so its will goes
+            // out now, unless it has a delay and the session goes on: the
+            // new connection came first and cancels it. So does a will of
+            // an earlier connection that waits for its delay.
+            let old = s.conn.take();
+            let delayed = s.delayed_will.take().map(|w| w.msg);
+            let will = match s.will.take() {
+                Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
+                _ => delayed.filter(|_| ends),
+            };
+            // Packets queued for the old connection must not reach the new
+            // one; the inflight window is resent below.
+            s.out.clear();
+            if let Some(old) = old {
+                // Before its CONNACK, a connection just closes: CONNACK comes
+                // before any other packet [MQTT-3.2.0-1].
+                if old.connacked.get() {
+                    Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
+                } else {
+                    old.close(Vec::new());
+                }
+                self.stats.connections -= 1;
+            }
+            if let Some(will) = will {
+                self.publish_will(will);
+            }
+            if ends {
+                self.remove_session(k);
+                key = None;
+            } else {
+                present = true;
+            }
+        }
+        let key = key.unwrap_or_else(|| {
+            let session = Session::new(c.client_id.as_str().into(), c.version, self.state.clone());
+            let k = self.sessions.insert(session);
+            self.by_client.insert(c.client_id.as_str().into(), k);
+            k
+        });
+        self.stats.connections += 1;
+        let props = self.connack_props(c);
+        let Some(s) = self.sessions.get_mut(key) else {
+            return Attached { key };
+        };
+        s.version = c.version;
+        s.username = c.username.as_deref().map(Box::from);
+        s.last_allowed = None;
+        s.bind(conn);
+        s.expiry = c.session_expiry.min(max_expiry);
+        s.expires_at = None;
+        s.will.clone_from(&c.will);
+        s.window = c.receive_maximum.min(self.shared.opts.max_inflight).max(1);
+        s.max_packet = c.max_packet_size;
+        s.aliases.clear();
+        connack_ok(c.version, present, &props, &mut s.out);
+        if present {
+            s.resend();
+        }
+        self.mark(key);
+        Attached { key }
+    }
+
+    fn connack_props(&self, c: &OwnedConnect) -> Vec<u8> {
+        let mut props = Vec::new();
+        if !c.version.is_v5() {
+            return props;
+        }
+        let o = &self.shared.opts;
+        let mut list = vec![
+            Property::U16(property::TOPIC_ALIAS_MAXIMUM, o.topic_alias_maximum),
+            Property::U32(
+                property::MAXIMUM_PACKET_SIZE,
+                o.max_packet_size.min(u32::MAX as usize) as u32,
+            ),
+        ];
+        if o.receive_maximum < u16::MAX {
+            list.push(Property::U16(property::RECEIVE_MAXIMUM, o.receive_maximum));
+        }
+        if c.server_keep_alive {
+            list.push(Property::U16(property::SERVER_KEEP_ALIVE, c.keep_alive));
+        }
+        if c.assigned {
+            list.push(Property::Str(
+                property::ASSIGNED_CLIENT_IDENTIFIER,
+                &c.client_id,
+            ));
+        }
+        if c.session_expiry > o.max_session_expiry {
+            list.push(Property::U32(
+                property::SESSION_EXPIRY_INTERVAL,
+                o.max_session_expiry,
+            ));
+        }
+        property::encode_all(&list, &mut props);
+        props
+    }
+
+    /// Unbinds a closed connection from its session.
+    pub(crate) fn detach(&mut self, key: Key, conn_id: u64, close: Close) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        if !s.has_conn(conn_id) {
+            return;
+        }
+        s.unbind();
+        s.out.clear();
+        s.aliases.clear();
+        self.stats.connections -= 1;
+        self.shared.connections.fetch_sub(1, Ordering::AcqRel);
+        let send_will = !matches!(close, Close::Graceful { will: false });
+        let will = s.will.take().filter(|_| send_will);
+        let expiry = s.expiry;
+        if expiry != 0 && expiry != u32::MAX {
+            s.expires_at = Some(Instant::now() + Duration::from_secs(u64::from(expiry)));
+        }
+        self.release_waiters(key);
+        if expiry == 0 {
+            self.remove_session(key);
+        }
+        if let Some(w) = will {
+            if w.delay == 0 || expiry == 0 {
+                self.publish_will(w.msg);
+            } else {
+                let delay = Duration::from_secs(u64::from(w.delay.min(expiry)));
+                self.schedule_will(key, w.msg, delay);
+            }
+        }
+    }
+
+    /// Publishes `msg` after `delay`, unless a new connection or the end of
+    /// the session takes it first.
+    pub(super) fn schedule_will(&mut self, key: Key, msg: Msg, delay: Duration) {
+        let Some(lane) = crate::broker::lane_ref(self.shared.id) else {
+            return;
+        };
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        self.next_will_id += 1;
+        let id = self.next_will_id;
+        s.delayed_will = Some(DelayedWill {
+            timer: id,
+            due: Instant::now() + delay,
+            msg,
+        });
+        tokio::task::spawn_local(async move {
+            tokio::time::sleep(delay).await;
+            {
+                let mut l = lane.borrow_mut();
+                // A state dump keeps the will with its due time.
+                if l.closing {
+                    return;
+                }
+                let Some(will) = l
+                    .sessions
+                    .get_mut(key)
+                    .and_then(|s| s.delayed_will.take_if(|w| w.timer == id))
+                else {
+                    return;
+                };
+                l.publish_will(will.msg);
+                l.flush();
+            }
+            crate::broker::ship(&lane).await;
+        });
+    }
+
+    /// Publishes a will. Its Message Expiry Interval starts now.
+    fn publish_will(&mut self, mut msg: Msg) {
+        msg.expires_at = crate::msg::expiry(msg.props());
+        self.publish_owned(&msg);
+    }
+}
+
+/// Queues a CONNACK accepting a connection.
+fn connack_ok(version: Version, present: bool, props: &[u8], out: &mut Vec<u8>) {
+    let ack = encode::ConnAckFields {
+        session_present: present,
+        code: reason::SUCCESS,
+        properties: props,
+    };
+    encode::connack(&ack, version, out);
+}
