@@ -62,6 +62,12 @@ impl Msg {
         unsafe { std::str::from_utf8_unchecked(b) }
     }
 
+    /// Bytes of topic, properties and payload.
+    #[inline]
+    pub(crate) const fn size(&self) -> usize {
+        (self.topic.1 + self.props.1 + self.payload.1) as usize
+    }
+
     #[inline]
     pub(crate) fn payload(&self) -> &[u8] {
         self.payload.get(&self.buf)

@@ -92,6 +92,9 @@ pub(crate) struct LaneTx {
     pub(crate) control: Mailbox<Control>,
     /// Deliveries routed on other lanes.
     pub(crate) data: Mailbox<Vec<Remote>>,
+    /// Bytes the lane's sessions counted against `max_state_bytes` at its
+    /// last sweep.
+    pub(crate) state: AtomicUsize,
 }
 
 /// State shared by all lanes of one broker.
@@ -137,8 +140,14 @@ pub struct Stats {
     /// QoS 1/2 messages a session still held, queued or unacked, when it
     /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
     pub dropped_session_ended: u64,
-    /// Retained messages not stored because `max_retained` was reached.
+    /// QoS 1/2 messages dropped instead of queued because
+    /// `max_state_bytes` was reached.
+    pub dropped_state_full: u64,
+    /// Retained messages not stored because `max_retained` or
+    /// `max_state_bytes` was reached.
     pub retained_rejected: u64,
+    /// Approximate bytes of state counted against `max_state_bytes`.
+    pub state_bytes: u64,
 }
 
 /// An MQTT broker. Dropping it stops listening and closes all connections.
@@ -164,6 +173,7 @@ impl Broker {
             lanes.push(LaneTx {
                 control: ctl_tx,
                 data: data_tx,
+                state: AtomicUsize::new(0),
             });
             receivers.push((ctl_rx, data_rx));
         }
@@ -336,6 +346,8 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
         total.dropped_too_large += s.dropped_too_large;
         total.dropped_expired += s.dropped_expired;
         total.dropped_session_ended += s.dropped_session_ended;
+        total.dropped_state_full += s.dropped_state_full;
+        total.state_bytes += s.state_bytes;
     }
     {
         let r = shared
@@ -344,6 +356,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
             .unwrap_or_else(PoisonError::into_inner);
         total.retained = r.len() as u64;
         total.retained_rejected = r.rejected;
+        total.state_bytes += r.bytes() as u64;
     }
     Ok(total)
 }

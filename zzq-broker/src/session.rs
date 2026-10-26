@@ -12,6 +12,7 @@ use zzq_proto::encode::{self, AckFields, PublishHeader};
 use zzq_proto::property::{MESSAGE_EXPIRY_INTERVAL, Property, SUBSCRIPTION_IDENTIFIER};
 use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 
+use crate::budget::{self, Charge, LaneTotal};
 use crate::conn::ConnShared;
 use crate::index::{Matches, SubIds};
 use crate::msg::{Arena, Msg, Publication, expired, same_family};
@@ -61,14 +62,29 @@ pub(crate) struct Waiter {
 pub(crate) enum Outcome {
     Sent,
     Queued,
-    /// The queue was full; the oldest queued message was dropped.
-    QueueFull,
+    /// The queue was full: this many messages were dropped, the oldest
+    /// queued ones, or the new one if it alone is over the byte limit.
+    QueueFull(u32),
+    /// The state budget was full, so the message was dropped instead of
+    /// queued.
+    StateFull,
     /// The connection's write buffer was over its limit.
     BufferFull,
     /// The session is offline and the message is QoS 0.
     Offline,
     /// Larger than the client's Maximum Packet Size.
     TooLarge,
+}
+
+/// What a session may queue beyond its inflight window.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueueLimit {
+    /// Messages.
+    pub(crate) count: usize,
+    /// Bytes of topics, properties and payloads.
+    pub(crate) bytes: usize,
+    /// The state budget is used up: nothing more may be queued.
+    pub(crate) state_full: bool,
 }
 
 #[derive(Debug)]
@@ -112,6 +128,8 @@ pub(crate) struct Session {
     /// a resumed client may allow fewer in flight than before.
     unsent: usize,
     queue: VecDeque<Queued>,
+    /// Bytes of the messages in `queue`, for `max_queued_bytes`.
+    queued_bytes: usize,
     next_pkid: u16,
     /// Queued messages dropped because they expired.
     pub(crate) expired: u64,
@@ -128,10 +146,13 @@ pub(crate) struct Session {
     /// A connection is attached. Shared subscription entries on every lane
     /// read it to prefer connected members.
     pub(crate) online: Arc<AtomicBool>,
+    /// What the session counts against `max_state_bytes`.
+    charge: Charge,
 }
 
 impl Session {
-    pub(crate) fn new(client_id: Box<str>, version: Version) -> Session {
+    pub(crate) fn new(client_id: Box<str>, version: Version, total: LaneTotal) -> Session {
+        let charge = Charge::new(total, budget::session(&client_id));
         Session {
             client_id,
             username: None,
@@ -155,6 +176,7 @@ impl Session {
             inflight: VecDeque::new(),
             unsent: 0,
             queue: VecDeque::new(),
+            queued_bytes: 0,
             next_pkid: 0,
             expired: 0,
             congested: false,
@@ -162,7 +184,32 @@ impl Session {
             in_use: None,
             arena: Arena::default(),
             online: Arc::default(),
+            charge,
         }
+    }
+
+    /// Adds or replaces a subscription. Returns whether it existed.
+    pub(crate) fn subscribe(
+        &mut self,
+        filter: &str,
+        opts: SubscriptionOptions,
+        sub_id: u32,
+        lanes: usize,
+    ) -> bool {
+        let existed = self.subs.insert(filter.into(), (opts, sub_id)).is_some();
+        if !existed {
+            self.charge.add(budget::subscription(filter, lanes));
+        }
+        existed
+    }
+
+    /// Removes a subscription. Returns whether it existed.
+    pub(crate) fn unsubscribe(&mut self, filter: &str, lanes: usize) -> bool {
+        let existed = self.subs.remove(filter).is_some();
+        if existed {
+            self.charge.sub(budget::subscription(filter, lanes));
+        }
+        existed
     }
 
     /// QoS 1/2 messages waiting for the inflight window.
@@ -261,18 +308,41 @@ impl Session {
     }
 
     /// Delivers a QoS 1 or 2 message: sends it if the window allows, queues
-    /// it otherwise.
-    pub(crate) fn deliver_qos12(&mut self, item: Queued, max_queued: usize) -> Outcome {
+    /// it otherwise. The oldest queued messages make room for it.
+    pub(crate) fn deliver_qos12(&mut self, item: Queued, limit: QueueLimit) -> Outcome {
         if !self.would_queue() {
+            self.charge.add(budget::item(&item));
             return self.send_inflight(item);
         }
-        let mut outcome = Outcome::Queued;
-        if self.queue.len() >= max_queued {
-            self.queue.pop_front();
-            outcome = Outcome::QueueFull;
+        if limit.state_full {
+            return Outcome::StateFull;
         }
+        let size = item.msg.size();
+        if size > limit.bytes {
+            return Outcome::QueueFull(1);
+        }
+        let mut dropped = 0;
+        while self.queue.len() >= limit.count || self.queued_bytes + size > limit.bytes {
+            let Some(old) = self.pop_queued() else {
+                break;
+            };
+            self.charge.sub(budget::item(&old));
+            dropped += 1;
+        }
+        self.charge.add(budget::item(&item));
+        self.queued_bytes += size;
         self.queue.push_back(item);
-        outcome
+        if dropped == 0 {
+            Outcome::Queued
+        } else {
+            Outcome::QueueFull(dropped)
+        }
+    }
+
+    fn pop_queued(&mut self) -> Option<Queued> {
+        let item = self.queue.pop_front()?;
+        self.queued_bytes -= item.msg.size();
+        Some(item)
     }
 
     /// Whether a QoS 1/2 delivery now would wait in the queue.
@@ -290,11 +360,14 @@ impl Session {
         self.would_queue() || self.inflight.len() >= SLOW_INFLIGHT
     }
 
+    /// Sends a message the session is charged for, and keeps it until the
+    /// client acks it.
     fn send_inflight(&mut self, item: Queued) -> Outcome {
         let pkid = self.alloc_pkid();
         let ok = self.encode(&Fields::of(&item, pkid, false));
         if !ok {
             self.free_pkid(pkid);
+            self.charge.sub(budget::item(&item));
             return Outcome::TooLarge;
         }
         self.inflight.push_back(Inflight {
@@ -350,13 +423,14 @@ impl Session {
         }
         let mut now = None;
         while self.conn.is_some() && self.inflight.len() < usize::from(self.window) {
-            let Some(item) = self.queue.pop_front() else {
+            let Some(item) = self.pop_queued() else {
                 break;
             };
             if item.msg.expires_at.is_some()
                 && expired(item.msg.expires_at, *now.get_or_insert_with(Instant::now))
             {
                 self.expired += 1;
+                self.charge.sub(budget::item(&item));
                 continue;
             }
             wrote |= self.send_inflight(item) == Outcome::Sent;
@@ -374,6 +448,7 @@ impl Session {
         }
         let f = self.inflight.remove(i)?;
         self.free_pkid(pkid);
+        self.charge.sub(budget::item(&f.item));
         Some(f)
     }
 
@@ -557,6 +632,56 @@ mod tests {
         }
     }
 
+    const fn limit(count: usize, bytes: usize) -> QueueLimit {
+        QueueLimit {
+            count,
+            bytes,
+            state_full: false,
+        }
+    }
+
+    /// The queue makes room by bytes, oldest first, and the lane total
+    /// follows every charge back to zero.
+    #[test]
+    fn queue_bytes_and_charges() {
+        let total = LaneTotal::default();
+        let mut s = Session::new("c".into(), Version::V5, total.clone());
+        let base = total.get();
+        assert!(base > 0);
+        let opts = SubscriptionOptions::default();
+        assert!(!s.subscribe("a/#", opts, 0, 2));
+        assert!(s.subscribe("a/#", opts, 0, 2));
+        let subscribed = total.get();
+        assert!(subscribed > base);
+        let size = item().msg.size();
+        let room = limit(usize::MAX, 3 * size);
+        for _ in 0..3 {
+            assert_eq!(s.deliver_qos12(item(), room), Outcome::Queued);
+        }
+        assert_eq!(s.deliver_qos12(item(), room), Outcome::QueueFull(1));
+        assert_eq!(s.queued(), 3);
+        // Larger than the limit alone, or no room left in the budget.
+        let small = limit(usize::MAX, size - 1);
+        assert_eq!(s.deliver_qos12(item(), small), Outcome::QueueFull(1));
+        let full = QueueLimit {
+            state_full: true,
+            ..room
+        };
+        assert_eq!(s.deliver_qos12(item(), full), Outcome::StateFull);
+        assert_eq!(total.get(), subscribed + 3 * budget::item(&item()));
+        assert_eq!(s.charge.get(), total.get());
+        assert!(s.unsubscribe("a/#", 2));
+        drop(s);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// Sends a message the session is charged for.
+    fn send(s: &mut Session) -> Outcome {
+        let i = item();
+        s.charge.add(budget::item(&i));
+        s.send_inflight(i)
+    }
+
     fn ids(s: &Session) -> Vec<u16> {
         s.inflight.iter().map(|f| f.pkid).collect()
     }
@@ -565,12 +690,12 @@ mod tests {
     /// IDs stay unique, and in order again once the window empties.
     #[test]
     fn pkids_skip_unacked_after_wrapping() {
-        let mut s = Session::new("c".into(), Version::V5);
-        s.send_inflight(item());
+        let mut s = Session::new("c".into(), Version::V5, LaneTotal::default());
+        send(&mut s);
         let stuck = s.inflight[0].pkid;
         for n in 0..140_000 {
-            s.send_inflight(item());
-            s.send_inflight(item());
+            send(&mut s);
+            send(&mut s);
             let mut v = ids(&s);
             v.sort_unstable();
             v.dedup();
@@ -583,8 +708,8 @@ mod tests {
         assert_eq!(s.on_puback(stuck), Ok(false));
         s.trim_buffers();
         assert!(s.in_use.is_none());
-        s.send_inflight(item());
-        s.send_inflight(item());
+        send(&mut s);
+        send(&mut s);
         let v = ids(&s);
         assert_eq!(v[1], v[0].wrapping_add(1).max(1));
     }
@@ -593,7 +718,7 @@ mod tests {
     /// the next sweep without one.
     #[test]
     fn trim_frees_buffers_of_idle_sessions_only() {
-        let mut s = Session::new("c".into(), Version::V5);
+        let mut s = Session::new("c".into(), Version::V5, LaneTotal::default());
         s.out.reserve(2 * IDLE_BUFFER);
         let mut buf = s.take_out();
         buf.clear();

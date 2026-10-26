@@ -419,6 +419,14 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
             c.server_keep_alive = true;
             conn.keep_alive.set(max);
         }
+        // A new session that outlives its connection needs room in the state
+        // budget.
+        if l.state_full
+            && c.session_expiry.min(o.max_session_expiry) != 0
+            && !l.has_session(&c.client_id)
+        {
+            return Err(reason::QUOTA_EXCEEDED);
+        }
         // A takeover frees the old connection's slot for the new one.
         let takeover = l.is_connected(&c.client_id);
         // `try_update`, the new name, needs Rust 1.99.

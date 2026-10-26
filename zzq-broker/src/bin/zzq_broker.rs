@@ -1,13 +1,15 @@
 //! Standalone broker.
 //!
 //! Usage: `zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM]
-//! [--client-ca PEM] [--retained-file PATH] [--busy-poll] [--spin-us N]`
+//! [--client-ca PEM] [--retained-file PATH] [--max-state-mib N] [--busy-poll]
+//! [--spin-us N]`
 //!
 //! `--cert` and `--key` enable `tls://`, `wss://` and `quic://` binds.
 //! `--client-ca` makes them require client certificates. `--retained-file`
-//! keeps retained messages across restarts. `--spin-us` sets how long a lane
-//! polls on after work before it sleeps. Prints each bound endpoint on
-//! its own line, then runs until killed.
+//! keeps retained messages across restarts. `--max-state-mib` sets
+//! `max_state_bytes`. `--spin-us` sets how long a lane polls on after work
+//! before it sleeps. Prints each bound endpoint on its own line, then runs
+//! until killed.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -21,6 +23,7 @@ struct Args {
     key: Option<String>,
     client_ca: Option<String>,
     retained_file: Option<String>,
+    max_state_mib: Option<usize>,
     busy_poll: bool,
     spin: Duration,
 }
@@ -33,6 +36,7 @@ fn parse() -> Option<Args> {
         key: None,
         client_ca: None,
         retained_file: None,
+        max_state_mib: None,
         busy_poll: false,
         spin: Config::default().spin,
     };
@@ -50,6 +54,7 @@ fn parse() -> Option<Args> {
             "--key" => a.key = Some(value),
             "--client-ca" => a.client_ca = Some(value),
             "--retained-file" => a.retained_file = Some(value),
+            "--max-state-mib" => a.max_state_mib = Some(value.parse().ok()?),
             "--spin-us" => a.spin = Duration::from_micros(value.parse().ok()?),
             _ => return None,
         }
@@ -65,6 +70,9 @@ fn options(a: &Args) -> Result<BrokerOptions, String> {
     if let Some(path) = &a.retained_file {
         let store = zzq_broker::FilePersistence::open(path).map_err(|e| format!("{path}: {e}"))?;
         opts.persistence = Some(std::sync::Arc::new(store));
+    }
+    if let Some(mib) = a.max_state_mib {
+        opts.max_state_bytes = mib.saturating_mul(1 << 20);
     }
     tls(a, &mut opts)?;
     Ok(opts)
@@ -130,7 +138,8 @@ fn main() -> ExitCode {
     let Some(args) = parse() else {
         eprintln!(
             "usage: zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM] \
-             [--client-ca PEM] [--retained-file PATH] [--busy-poll] [--spin-us N]"
+             [--client-ca PEM] [--retained-file PATH] [--max-state-mib N] \
+             [--busy-poll] [--spin-us N]"
         );
         return ExitCode::FAILURE;
     };

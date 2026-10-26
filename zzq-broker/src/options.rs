@@ -80,6 +80,11 @@ pub struct BrokerOptions {
     /// QoS 1/2 messages queued per session beyond the inflight window. The
     /// oldest is dropped and counted when full.
     pub max_queued: usize,
+    /// Bytes of topics, properties and payloads of the QoS 1/2 messages
+    /// queued per session beyond the inflight window. The oldest are
+    /// dropped and counted when full; a message larger than this is
+    /// dropped.
+    pub max_queued_bytes: usize,
     /// QoS 1/2 messages queued for a connected session before publishers that
     /// feed it get their acks held back. Acks resume at half of this.
     pub qos_queue_high: usize,
@@ -95,6 +100,13 @@ pub struct BrokerOptions {
     /// Retained topics stored. Retained messages for new topics beyond it
     /// are delivered but not stored, and counted.
     pub max_retained: usize,
+    /// Approximate bytes of broker state: sessions, their subscriptions and
+    /// the QoS 1/2 messages they hold, and retained messages. Lanes check it
+    /// 20 times a second. While it is reached, new sessions that would
+    /// outlive their connection get CONNACK Quota Exceeded, messages that
+    /// would wait in a session queue are dropped and counted, and retained
+    /// messages for new topics are not stored.
+    pub max_state_bytes: usize,
     /// Levels a topic name or filter may have. Deeper ones are rejected,
     /// which bounds the work and stack depth of matching.
     pub max_topic_levels: usize,
@@ -144,11 +156,13 @@ impl Default for BrokerOptions {
             max_packet_size: 16 << 20,
             max_inflight: 1024,
             max_queued: 100_000,
+            max_queued_bytes: usize::MAX,
             qos_queue_high: 1024,
             max_out_bytes: 64 << 20,
             receive_maximum: 65_535,
             max_subscriptions: usize::MAX,
             max_retained: usize::MAX,
+            max_state_bytes: usize::MAX,
             max_topic_levels: 128,
             topic_alias_maximum: 1024,
             max_session_expiry: u32::MAX,
@@ -176,11 +190,13 @@ impl fmt::Debug for BrokerOptions {
             .field("max_packet_size", &self.max_packet_size)
             .field("max_inflight", &self.max_inflight)
             .field("max_queued", &self.max_queued)
+            .field("max_queued_bytes", &self.max_queued_bytes)
             .field("qos_queue_high", &self.qos_queue_high)
             .field("max_out_bytes", &self.max_out_bytes)
             .field("receive_maximum", &self.receive_maximum)
             .field("max_subscriptions", &self.max_subscriptions)
             .field("max_retained", &self.max_retained)
+            .field("max_state_bytes", &self.max_state_bytes)
             .field("max_topic_levels", &self.max_topic_levels)
             .field("topic_alias_maximum", &self.topic_alias_maximum)
             .field("max_session_expiry", &self.max_session_expiry)

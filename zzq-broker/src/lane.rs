@@ -19,11 +19,12 @@ use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 
 use crate::broker::Shared;
+use crate::budget::LaneTotal;
 use crate::conn::{ConnShared, OwnedConnect, ReadBlocks};
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
-use crate::session::{Outcome, Queued, Session, Waiter};
+use crate::session::{Outcome, QueueLimit, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
@@ -45,6 +46,9 @@ pub(crate) struct LaneStats {
     pub(crate) dropped_too_large: u64,
     pub(crate) dropped_expired: u64,
     pub(crate) dropped_session_ended: u64,
+    pub(crate) dropped_state_full: u64,
+    /// Bytes the lane's sessions count against `max_state_bytes`.
+    pub(crate) state_bytes: u64,
 }
 
 /// A delivery for a session on another lane.
@@ -190,6 +194,10 @@ pub(crate) struct Lane {
     /// Acks of local publishers held for congested remote sessions.
     remote_waiters: FxHashMap<SubRef, Vec<Waiter>>,
     pub(crate) stats: LaneStats,
+    /// Bytes the sessions charge against `max_state_bytes`.
+    state: LaneTotal,
+    /// The state budget was reached at the last check.
+    pub(crate) state_full: bool,
     /// What connections without a buffer of their own read into.
     pub(crate) read_blocks: ReadBlocks,
     /// Calls of [`Lane::sweep`] so far.
@@ -218,6 +226,8 @@ impl Lane {
             fwd: Arena::default(),
             remote_waiters: FxHashMap::default(),
             stats: LaneStats::default(),
+            state: LaneTotal::default(),
+            state_full: false,
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
             next_conn_id: 0,
@@ -381,8 +391,11 @@ impl Lane {
         conn.close(bye);
     }
 
-    /// Binds a connection to its session, creating or resuming it, and
-    /// queues CONNACK.
+    /// Whether `client_id` has a session on this lane.
+    pub(crate) fn has_session(&self, client_id: &str) -> bool {
+        self.by_client.contains_key(client_id)
+    }
+
     /// Whether `client_id` has a live connection on this lane.
     pub(crate) fn is_connected(&self, client_id: &str) -> bool {
         self.by_client
@@ -391,6 +404,8 @@ impl Lane {
             .is_some_and(|s| s.conn.is_some())
     }
 
+    /// Binds a connection to its session, creating or resuming it, and
+    /// queues CONNACK.
     pub(crate) fn attach(&mut self, c: &OwnedConnect, conn: Rc<ConnShared>) -> Attached {
         let max_expiry = self.shared.opts.max_session_expiry;
         let mut present = false;
@@ -435,9 +450,8 @@ impl Lane {
             }
         }
         let key = key.unwrap_or_else(|| {
-            let k = self
-                .sessions
-                .insert(Session::new(c.client_id.as_str().into(), c.version));
+            let session = Session::new(c.client_id.as_str().into(), c.version, self.state.clone());
+            let k = self.sessions.insert(session);
             self.by_client.insert(c.client_id.as_str().into(), k);
             k
         });
@@ -575,7 +589,7 @@ impl Lane {
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set(msg);
+                .set(msg, self.state_full);
         }
         let p = Publication::of(msg);
         let mut owned = Some(msg.clone());
@@ -747,7 +761,7 @@ impl Lane {
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set(&msg);
+                .set(&msg, self.state_full);
             owned = Some(msg);
         }
         let m = self.publisher_matches(key, topic);
@@ -977,11 +991,20 @@ impl Lane {
             last,
             on_subscribe,
         } = g;
-        let max_out = self.shared.opts.max_out_bytes;
-        let max_queued = if on_subscribe {
-            usize::MAX
+        let o = &self.shared.opts;
+        let max_out = o.max_out_bytes;
+        let limit = if on_subscribe {
+            QueueLimit {
+                count: usize::MAX,
+                bytes: usize::MAX,
+                state_full: self.state_full,
+            }
         } else {
-            self.shared.opts.max_queued
+            QueueLimit {
+                count: o.max_queued,
+                bytes: o.max_queued_bytes,
+                state_full: self.state_full,
+            }
         };
         let Some(s) = self.sessions.get_mut(key) else {
             return;
@@ -1007,10 +1030,10 @@ impl Lane {
                     retain,
                     sub_id,
                 },
-                max_queued,
+                limit,
             )
         };
-        if matches!(outcome, Outcome::Queued | Outcome::QueueFull)
+        if matches!(outcome, Outcome::Queued | Outcome::QueueFull(_))
             && s.conn.is_some()
             && s.queued() >= self.shared.opts.qos_queue_high
         {
@@ -1033,7 +1056,8 @@ impl Lane {
                 self.mark(key);
             }
             Outcome::Queued => {}
-            Outcome::QueueFull => self.stats.dropped_queue_full += 1,
+            Outcome::QueueFull(n) => self.stats.dropped_queue_full += u64::from(n),
+            Outcome::StateFull => self.stats.dropped_state_full += 1,
             Outcome::BufferFull => self.stats.dropped_buffer_full += 1,
             Outcome::Offline => self.stats.dropped_offline += 1,
             Outcome::TooLarge => self.stats.dropped_too_large += 1,
@@ -1074,6 +1098,7 @@ impl Lane {
             .properties
             .get_int(property::SUBSCRIPTION_IDENTIFIER)
             .unwrap_or(0);
+        let lanes = self.shared.lanes.len();
         let mut codes = Vec::new();
         let mut wanted = Vec::new();
         let sync = self.sync();
@@ -1085,7 +1110,7 @@ impl Lane {
                 codes.push(code);
                 continue;
             }
-            let existed = s.subs.insert(filter.into(), (opts, sub_id)).is_some();
+            let existed = s.subscribe(filter, opts, sub_id, lanes);
             let entry = self.entry_for(key, filter, opts, sub_id);
             self.subscribe_entry(filter, &entry, sync.as_ref());
             codes.push(opts.qos as u8);
@@ -1204,11 +1229,12 @@ impl Lane {
         let mut codes = Vec::new();
         let sub = self.sub_ref(key);
         let sync = self.sync();
+        let lanes = self.shared.lanes.len();
         for filter in u.filters() {
             let existed = self
                 .sessions
                 .get_mut(key)
-                .is_some_and(|s| s.subs.remove(filter).is_some());
+                .is_some_and(|s| s.unsubscribe(filter, lanes));
             if existed {
                 self.unsubscribe_entry(filter, sub, sync.as_ref());
             }
@@ -1267,6 +1293,7 @@ impl Lane {
             Control::Stats(reply) => {
                 let mut stats = self.stats;
                 stats.sessions = self.sessions.len() as u64;
+                stats.state_bytes = self.state.get() as u64;
                 // Removed sessions added theirs to `self.stats`.
                 stats.dropped_expired += self
                     .sessions
@@ -1289,6 +1316,7 @@ impl Lane {
     /// Keep alive timeouts and session expiry, for the next of
     /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
+        self.check_state();
         let part = self.sweeps % SWEEP_PARTS;
         self.sweeps = self.sweeps.wrapping_add(1);
         // The retained store is shared; one lane, once a round, is enough.
@@ -1319,6 +1347,31 @@ impl Lane {
                 self.remove_session(key);
             }
         }
+    }
+
+    /// Publishes this lane's state bytes, and checks `max_state_bytes`
+    /// against those of all lanes and the retained store.
+    fn check_state(&mut self) {
+        let max = self.shared.opts.max_state_bytes;
+        if max == usize::MAX {
+            return;
+        }
+        self.shared.lanes[usize::from(self.id)]
+            .state
+            .store(self.state.get(), Ordering::Relaxed);
+        let retained = self
+            .shared
+            .retained
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .bytes();
+        let lanes: usize = self
+            .shared
+            .lanes
+            .iter()
+            .map(|l| l.state.load(Ordering::Relaxed))
+            .sum();
+        self.state_full = lanes + retained >= max;
     }
 
     fn shutdown(&mut self) {

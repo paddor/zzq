@@ -33,6 +33,7 @@
 //! ```
 
 mod broker;
+mod budget;
 mod conn;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
