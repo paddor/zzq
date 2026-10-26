@@ -138,6 +138,9 @@ struct Grant {
     /// The last delivery of this publish: it may take the owned message
     /// instead of cloning it.
     last: bool,
+    /// A retained message sent on subscribe. `max_retained` bounds those,
+    /// so `max_queued` does not drop them.
+    on_subscribe: bool,
 }
 
 /// Why a connection's read loop ended.
@@ -955,6 +958,7 @@ impl Lane {
             retain: e.opts.retain_as_published && p.retain,
             sub_id: e.sub_id,
             last,
+            on_subscribe: false,
         })
     }
 
@@ -965,9 +969,14 @@ impl Lane {
             retain,
             sub_id,
             last,
+            on_subscribe,
         } = g;
         let max_out = self.shared.opts.max_out_bytes;
-        let max_queued = self.shared.opts.max_queued;
+        let max_queued = if on_subscribe {
+            usize::MAX
+        } else {
+            self.shared.opts.max_queued
+        };
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -1047,6 +1056,7 @@ impl Lane {
                     retain: item.retain,
                     sub_id: item.sub_id,
                     last: true,
+                    on_subscribe: false,
                 };
                 self.deliver(*key, &p, &mut owned, g);
             }
@@ -1114,6 +1124,7 @@ impl Lane {
                 retain: true,
                 sub_id: SubIds::one(sub_id),
                 last: true,
+                on_subscribe: true,
             };
             let mut retained = msg.clone();
             retained.retain = true;

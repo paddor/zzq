@@ -22,6 +22,8 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a share group gives each message to a member with a
   connection. It waits at an offline member only when no member is
   connected.
+- `zzq-broker`: retained messages sent on subscribe no longer count
+  against `max_queued`, which dropped them; `max_retained` bounds them.
 
 ### Fixed
 

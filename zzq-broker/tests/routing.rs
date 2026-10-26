@@ -755,3 +755,32 @@ async fn authorizer_sees_shared_filters_without_the_prefix() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_set_larger_than_the_window_arrives_whole() {
+    let opts = BrokerOptions {
+        max_queued: 100,
+        max_inflight: 32,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let publ = client(&ctx, &uri, "p", Version::V5).await;
+    for i in 0..1000 {
+        publ.publish_retained(&format!("many/{i}"), format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    // Mosquitto #2887: every retained message reaches the subscriber, past
+    // max_queued; the window paces them.
+    let mut raw = Raw::connect(&uri, "all", Version::V5, 0).await;
+    raw.subscribe("many/#", QoS::AtLeastOnce.into()).await;
+    let mut seen = BTreeSet::new();
+    for _ in 0..1000 {
+        let p = raw.publish().await;
+        assert!(p.retain);
+        raw.complete(&p).await;
+        seen.insert(p.topic);
+    }
+    assert_eq!(seen.len(), 1000);
+    assert_eq!(broker.stats().await.unwrap().dropped_queue_full, 0);
+}
