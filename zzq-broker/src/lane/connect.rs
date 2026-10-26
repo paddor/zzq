@@ -16,14 +16,13 @@ use crate::slab::Key;
 use super::{Attached, Close, Lane};
 
 impl Lane {
-    /// A client ID for a client that sent none.
     /// A fresh client ID that `lane_for` maps to this lane, so the client
     /// finds its session here when it reconnects.
     pub(crate) fn assign_client_id(&mut self) -> String {
         let lanes = self.shared.lanes.len();
         loop {
-            self.next_client_no += 1;
-            let id = format!("zzq-{}-{}-{}", self.shared.id, self.id, self.next_client_no);
+            self.ids.client_no += 1;
+            let id = format!("zzq-{}-{}-{}", self.shared.id, self.id, self.ids.client_no);
             if crate::broker::lane_for(&id, lanes) == usize::from(self.id) {
                 return id;
             }
@@ -80,49 +79,14 @@ impl Lane {
     /// queues CONNACK.
     pub(crate) fn attach(&mut self, c: &OwnedConnect, conn: Rc<ConnShared>) -> Attached {
         let max_expiry = self.shared.opts.max_session_expiry;
-        let mut present = false;
-        let mut key = self.by_client.get(c.client_id.as_str()).copied();
-        if let Some(k) = key
-            && let Some(s) = self.sessions.get_mut(k)
-        {
-            // The old session ends if the new connection starts clean or the
-            // old one kept no session.
-            let ends = c.clean_start || s.expiry == 0;
-            // The old connection ends without DISCONNECT, so its will goes
-            // out now, unless it has a delay and the session goes on: the
-            // new connection came first and cancels it. So does a will of
-            // an earlier connection that waits for its delay.
-            let old = s.conn.take();
-            let delayed = s.delayed_will.take().map(|w| w.msg);
-            let will = match s.will.take() {
-                Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
-                _ => delayed.filter(|_| ends),
-            };
-            // Packets queued for the old connection must not reach the new
-            // one; the inflight window is resent below.
-            s.out.clear();
-            if let Some(old) = old {
-                // Before its CONNACK, a connection just closes: CONNACK comes
-                // before any other packet [MQTT-3.2.0-1].
-                if old.connacked.get() {
-                    Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
-                } else {
-                    old.close(Vec::new());
-                }
-                self.stats.connections -= 1;
-            }
-            if let Some(will) = will {
-                self.publish_will(will);
-            }
-            if ends {
-                self.remove_session(k);
-                key = None;
-            } else {
-                present = true;
-            }
-        }
-        let key = key.unwrap_or_else(|| {
-            let session = Session::new(c.client_id.as_str().into(), c.version, self.state.clone());
+        let key = self.by_client.get(c.client_id.as_str()).copied();
+        let present = key.is_some_and(|k| self.take_over(k, c));
+        let key = key.filter(|_| present).unwrap_or_else(|| {
+            let session = Session::new(
+                c.client_id.as_str().into(),
+                c.version,
+                self.budget.total.clone(),
+            );
             let k = self.sessions.insert(session);
             self.by_client.insert(c.client_id.as_str().into(), k);
             k
@@ -148,6 +112,47 @@ impl Lane {
         }
         self.mark(key);
         Attached { key }
+    }
+
+    /// Ends the old connection of session `k` for a new one. Returns whether
+    /// the session goes on.
+    fn take_over(&mut self, k: Key, c: &OwnedConnect) -> bool {
+        let Some(s) = self.sessions.get_mut(k) else {
+            return false;
+        };
+        // The old session ends if the new connection starts clean or the
+        // old one kept no session.
+        let ends = c.clean_start || s.expiry == 0;
+        // The old connection ends without DISCONNECT, so its will goes
+        // out now, unless it has a delay and the session goes on: the
+        // new connection came first and cancels it. So does a will of
+        // an earlier connection that waits for its delay.
+        let old = s.conn.take();
+        let delayed = s.delayed_will.take().map(|w| w.msg);
+        let will = match s.will.take() {
+            Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
+            _ => delayed.filter(|_| ends),
+        };
+        // Packets queued for the old connection must not reach the new
+        // one; the inflight window is resent on attach.
+        s.out.clear();
+        if let Some(old) = old {
+            // Before its CONNACK, a connection just closes: CONNACK comes
+            // before any other packet [MQTT-3.2.0-1].
+            if old.connacked.get() {
+                Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
+            } else {
+                old.close(Vec::new());
+            }
+            self.stats.connections -= 1;
+        }
+        if let Some(will) = will {
+            self.publish_will(will);
+        }
+        if ends {
+            self.remove_session(k);
+        }
+        !ends
     }
 
     fn connack_props(&self, c: &OwnedConnect) -> Vec<u8> {
@@ -227,8 +232,8 @@ impl Lane {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        self.next_will_id += 1;
-        let id = self.next_will_id;
+        self.ids.will += 1;
+        let id = self.ids.will;
         s.delayed_will = Some(DelayedWill {
             timer: id,
             due: Instant::now() + delay,

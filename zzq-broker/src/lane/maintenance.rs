@@ -63,7 +63,7 @@ impl Lane {
         }
         self.shared.lanes[usize::from(self.id)]
             .state
-            .store(self.state.get(), Ordering::Relaxed);
+            .store(self.budget.total.get(), Ordering::Relaxed);
         let retained = self
             .shared
             .retained
@@ -76,7 +76,7 @@ impl Lane {
             .iter()
             .map(|l| l.state.load(Ordering::Relaxed))
             .sum();
-        self.state_full = lanes + retained >= max;
+        self.budget.full = lanes + retained >= max;
     }
 
     /// Closes every connection as lost, so wills and session expiry run
@@ -98,7 +98,7 @@ impl Lane {
 
     /// Queues a marker for every other lane behind what waits for it.
     pub(super) fn drain(&mut self, sync: &Arc<SyncAck>) {
-        for (lane, batch) in self.remote.iter_mut().enumerate() {
+        for (lane, batch) in self.out.remote.iter_mut().enumerate() {
             if lane != usize::from(self.id) {
                 batch.push(Remote::Drained(sync.clone()));
             }
@@ -126,7 +126,7 @@ impl Lane {
             if self.by_client.contains_key(&st.client_id) {
                 continue;
             }
-            let (session, will) = Session::restore(st, self.state.clone(), lanes);
+            let (session, will) = Session::restore(st, self.budget.total.clone(), lanes);
             let subs: Vec<(Box<str>, SubscriptionOptions, u32)> = session
                 .subs
                 .iter()

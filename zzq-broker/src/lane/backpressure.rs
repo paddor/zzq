@@ -30,13 +30,13 @@ impl Lane {
             kind,
             pkid: p.pkid,
         };
-        match self.hit.take() {
+        match self.congestion.hit.take() {
             Some(Hit::Local(sub)) if sub != key && self.sessions.get(sub).is_some() => {
                 if let Some(s) = self.sessions.get_mut(sub) {
                     s.waiters.push(waiter);
                 }
             }
-            Some(Hit::Remote(sub)) => self.remote_waiters.entry(sub).or_default().push(waiter),
+            Some(Hit::Remote(sub)) => self.congestion.waiters.entry(sub).or_default().push(waiter),
             _ => {
                 if let Some(s) = self.sessions.get_mut(key) {
                     s.ack(kind, p.pkid, 0);

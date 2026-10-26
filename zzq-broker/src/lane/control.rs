@@ -98,18 +98,18 @@ impl Lane {
             }
             Control::Publish(msg) => self.publish_owned(&msg),
             Control::Congested(sub, true) => {
-                self.remote_congested.insert(sub);
+                self.congestion.remote.insert(sub);
             }
             Control::Congested(sub, false) => {
-                self.remote_congested.remove(&sub);
-                if let Some(waiters) = self.remote_waiters.remove(&sub) {
+                self.congestion.remote.remove(&sub);
+                if let Some(waiters) = self.congestion.waiters.remove(&sub) {
                     self.send_acks(&waiters);
                 }
             }
             Control::Stats(reply) => {
                 let mut stats = self.stats;
                 stats.sessions = self.sessions.len() as u64;
-                stats.state_bytes = self.state.get() as u64;
+                stats.state_bytes = self.budget.total.get() as u64;
                 // Removed sessions added theirs to `self.stats`.
                 stats.dropped_expired += self
                     .sessions

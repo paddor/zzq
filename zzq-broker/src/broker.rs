@@ -49,7 +49,7 @@ fn try_ship(lane: &LaneRef) -> bool {
     if !l.has_remote() {
         return true;
     }
-    let shipping = l.shipping.clone();
+    let shipping = l.out.shipping.clone();
     let Ok(_turn) = shipping.try_lock() else {
         return false;
     };
@@ -69,7 +69,7 @@ async fn ship_waiting(lane: &LaneRef) {
         if !l.has_remote() {
             return;
         }
-        (l.shared.clone(), l.shipping.clone())
+        (l.shared.clone(), l.out.shipping.clone())
     };
     let _turn = shipping.lock().await;
     loop {

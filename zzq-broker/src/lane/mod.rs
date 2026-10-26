@@ -79,43 +79,68 @@ pub(crate) struct Lane {
     by_client: FxHashMap<Box<str>, Key>,
     index: SubIndex,
     dirty: Vec<Key>,
-    remote: Box<[Vec<Remote>]>,
-    /// One task ships at a time, in arrival order, so batches for a lane
-    /// leave in the order they were collected, also while it is full.
-    pub(crate) shipping: Rc<tokio::sync::Mutex<()>>,
+    pub(crate) out: Outbox,
     held: Vec<Held>,
-    /// First congested target of the publish being routed.
-    hit: Option<Hit>,
-    /// Congested sessions on other lanes.
-    remote_congested: FxHashSet<SubRef>,
-    /// Copies of QoS 1/2 publishes for congested sessions on other lanes.
-    fwd: Arena,
-    /// Acks of local publishers held for congested remote sessions.
-    remote_waiters: FxHashMap<SubRef, Vec<Waiter>>,
+    congestion: Congestion,
     pub(crate) stats: LaneStats,
-    /// Bytes the sessions charge against `max_state_bytes`.
-    state: LaneTotal,
-    /// The share of retained messages sent on subscribe, which the store
-    /// counts.
-    retained_share: Rc<Charge>,
-    /// The state budget was reached at the last check.
-    pub(crate) state_full: bool,
+    pub(crate) budget: StateBudget,
     /// What connections without a buffer of their own read into.
     pub(crate) read_blocks: ReadBlocks,
     /// Calls of [`Lane::sweep`] so far.
     sweeps: u32,
-    next_conn_id: u64,
-    next_client_no: u64,
-    next_will_id: u64,
+    ids: Ids,
     pub(crate) shut_down: bool,
     /// Closing for a state dump: no new connections, no wills on timers.
     pub(crate) closing: bool,
 }
 
+/// What waits to go to other lanes.
+#[derive(Debug)]
+pub(crate) struct Outbox {
+    /// Batches by target lane.
+    remote: Box<[Vec<Remote>]>,
+    /// One task ships at a time, in arrival order, so batches for a lane
+    /// leave in the order they were collected, also while it is full.
+    pub(crate) shipping: Rc<tokio::sync::Mutex<()>>,
+    /// Copies of QoS 1/2 publishes for congested sessions on other lanes.
+    fwd: Arena,
+}
+
+/// Congested sessions and the publisher acks held for them.
+#[derive(Debug, Default)]
+struct Congestion {
+    /// First congested target of the publish being routed.
+    hit: Option<Hit>,
+    /// Congested sessions on other lanes.
+    remote: FxHashSet<SubRef>,
+    /// Acks of local publishers held for congested remote sessions.
+    waiters: FxHashMap<SubRef, Vec<Waiter>>,
+}
+
+/// The lane's part of `max_state_bytes`.
+#[derive(Debug)]
+pub(crate) struct StateBudget {
+    /// Bytes the sessions charge.
+    total: LaneTotal,
+    /// The share of retained messages sent on subscribe, which the store
+    /// counts.
+    retained_share: Rc<Charge>,
+    /// The budget was reached at the last check.
+    pub(crate) full: bool,
+}
+
+/// The last IDs the lane handed out.
+#[derive(Debug, Default)]
+struct Ids {
+    conn: u64,
+    client_no: u64,
+    will: u64,
+}
+
 impl Lane {
     pub(crate) fn new(id: u16, shared: Arc<Shared>) -> Lane {
         let lanes = shared.lanes.len();
-        let state = LaneTotal::default();
+        let total = LaneTotal::default();
         Lane {
             id,
             shared,
@@ -123,30 +148,30 @@ impl Lane {
             by_client: FxHashMap::default(),
             index: SubIndex::default(),
             dirty: Vec::new(),
-            remote: (0..lanes).map(|_| Vec::new()).collect(),
-            shipping: Rc::default(),
+            out: Outbox {
+                remote: (0..lanes).map(|_| Vec::new()).collect(),
+                shipping: Rc::default(),
+                fwd: Arena::default(),
+            },
             held: Vec::new(),
-            hit: None,
-            remote_congested: FxHashSet::default(),
-            fwd: Arena::default(),
-            remote_waiters: FxHashMap::default(),
+            congestion: Congestion::default(),
             stats: LaneStats::default(),
-            retained_share: Rc::new(Charge::new(state.clone(), 0)),
-            state,
-            state_full: false,
+            budget: StateBudget {
+                retained_share: Rc::new(Charge::new(total.clone(), 0)),
+                total,
+                full: false,
+            },
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
-            next_conn_id: 0,
-            next_client_no: 0,
-            next_will_id: 0,
+            ids: Ids::default(),
             shut_down: false,
             closing: false,
         }
     }
 
     pub(crate) const fn next_conn_id(&mut self) -> u64 {
-        self.next_conn_id += 1;
-        self.next_conn_id
+        self.ids.conn += 1;
+        self.ids.conn
     }
 
     const fn sub_ref(&self, key: Key) -> SubRef {

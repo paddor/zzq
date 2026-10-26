@@ -424,7 +424,7 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
         }
         // A new session that outlives its connection needs room in the state
         // budget.
-        if l.state_full
+        if l.budget.full
             && c.session_expiry.min(o.max_session_expiry) != 0
             && !l.has_session(&c.client_id)
         {

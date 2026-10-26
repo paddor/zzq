@@ -78,13 +78,14 @@ pub(super) struct Grant {
 impl Lane {
     /// Whether batches for other lanes are waiting.
     pub(crate) fn has_remote(&self) -> bool {
-        self.remote.iter().any(|b| !b.is_empty())
+        self.out.remote.iter().any(|b| !b.is_empty())
     }
 
     /// The next batch for another lane, and its lane. Its place gets a
     /// vector of the same size, so the next batch does not grow from empty.
     pub(crate) fn next_remote(&mut self) -> Option<(usize, Vec<Remote>)> {
         let (lane, batch) = self
+            .out
             .remote
             .iter_mut()
             .enumerate()
@@ -96,7 +97,7 @@ impl Lane {
     /// Puts back a batch [`Lane::next_remote`] took, which could not leave
     /// yet. Nothing was collected for its lane since.
     pub(crate) fn unship(&mut self, lane: usize, batch: Vec<Remote>) {
-        self.remote[lane] = batch;
+        self.out.remote[lane] = batch;
     }
 
     /// Routes a message that is not from a client connection.
@@ -106,7 +107,7 @@ impl Lane {
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set(msg, self.state_full);
+                .set(msg, self.budget.full);
         }
         let p = Publication::of(msg);
         let mut owned = Owned::of(msg.clone());
@@ -170,10 +171,10 @@ impl Lane {
             } else {
                 remote_lanes |= 1 << (e.sub.lane & 63);
                 if p.qos != QoS::AtMostOnce
-                    && !self.remote_congested.is_empty()
-                    && self.remote_congested.contains(&e.sub)
+                    && !self.congestion.remote.is_empty()
+                    && self.congestion.remote.contains(&e.sub)
                 {
-                    self.hit.get_or_insert(Hit::Remote(e.sub));
+                    self.congestion.hit.get_or_insert(Hit::Remote(e.sub));
                     remote_hot = true;
                 }
             }
@@ -186,7 +187,7 @@ impl Lane {
                 }
             } else {
                 let msg = owned.msg.get_or_insert_with(|| p.to_msg()).clone();
-                self.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
+                self.out.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
                     key: e.sub.key,
                     item: Queued {
                         msg,
@@ -198,13 +199,13 @@ impl Lane {
             }
         }
         if remote_lanes != 0 {
-            let (chunk, at, version, pins) = forward_packet(p, remote_hot, &mut self.fwd);
+            let (chunk, at, version, pins) = forward_packet(p, remote_hot, &mut self.out.fwd);
             let origin = Origin {
                 version,
                 from: from.map(|k| self.sub_ref(k)),
                 pins,
             };
-            for (lane, batch) in self.remote.iter_mut().enumerate() {
+            for (lane, batch) in self.out.remote.iter_mut().enumerate() {
                 if remote_lanes & (1 << (lane & 63)) != 0 && lane != usize::from(self.id) {
                     push_forward(batch, &chunk, at, origin);
                 }
@@ -280,13 +281,13 @@ impl Lane {
             QueueLimit {
                 count: usize::MAX,
                 bytes: usize::MAX,
-                state_full: self.state_full,
+                state_full: self.budget.full,
             }
         } else {
             QueueLimit {
                 count: o.max_queued,
                 bytes: o.max_queued_bytes,
-                state_full: self.state_full,
+                state_full: self.budget.full,
             }
         };
         let Some(s) = self.sessions.get_mut(key) else {
@@ -299,7 +300,7 @@ impl Lane {
                 s.deliver_qos0(p, retain, sub_id, max_out)
             }
         } else {
-            let kept = keep(s, p, owned, &self.state, g);
+            let kept = keep(s, p, owned, &self.budget.total, g);
             s.deliver_qos12(kept, limit)
         };
         if matches!(outcome, Outcome::Queued | Outcome::QueueFull(_))
@@ -312,7 +313,7 @@ impl Lane {
                 let sub = self.sub_ref(key);
                 self.broadcast(&|| Control::Congested(sub, true));
             }
-            self.hit.get_or_insert(Hit::Local(key));
+            self.congestion.hit.get_or_insert(Hit::Local(key));
         }
         self.count(key, outcome);
     }

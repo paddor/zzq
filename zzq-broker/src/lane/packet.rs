@@ -183,11 +183,11 @@ impl Lane {
                 .retained
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .set(&msg, self.state_full);
+                .set(&msg, self.budget.full);
             owned.msg = Some(msg);
         }
         let m = self.publisher_matches(key, topic);
-        self.hit = None;
+        self.congestion.hit = None;
         self.route_matches(Some(key), &m, &publication, &mut owned);
         self.ack_or_hold(key, p);
         Ok(())
