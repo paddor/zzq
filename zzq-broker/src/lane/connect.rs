@@ -40,7 +40,7 @@ impl Lane {
         let Some(mut s) = self.sessions.remove(key) else {
             return;
         };
-        self.stats.dropped.expired += s.flow.expired;
+        self.stats.add_session(&s);
         self.stats.dropped.session_ended += s.held();
         let sub = self.sub_ref(key);
         for filter in s.subs.keys() {

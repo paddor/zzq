@@ -129,12 +129,11 @@ impl Lane {
                 stats.sessions = self.sessions.len() as u64;
                 stats.state_bytes = self.budget.total.get() as u64;
                 // Removed sessions added theirs to `self.stats`.
-                stats.dropped.expired += self
-                    .sessions
-                    .keys()
-                    .filter_map(|k| self.sessions.get(k))
-                    .map(|s| s.flow.expired)
-                    .sum::<u64>();
+                for k in self.sessions.keys() {
+                    if let Some(s) = self.sessions.get(k) {
+                        stats.add_session(s);
+                    }
+                }
                 let _ = reply.send(stats);
             }
             Control::Quiesce(done) => {

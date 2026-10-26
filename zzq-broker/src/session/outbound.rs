@@ -178,7 +178,13 @@ impl Session {
                 self.charge.sub(budget::held(&h));
                 continue;
             }
-            wrote |= self.send_inflight(h) == Outcome::Sent;
+            match self.send_inflight(h) {
+                Outcome::Sent => {
+                    self.flow.sent += 1;
+                    wrote = true;
+                }
+                _ => self.flow.too_large += 1,
+            }
         }
         wrote
     }
@@ -267,19 +273,27 @@ impl Session {
     /// Resends held back inflight messages while the window has room.
     fn resend_unsent(&mut self) -> bool {
         let window = usize::from(self.flow.window);
-        let inflight = std::mem::take(&mut self.flow.inflight);
+        let mut inflight = std::mem::take(&mut self.flow.inflight);
         let mut wrote = false;
         while self.flow.unsent > 0
             && self.conn.is_some()
             && inflight.len() - self.flow.unsent < window
         {
-            let f = &inflight[inflight.len() - self.flow.unsent];
+            let at = inflight.len() - self.flow.unsent;
+            self.flow.unsent -= 1;
+            let f = &inflight[at];
             if f.released {
                 self.ack(PacketType::PubRel, f.pkid, 0);
-            } else {
-                self.encode(&Fields::of(&f.held.item, f.pkid, true));
+            } else if !self.encode(&Fields::of(&f.held.item, f.pkid, true)) {
+                // Larger than the client now takes, so it could never be
+                // acked: it gives up its slot.
+                if let Some(f) = inflight.remove(at) {
+                    self.free_pkid(f.pkid);
+                    self.charge.sub(budget::held(&f.held));
+                    self.flow.too_large += 1;
+                }
+                continue;
             }
-            self.flow.unsent -= 1;
             wrote = true;
         }
         self.flow.inflight = inflight;

@@ -188,6 +188,11 @@ pub(crate) struct Outbound {
     in_use: Option<Box<[u64; 1024]>>,
     /// Queued messages dropped because they expired.
     pub(crate) expired: u64,
+    /// Held messages dropped because they outgrew the client's Maximum
+    /// Packet Size.
+    pub(crate) too_large: u64,
+    /// Queued messages sent once the window had room.
+    pub(crate) sent: u64,
     /// Copies of messages held long.
     arena: Arena,
     /// Bytes charged for the slots `queue` and `inflight` have room for, and
@@ -206,6 +211,8 @@ impl Default for Outbound {
             next_pkid: 0,
             in_use: None,
             expired: 0,
+            too_large: 0,
+            sent: 0,
             arena: Arena::default(),
             room: 0,
         }

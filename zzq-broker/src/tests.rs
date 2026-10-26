@@ -429,3 +429,99 @@ async fn a_long_control_queue_lets_other_tasks_run() {
         "the control loop ran {seen} controls without a break"
     );
 }
+
+/// A v5 CONNECT for `id` that keeps its session, with a Receive Maximum
+/// and, if not zero, a Maximum Packet Size.
+fn keeping_connect(id: &str, clean_start: bool, receive: u16, max_packet: u32) -> Vec<u8> {
+    use zzq_proto::encode::{self, ConnectFields};
+    use zzq_proto::property::{MAXIMUM_PACKET_SIZE, RECEIVE_MAXIMUM, SESSION_EXPIRY_INTERVAL};
+    use zzq_proto::{Property, Version};
+
+    let mut props = vec![
+        Property::U32(SESSION_EXPIRY_INTERVAL, 60),
+        Property::U16(RECEIVE_MAXIMUM, receive),
+    ];
+    if max_packet > 0 {
+        props.push(Property::U32(MAXIMUM_PACKET_SIZE, max_packet));
+    }
+    let c = ConnectFields {
+        version: Version::V5,
+        clean_start,
+        keep_alive: 0,
+        properties: &props,
+        client_id: id,
+        will: None,
+        username: None,
+        password: None,
+    };
+    let mut out = Vec::new();
+    encode::connect(&c, &mut out);
+    out
+}
+
+async fn raw_with(uri: &str, connect: &[u8]) -> support::Raw {
+    let mut raw = support::Raw::open(uri).await;
+    raw.send(connect).await;
+    let got = raw.next().await;
+    assert!(
+        matches!(got, support::Got::ConnAck { code: 0, .. }),
+        "{got:?}"
+    );
+    raw
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unacked_message_too_large_after_a_reconnect_frees_its_slot() {
+    use zzq_proto::SubscriptionOptions;
+
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, uri) = setup(1, opts).await;
+    let mut sub = raw_with(&uri, &keeping_connect("sub", true, 1, 0)).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    broker
+        .publish("t", vec![0u8; 500], QoS::AtLeastOnce)
+        .unwrap();
+    assert_eq!(sub.publish().await.payload.len(), 500);
+    sub.reset();
+    stats_until(&broker, |s| s.connections == 0).await;
+    // Back with room for small messages only: the unacked one cannot be
+    // resent and must not keep the only window slot.
+    let mut sub = raw_with(&uri, &keeping_connect("sub", false, 1, 100)).await;
+    broker.publish("t", "ok", QoS::AtLeastOnce).unwrap();
+    assert_eq!(sub.publish().await.payload, b"ok");
+    let stats = stats_until(&broker, |s| s.dropped.too_large == 1).await;
+    assert_eq!(stats.dropped.too_large, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_messages_sent_or_dropped_on_reconnect_are_counted() {
+    use zzq_proto::SubscriptionOptions;
+
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, uri) = setup(1, opts).await;
+    let mut sub = raw_with(&uri, &keeping_connect("sub", true, 10, 0)).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    sub.reset();
+    stats_until(&broker, |s| s.connections == 0).await;
+    broker
+        .publish("t", vec![0u8; 500], QoS::AtLeastOnce)
+        .unwrap();
+    for _ in 0..3 {
+        broker.publish("t", "ok", QoS::AtLeastOnce).unwrap();
+    }
+    stats_until(&broker, |s| s.publishes == 4).await;
+    let mut sub = raw_with(&uri, &keeping_connect("sub", false, 10, 100)).await;
+    for _ in 0..3 {
+        assert_eq!(sub.publish().await.payload, b"ok");
+    }
+    let stats = stats_until(&broker, |s| s.deliveries == 3 && s.dropped.too_large == 1).await;
+    assert_eq!((stats.deliveries, stats.dropped.too_large), (3, 1));
+}

@@ -48,6 +48,16 @@ pub(crate) struct LaneStats {
     pub(crate) state_bytes: u64,
 }
 
+impl LaneStats {
+    /// Adds what session `s` counts itself: messages it sent from its
+    /// queue, and those it dropped.
+    pub(crate) const fn add_session(&mut self, s: &Session) {
+        self.deliveries += s.flow.sent;
+        self.dropped.expired += s.flow.expired;
+        self.dropped.too_large += s.flow.too_large;
+    }
+}
+
 /// Why a connection's read loop ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Close {

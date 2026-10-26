@@ -105,6 +105,11 @@ Notable changes to zzq. The format follows
   before its connections ran again, and MQTT-SN QoS -1 publishes, which need
   no connection, queued without a limit. A lane now lets its connections
   run every 64 controls, and drops QoS -1 publishes while 4096 controls wait.
+- `zzq-broker`: an unacked message too large for the Maximum Packet Size a
+  client gave on reconnect kept its inflight slot for the life of the session.
+  Queued messages dropped for that reason were not counted, and queued
+  messages sent once the window had room were missing from
+  `Stats::deliveries` and `$SYS/broker/messages/sent`.
 
 ## [0.1.1] - 2026-10-26
 
