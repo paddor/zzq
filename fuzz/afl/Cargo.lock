@@ -202,7 +202,7 @@ checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
 name = "zzq-broker"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "bytestring",
@@ -225,11 +225,11 @@ dependencies = [
 
 [[package]]
 name = "zzq-proto"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "zzq-tokio"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "thiserror",
