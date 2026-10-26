@@ -142,6 +142,31 @@ async fn wildcards_and_unsubscribe() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn ended_session_leaves_no_subscriptions() {
+    for lanes in [1, 2] {
+        let (ctx, broker, uri) = setup(lanes).await;
+        let sub = client(&ctx, &uri, "s", Version::V5).await;
+        sub.subscribe("a", QoS::AtMostOnce).await.unwrap();
+        sub.subscribe("b", QoS::AtMostOnce).await.unwrap();
+        assert_eq!(broker.stats().await.unwrap().subscriptions, 2);
+        sub.disconnect().await;
+        let mut stats = broker.stats().await.unwrap();
+        for _ in 0..50 {
+            if (stats.sessions, stats.subscriptions) == (0, 0) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stats = broker.stats().await.unwrap();
+        }
+        assert_eq!(
+            (stats.sessions, stats.subscriptions),
+            (0, 0),
+            "{lanes} lanes"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn retained_messages() {
     let opts = BrokerOptions {
         sys_interval: None,
