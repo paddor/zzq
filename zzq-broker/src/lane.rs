@@ -234,6 +234,9 @@ pub(crate) struct Lane {
     pub(crate) stats: LaneStats,
     /// Bytes the sessions charge against `max_state_bytes`.
     state: LaneTotal,
+    /// The share of retained messages sent on subscribe, which the store
+    /// counts.
+    retained_share: Rc<Charge>,
     /// The state budget was reached at the last check.
     pub(crate) state_full: bool,
     /// What connections without a buffer of their own read into.
@@ -251,6 +254,7 @@ pub(crate) struct Lane {
 impl Lane {
     pub(crate) fn new(id: u16, shared: Arc<Shared>) -> Lane {
         let lanes = shared.lanes.len();
+        let state = LaneTotal::default();
         Lane {
             id,
             shared,
@@ -266,7 +270,8 @@ impl Lane {
             fwd: Arena::default(),
             remote_waiters: FxHashMap::default(),
             stats: LaneStats::default(),
-            state: LaneTotal::default(),
+            retained_share: Rc::new(Charge::new(state.clone(), 0)),
+            state,
             state_full: false,
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
@@ -1206,7 +1211,10 @@ impl Lane {
             };
             let mut retained = msg.clone();
             retained.retain = true;
-            let mut owned = Owned::of(retained);
+            let mut owned = Owned {
+                msg: Some(retained),
+                share: Some(self.retained_share.clone()),
+            };
             self.deliver(key, &p, &mut owned, g);
         }
     }

@@ -22,8 +22,12 @@ pub(crate) struct RetainedStore {
     /// Retained messages refused because `max` or the state budget was
     /// reached.
     pub(crate) rejected: u64,
-    /// Bytes counted against `max_state_bytes`: messages and tree nodes.
+    /// Bytes counted against `max_state_bytes`: messages, also released
+    /// ones, and tree nodes.
     bytes: usize,
+    /// Messages the store let go that sessions still hold. They count until
+    /// the last session drops them.
+    released: Vec<Msg>,
     /// When messages with a Message Expiry Interval run out, soonest first.
     /// One entry per stored topic with a deadline.
     expiring: BTreeSet<(Instant, Box<str>)>,
@@ -44,6 +48,7 @@ impl Default for RetainedStore {
             max: usize::MAX,
             rejected: 0,
             bytes: 0,
+            released: Vec::new(),
             expiring: BTreeSet::new(),
             persist: None,
         }
@@ -88,9 +93,7 @@ impl RetainedStore {
     /// change.
     pub(crate) fn set(&mut self, msg: &Msg, full: bool) {
         if msg.payload().is_empty() {
-            if let Some(old) = self.remove(msg.topic()) {
-                reschedule(&mut self.expiring, msg.topic(), old.expires_at, None);
-            }
+            self.remove(msg.topic());
         } else if (full || self.len >= self.max) && self.stored(msg.topic()).is_none() {
             self.rejected += 1;
             return;
@@ -123,13 +126,14 @@ impl RetainedStore {
         let new = msg.expires_at;
         self.bytes += msg.size();
         let old = node.msg.replace(msg);
-        match &old {
+        if let Some(m) = &node.msg {
+            let old = old.as_ref().and_then(|o| o.expires_at);
+            reschedule(&mut self.expiring, m.topic(), old, new);
+        }
+        match old {
+            Some(o) if o.is_shared() => self.released.push(o),
             Some(o) => self.bytes -= o.size(),
             None => self.len += 1,
-        }
-        if let Some(m) = &node.msg {
-            let old = old.and_then(|o| o.expires_at);
-            reschedule(&mut self.expiring, m.topic(), old, new);
         }
     }
 
@@ -162,16 +166,38 @@ impl RetainedStore {
         self.bytes
     }
 
-    /// Removes the message of `topic` and the tree nodes left empty.
-    fn remove(&mut self, topic: &str) -> Option<Msg> {
-        let old = remove(&mut self.root, topic.split('/'), &mut self.bytes)?;
+    /// Removes the message of `topic`, its expiry entry and the tree nodes
+    /// left empty.
+    fn remove(&mut self, topic: &str) {
+        let Some(old) = remove(&mut self.root, topic.split('/'), &mut self.bytes) else {
+            return;
+        };
         self.len -= 1;
-        self.bytes -= old.size();
-        Some(old)
+        reschedule(&mut self.expiring, topic, old.expires_at, None);
+        self.release(old);
     }
 
-    /// Drops messages whose Message Expiry Interval ran out.
+    /// Takes a message the store let go off the count, unless a session
+    /// still holds it.
+    fn release(&mut self, old: Msg) {
+        if old.is_shared() {
+            self.released.push(old);
+        } else {
+            self.bytes -= old.size();
+        }
+    }
+
+    /// Drops messages whose Message Expiry Interval ran out, and released
+    /// ones no session holds anymore.
     pub(crate) fn sweep(&mut self, now: Instant) {
+        let bytes = &mut self.bytes;
+        self.released.retain(|m| {
+            let held = m.is_shared();
+            if !held {
+                *bytes -= m.size();
+            }
+            held
+        });
         while let Some((t, _)) = self.expiring.first()
             && *t <= now
         {
@@ -396,6 +422,27 @@ mod tests {
             store.set(&Msg::new(topic, &[], &[], QoS::AtMostOnce, true), false);
         }
         assert_eq!((store.len(), store.bytes()), (0, 0));
+    }
+
+    #[test]
+    fn a_message_counts_until_no_session_holds_it() {
+        let mut store = RetainedStore::default();
+        store.set(&msg("a"), false);
+        let one = store.bytes();
+        let held = store.matching("a").pop().unwrap();
+        // Replaced, the old message counts while a session holds it.
+        store.set(&msg("a"), false);
+        assert_eq!(store.bytes(), one + held.size());
+        drop(held);
+        store.sweep(Instant::now());
+        assert_eq!(store.bytes(), one);
+        let held = store.matching("a").pop().unwrap();
+        store.set(&Msg::new("a", &[], &[], QoS::AtMostOnce, true), false);
+        store.sweep(Instant::now());
+        assert_eq!(store.bytes(), held.size());
+        drop(held);
+        store.sweep(Instant::now());
+        assert_eq!(store.bytes(), 0);
     }
 
     #[test]

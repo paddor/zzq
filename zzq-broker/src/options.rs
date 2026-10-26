@@ -103,11 +103,12 @@ pub struct BrokerOptions {
     pub max_retained: usize,
     /// Approximate bytes of broker state: sessions, their subscriptions and
     /// the QoS 1/2 messages they hold, and retained messages. A message that
-    /// sessions of one lane share counts once. Lanes check it 20 times a
-    /// second. While it is reached, new sessions that would
-    /// outlive their connection get CONNACK Quota Exceeded, messages that
-    /// would wait in a session queue are dropped and counted, and retained
-    /// messages for new topics are not stored.
+    /// sessions of one lane share counts once, and so does a retained
+    /// message sessions got on subscribe. Lanes check it 20 times a second.
+    /// While it is reached, new sessions that would outlive their connection
+    /// get CONNACK Quota Exceeded, messages that would wait in a session
+    /// queue are dropped and counted, and retained messages for new topics
+    /// are not stored.
     pub max_state_bytes: usize,
     /// Levels a topic name or filter may have. Deeper ones are rejected,
     /// which bounds the work and stack depth of matching.

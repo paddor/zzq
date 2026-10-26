@@ -5,8 +5,10 @@
 //! strings and messages, scaled for hash table and allocator slack. Queues
 //! and the arena that holds message copies count as allocated, since they
 //! keep their room as they empty. A message that sessions of one lane share
-//! counts once. Each lane adds up
-//! all counts on its sweep, so a check costs no atomics.
+//! counts once. A retained message counts with the store until no session
+//! holds it either, so a session that got it on subscribe charges only its
+//! slot. Each lane adds up all counts on its sweep, so a check costs no
+//! atomics.
 
 use std::cell::Cell;
 use std::mem::size_of;

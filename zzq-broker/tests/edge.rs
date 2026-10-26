@@ -423,6 +423,39 @@ async fn a_fanned_out_message_counts_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_retained_message_sent_on_subscribe_counts_once() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("p"))
+        .await
+        .unwrap();
+    let size = 8192;
+    p.publish_retained("r", "x".repeat(size), QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    // A subscriber that never acks holds the message in its window.
+    let mut s = Raw::connect(&uri, "s", Version::V311, 0).await;
+    let before = broker.stats().await.unwrap().state_bytes;
+    s.subscribe("r", QoS::AtLeastOnce).await;
+    let (byte1, _) = s.packet().await.expect("PUBLISH");
+    assert_eq!(byte1 >> 4, 3);
+    let grown = broker.stats().await.unwrap().state_bytes - before;
+    // The subscription and a slot; the store counts the bytes.
+    assert!(grown < (size / 4) as u64, "{grown}");
+    // Cleared from the store, the bytes count while the session holds them.
+    p.publish_retained("r", "", QoS::AtLeastOnce).await.unwrap();
+    let held = broker.stats().await.unwrap().state_bytes;
+    assert!(held > size as u64, "{held}");
+    drop(s);
+    p.disconnect().await;
+    // A sweep takes the bytes back once no session holds them.
+    stats_until(&broker, |s| s.sessions == 0 && s.state_bytes == 0).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn state_bytes_return_to_zero() {
     let opts = BrokerOptions {
         sys_interval: None,

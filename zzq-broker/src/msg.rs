@@ -102,6 +102,11 @@ impl Msg {
         m
     }
 
+    /// Whether another handle shares the buffer.
+    pub(crate) fn is_shared(&self) -> bool {
+        !self.buf.is_unique()
+    }
+
     /// Whether the message shares `chunk`.
     pub(crate) fn pins(&self, chunk: &Bytes) -> bool {
         !self.buf.is_empty() && within(chunk, &self.buf)
