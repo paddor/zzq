@@ -45,6 +45,10 @@ Notable changes to zzq. The format follows
   a DISCONNECT, which may only follow CONNACK.
 - `zzq-broker`: `Authorizer::may_subscribe` got shared filters with their
   `$share/{group}/` prefix, so a rule on the topic filter did not apply.
+- `zzq-broker`: with several IO lanes, a client that subscribed while
+  another lane updated a retained message could keep the older value.
+  Retained messages are now read once every lane has the subscription,
+  and go out after SUBACK.
 
 ## [0.1.1] - 2026-10-26
 

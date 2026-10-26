@@ -530,29 +530,30 @@ async fn retained_message_arrives_once_when_subscribing_during_publish() {
             tokio::time::sleep(Duration::from_millis(i * 7)).await;
             let mut raw = Raw::connect(&uri, &format!("r{i}"), Version::V5, 0).await;
             raw.subscribe("race", QoS::AtMostOnce.into()).await;
-            let mut values = Vec::new();
-            let mut retained = 0;
-            while let Some(got) = raw.try_next_within(Duration::from_millis(300)).await {
-                let Some(Got::Publish(p)) = got else {
-                    panic!("{got:?}");
+            // (value, retained) in arrival order.
+            let mut got = Vec::new();
+            while let Some(next) = raw.try_next_within(Duration::from_millis(300)).await {
+                let Some(Got::Publish(p)) = next else {
+                    panic!("{next:?}");
                 };
-                retained += usize::from(p.retain);
-                values.push(
-                    std::str::from_utf8(&p.payload)
-                        .unwrap()
-                        .parse::<u32>()
-                        .unwrap(),
-                );
+                let n: u32 = std::str::from_utf8(&p.payload).unwrap().parse().unwrap();
+                got.push((n, p.retain));
             }
-            (retained, values)
+            got
         }));
     }
     writer.await.unwrap();
-    // VerneMQ #1633: one retained copy, then only newer values.
+    // VerneMQ #1633: at most one retained copy, live messages in order, and
+    // the last value always arrives. The retained copy is read once every
+    // lane has the subscription, so it may be newer than live messages still
+    // on their way from another lane.
     for r in readers {
-        let (retained, values) = r.await.unwrap();
-        assert!(retained <= 1, "{retained} retained copies");
-        assert!(values.windows(2).all(|w| w[0] < w[1]), "{values:?}");
+        let got = r.await.unwrap();
+        let retained = got.iter().filter(|(_, r)| *r).count();
+        let live: Vec<u32> = got.iter().filter(|(_, r)| !r).map(|(n, _)| *n).collect();
+        assert!(retained <= 1, "{got:?}");
+        assert!(live.windows(2).all(|w| w[0] < w[1]), "{got:?}");
+        assert_eq!(got.iter().map(|(n, _)| *n).max(), Some(3000), "{got:?}");
     }
     drop(ctx);
 }

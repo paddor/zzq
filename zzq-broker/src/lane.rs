@@ -105,7 +105,13 @@ pub(crate) struct Held {
     pub(crate) key: Key,
     pub(crate) sync: Arc<SyncAck>,
     pub(crate) packet: Vec<u8>,
+    /// New subscriptions that get retained messages after the ack.
+    pub(crate) retained: Vec<Wanted>,
 }
+
+/// A subscription that gets the retained messages it matches: filter,
+/// granted QoS and Subscription Identifier.
+type Wanted = (Box<str>, QoS, u32);
 
 /// Work sent to a lane by other lanes or the broker handle.
 #[derive(Debug)]
@@ -1069,7 +1075,7 @@ impl Lane {
             .get_int(property::SUBSCRIPTION_IDENTIFIER)
             .unwrap_or(0);
         let mut codes = Vec::new();
-        let mut retained = Vec::new();
+        let mut wanted = Vec::new();
         let sync = self.sync();
         for (filter, opts) in sub.filters() {
             let Some(s) = self.sessions.get_mut(key) else {
@@ -1084,17 +1090,7 @@ impl Lane {
             self.subscribe_entry(filter, &entry, sync.as_ref());
             codes.push(opts.qos as u8);
             if retained_wanted(filter, opts, existed) {
-                let store = self
-                    .shared
-                    .retained
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                retained.extend(
-                    store
-                        .matching(filter)
-                        .into_iter()
-                        .map(|m| (m, opts.qos, sub_id)),
-                );
+                wanted.push((filter.into(), opts.qos, sub_id));
             }
         }
         self.stats.subscriptions = self.index.len() as u64;
@@ -1108,7 +1104,32 @@ impl Lane {
             codes: &codes,
         };
         let version = s.version;
-        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out));
+        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out), wanted);
+    }
+
+    /// Sends the retained messages `wanted` subscriptions match. Read only
+    /// once every lane has the subscriptions: a publish on another lane then
+    /// either updated the store already, or is routed to them live.
+    fn send_retained(&mut self, key: Key, wanted: &[Wanted]) {
+        if wanted.is_empty() {
+            return;
+        }
+        let mut retained = Vec::new();
+        {
+            let store = self
+                .shared
+                .retained
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            for (filter, qos, sub_id) in wanted {
+                retained.extend(
+                    store
+                        .matching(filter)
+                        .into_iter()
+                        .map(|m| (m, *qos, *sub_id)),
+                );
+            }
+        }
         self.deliver_retained(key, retained);
     }
 
@@ -1144,16 +1165,23 @@ impl Lane {
         key: Key,
         sync: Option<Arc<SyncAck>>,
         encode: impl FnOnce(&mut Vec<u8>),
+        retained: Vec<Wanted>,
     ) {
         if let Some(sync) = sync {
             let mut packet = Vec::new();
             encode(&mut packet);
-            self.held.push(Held { key, sync, packet });
+            self.held.push(Held {
+                key,
+                sync,
+                packet,
+                retained,
+            });
         } else {
             if let Some(s) = self.sessions.get_mut(key) {
                 encode(&mut s.out);
             }
             self.mark(key);
+            self.send_retained(key, &retained);
         }
     }
 
@@ -1168,6 +1196,7 @@ impl Lane {
             s.out.extend_from_slice(&h.packet);
         }
         self.mark(h.key);
+        self.send_retained(h.key, &h.retained);
         self.flush();
     }
 
@@ -1200,7 +1229,12 @@ impl Lane {
             codes: &codes,
         };
         let version = s.version;
-        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out));
+        self.ack_after_sync(
+            key,
+            sync,
+            |out| encode::suback(&a, version, out),
+            Vec::new(),
+        );
     }
 
     /// Handles a control message.
