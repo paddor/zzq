@@ -130,3 +130,57 @@ async fn sessions_do_not_expire_while_the_lane_closes_for_a_dump() {
         "the dump would miss the session, or send its will twice"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_kicked_connection_that_stopped_reading_lets_go() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zzq_proto::encode::{self, ConnectFields};
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let idle = lane_refs(&ctx, &broker, 0).await;
+    // A subscriber that stops reading, with little room to receive.
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut stuck = socket
+        .connect(uri.trim_start_matches("tcp://").parse().unwrap())
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    let c = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &[],
+        client_id: "stuck",
+        will: None,
+        username: None,
+        password: None,
+    };
+    encode::connect(&c, &mut out);
+    let opts = SubscriptionOptions::from(QoS::AtMostOnce);
+    encode::subscribe(Version::V5, 1, &[], &[("flood", opts)], &mut out);
+    stuck.write_all(&out).await.unwrap();
+    let mut acks = [0u8; 64];
+    let _ = stuck.read(&mut acks).await.unwrap();
+    stats_until(&broker, |s| s.subscriptions == 1).await;
+
+    let clients = Context::new().unwrap();
+    let publisher = Client::connect(&clients, &uri, ClientOptions::new("pub"))
+        .await
+        .unwrap();
+    for _ in 0..20_000 {
+        publisher
+            .publish("flood", vec![7u8; 1024], QoS::AtMostOnce)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // A takeover kicks the stuck connection while its writer waits for room.
+    let fresh = support::Raw::connect(&uri, "stuck", Version::V5, 0).await;
+    drop(fresh);
+    publisher.disconnect().await;
+    stats_until(&broker, |s| s.connections == 0).await;
+    assert_eq!(refs_settle(&ctx, &broker, 0, idle).await, idle);
+    drop(stuck);
+}

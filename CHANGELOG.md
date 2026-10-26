@@ -81,6 +81,9 @@ Notable changes to zzq. The format follows
   longer expire, so the file keeps them with their delayed wills instead of
   sending a will that the next start sends again. A connection that reached a
   lane after it shut down is refused with "server unavailable".
+- `zzq-broker`: a connection closed while its peer had stopped reading kept
+  its socket and up to `max_out_bytes` of output forever, past
+  `max_connections`. Its writer now gets 2 s to finish, then stops.
 
 ## [0.1.1] - 2026-10-26
 

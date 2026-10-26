@@ -7,11 +7,12 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::task::{Poll, ready};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use zzq_proto::packet::{Connect, decode, fixed_header};
 use zzq_proto::property;
 use zzq_proto::{DecodeError, Packet, PacketType, Version, encode, reason};
@@ -27,6 +28,10 @@ use crate::slab::Key;
 /// small and doubles while reads fill the buffer.
 const MIN_CHUNK: usize = 1 << 10;
 const READ_CHUNK: usize = 256 << 10;
+
+/// How long a closed connection's writer may take to write what is left,
+/// such as to a peer that stopped reading, before it is stopped.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
 
 /// A connection without a buffer of its own reads into a block of its
 /// lane, so an idle connection holds no read buffer. Packets are sliced out
@@ -223,7 +228,7 @@ where
     // Boxed, so the handshake's state is freed once it is done instead of
     // sizing every connection's future.
     let started = Box::pin(start(&lane, d.initial, d.peer_cert, &mut r, w)).await;
-    let Some((key, conn, version, buf)) = started else {
+    let Some((key, conn, version, buf, mut writer)) = started else {
         return;
     };
     let close = read_loop(&lane, key, &conn, &mut r, buf).await;
@@ -242,6 +247,12 @@ where
         l.flush();
     }
     crate::broker::ship(&lane).await;
+    if tokio::time::timeout(CLOSE_LINGER, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
 }
 
 /// Reads CONNECT, attaches the session and starts the writer.
@@ -251,7 +262,7 @@ async fn start<R, W>(
     peer_cert: Option<Vec<u8>>,
     r: &mut R,
     w: W,
-) -> Option<(Key, Rc<ConnShared>, Version, BytesMut)>
+) -> Option<(Key, Rc<ConnShared>, Version, BytesMut, JoinHandle<()>)>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
@@ -293,8 +304,8 @@ where
     lane.borrow_mut().flush();
     // A will published on takeover may go to other lanes.
     crate::broker::ship(lane).await;
-    tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
-    Some((key, conn, version, buf))
+    let writer = tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
+    Some((key, conn, version, buf, writer))
 }
 
 type ConnectError = (Option<Version>, u8);
