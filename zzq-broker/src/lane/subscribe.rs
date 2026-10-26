@@ -40,10 +40,9 @@ impl Lane {
     ) {
         self.index.add(filter, entry.clone());
         let filter: Box<str> = filter.into();
-        if let Some(s) = sync {
-            s.expect(self.shared.lanes.len() - 1);
-        }
-        self.broadcast(&|| Control::SubAdd(filter.clone(), entry.clone(), sync.cloned()));
+        self.broadcast(&|| {
+            Control::SubAdd(filter.clone(), entry.clone(), sync.map(SyncAck::ticket))
+        });
     }
 
     pub(super) fn unsubscribe_entry(
@@ -54,10 +53,7 @@ impl Lane {
     ) -> bool {
         let removed = self.index.remove(filter, sub);
         let filter: Box<str> = filter.into();
-        if let Some(s) = sync {
-            s.expect(self.shared.lanes.len() - 1);
-        }
-        self.broadcast(&|| Control::SubRemove(filter.clone(), sub, sync.cloned()));
+        self.broadcast(&|| Control::SubRemove(filter.clone(), sub, sync.map(SyncAck::ticket)));
         removed
     }
 

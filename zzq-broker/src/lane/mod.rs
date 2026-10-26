@@ -26,7 +26,7 @@ mod route;
 mod subscribe;
 
 use backpressure::Hit;
-pub(crate) use control::{Control, Dump, SyncAck};
+pub(crate) use control::{Control, Dump, SyncAck, Ticket};
 pub(crate) use route::Remote;
 use subscribe::Held;
 

@@ -84,6 +84,8 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a connection closed while its peer had stopped reading kept
   its socket and up to `max_out_bytes` of output forever, past
   `max_connections`. Its writer now gets 2 s to finish, then stops.
+- `zzq-broker`: a SUBSCRIBE or UNSUBSCRIBE whose change a stopping lane never
+  applied waited for its ack forever, holding the lane.
 
 ## [0.1.1] - 2026-10-26
 

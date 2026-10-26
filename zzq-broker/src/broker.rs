@@ -472,7 +472,7 @@ fn install(
                 }
                 for batch in batches.drain(..) {
                     for r in batch {
-                        lane.deliver_remote(&r);
+                        lane.deliver_remote(r);
                     }
                 }
                 lane.flush();

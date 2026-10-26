@@ -4,7 +4,8 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use tokio::sync::{Notify, oneshot};
+use tokio::sync::oneshot;
+use zzq_tokio::signal::StateSignal;
 
 use crate::dump::Part;
 use crate::index::{Entry, SubRef};
@@ -13,28 +14,49 @@ use crate::state::SessionState;
 
 use super::{Lane, LaneStats};
 
-/// Counts the lanes that still have to apply a subscription change.
+/// Counts the lanes that still have to apply a change, such as a new
+/// subscription, and wakes the waiter once none has to.
 #[derive(Debug, Default)]
 pub(crate) struct SyncAck {
     remaining: AtomicUsize,
-    notify: Notify,
+    changed: StateSignal,
 }
 
 impl SyncAck {
-    pub(crate) fn expect(&self, n: usize) {
-        self.remaining.fetch_add(n, Ordering::AcqRel);
-    }
-
-    pub(super) fn done(&self) {
-        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.notify.notify_one();
-        }
+    /// A share for one more lane, counted down when the lane drops it.
+    pub(crate) fn ticket(self: &Arc<Self>) -> Ticket {
+        // The ticket travels to its lane through a queue, which orders this
+        // before the countdown.
+        self.remaining.fetch_add(1, Ordering::Relaxed);
+        Ticket(self.clone())
     }
 
     /// Waits until every lane applied the change.
     pub(crate) async fn wait(&self) {
-        while self.remaining.load(Ordering::Acquire) > 0 {
-            self.notify.notified().await;
+        self.changed
+            .until(|| (self.remaining.load(Ordering::Acquire) == 0).then_some(()))
+            .await;
+    }
+}
+
+/// One lane's share of a [`SyncAck`]. The lane drops it once it applied
+/// the change, and a lane that stopped drops it with its queue, so the
+/// waiter never waits for a lane that is gone.
+#[derive(Debug)]
+pub(crate) struct Ticket(Arc<SyncAck>);
+
+impl Ticket {
+    /// A share of the same change for another lane.
+    pub(crate) fn another(&self) -> Ticket {
+        self.0.ticket()
+    }
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        // Release: what the lane did before is visible to the waiter.
+        if self.0.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.changed.notify_changed();
         }
     }
 }
@@ -43,9 +65,9 @@ impl SyncAck {
 #[derive(Debug)]
 pub(crate) enum Control {
     /// Add a subscription, then count down the ack.
-    SubAdd(Box<str>, Entry, Option<Arc<SyncAck>>),
+    SubAdd(Box<str>, Entry, Option<Ticket>),
     /// Remove a subscription, then count down the ack.
-    SubRemove(Box<str>, SubRef, Option<Arc<SyncAck>>),
+    SubRemove(Box<str>, SubRef, Option<Ticket>),
     Publish(Msg),
     /// A session on another lane crossed its queue watermark.
     Congested(SubRef, bool),
@@ -55,7 +77,7 @@ pub(crate) enum Control {
     /// Close every connection as lost and refuse new ones, then answer.
     Quiesce(oneshot::Sender<()>),
     /// Ship what is waiting for other lanes, then a marker to each.
-    Drain(Arc<SyncAck>),
+    Drain(Ticket),
     /// Write the sessions that outlive their connection, then answer.
     Dump(Box<Dump>),
     /// Add sessions from a state file, then answer. Their subscriptions
@@ -82,18 +104,14 @@ impl Lane {
     /// Handles a control message.
     pub(crate) fn control(&mut self, c: Control) {
         match c {
-            Control::SubAdd(filter, entry, sync) => {
+            Control::SubAdd(filter, entry, ticket) => {
                 self.index.add(&filter, entry);
-                if let Some(s) = sync {
-                    s.done();
-                }
+                drop(ticket);
                 self.stats.subscriptions = self.index.len() as u64;
             }
-            Control::SubRemove(filter, sub, sync) => {
+            Control::SubRemove(filter, sub, ticket) => {
                 self.index.remove(&filter, sub);
-                if let Some(s) = sync {
-                    s.done();
-                }
+                drop(ticket);
                 self.stats.subscriptions = self.index.len() as u64;
             }
             Control::Publish(msg) => self.publish_owned(&msg),
@@ -123,7 +141,7 @@ impl Lane {
                 self.quiesce();
                 let _ = done.send(());
             }
-            Control::Drain(sync) => self.drain(&sync),
+            Control::Drain(ticket) => self.drain(&ticket),
             Control::Dump(d) => {
                 let Dump { mut part, reply } = *d;
                 let written = self.dump(&mut part);
@@ -143,5 +161,22 @@ impl Lane {
             }
         }
         self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::super::Remote;
+    use super::*;
+
+    #[tokio::test]
+    async fn a_lane_that_never_handles_its_part_still_counts_down() {
+        let sync = Arc::new(SyncAck::default());
+        // Queued for a lane that stopped: dropped with its queue.
+        drop(Remote::Drained(sync.ticket()));
+        let waited = tokio::time::timeout(Duration::from_secs(1), sync.wait()).await;
+        assert!(waited.is_ok(), "the waiter hangs");
     }
 }

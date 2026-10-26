@@ -1,7 +1,7 @@
 //! Routing a publish to the lane's sessions and to other lanes.
 
 use std::rc::Rc;
-use std::sync::{Arc, PoisonError};
+use std::sync::PoisonError;
 
 use bytes::Bytes;
 use zzq_proto::encode;
@@ -14,7 +14,7 @@ use crate::msg::{Arena, Block, Msg, Publication};
 use crate::session::{Kept, Outcome, QueueLimit, Queued, Session};
 use crate::slab::Key;
 
-use super::{Control, Hit, Lane, SyncAck};
+use super::{Control, Hit, Lane, Ticket};
 
 /// A delivery for a session on another lane.
 #[derive(Debug)]
@@ -30,7 +30,7 @@ pub(crate) enum Remote {
     /// A delivery to one session, chosen for a shared subscription.
     Deliver { key: Key, item: Queued },
     /// The last batch the sending lane ships before a state dump.
-    Drained(Arc<SyncAck>),
+    Drained(Ticket),
 }
 
 /// How forwarded packets were sent.
@@ -336,7 +336,7 @@ impl Lane {
     }
 
     /// Delivers a message routed on another lane.
-    pub(crate) fn deliver_remote(&mut self, r: &Remote) {
+    pub(crate) fn deliver_remote(&mut self, r: Remote) {
         match r {
             Remote::Forward {
                 chunk,
@@ -344,12 +344,13 @@ impl Lane {
                 more,
                 origin,
             } => {
-                self.route_forwarded(chunk, *first, *origin);
+                self.route_forwarded(&chunk, first, origin);
                 for at in more {
-                    self.route_forwarded(chunk, *at, *origin);
+                    self.route_forwarded(&chunk, at, origin);
                 }
             }
-            Remote::Drained(sync) => sync.done(),
+            // After what came before it in the batch.
+            Remote::Drained(ticket) => drop(ticket),
             Remote::Deliver { key, item } => {
                 let p = Publication::of(&item.msg);
                 let mut owned = Owned::of(item.msg.clone());
@@ -360,7 +361,7 @@ impl Lane {
                     last: true,
                     on_subscribe: false,
                 };
-                self.deliver(*key, &p, &mut owned, g);
+                self.deliver(key, &p, &mut owned, g);
             }
         }
     }

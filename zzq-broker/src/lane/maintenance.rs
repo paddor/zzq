@@ -15,7 +15,7 @@ use crate::session::Session;
 use crate::slab::Key;
 use crate::state::SessionState;
 
-use super::{Close, Lane, Phase, Remote, SWEEP_PARTS, SyncAck};
+use super::{Close, Lane, Phase, Remote, SWEEP_PARTS, SyncAck, Ticket};
 
 impl Lane {
     /// Keep alive timeouts and session expiry, for the next of
@@ -119,10 +119,10 @@ impl Lane {
     }
 
     /// Queues a marker for every other lane behind what waits for it.
-    pub(super) fn drain(&mut self, sync: &Arc<SyncAck>) {
+    pub(super) fn drain(&mut self, ticket: &Ticket) {
         for (lane, batch) in self.out.remote.iter_mut().enumerate() {
             if lane != usize::from(self.id) {
-                batch.push(Remote::Drained(sync.clone()));
+                batch.push(Remote::Drained(ticket.another()));
             }
         }
     }

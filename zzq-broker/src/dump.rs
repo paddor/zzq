@@ -125,11 +125,10 @@ async fn quiesce(shared: &Shared) -> Result<()> {
     for rx in closed {
         rx.await.map_err(|_| Error::Closed)?;
     }
-    let n = shared.lanes.len();
+    // Each lane passes its share on to the markers it queues for the others.
     let drained = Arc::new(SyncAck::default());
-    drained.expect(n * (n - 1));
     for lane in &shared.lanes {
-        push(lane, Control::Drain(drained.clone()))?;
+        push(lane, Control::Drain(drained.ticket()))?;
     }
     drained.wait().await;
     Ok(())
