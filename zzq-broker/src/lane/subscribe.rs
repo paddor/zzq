@@ -192,7 +192,7 @@ impl Lane {
             });
         } else {
             if let Some(s) = self.sessions.get_mut(key) {
-                encode(&mut s.out);
+                encode(&mut s.out.buf);
             }
             self.mark(key);
             self.send_retained(key, &retained);
@@ -207,7 +207,7 @@ impl Lane {
     /// Queues an ack packet that was held for other lanes.
     pub(crate) fn release(&mut self, h: &Held) {
         if let Some(s) = self.sessions.get_mut(h.key) {
-            s.out.extend_from_slice(&h.packet);
+            s.out.buf.extend_from_slice(&h.packet);
         }
         self.mark(h.key);
         self.send_retained(h.key, &h.retained);

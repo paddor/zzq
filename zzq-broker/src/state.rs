@@ -363,7 +363,7 @@ fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
         b.push(opts.to_byte(Version::V5));
         put_u32(b, *sub_id);
     }
-    let mut rel: Vec<u16> = s.awaiting_rel.iter().copied().collect();
+    let mut rel: Vec<u16> = s.inbound.awaiting_rel.iter().copied().collect();
     rel.sort_unstable();
     put_count(b, rel.len());
     for pkid in rel {

@@ -115,7 +115,7 @@ impl Lane {
                     .sessions
                     .keys()
                     .filter_map(|k| self.sessions.get(k))
-                    .map(|s| s.expired)
+                    .map(|s| s.flow.expired)
                     .sum::<u64>();
                 let _ = reply.send(stats);
             }

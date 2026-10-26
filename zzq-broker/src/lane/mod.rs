@@ -180,8 +180,8 @@ impl Lane {
 
     #[inline]
     fn mark_in(dirty: &mut Vec<Key>, s: &mut Session, key: Key) {
-        if !s.dirty {
-            s.dirty = true;
+        if !s.out.dirty {
+            s.out.dirty = true;
             dirty.push(key);
         }
     }
@@ -189,9 +189,9 @@ impl Lane {
     #[inline]
     fn mark(&mut self, key: Key) {
         if let Some(s) = self.sessions.get_mut(key)
-            && !s.dirty
+            && !s.out.dirty
         {
-            s.dirty = true;
+            s.out.dirty = true;
             self.dirty.push(key);
         }
     }
@@ -201,7 +201,7 @@ impl Lane {
     pub(crate) fn flush(&mut self) {
         for key in self.dirty.drain(..) {
             if let Some(s) = self.sessions.get_mut(key) {
-                s.dirty = false;
+                s.out.dirty = false;
                 if let Some(c) = &s.conn {
                     c.wake.notify_one();
                 }

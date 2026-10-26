@@ -610,7 +610,7 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             let buf = {
                 let mut l = lane.borrow_mut();
                 match l.sessions.get_mut(key) {
-                    Some(s) if s.has_conn(conn.id) && !s.out.is_empty() => {
+                    Some(s) if s.has_conn(conn.id) && !s.out.buf.is_empty() => {
                         conn.connacked.set(true);
                         s.take_out()
                     }
@@ -629,7 +629,7 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             if let Some(s) = l.sessions.get_mut(key)
                 && s.has_conn(conn.id)
             {
-                s.spare = buf;
+                s.out.spare = buf;
             }
         }
         // TLS may only have buffered the last bytes: push them out before

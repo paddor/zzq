@@ -66,7 +66,7 @@ impl Lane {
             }
             Packet::PingReq => {
                 if let Some(s) = self.sessions.get_mut(key) {
-                    encode::pingresp(&mut s.out);
+                    encode::pingresp(&mut s.out.buf);
                 }
                 self.mark(key);
                 Ok(())
@@ -110,7 +110,7 @@ impl Lane {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        let code = if s.awaiting_rel.remove(&a.pkid) {
+        let code = if s.inbound.awaiting_rel.remove(&a.pkid) {
             0
         } else {
             reason::PACKET_IDENTIFIER_NOT_FOUND
@@ -210,13 +210,13 @@ fn resolve_alias(
     }
     let mut aliased = None;
     if p.topic.is_empty() {
-        let topic = s.aliases.get(alias).cloned().flatten();
+        let topic = s.inbound.aliases.get(alias).cloned().flatten();
         aliased = Some(topic.ok_or(Close::Protocol(reason::PROTOCOL_ERROR))?);
     } else {
-        if s.aliases.len() <= alias {
-            s.aliases.resize(alias + 1, None);
+        if s.inbound.aliases.len() <= alias {
+            s.inbound.aliases.resize(alias + 1, None);
         }
-        s.aliases[alias] = Some(ByteString::from(p.topic));
+        s.inbound.aliases[alias] = Some(ByteString::from(p.topic));
     }
     let mut props = Vec::new();
     for prop in p
@@ -233,7 +233,7 @@ fn resolve_alias(
 /// topic.
 #[inline]
 fn may_publish(acl: &dyn Authorizer, s: &mut Session, topic: &str) -> bool {
-    if let Some((last, allowed)) = &s.last_allowed
+    if let Some((last, allowed)) = &s.inbound.last_allowed
         && **last == *topic
     {
         return *allowed;
@@ -243,7 +243,7 @@ fn may_publish(acl: &dyn Authorizer, s: &mut Session, topic: &str) -> bool {
         username: s.username.as_deref(),
     };
     let allowed = acl.may_publish(&client, topic);
-    s.last_allowed = Some((topic.into(), allowed));
+    s.inbound.last_allowed = Some((topic.into(), allowed));
     allowed
 }
 
@@ -270,8 +270,8 @@ fn admit_publish(
             Ok(false)
         }
         QoS::ExactlyOnce => {
-            let fresh = s.awaiting_rel.insert(p.pkid);
-            if fresh && s.awaiting_rel.len() > receive_max {
+            let fresh = s.inbound.awaiting_rel.insert(p.pkid);
+            if fresh && s.inbound.awaiting_rel.len() > receive_max {
                 return Err(Close::Protocol(reason::RECEIVE_MAXIMUM_EXCEEDED));
             }
             if !fresh {

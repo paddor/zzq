@@ -33,7 +33,7 @@ impl Lane {
         match self.congestion.hit.take() {
             Some(Hit::Local(sub)) if sub != key && self.sessions.get(sub).is_some() => {
                 if let Some(s) = self.sessions.get_mut(sub) {
-                    s.waiters.push(waiter);
+                    s.backpressure.waiters.push(waiter);
                 }
             }
             Some(Hit::Remote(sub)) => self.congestion.waiters.entry(sub).or_default().push(waiter),
@@ -53,11 +53,11 @@ impl Lane {
         };
         let low = self.shared.opts.qos_queue_high / 2;
         let drained = s.conn.is_none() || s.queued() <= low;
-        if !s.congested || !drained {
+        if !s.backpressure.congested || !drained {
             return;
         }
-        s.congested = false;
-        let waiters = std::mem::take(&mut s.waiters);
+        s.backpressure.congested = false;
+        let waiters = std::mem::take(&mut s.backpressure.waiters);
         let sub = self.sub_ref(key);
         self.broadcast(&|| Control::Congested(sub, false));
         self.send_acks(&waiters);

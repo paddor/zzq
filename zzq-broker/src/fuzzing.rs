@@ -89,7 +89,7 @@ fn state_image_seed() -> Vec<u8> {
         0,
         1,
     );
-    s.awaiting_rel.insert(9);
+    s.inbound.awaiting_rel.insert(9);
     let limit = QueueLimit {
         count: usize::MAX,
         bytes: usize::MAX,

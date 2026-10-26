@@ -120,7 +120,7 @@ impl Lane {
     pub(super) fn publisher_matches(&mut self, key: Key, topic: &str) -> Rc<Matches> {
         let generation = self.index.generation();
         if let Some(session) = self.sessions.get(key)
-            && let Some((last, at, matches)) = &session.last_topic
+            && let Some((last, at, matches)) = &session.inbound.last_topic
             && *at == generation
             && **last == *topic
         {
@@ -131,13 +131,14 @@ impl Lane {
             // Reuse the topic buffer: a publisher changing topics should not
             // allocate per message.
             let mut last = session
+                .inbound
                 .last_topic
                 .take()
                 .map(|(t, _, _)| t)
                 .unwrap_or_default();
             last.clear();
             last.push_str(topic);
-            session.last_topic = Some((last, generation, matches.clone()));
+            session.inbound.last_topic = Some((last, generation, matches.clone()));
         }
         matches
     }
@@ -307,8 +308,8 @@ impl Lane {
             && s.conn.is_some()
             && s.queued() >= self.shared.opts.qos_queue_high
         {
-            let newly = !s.congested;
-            s.congested = true;
+            let newly = !s.backpressure.congested;
+            s.backpressure.congested = true;
             if newly {
                 let sub = self.sub_ref(key);
                 self.broadcast(&|| Control::Congested(sub, true));

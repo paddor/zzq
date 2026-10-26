@@ -39,7 +39,7 @@ impl Lane {
         let Some(mut s) = self.sessions.remove(key) else {
             return;
         };
-        self.stats.dropped_expired += s.expired;
+        self.stats.dropped_expired += s.flow.expired;
         self.stats.dropped_session_ended += s.held();
         let sub = self.sub_ref(key);
         for filter in s.subs.keys() {
@@ -98,15 +98,15 @@ impl Lane {
         };
         s.version = c.version;
         s.username = c.username.as_deref().map(Box::from);
-        s.last_allowed = None;
+        s.inbound.last_allowed = None;
         s.bind(conn);
         s.expiry = c.session_expiry.min(max_expiry);
         s.expires_at = None;
         s.will.clone_from(&c.will);
-        s.window = c.receive_maximum.min(self.shared.opts.max_inflight).max(1);
+        s.flow.window = c.receive_maximum.min(self.shared.opts.max_inflight).max(1);
         s.max_packet = c.max_packet_size;
-        s.aliases.clear();
-        connack_ok(c.version, present, &props, &mut s.out);
+        s.inbound.aliases.clear();
+        connack_ok(c.version, present, &props, &mut s.out.buf);
         if present {
             s.resend();
         }
@@ -135,7 +135,7 @@ impl Lane {
         };
         // Packets queued for the old connection must not reach the new
         // one; the inflight window is resent on attach.
-        s.out.clear();
+        s.out.buf.clear();
         if let Some(old) = old {
             // Before its CONNACK, a connection just closes: CONNACK comes
             // before any other packet [MQTT-3.2.0-1].
@@ -199,8 +199,8 @@ impl Lane {
             return;
         }
         s.unbind();
-        s.out.clear();
-        s.aliases.clear();
+        s.out.buf.clear();
+        s.inbound.aliases.clear();
         self.stats.connections -= 1;
         self.shared.connections.fetch_sub(1, Ordering::AcqRel);
         let send_will = !matches!(close, Close::Graceful { will: false });
