@@ -160,7 +160,8 @@ fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, d
         return;
     }
     let msg = Msg::new(&name, data, &[], QoS::AtMostOnce, retain);
-    let lane = shared.ctx.next_lane().index();
+    // One lane per topic keeps the publishes to it in order.
+    let lane = crate::broker::lane_for(msg.topic(), shared.lanes.len());
     // Anyone can send these, so they are dropped while the lane is behind.
     let _ = shared.lanes[lane]
         .control

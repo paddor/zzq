@@ -110,6 +110,10 @@ Notable changes to zzq. The format follows
   Queued messages dropped for that reason were not counted, and queued
   messages sent once the window had room were missing from
   `Stats::deliveries` and `$SYS/broker/messages/sent`.
+- `zzq-broker`: with several IO lanes, messages that `Broker::publish`,
+  `publish_retained` or MQTT-SN QoS -1 sent to one topic could reach
+  subscribers out of order, and the retained store could keep an older one.
+  They now go through the lane of their topic.
 
 ## [0.1.1] - 2026-10-26
 

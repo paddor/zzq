@@ -295,12 +295,14 @@ impl Broker {
         Ok(rx.await.map_err(|_| Error::Closed)??)
     }
 
-    /// Publishes a message as the broker itself.
+    /// Publishes a message as the broker itself. Messages to one topic
+    /// reach subscribers in the order they were published.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidTopic`] for a topic clients could not publish to, and
-    /// [`Error::TooLarge`] for a message MQTT cannot carry.
+    /// [`Error::InvalidTopic`] for a topic clients could not publish to,
+    /// [`Error::TooLarge`] for a message MQTT cannot carry, and
+    /// [`Error::Closed`] once the broker has shut down.
     pub fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
         self.send_publish(topic, payload.as_ref(), qos, false)
     }
@@ -416,9 +418,10 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
     Ok(total)
 }
 
-/// Routes a message from the broker itself on the next lane.
+/// Routes a message from the broker itself. Messages to one topic go
+/// through one lane, so they keep their order.
 pub(crate) fn publish(shared: &Shared, msg: Msg) -> Result<()> {
-    let lane = shared.ctx.next_lane().index();
+    let lane = lane_for(msg.topic(), shared.lanes.len());
     shared.lanes[lane]
         .control
         .push(Control::Publish(msg))

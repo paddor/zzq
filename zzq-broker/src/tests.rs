@@ -525,3 +525,27 @@ async fn queued_messages_sent_or_dropped_on_reconnect_are_counted() {
     let stats = stats_until(&broker, |s| s.deliveries == 3 && s.dropped.too_large == 1).await;
     assert_eq!((stats.deliveries, stats.dropped.too_large), (3, 1));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broker_publishes_to_one_topic_keep_their_order() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, uri) = setup(4, opts).await;
+    let clients = Context::new().unwrap();
+    let mut sub = Client::connect(&clients, &uri, ClientOptions::new("sub"))
+        .await
+        .unwrap();
+    sub.subscribe("seq", QoS::AtLeastOnce).await.unwrap();
+    for i in 0..1000u32 {
+        broker
+            .publish("seq", i.to_be_bytes(), QoS::AtLeastOnce)
+            .unwrap();
+    }
+    for want in 0..1000u32 {
+        let m = support::next(&mut sub).await;
+        let got = u32::from_be_bytes(m.payload[..].try_into().unwrap());
+        assert_eq!(got, want);
+    }
+}
