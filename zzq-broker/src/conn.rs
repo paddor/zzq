@@ -304,8 +304,17 @@ async fn read_connect<R: AsyncRead + Unpin>(
     peer_cert: Option<&[u8]>,
 ) -> Result<OwnedConnect, ConnectError> {
     loop {
+        // The first byte is enough to refuse a packet that is not CONNECT
+        // [MQTT-3.1.0-1], without buffering its body.
+        if buf.first().is_some_and(|&b| b >> 4 != 1) {
+            return Err((None, reason::PROTOCOL_ERROR));
+        }
         match decode(buf, Version::V5, max) {
             Ok(Some((Packet::Connect(c), n))) => {
+                // zzq supports no enhanced authentication [MQTT-4.12.0-1].
+                if c.properties.get(property::AUTHENTICATION_METHOD).is_some() {
+                    return Err((Some(c.version), reason::BAD_AUTHENTICATION_METHOD));
+                }
                 if let Some(auth) = auth {
                     let info = ConnectInfo {
                         client_id: c.client_id,
@@ -327,7 +336,9 @@ async fn read_connect<R: AsyncRead + Unpin>(
             Err(DecodeError::UnsupportedVersion(_)) => {
                 return Err((Some(Version::V311), reason::UNSUPPORTED_PROTOCOL_VERSION));
             }
-            Err(e) => return Err((None, e.reason_code())),
+            // A v5 client learns why its CONNECT failed; earlier versions
+            // have no code for it.
+            Err(e) => return Err((is_v5_connect(buf).then_some(Version::V5), e.reason_code())),
         }
         buf.reserve(MIN_CHUNK);
         match r.read_buf(buf).await {
@@ -335,6 +346,14 @@ async fn read_connect<R: AsyncRead + Unpin>(
             Ok(_) => {}
         }
     }
+}
+
+/// Whether `buf` starts with a CONNECT that names MQTT 5.0.
+fn is_v5_connect(buf: &[u8]) -> bool {
+    let Ok(Some(fh)) = fixed_header(buf) else {
+        return false;
+    };
+    buf.get(fh.header_len..fh.header_len + 7) == Some(&[0, 4, b'M', b'Q', b'T', b'T', 5][..])
 }
 
 /// Sends a refusing CONNACK and closes. Over QUIC, closing without

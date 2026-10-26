@@ -19,6 +19,10 @@ Notable changes to zzq. The format follows
 - `zzq-proto`: a 3.1.1 CONNECT with a password but no user name, and No
   Local on a shared subscription, are refused. An empty topic name without
   a topic alias is a protocol error.
+- `zzq-broker`: a CONNECT with an Authentication Method is refused with
+  "bad authentication method", and a v5 CONNECT that does not decode gets
+  a CONNACK with the reason. A first packet other than CONNECT is refused
+  from its first byte, without waiting for its body.
 
 ## [0.1.1] - 2026-10-26
 

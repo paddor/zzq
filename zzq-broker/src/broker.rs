@@ -485,7 +485,12 @@ pub fn lane_for(client_id: &str, lanes: usize) -> usize {
 pub(crate) async fn admit(shared: Arc<Shared>, stream: zzq_tokio::transport::Stream) {
     let max = shared.opts.max_packet_size;
     let mut buf = bytes::BytesMut::new();
-    let done = |b: &[u8]| !matches!(zzq_proto::decode(b, zzq_proto::Version::V5, max), Ok(None));
+    // Stops at a whole CONNECT, a decode error, or a first byte that is not
+    // CONNECT, which the connection refuses without its body.
+    let done = |b: &[u8]| {
+        b.first().is_some_and(|&x| x >> 4 != 1)
+            || !matches!(zzq_proto::decode(b, zzq_proto::Version::V5, max), Ok(None))
+    };
     let read =
         tokio::time::timeout(shared.opts.connect_timeout, stream.prefetch(&mut buf, done)).await;
     let Ok(Ok(stream)) = read else {
