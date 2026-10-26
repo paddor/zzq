@@ -47,6 +47,8 @@ const TICK: Duration = Duration::from_secs(1);
 /// sends.
 const MAX_SEND: usize = 65_507;
 
+/// Controls queued for a lane beyond which QoS -1 publishes are dropped.
+const CONNECTIONLESS_QUEUE: usize = 4096;
 /// Time a client has to answer WILLTOPICREQ and WILLMSGREQ.
 const WILL_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -159,7 +161,10 @@ fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, d
     }
     let msg = Msg::new(&name, data, &[], QoS::AtMostOnce, retain);
     let lane = shared.ctx.next_lane().index();
-    let _ = shared.lanes[lane].control.push(Control::Publish(msg));
+    // Anyone can send these, so they are dropped while the lane is behind.
+    let _ = shared.lanes[lane]
+        .control
+        .push_below(Control::Publish(msg), CONNECTIONLESS_QUEUE);
 }
 
 /// One MQTT-SN client and its MQTT connection.

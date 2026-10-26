@@ -101,6 +101,10 @@ Notable changes to zzq. The format follows
   message long, offline or behind many unacked ones, kept the publisher's
   whole read buffer for it. It now gets a copy, like members on the
   publisher's lane.
+- `zzq-broker`: a lane handled all queued controls, such as broker publishes,
+  before its connections ran again, and MQTT-SN QoS -1 publishes, which need
+  no connection, queued without a limit. A lane now lets its connections
+  run every 64 controls, and drops QoS -1 publishes while 4096 controls wait.
 
 ## [0.1.1] - 2026-10-26
 

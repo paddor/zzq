@@ -103,6 +103,22 @@ impl<T> Mailbox<T> {
         Ok(())
     }
 
+    /// Queues `item` while fewer than `limit` items are queued, for work
+    /// that may be dropped rather than wait. Hands it back otherwise.
+    pub(crate) fn push_below(&self, item: T, limit: usize) -> Result<(), T> {
+        let mut st = self.shared.lock();
+        if st.closed || st.items.len() >= limit {
+            return Err(item);
+        }
+        let wake = st.items.is_empty();
+        st.items.push(item);
+        drop(st);
+        if wake {
+            self.shared.ready.mark();
+        }
+        Ok(())
+    }
+
     /// Queues `item`, waiting while the mailbox is full. Hands it back once
     /// the mailbox is closed.
     pub(crate) async fn send(&self, item: T) -> Result<(), T> {
@@ -232,6 +248,18 @@ mod tests {
         got.clear();
         assert!(rx.recv_all(&mut got).await);
         assert_eq!(got, [2]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn push_below_refuses_once_the_limit_is_queued() {
+        let (tx, rx) = mailbox::<u32>(usize::MAX);
+        assert!(tx.push_below(1, 2).is_ok());
+        assert!(tx.push_below(2, 2).is_ok());
+        assert_eq!(tx.push_below(3, 2), Err(3));
+        let mut got = Vec::new();
+        assert!(rx.recv_all(&mut got).await);
+        assert_eq!(got, [1, 2]);
+        assert!(tx.push_below(4, 2).is_ok(), "room again");
     }
 
     #[tokio::test(flavor = "current_thread")]

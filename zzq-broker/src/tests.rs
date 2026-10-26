@@ -13,6 +13,26 @@ use crate::lane::Lane;
 use crate::{Broker, BrokerOptions, Context};
 use support::{WAIT, setup, stats_until};
 
+/// Polls `f` on lane `i` until it returns `Some`. Fails after [`WAIT`].
+async fn lane_until<T: Send + 'static>(
+    ctx: &Context,
+    broker: &Broker,
+    i: usize,
+    f: impl Fn(&mut Lane) -> Option<T> + Send + Sync + Clone + 'static,
+) -> T {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    loop {
+        if let Some(t) = on_lane(ctx, broker, i, f.clone()).await {
+            return t;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "lane never got there"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// Holders of lane `i`'s state: its loops, and every task of a connection,
 /// timer or wait that runs on it.
 async fn lane_refs(ctx: &Context, broker: &Broker, i: usize) -> usize {
@@ -375,11 +395,37 @@ async fn a_shared_message_for_an_offline_member_on_another_lane_is_copied() {
     let _ = publisher.next().await;
     // Queued for an offline session, it must not pin the read buffer of
     // the publisher on lane 0.
-    let room = on_lane(&ctx, &broker, 1, move |l| {
-        let s = l.sessions.keys().find_map(|k| l.sessions.get(k)).unwrap();
-        assert_eq!(s.queued(), 1);
-        s.arena_room()
+    let room = lane_until(&ctx, &broker, 1, |l| {
+        let s = l.sessions.keys().find_map(|k| l.sessions.get(k))?;
+        (s.queued() == 1).then(|| s.arena_room())
     })
     .await;
     assert!(room > 0, "the message was not copied");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_control_queue_lets_other_tasks_run() {
+    let (ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+    let id = broker.id();
+    let seen = on_lane(&ctx, &broker, 0, move |l| {
+        for _ in 0..1000 {
+            let msg = crate::msg::Msg::new("t", b"x", &[], QoS::AtMostOnce, false);
+            let _ = l.shared.lanes[0]
+                .control
+                .push(crate::lane::Control::Publish(msg));
+        }
+        // Queued behind the control loop, which the pushes woke.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_local(async move {
+            let lane = crate::broker::lane_ref(id).unwrap();
+            let _ = tx.send(lane.borrow().stats.publishes);
+        });
+        rx
+    })
+    .await;
+    let seen = seen.await.unwrap();
+    assert!(
+        seen < 1000,
+        "the control loop ran {seen} controls without a break"
+    );
 }

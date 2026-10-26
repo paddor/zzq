@@ -23,6 +23,8 @@ use crate::{Error, Result};
 
 /// Batches in flight to one lane before senders wait.
 const DATA_BATCHES: usize = 64;
+/// Controls a lane handles before it lets its connections run.
+const CONTROL_RUN: usize = 64;
 /// Interval of keep alive and session expiry checks, each over a part of
 /// the sessions, so a lane with many does not stall for one long sweep.
 const SWEEP: Duration = Duration::from_millis(1000 / crate::lane::SWEEP_PARTS as u64);
@@ -446,10 +448,13 @@ fn install(
     tokio::task::spawn_local(async move {
         let mut controls = Vec::new();
         while ctl_rx.recv_all(&mut controls).await {
-            for c in controls.drain(..) {
+            for (i, c) in controls.drain(..).enumerate() {
                 let last = matches!(c, Control::Shutdown(_));
                 l.borrow_mut().control(c);
                 ship(&l).await;
+                if i % CONTROL_RUN == CONTROL_RUN - 1 {
+                    tokio::task::yield_now().await;
+                }
                 if last {
                     LANES.with(|lanes| lanes.borrow_mut().remove(&broker));
                     // Ends the data loop, which would otherwise keep the
