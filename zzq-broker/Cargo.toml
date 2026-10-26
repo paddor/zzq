@@ -29,6 +29,7 @@ bytestring.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 rcgen = "0.14"

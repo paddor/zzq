@@ -24,7 +24,7 @@ use crate::conn::{ConnShared, OwnedConnect, ReadBlocks};
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
-use crate::session::{Outcome, QueueLimit, Queued, Session, Waiter};
+use crate::session::{DelayedWill, Outcome, QueueLimit, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
@@ -378,8 +378,8 @@ impl Lane {
         if self.by_client.get(&s.client_id) == Some(&key) {
             self.by_client.remove(&s.client_id);
         }
-        if let Some((_, will)) = s.delayed_will.take() {
-            self.publish_will(will);
+        if let Some(will) = s.delayed_will.take() {
+            self.publish_will(will.msg);
         }
     }
 
@@ -421,7 +421,7 @@ impl Lane {
             // new connection came first and cancels it. So does a will of
             // an earlier connection that waits for its delay.
             let old = s.conn.take();
-            let delayed = s.delayed_will.take().map(|(_, m)| m);
+            let delayed = s.delayed_will.take().map(|w| w.msg);
             let will = match s.will.take() {
                 Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
                 _ => delayed.filter(|_| ends),
@@ -557,19 +557,23 @@ impl Lane {
         };
         self.next_will_id += 1;
         let id = self.next_will_id;
-        s.delayed_will = Some((id, msg));
+        s.delayed_will = Some(DelayedWill {
+            timer: id,
+            due: Instant::now() + delay,
+            msg,
+        });
         tokio::task::spawn_local(async move {
             tokio::time::sleep(delay).await;
             {
                 let mut l = lane.borrow_mut();
-                let Some((_, msg)) = l
+                let Some(will) = l
                     .sessions
                     .get_mut(key)
-                    .and_then(|s| s.delayed_will.take_if(|(i, _)| *i == id))
+                    .and_then(|s| s.delayed_will.take_if(|w| w.timer == id))
                 else {
                     return;
                 };
-                l.publish_will(msg);
+                l.publish_will(will.msg);
                 l.flush();
             }
             crate::broker::ship(&lane).await;

@@ -48,6 +48,7 @@ mod retain;
 mod session;
 mod slab;
 mod sn;
+mod state;
 mod sys;
 
 pub use broker::{Broker, Stats, lane_for};

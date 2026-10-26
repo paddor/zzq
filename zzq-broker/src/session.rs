@@ -17,6 +17,7 @@ use crate::conn::ConnShared;
 use crate::index::{Matches, SubIds};
 use crate::msg::{Arena, Msg, Publication, expired, same_family};
 use crate::slab::Key;
+use crate::state::SessionState;
 
 /// Write buffers above this size are freed once their session goes idle.
 const IDLE_BUFFER: usize = 64 << 10;
@@ -30,6 +31,19 @@ pub(crate) struct Will {
     pub(crate) msg: Msg,
     /// Will Delay Interval, seconds.
     pub(crate) delay: u32,
+}
+
+/// The will of a lost connection, waiting for its delay.
+#[derive(Debug)]
+pub(crate) struct DelayedWill {
+    /// ID of the timer that publishes it.
+    pub(crate) timer: u64,
+    #[cfg_attr(
+        not(any(test, feature = "fuzzing")),
+        expect(dead_code, reason = "the state dump at shutdown reads it next")
+    )]
+    pub(crate) due: Instant,
+    pub(crate) msg: Msg,
 }
 
 /// A message waiting for the inflight window.
@@ -100,9 +114,7 @@ pub(crate) struct Session {
     pub(crate) expiry: u32,
     pub(crate) expires_at: Option<Instant>,
     pub(crate) will: Option<Will>,
-    /// Will of a lost connection waiting for its delay, and the ID of its
-    /// timer.
-    pub(crate) delayed_will: Option<(u64, Msg)>,
+    pub(crate) delayed_will: Option<DelayedWill>,
     /// Encoded packets waiting for the writer.
     pub(crate) out: Vec<u8>,
     /// The writer's second buffer, swapped with `out` on each write.
@@ -591,6 +603,70 @@ impl Session {
     }
 }
 
+#[cfg_attr(
+    not(any(test, feature = "fuzzing")),
+    expect(dead_code, reason = "the state dump at shutdown uses these next")
+)]
+impl Session {
+    /// Messages sent and not acked: packet ID, message, and whether PUBREC
+    /// released it.
+    pub(crate) fn inflight(&self) -> impl ExactSizeIterator<Item = (u16, &Queued, bool)> {
+        self.inflight.iter().map(|f| (f.pkid, &f.item, f.released))
+    }
+
+    /// Messages waiting for the inflight window, oldest first.
+    pub(crate) fn queue(&self) -> impl ExactSizeIterator<Item = &Queued> {
+        self.queue.iter()
+    }
+
+    /// The last packet ID sent.
+    pub(crate) const fn next_pkid(&self) -> u16 {
+        self.next_pkid
+    }
+
+    /// The offline session `st` describes, charging `total`. A delayed will
+    /// comes back apart, for the lane to time it.
+    pub(crate) fn restore(
+        st: SessionState,
+        total: LaneTotal,
+        lanes: usize,
+    ) -> (Session, Option<(Instant, Msg)>) {
+        let mut s = Session::new(st.client_id, st.version, total);
+        s.username = st.username;
+        s.expiry = st.expiry;
+        s.expires_at = st.expires_at;
+        s.will = st.will;
+        s.next_pkid = st.next_pkid;
+        for (filter, opts, sub_id) in &st.subs {
+            s.subscribe(filter, *opts, *sub_id, lanes);
+        }
+        s.awaiting_rel.extend(st.awaiting_rel);
+        for (pkid, item, released) in st.inflight {
+            s.charge.add(budget::item(&item));
+            s.inflight.push_back(Inflight {
+                pkid,
+                item,
+                released,
+            });
+        }
+        if !s.inflight.is_empty() {
+            // The window may hold IDs out of order since a wrap; the bitmap
+            // finds free ones in any order.
+            let mut bits = Box::new([0; 1024]);
+            for f in &s.inflight {
+                bits[usize::from(f.pkid >> 6)] |= 1u64 << (f.pkid & 63);
+            }
+            s.in_use = Some(bits);
+        }
+        for item in st.queue {
+            s.charge.add(budget::item(&item));
+            s.queued_bytes += item.msg.size();
+            s.queue.push_back(item);
+        }
+        (s, st.delayed_will)
+    }
+}
+
 struct Fields<'a> {
     topic: &'a str,
     payload: &'a [u8],
@@ -671,6 +747,36 @@ mod tests {
         assert_eq!(total.get(), subscribed + 3 * budget::item(&item()));
         assert_eq!(s.charge.get(), total.get());
         assert!(s.unsubscribe("a/#", 2));
+        drop(s);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// A restored window may hold IDs out of order since a wrap: new IDs
+    /// skip them. The charges go with the session.
+    #[test]
+    fn restored_session_skips_ids_in_use() {
+        let total = LaneTotal::default();
+        let st = SessionState {
+            client_id: "c".into(),
+            username: None,
+            version: Version::V5,
+            expiry: 60,
+            expires_at: None,
+            will: None,
+            delayed_will: None,
+            next_pkid: 7,
+            subs: vec![("a/#".into(), SubscriptionOptions::default(), 0)],
+            awaiting_rel: Vec::new(),
+            inflight: vec![
+                (65535, item(), false),
+                (8, item(), false),
+                (7, item(), false),
+            ],
+            queue: vec![item()],
+        };
+        let (mut s, _) = Session::restore(st, total.clone(), 1);
+        assert_eq!((s.queued(), s.inflight.len()), (1, 3));
+        assert_eq!(s.alloc_pkid(), 9);
         drop(s);
         assert_eq!(total.get(), 0);
     }

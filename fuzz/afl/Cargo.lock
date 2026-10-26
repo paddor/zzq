@@ -201,6 +201,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fb433233f2df9344722454bc7e96465c9d03bff9d77c248f9e7523fe79585b5"
 
 [[package]]
+name = "xxhash-rust"
+version = "0.8.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "550a2b930b62486a393c52d5c3b84bff264b28aa437ed64694d31e93b1757af7"
+
+[[package]]
 name = "zzq-broker"
 version = "0.1.1"
 dependencies = [
@@ -209,6 +215,7 @@ dependencies = [
  "rustc-hash",
  "thiserror",
  "tokio",
+ "xxhash-rust",
  "zzq-proto",
  "zzq-tokio",
 ]

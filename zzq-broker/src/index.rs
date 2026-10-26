@@ -54,6 +54,11 @@ impl SubIds {
     pub(crate) fn iter(self) -> impl Iterator<Item = u32> {
         self.0.into_iter().take_while(|&id| id != 0)
     }
+
+    /// All four slots, free ones as 0.
+    pub(crate) const fn slots(self) -> [u32; 4] {
+        self.0
+    }
 }
 
 /// One subscription of one session.
