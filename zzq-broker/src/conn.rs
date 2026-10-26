@@ -419,6 +419,9 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
             c.server_keep_alive = true;
             conn.keep_alive.set(max);
         }
+        if l.closing {
+            return Err(reason::SERVER_UNAVAILABLE);
+        }
         // A new session that outlives its connection needs room in the state
         // budget.
         if l.state_full

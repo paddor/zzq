@@ -38,10 +38,6 @@ pub(crate) struct Will {
 pub(crate) struct DelayedWill {
     /// ID of the timer that publishes it.
     pub(crate) timer: u64,
-    #[cfg_attr(
-        not(any(test, feature = "fuzzing")),
-        expect(dead_code, reason = "the state dump at shutdown reads it next")
-    )]
     pub(crate) due: Instant,
     pub(crate) msg: Msg,
 }
@@ -603,10 +599,6 @@ impl Session {
     }
 }
 
-#[cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(dead_code, reason = "the state dump at shutdown uses these next")
-)]
 impl Session {
     /// Messages sent and not acked: packet ID, message, and whether PUBREC
     /// released it.

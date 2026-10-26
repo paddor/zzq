@@ -1,15 +1,16 @@
 //! Standalone broker.
 //!
 //! Usage: `zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM]
-//! [--client-ca PEM] [--retained-file PATH] [--max-state-mib N] [--busy-poll]
-//! [--spin-us N]`
+//! [--client-ca PEM] [--retained-file PATH] [--state-file PATH]
+//! [--max-state-mib N] [--busy-poll] [--spin-us N]`
 //!
 //! `--cert` and `--key` enable `tls://`, `wss://` and `quic://` binds.
 //! `--client-ca` makes them require client certificates. `--retained-file`
-//! keeps retained messages across restarts. `--max-state-mib` sets
-//! `max_state_bytes`. `--spin-us` sets how long a lane polls on after work
-//! before it sleeps. Prints each bound endpoint on its own line, then runs
-//! until killed.
+//! keeps retained messages across restarts. `--state-file` keeps sessions
+//! across a restart: SIGTERM or SIGINT write it, and the next start loads
+//! it. `--max-state-mib` sets `max_state_bytes`. `--spin-us` sets how long
+//! a lane polls on after work before it sleeps. Prints each bound endpoint
+//! on its own line, then runs until SIGTERM or SIGINT.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -23,6 +24,7 @@ struct Args {
     key: Option<String>,
     client_ca: Option<String>,
     retained_file: Option<String>,
+    state_file: Option<String>,
     max_state_mib: Option<usize>,
     busy_poll: bool,
     spin: Duration,
@@ -36,6 +38,7 @@ fn parse() -> Option<Args> {
         key: None,
         client_ca: None,
         retained_file: None,
+        state_file: None,
         max_state_mib: None,
         busy_poll: false,
         spin: Config::default().spin,
@@ -54,6 +57,7 @@ fn parse() -> Option<Args> {
             "--key" => a.key = Some(value),
             "--client-ca" => a.client_ca = Some(value),
             "--retained-file" => a.retained_file = Some(value),
+            "--state-file" => a.state_file = Some(value),
             "--max-state-mib" => a.max_state_mib = Some(value.parse().ok()?),
             "--spin-us" => a.spin = Duration::from_micros(value.parse().ok()?),
             _ => return None,
@@ -71,6 +75,7 @@ fn options(a: &Args) -> Result<BrokerOptions, String> {
         let store = zzq_broker::FilePersistence::open(path).map_err(|e| format!("{path}: {e}"))?;
         opts.persistence = Some(std::sync::Arc::new(store));
     }
+    opts.state_file = a.state_file.as_ref().map(Into::into);
     if let Some(mib) = a.max_state_mib {
         opts.max_state_bytes = mib.saturating_mul(1 << 20);
     }
@@ -130,16 +135,37 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
             .map_err(|e| format!("bind {uri}: {}", chain(&e)))?;
         println!("{ep}");
     }
-    std::future::pending::<()>().await;
+    stopped().await.map_err(|e| format!("signals: {e}"))?;
+    broker
+        .shutdown()
+        .await
+        .map_err(|e| format!("shutdown: {}", chain(&e)))
+}
+
+/// Waits for SIGTERM or SIGINT.
+#[cfg(unix)]
+async fn stopped() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
     Ok(())
+}
+
+#[cfg(not(unix))]
+async fn stopped() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 fn main() -> ExitCode {
     let Some(args) = parse() else {
         eprintln!(
             "usage: zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM] \
-             [--client-ca PEM] [--retained-file PATH] [--max-state-mib N] \
-             [--busy-poll] [--spin-us N]"
+             [--client-ca PEM] [--retained-file PATH] [--state-file PATH] \
+             [--max-state-mib N] [--busy-poll] [--spin-us N]"
         );
         return ExitCode::FAILURE;
     };

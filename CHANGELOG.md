@@ -22,6 +22,12 @@ Notable changes to zzq. The format follows
   `Stats::dropped_state_full`, and retained messages for new topics are not
   stored. `Stats::state_bytes` and `$SYS/broker/state/bytes` show the
   estimate, and `zzq_broker --max-state-mib` sets the limit.
+- `zzq-broker`: `BrokerOptions::state_file` keeps sessions over a restart.
+  `Broker::shutdown` closes every connection as lost, so wills go out, and
+  writes the sessions with their subscriptions, queues, unacked messages
+  and delayed wills, plus the retained messages unless `persistence` keeps
+  them. `Broker::new` loads the file and renames it to `<name>.loaded`.
+  `zzq_broker --state-file` writes it on SIGTERM or SIGINT.
 
 ### Changed
 
@@ -33,6 +39,10 @@ Notable changes to zzq. The format follows
   connected.
 - `zzq-broker`: retained messages sent on subscribe no longer count
   against `max_queued`, which dropped them; `max_retained` bounds them.
+- `zzq-broker`: `Broker::shutdown` returns a `Result`, for a state file it
+  could not write.
+- `zzq-broker`: `zzq_broker` shuts down on SIGTERM or SIGINT, telling v5
+  clients "server shutting down", instead of dying with the signal.
 
 ### Fixed
 

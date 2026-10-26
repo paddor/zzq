@@ -28,7 +28,7 @@ bytes = { workspace = true, features = ["std"] }
 bytestring.workspace = true
 rustc-hash.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
+tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros", "signal"] }
 xxhash-rust.workspace = true
 
 [dev-dependencies]

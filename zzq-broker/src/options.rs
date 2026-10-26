@@ -1,4 +1,5 @@
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -129,6 +130,15 @@ pub struct BrokerOptions {
     /// Durable storage for retained messages. `None` keeps them in memory
     /// only.
     pub persistence: Option<Arc<dyn crate::Persistence>>,
+    /// File that keeps sessions over a restart: [`Broker::shutdown`]
+    /// closes every connection and writes it, and [`Broker::new`] loads it
+    /// and renames it to `<name>.loaded`. It holds the retained messages
+    /// too, unless `persistence` keeps them. Sessions that end with their
+    /// connection are left out.
+    ///
+    /// [`Broker::shutdown`]: crate::Broker::shutdown
+    /// [`Broker::new`]: crate::Broker::new
+    pub state_file: Option<PathBuf>,
     /// Interval of the retained `$SYS/broker/...` status messages. `None`
     /// turns them off.
     pub sys_interval: Option<Duration>,
@@ -172,6 +182,7 @@ impl Default for BrokerOptions {
             authenticator: None,
             authorizer: None,
             persistence: None,
+            state_file: None,
             sys_interval: Some(Duration::from_secs(10)),
             transport: TransportOptions::default(),
             sn_gateway_id: 1,
@@ -206,6 +217,7 @@ impl fmt::Debug for BrokerOptions {
             .field("authenticator", &self.authenticator.is_some())
             .field("authorizer", &self.authorizer.is_some())
             .field("persistence", &self.persistence.is_some())
+            .field("state_file", &self.state_file)
             .field("sys_interval", &self.sys_interval)
             .field("transport", &self.transport)
             .field("sn_gateway_id", &self.sn_gateway_id)

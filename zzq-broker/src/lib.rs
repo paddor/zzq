@@ -35,6 +35,7 @@
 mod broker;
 mod budget;
 mod conn;
+mod dump;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
@@ -81,6 +82,9 @@ pub enum Error {
     /// The persistence backend failed to load retained messages.
     #[error("loading retained messages failed")]
     Persistence(#[source] std::io::Error),
+    /// [`BrokerOptions::state_file`] could not be read or written.
+    #[error("state file failed")]
+    State(#[source] std::io::Error),
 }
 
 /// Broker result.

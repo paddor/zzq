@@ -162,7 +162,8 @@ impl Broker {
     /// # Errors
     ///
     /// [`Error::Persistence`] if stored retained messages cannot be loaded,
-    /// and [`Error::Transport`] if the lanes have stopped.
+    /// [`Error::State`] if the state file cannot be read, and
+    /// [`Error::Transport`] if the lanes have stopped.
     pub async fn new(ctx: &Context, opts: BrokerOptions) -> Result<Broker> {
         let n = ctx.lanes();
         let mut lanes = Vec::with_capacity(n);
@@ -188,11 +189,18 @@ impl Broker {
             connections: AtomicUsize::new(0),
             tasks: Mutex::default(),
         });
+        // Stops the lanes again when a later step fails.
+        let broker = Broker {
+            shared: shared.clone(),
+        };
         for (i, (ctl_rx, data_rx)) in receivers.into_iter().enumerate() {
             let s = shared.clone();
             ctx.lane(i)
                 .call(move || install(i as u16, s, ctl_rx, data_rx))
                 .await?;
+        }
+        if let Some(path) = &shared.opts.state_file {
+            crate::dump::load(&shared, path).await?;
         }
         if let Some(every) = shared.opts.sys_interval {
             let s = shared.clone();
@@ -206,7 +214,7 @@ impl Broker {
                 })
                 .await?;
         }
-        Ok(Broker { shared })
+        Ok(broker)
     }
 
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
@@ -297,10 +305,21 @@ impl Broker {
     }
 
     /// Stops the broker and waits until every lane has closed its
-    /// listeners and connections. Dropping the broker stops it too, but
-    /// without waiting.
-    pub async fn shutdown(self) {
+    /// listeners and connections. With [`BrokerOptions::state_file`], it
+    /// first closes every connection as lost, so wills go out as usual,
+    /// and writes the sessions there. Dropping the broker stops it too,
+    /// without waiting or writing state.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::State`] if the state file could not be written. The
+    /// broker stops anyway.
+    pub async fn shutdown(self) -> Result<()> {
         self.abort_tasks();
+        let saved = match &self.shared.opts.state_file {
+            Some(path) => crate::dump::save(&self.shared, path).await,
+            None => Ok(()),
+        };
         let mut done = Vec::with_capacity(self.shared.lanes.len());
         for lane in &self.shared.lanes {
             let (tx, rx) = oneshot::channel();
@@ -311,6 +330,7 @@ impl Broker {
         for rx in done {
             let _ = rx.await;
         }
+        saved
     }
 
     fn abort_tasks(&self) {

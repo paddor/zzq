@@ -1,8 +1,18 @@
 //! The standalone broker binary.
 
-use std::process::Command;
+use std::process::{Child, Command};
 
 const EXE: &str = env!("CARGO_BIN_EXE_zzq_broker");
+
+/// Kills the broker when the test ends, even on failure.
+struct Running(Child);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 #[test]
 fn bad_flags_print_usage() {
@@ -21,25 +31,71 @@ fn bind_errors_name_the_cause() {
     assert!(err.contains("transport failed: address in use"), "{err}");
 }
 
-#[cfg(feature = "tls")]
-mod tls {
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_keeps_sessions_in_the_state_file() {
     use std::io::{BufRead, BufReader};
-    use std::process::{Child, Command, Stdio};
+    use std::process::Stdio;
 
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
-    use super::EXE;
+    let dir = std::env::temp_dir().join(format!("zzq-bin-state-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("state");
+    let start = || {
+        let mut child = Command::new(EXE)
+            .args(["--lanes", "2", "--bind", "tcp://127.0.0.1:0"])
+            .args(["--state-file", file.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut uri = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut uri)
+            .unwrap();
+        (Running(child), uri.trim().to_owned())
+    };
+    // SIGTERM, then a clean exit.
+    let stop = |mut b: Running| {
+        let pid = b.0.id().to_string();
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &pid])
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(b.0.wait().unwrap().success());
+    };
+    let durable = ClientOptions {
+        clean_start: false,
+        session_expiry: 600,
+        ..ClientOptions::new("bin-durable")
+    };
+    let ctx = Context::new().unwrap();
+    let (broker, uri) = start();
+    let c = Client::connect(&ctx, &uri, durable.clone()).await.unwrap();
+    c.subscribe("bin/q", QoS::AtLeastOnce).await.unwrap();
+    c.disconnect().await;
+    stop(broker);
+    assert!(file.exists());
+    let (broker, uri) = start();
+    let c = Client::connect(&ctx, &uri, durable).await.unwrap();
+    assert!(c.connected().session_present);
+    stop(broker);
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
-    /// Kills the broker when the test ends, even on failure.
-    struct Running(Child);
+#[cfg(feature = "tls")]
+mod tls {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
 
-    impl Drop for Running {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    use zzq_broker::Context;
+    use zzq_client::{Client, ClientOptions, QoS};
+
+    use super::{EXE, Running};
 
     #[tokio::test(flavor = "multi_thread")]
 

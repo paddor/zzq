@@ -118,7 +118,10 @@ fn shutdown(this: VALUE) -> RbResult<VALUE> {
     let store = native.store.clone();
     match taken.map(Arc::try_unwrap) {
         Some(Ok(b)) => op::new(async move {
-            b.shutdown().await;
+            // TODO: raise the shutdown error once Cargo.toml requires the next
+            // zzq-broker release, whose shutdown returns one.
+            #[allow(clippy::let_unit_value, reason = "unit before that release")]
+            let _ = b.shutdown().await;
             if let Some(store) = store {
                 store.flush();
             }

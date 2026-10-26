@@ -27,11 +27,6 @@
 //! checks counts against the input before it allocates, and refuses state
 //! a session could not have.
 
-#![cfg_attr(
-    not(any(test, feature = "fuzzing")),
-    expect(dead_code, reason = "the state dump at shutdown uses it next")
-)]
-
 use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 

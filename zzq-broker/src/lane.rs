@@ -2,6 +2,8 @@
 //! index, and the packet handling for its connections.
 
 use std::cell::RefCell;
+use std::fs::File;
+use std::io::{self, BufWriter};
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +28,7 @@ use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
 use crate::session::{DelayedWill, Outcome, QueueLimit, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
+use crate::state::{ImageWriter, SessionState};
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
 
@@ -64,6 +67,8 @@ pub(crate) enum Remote {
     },
     /// A delivery to one session, chosen for a shared subscription.
     Deliver { key: Key, item: Queued },
+    /// The last batch the sending lane ships before a state dump.
+    Drained(Arc<SyncAck>),
 }
 
 /// How forwarded packets were sent.
@@ -85,7 +90,7 @@ pub(crate) struct SyncAck {
 }
 
 impl SyncAck {
-    fn expect(&self, n: usize) {
+    pub(crate) fn expect(&self, n: usize) {
         self.remaining.fetch_add(n, Ordering::AcqRel);
     }
 
@@ -130,6 +135,24 @@ pub(crate) enum Control {
     Stats(oneshot::Sender<LaneStats>),
     /// Close every connection and stop, then answer.
     Shutdown(Option<oneshot::Sender<()>>),
+    /// Close every connection as lost and refuse new ones, then answer.
+    Quiesce(oneshot::Sender<()>),
+    /// Ship what is waiting for other lanes, then a marker to each.
+    Drain(Arc<SyncAck>),
+    /// Write the sessions that outlive their connection.
+    Dump(Box<Dump>),
+    /// Add sessions from a state file, then answer. Their subscriptions
+    /// count down the ack on the other lanes.
+    Restore(Vec<SessionState>, Arc<SyncAck>, oneshot::Sender<()>),
+}
+
+pub(crate) type StateWriter = ImageWriter<BufWriter<File>>;
+
+/// A state file being written, passed from lane to lane.
+#[derive(Debug)]
+pub(crate) struct Dump {
+    pub(crate) writer: StateWriter,
+    pub(crate) reply: oneshot::Sender<io::Result<StateWriter>>,
 }
 
 /// A congested session a QoS 1/2 publish was routed to.
@@ -206,6 +229,8 @@ pub(crate) struct Lane {
     next_client_no: u64,
     next_will_id: u64,
     pub(crate) shut_down: bool,
+    /// Closing for a state dump: no new connections, no wills on timers.
+    pub(crate) closing: bool,
 }
 
 impl Lane {
@@ -234,6 +259,7 @@ impl Lane {
             next_client_no: 0,
             next_will_id: 0,
             shut_down: false,
+            closing: false,
         }
     }
 
@@ -566,6 +592,10 @@ impl Lane {
             tokio::time::sleep(delay).await;
             {
                 let mut l = lane.borrow_mut();
+                // A state dump keeps the will with its due time.
+                if l.closing {
+                    return;
+                }
                 let Some(will) = l
                     .sessions
                     .get_mut(key)
@@ -1082,6 +1112,7 @@ impl Lane {
                     self.route_forwarded(chunk, *at, *origin);
                 }
             }
+            Remote::Drained(sync) => sync.done(),
             Remote::Deliver { key, item } => {
                 let p = Publication::of(&item.msg);
                 let mut owned = Some(item.msg.clone());
@@ -1307,6 +1338,19 @@ impl Lane {
                     .sum::<u64>();
                 let _ = reply.send(stats);
             }
+            Control::Quiesce(done) => {
+                self.quiesce();
+                let _ = done.send(());
+            }
+            Control::Drain(sync) => self.drain(&sync),
+            Control::Dump(d) => {
+                let Dump { mut writer, reply } = *d;
+                let _ = reply.send(self.dump(&mut writer).map(|()| writer));
+            }
+            Control::Restore(states, sync, done) => {
+                self.restore(states, &sync);
+                let _ = done.send(());
+            }
             Control::Shutdown(done) => {
                 self.shutdown();
                 if let Some(done) = done {
@@ -1376,6 +1420,73 @@ impl Lane {
             .map(|l| l.state.load(Ordering::Relaxed))
             .sum();
         self.state_full = lanes + retained >= max;
+    }
+
+    /// Closes every connection as lost, so wills and session expiry run
+    /// as usual, and refuses new ones.
+    fn quiesce(&mut self) {
+        self.closing = true;
+        let connected: Vec<(Key, Rc<ConnShared>)> = self
+            .sessions
+            .keys()
+            .filter_map(|k| Some((k, self.sessions.get(k)?.conn.clone()?)))
+            .collect();
+        for (key, conn) in connected {
+            if let Some(s) = self.sessions.get(key) {
+                Self::kick(&conn, s.version, reason::SERVER_SHUTTING_DOWN);
+            }
+            self.detach(key, conn.id, Close::Kicked);
+        }
+    }
+
+    /// Queues a marker for every other lane behind what waits for it.
+    fn drain(&mut self, sync: &Arc<SyncAck>) {
+        for (lane, batch) in self.remote.iter_mut().enumerate() {
+            if lane != usize::from(self.id) {
+                batch.push(Remote::Drained(sync.clone()));
+            }
+        }
+    }
+
+    /// Writes the sessions that outlive their connection.
+    fn dump(&self, w: &mut StateWriter) -> io::Result<()> {
+        for key in self.sessions.keys() {
+            if let Some(s) = self.sessions.get(key)
+                && s.expiry != 0
+            {
+                w.session(s)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds sessions from a state file, with their subscriptions on every
+    /// lane and their delayed wills timed.
+    fn restore(&mut self, states: Vec<SessionState>, sync: &Arc<SyncAck>) {
+        let lanes = self.shared.lanes.len();
+        let now = Instant::now();
+        for st in states {
+            if self.by_client.contains_key(&st.client_id) {
+                continue;
+            }
+            let (session, will) = Session::restore(st, self.state.clone(), lanes);
+            let subs: Vec<(Box<str>, SubscriptionOptions, u32)> = session
+                .subs
+                .iter()
+                .map(|(f, (opts, id))| (f.clone(), *opts, *id))
+                .collect();
+            let client_id = session.client_id.clone();
+            let key = self.sessions.insert(session);
+            self.by_client.insert(client_id, key);
+            for (filter, opts, sub_id) in subs {
+                let entry = self.entry_for(key, &filter, opts, sub_id);
+                self.subscribe_entry(&filter, &entry, Some(sync));
+            }
+            if let Some((due, msg)) = will {
+                self.schedule_will(key, msg, due.saturating_duration_since(now));
+            }
+        }
+        self.stats.subscriptions = self.index.len() as u64;
     }
 
     fn shutdown(&mut self) {

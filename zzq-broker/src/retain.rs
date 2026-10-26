@@ -145,6 +145,18 @@ impl RetainedStore {
         self.len
     }
 
+    /// Every stored message, except the `$SYS/` ones the broker writes
+    /// itself.
+    pub(crate) fn messages(&self) -> Vec<Msg> {
+        let mut out = Vec::with_capacity(self.len);
+        for (name, child) in &self.root.children {
+            if &**name != "$SYS" {
+                every(child, &mut out);
+            }
+        }
+        out
+    }
+
     /// Bytes counted against `max_state_bytes`.
     pub(crate) const fn bytes(&self) -> usize {
         self.bytes
@@ -209,6 +221,13 @@ fn collect(node: &Node, levels: &[&str], first: bool, now: Instant, out: &mut Ve
                 collect(child, rest, false, now, out);
             }
         }
+    }
+}
+
+fn every(node: &Node, out: &mut Vec<Msg>) {
+    out.extend(node.msg.clone());
+    for child in node.children.values() {
+        every(child, out);
     }
 }
 
