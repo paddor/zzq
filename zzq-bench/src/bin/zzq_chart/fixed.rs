@@ -1,7 +1,7 @@
 //! The fixed-load chart: brokers with many connections at offered rates.
 //! Each row is one scenario, with panels for latency, broker CPU and broker
 //! memory over the offered rate. A failed step gets a cross, and its line
-//! ends before it.
+//! ends before it. A list right of the panels says why each step failed.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -11,8 +11,8 @@ use plotters::prelude::*;
 use plotters::style::text_anchor::{HPos, Pos, VPos};
 
 use crate::draw::{
-    self, AXIS, BACKGROUND, GRID, Header, Impl, Latency, Legend, N_TICKS, PANEL_H, ROW_GAP, Result,
-    SizeAxis, TEXT, TOP, WIDTH,
+    self, AXIS, BACKGROUND, GRID, Header, Impl, Latency, Legend, MUTED, N_TICKS, PANEL_H, ROW_GAP,
+    Result, SizeAxis, TEXT, TOP, WIDTH,
 };
 
 /// One step of one impl.
@@ -47,6 +47,12 @@ pub(crate) struct FixedChart<'a> {
 /// The lowest latency on the axis, in microseconds.
 const LAT_FLOOR: f64 = 10.0;
 
+/// Width of the list of failed steps right of each row.
+const FAILS_W: u32 = 230;
+
+/// Height of one line in the list of failed steps.
+const FAIL_LINE_H: i32 = 14;
+
 /// The load generator fails a step that delivers less than this share of
 /// the offered rate, in percent.
 const MIN_DELIVERED_PCT: f64 = 95.0;
@@ -68,10 +74,12 @@ pub(crate) fn draw(chart: &FixedChart<'_>) -> Result {
         let y = TOP + i * (PANEL_H + ROW_GAP);
         titles.push((y - 6, row.title));
         let area = root.clone().shrink((0, y), (WIDTH, PANEL_H));
-        let panels = area.split_evenly((1, 3));
+        let (plots, fails) = area.split_horizontally(WIDTH - FAILS_W);
+        let panels = plots.split_evenly((1, 3));
         latency_panel(&panels[0], chart, row)?;
         value_panel(&panels[1], chart, row, &CPU)?;
         value_panel(&panels[2], chart, row, &RSS)?;
+        failure_list(&fails, chart, row)?;
     }
     let spec = Legend {
         impls: chart.impls,
@@ -114,8 +122,7 @@ fn fmt_us(v: f64) -> String {
 }
 
 /// p99 lines with whiskers from p50 to p99.9 on a log axis. A failed step
-/// is a cross at its p99 (or the top of the axis), and the top left of the
-/// panel lists why each step failed.
+/// is a cross at its p99, or at the top of the axis.
 fn latency_panel(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) -> Result {
     let n = row.rates.len();
     let peak = row
@@ -138,7 +145,6 @@ fn latency_panel(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) 
         .draw()?;
 
     let clamp = |v: f64| v.clamp(LAT_FLOOR, top);
-    let mut labels = 0;
     for imp in chart.impls.iter().rev() {
         let mut line = Vec::new();
         for (i, &rate) in row.rates.iter().enumerate() {
@@ -150,12 +156,6 @@ fn latency_panel(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) 
                 // A step without samples has no latency to place it at.
                 let mark = (x, Some(s.lat.p99).filter(|&v| v > 0.0).map_or(top, clamp));
                 cross(&mut cc, mark, imp.color)?;
-                let style = ("sans-serif", 10).into_font().color(&imp.color);
-                let style = style.pos(Pos::new(HPos::Left, VPos::Top));
-                let text = format!("failed at {}: {}", rate_label(&row.rates, x), failure(s));
-                let label = Text::new(text, (14, 6 + 12 * labels), style);
-                cc.draw_series(std::iter::once(EmptyElement::at((0.0, top)) + label))?;
-                labels += 1;
                 continue;
             }
             let l = Latency {
@@ -171,15 +171,59 @@ fn latency_panel(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) 
     Ok(())
 }
 
+/// One line per impl with a failed step, in legend order: a mark in the
+/// impl's color, then its name, the step and why it failed.
+fn failure_list(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) -> Result {
+    let at = |color: &RGBColor, size| {
+        ("sans-serif", size)
+            .into_font()
+            .color(color)
+            .pos(Pos::new(HPos::Left, VPos::Center))
+    };
+    area.draw(&Text::new("failed steps", (0, 8), at(&TEXT, 12)))?;
+    let mut y = 8 + 2 * FAIL_LINE_H;
+    for imp in chart.impls {
+        let failed = row.rates.iter().enumerate().find_map(|(i, &rate)| {
+            let s = row.steps.get(&(imp.key, rate))?;
+            s.failed.then_some((i, s))
+        });
+        let Some((i, s)) = failed else { continue };
+        area.draw(&PathElement::new(
+            [(0, y), (14, y)],
+            imp.color.stroke_width(2),
+        ))?;
+        let name = if imp.ours {
+            format!("{} ({})", imp.label, imp.runs_on)
+        } else {
+            imp.label.to_owned()
+        };
+        let text = format!(
+            "{name}, {}: {}",
+            rate_label(&row.rates, i as f64),
+            failure(s)
+        );
+        area.draw(&Text::new(text, (20, y), at(&TEXT, 10)))?;
+        y += FAIL_LINE_H;
+    }
+    if y == 8 + 2 * FAIL_LINE_H {
+        area.draw(&Text::new("none", (0, y), at(&MUTED, 10)))?;
+    }
+    Ok(())
+}
+
 /// Why a step failed, in a few words.
 fn failure(s: &Step) -> String {
+    let mut why = Vec::new();
     if s.delivered_pct < MIN_DELIVERED_PCT {
-        format!("{:.0}% delivered", s.delivered_pct)
-    } else if s.closed > 0 {
-        format!("{} closed", s.closed)
-    } else {
-        format!("p50 {}", fmt_us(s.lat.p50))
+        why.push(format!("{:.0}% delivered", s.delivered_pct));
     }
+    if s.closed > 0 {
+        why.push(format!("{} closed", s.closed));
+    }
+    if why.is_empty() {
+        why.push(format!("p50 {}", fmt_us(s.lat.p50)));
+    }
+    why.join(", ")
 }
 
 /// What a value panel shows: its caption, a step's value, and the unit on
