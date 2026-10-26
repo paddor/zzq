@@ -645,6 +645,60 @@ async fn connection_churn_leaves_no_connections_or_sessions() {
     .await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn shared_group_skips_offline_members() {
+    let (ctx, broker, uri) = setup(2, BrokerOptions::default()).await;
+    let publ = client(&ctx, &uri, "p", Version::V5).await;
+    let keep = |id: &str, clean_start| ClientOptions {
+        session_expiry: 60,
+        clean_start,
+        ..ClientOptions::new(id)
+    };
+    let away = Client::connect(&ctx, &uri, keep("away", true))
+        .await
+        .unwrap();
+    away.subscribe("$share/g/work", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let mut here = Client::connect(&ctx, &uri, keep("here", true))
+        .await
+        .unwrap();
+    here.subscribe("$share/g/work", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    away.disconnect().await;
+    stats_until(&broker, |s| s.connections == 2).await;
+    // Mosquitto #2662: the connected member gets every message (4.8.2).
+    for i in 0..20 {
+        publ.publish("work", format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    for i in 0..20 {
+        assert_eq!(next(&mut here).await.payload, format!("{i}"));
+    }
+    let mut away = Client::connect(&ctx, &uri, keep("away", false))
+        .await
+        .unwrap();
+    nothing(&mut away).await;
+    // With no member connected, the message waits at one of them.
+    here.disconnect().await;
+    away.disconnect().await;
+    stats_until(&broker, |s| s.connections == 1).await;
+    publ.publish("work", "later", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let mut got = 0;
+    for id in ["here", "away"] {
+        let mut c = Client::connect(&ctx, &uri, keep(id, false)).await.unwrap();
+        if let Ok(Some(m)) = tokio::time::timeout(Duration::from_millis(500), c.recv()).await {
+            assert_eq!(m.payload, "later");
+            got += 1;
+        }
+    }
+    assert_eq!(got, 1);
+}
+
 /// Keeps everyone off `secret/`.
 struct NoSecrets;
 

@@ -2,6 +2,8 @@
 
 use std::collections::VecDeque;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use bytestring::ByteString;
@@ -123,6 +125,9 @@ pub(crate) struct Session {
     in_use: Option<Box<[u64; 1024]>>,
     /// Copies of messages held long.
     pub(crate) arena: Arena,
+    /// A connection is attached. Shared subscription entries on every lane
+    /// read it to prefer connected members.
+    pub(crate) online: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -156,6 +161,7 @@ impl Session {
             waiters: Vec::new(),
             in_use: None,
             arena: Arena::default(),
+            online: Arc::default(),
         }
     }
 
@@ -163,6 +169,18 @@ impl Session {
     #[inline]
     pub(crate) fn queued(&self) -> usize {
         self.queue.len()
+    }
+
+    /// Attaches a connection.
+    pub(crate) fn bind(&mut self, conn: Rc<ConnShared>) {
+        self.conn = Some(conn);
+        self.online.store(true, Ordering::Relaxed);
+    }
+
+    /// Detaches the connection.
+    pub(crate) fn unbind(&mut self) {
+        self.conn = None;
+        self.online.store(false, Ordering::Relaxed);
     }
 
     /// QoS 1/2 messages not delivered yet: queued, or sent and not acked.

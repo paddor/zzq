@@ -19,6 +19,9 @@ Notable changes to zzq. The format follows
 - `zzq-proto`: invalid topic filters fail with the new
   `DecodeError::InvalidFilter`, reason code "topic filter invalid", instead
   of `InvalidTopic`.
+- `zzq-broker`: a share group gives each message to a member with a
+  connection. It waits at an offline member only when no member is
+  connected.
 
 ### Fixed
 

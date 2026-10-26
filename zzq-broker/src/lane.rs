@@ -333,6 +333,9 @@ impl Lane {
             opts,
             sub_id: SubIds::one(sub_id),
             share: is_shared(filter).then(|| Arc::from(filter)),
+            online: is_shared(filter)
+                .then(|| self.sessions.get(key).map(|s| s.online.clone()))
+                .flatten(),
         }
     }
 
@@ -340,7 +343,7 @@ impl Lane {
     /// out now.
     fn remove_session(&mut self, key: Key) {
         if let Some(s) = self.sessions.get_mut(key) {
-            s.conn = None;
+            s.unbind();
         }
         self.release_waiters(key);
         let Some(mut s) = self.sessions.remove(key) else {
@@ -437,7 +440,7 @@ impl Lane {
         s.version = c.version;
         s.username = c.username.as_deref().map(Box::from);
         s.last_allowed = None;
-        s.conn = Some(conn);
+        s.bind(conn);
         s.expiry = c.session_expiry.min(max_expiry);
         s.expires_at = None;
         s.will.clone_from(&c.will);
@@ -495,7 +498,7 @@ impl Lane {
         if !s.has_conn(conn_id) {
             return;
         }
-        s.conn = None;
+        s.unbind();
         s.out.clear();
         s.aliases.clear();
         self.stats.connections -= 1;
