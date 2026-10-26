@@ -549,3 +549,48 @@ async fn broker_publishes_to_one_topic_keep_their_order() {
         assert_eq!(got, want);
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_returns_once_connections_said_goodbye() {
+    use zzq_proto::{SubscriptionOptions, Version, reason};
+
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(2, opts).await;
+    let mut readers = Vec::new();
+    for i in 0..20 {
+        let mut raw = support::Raw::connect(&uri, &format!("c{i}"), Version::V5, 0).await;
+        raw.subscribe("t", SubscriptionOptions::from(QoS::AtMostOnce))
+            .await;
+        readers.push(raw);
+    }
+    for _ in 0..200 {
+        broker
+            .publish("t", vec![0u8; 4096], QoS::AtMostOnce)
+            .unwrap();
+    }
+    stats_until(&broker, |s| s.deliveries == 20 * 200).await;
+    let readers: Vec<_> = readers
+        .into_iter()
+        .map(|mut raw| {
+            tokio::spawn(async move {
+                loop {
+                    match raw.try_next().await {
+                        Some(support::Got::Publish(_)) => {}
+                        Some(support::Got::Disconnect { reason }) => return Some(reason),
+                        _ => return None,
+                    }
+                }
+            })
+        })
+        .collect();
+    broker.shutdown().await.unwrap();
+    // The lanes stop with the context: whatever they have not written yet
+    // is lost.
+    drop(ctx);
+    for r in readers {
+        assert_eq!(r.await.unwrap(), Some(reason::SERVER_SHUTTING_DOWN));
+    }
+}
