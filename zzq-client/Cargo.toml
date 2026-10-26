@@ -29,7 +29,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", "macros"] }
 
 [dev-dependencies]
-# Path only, so publishing drops it: zzq-broker dev-depends on zzq-client.
+# Path only, so publishing drops it and the two crates publish in any order.
 zzq-broker = { path = "../zzq-broker" }
 zzq-proto = { workspace = true, features = ["std"] }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

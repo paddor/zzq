@@ -32,7 +32,8 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", 
 
 [dev-dependencies]
 rcgen = "0.14"
-zzq-client.workspace = true
+# Path only, so publishing drops it and the two crates publish in any order.
+zzq-client = { path = "../zzq-client" }
 zzq-proto = { workspace = true, features = ["std"] }
 
 tokio = { workspace = true, features = ["rt-multi-thread"] }
