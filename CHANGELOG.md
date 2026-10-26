@@ -121,6 +121,10 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: `AuthDecision::Deny` with a code below 0x80, such as
   `ReasonCode::SUCCESS`, sent a CONNACK that accepted the client and then
   closed. It now refuses with "not authorized".
+- `zzq-broker`, `zzq-client`: a packet header alone made a connection
+  allocate the whole packet it announced, up to `max_packet_size` in the
+  broker and 256 MiB in the client. A read buffer now grows to at most
+  twice what arrived.
 
 ## [0.1.1] - 2026-10-26
 

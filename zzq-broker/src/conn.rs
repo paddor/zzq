@@ -485,6 +485,13 @@ fn complete_len(buf: &[u8], max: usize) -> Result<(usize, usize), DecodeError> {
     Ok((at, 0))
 }
 
+/// Capacity for the rest of a packet of `partial` bytes in a buffer that
+/// holds `have`: all of it, but no more than twice what came so far, so a
+/// header alone cannot make the connection allocate a large packet.
+fn packet_room(have: usize, partial: usize) -> usize {
+    partial.min(have.saturating_mul(2).max(READ_CHUNK))
+}
+
 /// Next read size: double after a full read, halve after a small one.
 fn next_chunk(chunk: usize, read: usize, room: usize) -> usize {
     if read == room {
@@ -576,7 +583,8 @@ async fn read_more<R: AsyncRead + Unpin>(
     } else if !*own {
         // Sized here: growing a slice of the block would allocate as much
         // as the block.
-        let mut b = BytesMut::with_capacity((buf.len() + *chunk).max(partial));
+        let mut b =
+            BytesMut::with_capacity((buf.len() + *chunk).max(packet_room(buf.len(), partial)));
         b.extend_from_slice(buf);
         *buf = b;
         *own = true;
@@ -586,9 +594,10 @@ async fn read_more<R: AsyncRead + Unpin>(
         if buf.capacity() - buf.len() < *chunk / 4 {
             buf.reserve(*chunk);
         }
-        // Room for a large packet in one allocation.
-        if partial > buf.capacity() {
-            buf.reserve(partial - buf.len());
+        // Room for a large packet in few allocations.
+        let room = packet_room(buf.len(), partial);
+        if room > buf.capacity() {
+            buf.reserve(room - buf.len());
         }
     }
     let room = buf.capacity() - buf.len();
@@ -664,5 +673,18 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             let _ = w.shutdown().await;
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_header_alone_does_not_get_room_for_its_whole_packet() {
+        assert_eq!(packet_room(5, 16 << 20), READ_CHUNK);
+        assert_eq!(packet_room(1 << 20, 16 << 20), 2 << 20);
+        assert_eq!(packet_room(10 << 20, 16 << 20), 16 << 20);
+        assert_eq!(packet_room(5, 100), 100);
     }
 }

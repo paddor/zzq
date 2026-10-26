@@ -75,6 +75,9 @@ pub(super) fn make_room(buf: &mut BytesMut) {
         Ok(Some(h)) => h.packet_len().min(MAX_PACKET),
         _ => 0,
     };
+    // All of the packet, but no more than twice what came so far, so a
+    // header alone cannot make the client allocate a large packet.
+    let partial = partial.min(buf.len().saturating_mul(2).max(READ_BUF));
     if buf.capacity() - buf.len() < READ_MIN || buf.capacity() < partial {
         buf.reserve((READ_BUF / 2).max(partial.saturating_sub(buf.len())));
     }
@@ -110,5 +113,29 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
         }
         spare = buf;
         spare.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_header_alone_does_not_reserve_its_whole_packet() {
+        // A PUBLISH header that says 200 MiB follow.
+        let mut len = [0u8; 4];
+        let n = zzq_proto::varint::encode(200 << 20, &mut len);
+        let mut buf = BytesMut::new();
+        buf.extend_from_slice(&[0x30]);
+        buf.extend_from_slice(&len[..n]);
+        make_room(&mut buf);
+        assert!(buf.capacity() <= 2 * READ_BUF, "{}", buf.capacity());
+        // With most of it in, the rest fits in one go.
+        let mut buf = BytesMut::with_capacity(150 << 20);
+        buf.extend_from_slice(&[0x30]);
+        buf.extend_from_slice(&len[..n]);
+        buf.resize(150 << 20, 0);
+        make_room(&mut buf);
+        assert!(buf.capacity() >= (200 << 20) + 5);
     }
 }
