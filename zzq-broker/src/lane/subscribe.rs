@@ -14,7 +14,7 @@ use crate::options::{Authorizer, ClientInfo};
 use crate::session::Session;
 use crate::slab::Key;
 
-use super::route::{Grant, Owned};
+use super::route::{Extra, Grant, Owned};
 use super::{Control, Lane, SyncAck};
 
 /// An ack packet held until other lanes applied a subscription change.
@@ -144,6 +144,11 @@ impl Lane {
 
     /// Sends retained messages for new subscriptions, with RETAIN set.
     fn deliver_retained(&mut self, key: Key, retained: Vec<(Msg, QoS, u32)>) {
+        // The batch may queue beyond the limits, but not batches before it.
+        let extra = Extra {
+            count: retained.len(),
+            bytes: retained.iter().map(|(m, _, _)| m.size()).sum(),
+        };
         for (msg, max_qos, sub_id) in retained {
             let p = Publication {
                 retain: true,
@@ -154,7 +159,7 @@ impl Lane {
                 retain: true,
                 sub_id: SubIds::one(sub_id),
                 last: true,
-                on_subscribe: true,
+                extra,
             };
             let mut retained = msg.clone();
             retained.retain = true;

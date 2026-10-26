@@ -40,8 +40,10 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a share group gives each message to a member with a
   connection. It waits at an offline member only when no member is
   connected.
-- `zzq-broker`: retained messages sent on subscribe no longer count
-  against `max_queued`, which dropped them; `max_retained` bounds them.
+- `zzq-broker`: retained messages sent on subscribe may queue beyond
+  `max_queued` and `max_queued_bytes` by what that SUBSCRIBE sends, so the
+  limits no longer drop them, and repeated SUBSCRIBEs cannot grow the queue
+  without bound.
 - `zzq-broker`: `Broker::shutdown` returns a `Result`, for a state file it
   could not write.
 - `zzq-broker`: `zzq_broker` shuts down on SIGTERM or SIGINT, telling v5

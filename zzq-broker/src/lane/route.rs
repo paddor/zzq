@@ -70,9 +70,16 @@ pub(super) struct Grant {
     /// The last delivery of this publish: it may take the owned message
     /// instead of cloning it.
     pub(super) last: bool,
-    /// A retained message sent on subscribe. `max_retained` bounds those,
-    /// so `max_queued` does not drop them.
-    pub(super) on_subscribe: bool,
+    /// What the session may queue beyond `max_queued` and
+    /// `max_queued_bytes`: the batch of retained messages a SUBSCRIBE sends.
+    pub(super) extra: Extra,
+}
+
+/// Messages and bytes a delivery may queue beyond the limits.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Extra {
+    pub(super) count: usize,
+    pub(super) bytes: usize,
 }
 
 impl Lane {
@@ -263,7 +270,7 @@ impl Lane {
             retain: e.opts.retain_as_published && p.retain,
             sub_id: e.sub_id,
             last,
-            on_subscribe: false,
+            extra: Extra::default(),
         })
     }
 
@@ -273,23 +280,15 @@ impl Lane {
             qos,
             retain,
             sub_id,
-            on_subscribe,
+            extra,
             ..
         } = g;
         let o = &self.shared.opts;
         let max_out = o.max_out_bytes;
-        let limit = if on_subscribe {
-            QueueLimit {
-                count: usize::MAX,
-                bytes: usize::MAX,
-                state_full: self.budget.full,
-            }
-        } else {
-            QueueLimit {
-                count: o.max_queued,
-                bytes: o.max_queued_bytes,
-                state_full: self.budget.full,
-            }
+        let limit = QueueLimit {
+            count: o.max_queued.saturating_add(extra.count),
+            bytes: o.max_queued_bytes.saturating_add(extra.bytes),
+            state_full: self.budget.full,
         };
         let Some(s) = self.sessions.get_mut(key) else {
             return;
@@ -359,7 +358,7 @@ impl Lane {
                     retain: item.retain,
                     sub_id: item.sub_id,
                     last: true,
-                    on_subscribe: false,
+                    extra: Extra::default(),
                 };
                 self.deliver(key, &p, &mut owned, g);
             }

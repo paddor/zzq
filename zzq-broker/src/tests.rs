@@ -309,3 +309,31 @@ async fn a_v5_publisher_past_the_receive_maximum_is_disconnected() {
         .disconnected(&[reason::RECEIVE_MAXIMUM_EXCEEDED])
         .await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retained_messages_on_subscribe_queue_past_the_limit_only_by_their_batch() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        max_queued: 10,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, uri) = setup(1, opts).await;
+    for i in 0..50 {
+        broker
+            .publish_retained(&format!("r/{i}"), "x", QoS::AtLeastOnce)
+            .unwrap();
+    }
+    stats_until(&broker, |s| s.retained == 50).await;
+    let mut sub = support::Raw::connect(&uri, "sub", Version::V5, 0).await;
+    // Never acked, and each SUBSCRIBE sends all 50 again.
+    for _ in 0..4 {
+        sub.subscribe("r/#", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+    }
+    // One in flight, then at most 10 + 50 queued: 39 dropped by the
+    // second batch and 50 by each after it.
+    let stats = stats_until(&broker, |s| s.dropped.queue_full >= 139).await;
+    assert_eq!(stats.dropped.queue_full, 139);
+}
