@@ -196,44 +196,100 @@ impl<W: Write> ImageWriter<W> {
     }
 }
 
-/// Decodes a whole image. Fails on a wrong header, another version, a
-/// record that does not check out, or a missing end, as after a torn
-/// write.
-pub(crate) fn read_image(data: &[u8], clock: Clock) -> Result<Vec<Record>, &'static str> {
-    let rest = data
-        .strip_prefix(MAGIC.as_slice())
-        .ok_or("not a state image")?;
-    let (version, mut rest) = rest.split_first_chunk::<2>().ok_or("not a state image")?;
-    if u16::from_be_bytes(*version) != VERSION {
-        return Err("unsupported state version");
-    }
-    let mut records = Vec::new();
-    loop {
-        let (len, r) = rest.split_first_chunk::<8>().ok_or("torn image")?;
-        let (sum, r) = r.split_first_chunk::<8>().ok_or("torn image")?;
-        let len = usize::try_from(u64::from_be_bytes(*len)).map_err(|_| "torn image")?;
-        let (body, r) = r.split_at_checked(len).ok_or("torn image")?;
-        if xxh3_64(body) != u64::from_be_bytes(*sum) {
-            return Err("record checksum mismatch");
+/// Decodes an image from pieces of any size, such as a decompressor
+/// yields. Fails on a wrong header, another version, a record that does
+/// not check out, or a missing end, as after a torn write.
+#[derive(Debug)]
+pub(crate) struct ImageReader {
+    clock: Clock,
+    records: Vec<Record>,
+    /// The start of a record whose bytes have not all come yet.
+    buf: Vec<u8>,
+    started: bool,
+    ended: bool,
+}
+
+impl ImageReader {
+    pub(crate) const fn new(clock: Clock) -> ImageReader {
+        ImageReader {
+            clock,
+            records: Vec::new(),
+            buf: Vec::new(),
+            started: false,
+            ended: false,
         }
-        rest = r;
-        let mut d = Decoder(body);
-        let record = match d.u8()? {
-            END => {
-                d.end()?;
-                return if rest.is_empty() {
-                    Ok(records)
-                } else {
-                    Err("bytes after the end")
-                };
-            }
-            SESSION => Record::Session(Box::new(d.session(clock)?)),
-            RETAINED => Record::Retained(d.msg(clock)?),
-            _ => return Err("unknown record"),
-        };
-        d.end()?;
-        records.push(record);
     }
+
+    /// Decodes the records `piece` completes.
+    pub(crate) fn read(&mut self, piece: &[u8]) -> Result<(), &'static str> {
+        if self.ended && !piece.is_empty() {
+            return Err("bytes after the end");
+        }
+        self.buf.extend_from_slice(piece);
+        let mut rest = &self.buf[..];
+        if !self.started {
+            let Some((head, r)) = rest.split_first_chunk::<10>() else {
+                return Ok(());
+            };
+            let (magic, version) = head.split_at(MAGIC.len());
+            if magic != MAGIC {
+                return Err("not a state image");
+            }
+            if version != VERSION.to_be_bytes() {
+                return Err("unsupported state version");
+            }
+            rest = r;
+            self.started = true;
+        }
+        while let Some((len, r)) = rest.split_first_chunk::<8>()
+            && let Some((sum, r)) = r.split_first_chunk::<8>()
+        {
+            let len = usize::try_from(u64::from_be_bytes(*len)).map_err(|_| "torn image")?;
+            let Some((body, r)) = r.split_at_checked(len) else {
+                break;
+            };
+            if xxh3_64(body) != u64::from_be_bytes(*sum) {
+                return Err("record checksum mismatch");
+            }
+            rest = r;
+            let mut d = Decoder(body);
+            let record = match d.u8()? {
+                END => None,
+                SESSION => Some(Record::Session(Box::new(d.session(self.clock)?))),
+                RETAINED => Some(Record::Retained(d.msg(self.clock)?)),
+                _ => return Err("unknown record"),
+            };
+            d.end()?;
+            let Some(record) = record else {
+                if !rest.is_empty() {
+                    return Err("bytes after the end");
+                }
+                self.ended = true;
+                break;
+            };
+            self.records.push(record);
+        }
+        let used = self.buf.len() - rest.len();
+        self.buf.drain(..used);
+        Ok(())
+    }
+
+    /// The records, once the end has come.
+    pub(crate) fn finish(self) -> Result<Vec<Record>, &'static str> {
+        match (self.started, self.ended) {
+            (_, true) => Ok(self.records),
+            (true, false) => Err("torn image"),
+            (false, false) => Err("not a state image"),
+        }
+    }
+}
+
+/// Decodes a whole image.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn read_image(data: &[u8], clock: Clock) -> Result<Vec<Record>, &'static str> {
+    let mut image = ImageReader::new(clock);
+    image.read(data)?;
+    image.finish()
 }
 
 /// An image of one record with `body`, checksum and end included.
@@ -686,6 +742,29 @@ mod tests {
         let mut more = bytes;
         more.push(0);
         assert_eq!(read_image(&more, clock).err(), Some("bytes after the end"));
+    }
+
+    #[test]
+    fn an_image_reads_in_pieces_of_any_size() {
+        let clock = Clock::now();
+        let bytes = image(clock, state(clock));
+        let read = |pieces: &mut dyn Iterator<Item = &[u8]>| {
+            let mut r = ImageReader::new(clock);
+            for p in pieces {
+                r.read(p)?;
+            }
+            r.finish().map(|records| records.len())
+        };
+        for cut in 0..=bytes.len() {
+            let (a, b) = bytes.split_at(cut);
+            assert_eq!(read(&mut [a, b].into_iter()), Ok(2), "cut at {cut}");
+            assert!(read(&mut [a].into_iter()).is_err() || b.is_empty());
+        }
+        assert_eq!(read(&mut bytes.chunks(1)), Ok(2));
+        assert_eq!(
+            read(&mut [&bytes[..], &[0]].into_iter()),
+            Err("bytes after the end")
+        );
     }
 
     /// A session body: client ID "c", protocol level `level`, no

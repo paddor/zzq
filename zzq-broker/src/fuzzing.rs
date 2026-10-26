@@ -7,10 +7,10 @@ pub fn retained_log(data: &[u8]) {
     let _ = crate::persist::parse_log(data);
 }
 
-/// Decodes `data` as a state image, and as the body of a record with a
-/// valid checksum, which the checksum would otherwise keep mutations
-/// from. Sessions it holds restore and encode to an image that decodes
-/// again.
+/// Decodes `data` as a state image, whole and in pieces, and as the body
+/// of a record with a valid checksum, which the checksum would otherwise
+/// keep mutations from. Sessions it holds restore and encode to an image
+/// that decodes again.
 ///
 /// # Panics
 ///
@@ -21,9 +21,20 @@ pub fn state_image(data: &[u8]) {
 }
 
 fn state_records(data: &[u8]) {
-    use crate::state::{Clock, ImageWriter, Record, read_image};
+    use crate::state::{Clock, ImageReader, ImageWriter, Record, read_image};
     let clock = Clock::now();
-    let Ok(records) = read_image(data, clock) else {
+    let whole = read_image(data, clock);
+    let mut pieces = ImageReader::new(clock);
+    let read = data
+        .chunks(1 + data.len() % 7)
+        .try_for_each(|p| pieces.read(p))
+        .and_then(|()| pieces.finish());
+    assert_eq!(
+        whole.as_ref().map(Vec::len).ok(),
+        read.map(|r| r.len()).ok(),
+        "pieces decode otherwise"
+    );
+    let Ok(records) = whole else {
         return;
     };
     let Ok(mut w) = ImageWriter::new(Vec::new(), clock) else {

@@ -9,25 +9,26 @@
 //! writers can interleave them. The file is synced, then renamed over the
 //! state file.
 //!
-//! Start decompresses the image, hands each session to the lane its client
-//! ID maps to, and renames the file to `<name>.loaded`, so a later crash
-//! cannot bring back state that changed since.
+//! Start decompresses and decodes the image as it reads the file, hands
+//! each session to the lane its client ID maps to, and renames the file to
+//! `<name>.loaded`, so a later crash cannot bring back state that changed
+//! since.
 
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{self, File};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use tokio::sync::oneshot;
-use zrip::CompressContext;
+use zrip::{CompressContext, FrameDecoder};
 
 use crate::broker::{LaneTx, Shared, lane_for};
 use crate::lane::{Control, Dump, SyncAck};
 use crate::msg::Msg;
 use crate::session::Session;
-use crate::state::{Clock, ImageWriter, Record, SessionState, read_image};
+use crate::state::{Clock, ImageReader, ImageWriter, Record, SessionState};
 use crate::{Error, Result};
 
 /// Image bytes per frame, or a little more, as a frame ends on a record.
@@ -184,15 +185,12 @@ fn retained(shared: &Shared, head: &mut Part) -> io::Result<()> {
 /// Loads the state file, if there is one, into the lanes and the retained
 /// store, then sets it aside.
 pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
+    let file = match File::open(path) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(Error::State(e)),
     };
-    let image = zrip::decompress(&data).map_err(damaged)?;
-    drop(data);
-    let records = read_image(&image, Clock::now()).map_err(damaged)?;
-    drop(image);
+    let records = decode(file)?;
     let n = shared.lanes.len();
     let mut sessions: Vec<Vec<SessionState>> = (0..n).map(|_| Vec::new()).collect();
     {
@@ -221,6 +219,25 @@ pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
     subscribed.wait().await;
     fs::rename(path, with_suffix(path, ".loaded")).map_err(Error::State)?;
     sync_dir(path).map_err(Error::State)
+}
+
+/// Decompresses and decodes the image a piece at a time, with no buffer
+/// for all of it: freeing a big one makes glibc keep later allocations off
+/// mmap, which fragments the heap.
+fn decode(file: File) -> Result<Vec<Record>> {
+    let mut zip = FrameDecoder::new(BufReader::new(file));
+    let mut image = ImageReader::new(Clock::now());
+    let mut piece = vec![0; FRAME];
+    loop {
+        let n = match zip.read(&mut piece) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(Error::State(e)),
+        };
+        image.read(&piece[..n]).map_err(damaged)?;
+    }
+    image.finish().map_err(damaged)
 }
 
 fn damaged(why: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
