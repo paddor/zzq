@@ -68,11 +68,13 @@ async fn write(shared: &Shared, tmp: &Path) -> Result<()> {
     }
     // A persistence backend keeps retained messages itself.
     if shared.opts.persistence.is_none() {
-        let retained = shared
+        let mut retained = shared
             .retained
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .messages();
+        // In topic order, so equal state makes an equal image.
+        retained.sort_unstable_by(|a, b| a.topic().cmp(b.topic()));
         for m in &retained {
             writer.retained(m).map_err(Error::State)?;
         }

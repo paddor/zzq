@@ -118,6 +118,8 @@ fn chain(e: &dyn std::error::Error) -> String {
 }
 
 async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
+    // Before anything is bound, so no signal finds the default handler.
+    let stopped = stop_signal().map_err(|e| format!("signals: {e}"))?;
     let config = Config {
         io_threads: a.lanes,
         name: "zzq".to_owned(),
@@ -135,29 +137,32 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
             .map_err(|e| format!("bind {uri}: {}", chain(&e)))?;
         println!("{ep}");
     }
-    stopped().await.map_err(|e| format!("signals: {e}"))?;
+    stopped.await;
     broker
         .shutdown()
         .await
         .map_err(|e| format!("shutdown: {}", chain(&e)))
 }
 
-/// Waits for SIGTERM or SIGINT.
+/// Handles SIGTERM and SIGINT from now on, and returns the wait for either.
 #[cfg(unix)]
-async fn stopped() -> std::io::Result<()> {
+fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
     use tokio::signal::unix::{SignalKind, signal};
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
-    tokio::select! {
-        _ = term.recv() => {}
-        _ = int.recv() => {}
-    }
-    Ok(())
+    Ok(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+    })
 }
 
 #[cfg(not(unix))]
-async fn stopped() -> std::io::Result<()> {
-    tokio::signal::ctrl_c().await
+fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
+    Ok(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
 }
 
 fn main() -> ExitCode {
