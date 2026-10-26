@@ -129,6 +129,10 @@ Notable changes to zzq. The format follows
   `FilePersistence` queued every change in memory. A topic now waits for the
   writer with its latest change only. Compaction writes `<log>.tmp`, so a
   log `zzq.log` and a state file `zzq` no longer share `zzq.tmp`.
+- `zzq-broker`: retained messages and subscriptions loaded from the
+  persistence or the state file skipped the `max_topic_levels` check, though
+  the store and the index walk topics a level at a time. Deeper ones are now
+  left out.
 
 ## [0.1.1] - 2026-10-26
 

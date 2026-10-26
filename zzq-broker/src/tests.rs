@@ -657,3 +657,36 @@ async fn a_denial_with_a_success_code_still_refuses() {
     let (_raw, code) = support::Raw::connect_with(&uri, &c).await;
     assert_eq!(code, reason::NOT_AUTHORIZED);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_topics_deeper_than_allowed_are_not_loaded() {
+    use std::sync::Arc;
+
+    use crate::{FilePersistence, Persistence, Retained};
+
+    let dir = std::env::temp_dir().join(format!("zzq-deep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("retained.log");
+    let _ = std::fs::remove_file(&path);
+    {
+        let p = FilePersistence::open(&path).unwrap();
+        for topic in ["ok/1".to_owned(), "a/".repeat(1000) + "a"] {
+            p.set_retained(&Retained {
+                topic,
+                payload: "x".into(),
+                qos: QoS::AtMostOnce,
+                properties: bytes::Bytes::new(),
+                expires_at: None,
+            });
+        }
+        p.flush();
+    }
+    let opts = BrokerOptions {
+        persistence: Some(Arc::new(FilePersistence::open(&path).unwrap())),
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, _uri) = setup(1, opts).await;
+    assert_eq!(broker.stats().await.unwrap().retained, 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}

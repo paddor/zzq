@@ -69,6 +69,7 @@ impl RetainedStore {
     pub(crate) fn new(
         persist: Option<Arc<dyn Persistence>>,
         max: usize,
+        max_levels: usize,
     ) -> std::io::Result<RetainedStore> {
         let mut store = RetainedStore {
             max,
@@ -78,6 +79,11 @@ impl RetainedStore {
         if let Some(p) = store.persist.clone() {
             let (now, wall) = (Instant::now(), SystemTime::now());
             for r in p.load_retained()? {
+                // Deeper than clients may publish now: the store walks topics
+                // a level at a time.
+                if crate::msg::too_deep(&r.topic, max_levels) {
+                    continue;
+                }
                 match from_stored(&r, now, wall) {
                     Some(m) => store.insert(m),
                     // Expired while the broker was down.
@@ -358,7 +364,7 @@ mod tests {
     fn persisted_messages_keep_their_deadline() {
         let p = Arc::new(Recorded::default());
         let persist: Arc<dyn Persistence> = p.clone();
-        let mut store = RetainedStore::new(Some(persist), usize::MAX).unwrap();
+        let mut store = RetainedStore::new(Some(persist), usize::MAX, usize::MAX).unwrap();
         let mut m = msg("kept");
         m.expires_at = Some(Instant::now() + std::time::Duration::from_secs(60));
         store.set(&m, false);
