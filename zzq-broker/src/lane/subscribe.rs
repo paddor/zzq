@@ -21,6 +21,8 @@ use super::{Control, Lane, SyncAck};
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) key: Key,
+    /// The connection the ack is for.
+    pub(crate) conn: u64,
     pub(crate) sync: Arc<SyncAck>,
     pub(crate) packet: Vec<u8>,
     /// New subscriptions that get retained messages after the ack.
@@ -180,8 +182,14 @@ impl Lane {
         if let Some(sync) = sync {
             let mut packet = Vec::new();
             encode(&mut packet);
+            let conn = self
+                .sessions
+                .get(key)
+                .and_then(|s| s.conn.as_ref())
+                .map_or(0, |c| c.id);
             self.held.push(Held {
                 key,
+                conn,
                 sync,
                 packet,
                 retained,
@@ -195,14 +203,17 @@ impl Lane {
         }
     }
 
-    /// Ack packets waiting for other lanes.
-    pub(crate) fn take_held(&mut self) -> Vec<Held> {
-        std::mem::take(&mut self.held)
+    /// Ack packets for connection `conn` waiting for other lanes.
+    pub(crate) fn take_held(&mut self, conn: u64) -> Vec<Held> {
+        self.held.extract_if(.., |h| h.conn == conn).collect()
     }
 
     /// Queues an ack packet that was held for other lanes.
     pub(crate) fn release(&mut self, h: &Held) {
-        if let Some(s) = self.sessions.get_mut(h.key) {
+        // Not to a connection that took the session over meanwhile.
+        if let Some(s) = self.sessions.get_mut(h.key)
+            && s.has_conn(h.conn)
+        {
             s.out.buf.extend_from_slice(&h.packet);
         }
         self.mark(h.key);
@@ -284,4 +295,81 @@ fn may_subscribe(acl: Option<&dyn Authorizer>, s: &Session, filter: &str) -> boo
 /// Retain Handling. Shared subscriptions never do.
 fn retained_wanted(filter: &str, opts: SubscriptionOptions, existed: bool) -> bool {
     !is_shared(filter) && (opts.retain_handling == 0 || (opts.retain_handling == 1 && !existed))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use zzq_proto::encode::{self, ConnectFields, SubAckFields};
+    use zzq_proto::property::SESSION_EXPIRY_INTERVAL;
+    use zzq_proto::{PacketType, Property, Version};
+
+    use super::{Held, SyncAck};
+    use crate::BrokerOptions;
+    use crate::tests::on_lane;
+    use crate::tests::support::{Got, Raw, setup};
+
+    fn connect(clean_start: bool) -> Vec<u8> {
+        let props = [Property::U32(SESSION_EXPIRY_INTERVAL, 60)];
+        let c = ConnectFields {
+            version: Version::V5,
+            clean_start,
+            keep_alive: 0,
+            properties: &props,
+            client_id: "x",
+            will: None,
+            username: None,
+            password: None,
+        };
+        let mut out = Vec::new();
+        encode::connect(&c, &mut out);
+        out
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_held_suback_stays_with_its_connection() {
+        let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+        let mut old = Raw::open(&uri).await;
+        old.send(&connect(true)).await;
+        assert!(matches!(old.next().await, Got::ConnAck { code: 0, .. }));
+        // A SUBACK of the old connection, held for a lane that has not
+        // applied the subscription yet.
+        let ticket = on_lane(&ctx, &broker, 0, |l| {
+            let key = l.by_client["x"];
+            let sync = Arc::new(SyncAck::default());
+            let ticket = sync.ticket();
+            let mut packet = Vec::new();
+            let a = SubAckFields {
+                kind: PacketType::SubAck,
+                pkid: 5,
+                properties: &[],
+                codes: &[1],
+            };
+            encode::suback(&a, Version::V5, &mut packet);
+            let conn = l
+                .sessions
+                .get(key)
+                .and_then(|s| s.conn.as_ref())
+                .map_or(0, |c| c.id);
+            l.held.push(Held {
+                key,
+                conn,
+                sync,
+                packet,
+                retained: Vec::new(),
+            });
+            ticket
+        })
+        .await;
+        let mut new = Raw::open(&uri).await;
+        new.send(&connect(false)).await;
+        assert!(matches!(new.next().await, Got::ConnAck { code: 0, .. }));
+        let mut ping = Vec::new();
+        encode::pingreq(&mut ping);
+        new.send(&ping).await;
+        assert_eq!(new.next().await, Got::PingResp);
+        drop(ticket);
+        new.quiet(300).await;
+    }
 }

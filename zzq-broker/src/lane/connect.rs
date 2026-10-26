@@ -193,6 +193,8 @@ impl Lane {
 
     /// Unbinds a closed connection from its session.
     pub(crate) fn detach(&mut self, key: Key, conn_id: u64, close: Close) {
+        // Acks the connection can no longer get.
+        self.held.retain(|h| h.conn != conn_id);
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };

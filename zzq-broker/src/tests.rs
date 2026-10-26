@@ -1,7 +1,7 @@
 //! Regression tests that look inside the lanes: their tasks and state.
 
 #[path = "../tests/support/mod.rs"]
-mod support;
+pub(crate) mod support;
 
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,7 +24,7 @@ async fn lane_refs(ctx: &Context, broker: &Broker, i: usize) -> usize {
 }
 
 /// Runs `f` with the state of lane `i` of `broker`.
-async fn on_lane<T: Send + 'static>(
+pub(crate) async fn on_lane<T: Send + 'static>(
     ctx: &Context,
     broker: &Broker,
     i: usize,
@@ -183,4 +183,70 @@ async fn a_kicked_connection_that_stopped_reading_lets_go() {
     stats_until(&broker, |s| s.connections == 0).await;
     assert_eq!(refs_settle(&ctx, &broker, 0, idle).await, idle);
     drop(stuck);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
+    use zzq_proto::encode::{self, ConnectFields, PublishHeader};
+    use zzq_proto::property::SESSION_EXPIRY_INTERVAL;
+    use zzq_proto::{PacketType, Property, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        qos_queue_high: 2,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, _broker, uri) = setup(1, opts).await;
+    let mut sub = Raw::connect(&uri, "sub", Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    let props = [Property::U32(SESSION_EXPIRY_INTERVAL, 60)];
+    let connect = |clean_start| ConnectFields {
+        version: Version::V5,
+        clean_start,
+        keep_alive: 0,
+        properties: &props,
+        client_id: "pub",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (mut first, _) = Raw::connect_with(&uri, &connect(true)).await;
+    for pkid in 1..=3 {
+        first.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+    }
+    // The third makes the subscriber congested, so its ack waits.
+    for pkid in 1..=2 {
+        let got = first.next().await;
+        assert!(
+            matches!(got, Got::Ack { pkid: p, .. } if p == pkid),
+            "{got:?}"
+        );
+    }
+    first.quiet(100).await;
+    first.reset();
+    let (mut again, _) = Raw::connect_with(&uri, &connect(false)).await;
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: true,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        topic: "t",
+        pkid: 3,
+        properties: &[],
+    };
+    let mut resend = Vec::new();
+    encode::publish(&h, b"x", &mut resend);
+    again.send(&resend).await;
+    again.quiet(100).await;
+    // The subscriber drains: the held acks go out.
+    for _ in 0..4 {
+        let p = sub.publish().await;
+        sub.ack(PacketType::PubAck, p.pkid).await;
+    }
+    let got = again.next().await;
+    assert!(matches!(got, Got::Ack { pkid: 3, .. }), "{got:?}");
+    again.quiet(300).await;
 }

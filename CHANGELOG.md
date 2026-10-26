@@ -86,6 +86,11 @@ Notable changes to zzq. The format follows
   `max_connections`. Its writer now gets 2 s to finish, then stops.
 - `zzq-broker`: a SUBSCRIBE or UNSUBSCRIBE whose change a stopping lane never
   applied waited for its ack forever, holding the lane.
+- `zzq-broker`: a SUBACK or UNSUBACK held for other lanes could reach the
+  connection that took the session over, and one connection could wait for
+  another's held acks. A publisher that reconnected while its PUBACK was
+  held for a congested subscriber got the ack twice. Held acks now go only
+  to the connection they answer.
 
 ## [0.1.1] - 2026-10-26
 

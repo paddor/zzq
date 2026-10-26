@@ -25,8 +25,14 @@ impl Lane {
             QoS::AtLeastOnce => PacketType::PubAck,
             QoS::ExactlyOnce => PacketType::PubRec,
         };
+        let conn = self
+            .sessions
+            .get(key)
+            .and_then(|s| s.conn.as_ref())
+            .map_or(0, |c| c.id);
         let waiter = Waiter {
             publisher: key,
+            conn,
             kind,
             pkid: p.pkid,
         };
@@ -65,7 +71,10 @@ impl Lane {
 
     pub(super) fn send_acks(&mut self, waiters: &[Waiter]) {
         for w in waiters {
-            if let Some(p) = self.sessions.get_mut(w.publisher) {
+            // A publisher that reconnected sends the publish again.
+            if let Some(p) = self.sessions.get_mut(w.publisher)
+                && p.has_conn(w.conn)
+            {
                 p.ack(w.kind, w.pkid, 0);
                 self.mark(w.publisher);
             }

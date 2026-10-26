@@ -525,7 +525,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
         // Let other connections on this lane run, such as subscribers whose
         // acks free up their window.
         tokio::task::yield_now().await;
-        let held = lane.borrow_mut().take_held();
+        let held = lane.borrow_mut().take_held(conn.id);
         for h in held {
             h.sync.wait().await;
             lane.borrow_mut().release(&h);

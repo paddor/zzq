@@ -76,6 +76,8 @@ struct Inflight {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Waiter {
     pub(crate) publisher: Key,
+    /// The publisher's connection that sent the publish.
+    pub(crate) conn: u64,
     pub(crate) kind: PacketType,
     pub(crate) pkid: u16,
 }
