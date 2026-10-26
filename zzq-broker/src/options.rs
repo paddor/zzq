@@ -56,8 +56,17 @@ pub trait Authorizer: Send + Sync + 'static {
     /// client's publishes changes.
     fn may_publish(&self, client: &ClientInfo<'_>, topic: &str) -> bool;
 
-    /// Whether the client may subscribe to `filter`.
+    /// Whether the client may subscribe to `filter`. Shared subscriptions
+    /// ask [`Authorizer::may_subscribe_shared`] instead.
     fn may_subscribe(&self, client: &ClientInfo<'_>, filter: &str) -> bool;
+
+    /// Whether the client may join the share group `group` on `filter`,
+    /// the filter after `$share/{group}/`. By default the rule of
+    /// [`Authorizer::may_subscribe`] for `filter`.
+    fn may_subscribe_shared(&self, client: &ClientInfo<'_>, group: &str, filter: &str) -> bool {
+        let _ = group;
+        self.may_subscribe(client, filter)
+    }
 }
 
 /// Broker settings.

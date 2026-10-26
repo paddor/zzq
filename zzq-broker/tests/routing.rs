@@ -7,10 +7,11 @@
 mod support;
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use support::{Got, Pub, Raw, WAIT, client, next, nothing, props, setup, stats_until};
-use zzq_broker::BrokerOptions;
+use zzq_broker::{Authorizer, BrokerOptions, ClientInfo};
 use zzq_client::{Client, ClientOptions};
 use zzq_proto::encode::{self, ConnectFields, WillFields};
 use zzq_proto::property::{
@@ -642,4 +643,61 @@ async fn connection_churn_leaves_no_connections_or_sessions() {
         s.connections == 0 && s.sessions == 0 && s.subscriptions == 0
     })
     .await;
+}
+
+/// Keeps everyone off `secret/`.
+struct NoSecrets;
+
+impl Authorizer for NoSecrets {
+    fn may_publish(&self, _: &ClientInfo<'_>, _: &str) -> bool {
+        true
+    }
+
+    fn may_subscribe(&self, _: &ClientInfo<'_>, filter: &str) -> bool {
+        !filter.starts_with("secret/")
+    }
+}
+
+/// Keeps everyone out of the share group `nope`.
+struct NoNope;
+
+impl Authorizer for NoNope {
+    fn may_publish(&self, _: &ClientInfo<'_>, _: &str) -> bool {
+        true
+    }
+
+    fn may_subscribe(&self, _: &ClientInfo<'_>, _: &str) -> bool {
+        true
+    }
+
+    fn may_subscribe_shared(&self, _: &ClientInfo<'_>, group: &str, _: &str) -> bool {
+        group != "nope"
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn authorizer_sees_shared_filters_without_the_prefix() {
+    let topics: Arc<dyn Authorizer> = Arc::new(NoSecrets);
+    let groups: Arc<dyn Authorizer> = Arc::new(NoNope);
+    // NanoMQ #2463: `$share/{group}/` must not get a filter past the rules.
+    for (acl, filter, allowed) in [
+        (&topics, "secret/x", false),
+        (&topics, "$share/g/secret/#", false),
+        (&topics, "$share/g/public/#", true),
+        (&groups, "$share/nope/a", false),
+        (&groups, "$share/ok/a", true),
+    ] {
+        let opts = BrokerOptions {
+            authorizer: Some(acl.clone()),
+            ..BrokerOptions::default()
+        };
+        let (_ctx, _broker, uri) = setup(1, opts).await;
+        let mut raw = Raw::connect(&uri, "acl", Version::V5, 0).await;
+        let want = if allowed { 0 } else { reason::NOT_AUTHORIZED };
+        assert_eq!(
+            raw.subscribe(filter, QoS::AtMostOnce.into()).await,
+            [want],
+            "{filter}"
+        );
+    }
 }

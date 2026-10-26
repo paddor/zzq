@@ -10,6 +10,9 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: `Stats::dropped_session_ended` counts the QoS 1/2 messages
   a session still held, queued or unacked, when it ended.
   `$SYS/broker/messages/dropped` includes them.
+- `zzq-broker`: `Authorizer::may_subscribe_shared` decides on shared
+  subscriptions, given the share group. By default it applies
+  `may_subscribe` to the filter after `$share/{group}/`.
 
 ### Changed
 
@@ -35,6 +38,8 @@ Notable changes to zzq. The format follows
   client's new Receive Maximum allows.
 - `zzq-broker`: a connection taken over before its CONNACK closes without
   a DISCONNECT, which may only follow CONNACK.
+- `zzq-broker`: `Authorizer::may_subscribe` got shared filters with their
+  `$share/{group}/` prefix, so a rule on the topic filter did not apply.
 
 ## [0.1.1] - 2026-10-26
 

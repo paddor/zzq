@@ -15,7 +15,7 @@ use tokio::sync::{Notify, oneshot};
 use zzq_proto::encode::{self, SubAckFields};
 use zzq_proto::packet::{Ack, Publish, Subscribe, Unsubscribe, decode};
 use zzq_proto::property::{self, Property};
-use zzq_proto::topic::is_shared;
+use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 
 use crate::broker::Shared;
@@ -1471,7 +1471,10 @@ fn may_subscribe(acl: Option<&dyn Authorizer>, s: &Session, filter: &str) -> boo
             client_id: &s.client_id,
             username: s.username.as_deref(),
         };
-        acl.may_subscribe(&client, filter)
+        match SharedFilter::try_from(filter) {
+            Ok(shared) => acl.may_subscribe_shared(&client, shared.group, shared.filter),
+            Err(_) => acl.may_subscribe(&client, filter),
+        }
     })
 }
 
