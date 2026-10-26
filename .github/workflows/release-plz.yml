@@ -1,0 +1,55 @@
+name: release-plz
+
+# On every push to main, opens or updates the release PR, and publishes the
+# crate versions that crates.io doesn't have yet. The filename stays
+# release-plz.yml: crates.io trusts this workflow to publish the zzq crates.
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'paddor'
+    permissions:
+      contents: write
+      pull-requests: read
+      # Trusted publishing to crates.io.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  release-pr:
+    name: release PR
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'paddor'
+    permissions:
+      contents: write
+      pull-requests: write
+    concurrency:
+      group: release-plz-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
