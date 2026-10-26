@@ -118,6 +118,9 @@ Notable changes to zzq. The format follows
   MQTT-SN client task panic, and a zero `receive_maximum` refused every v5
   client. `Broker::new` now refuses them with the new
   `Error::InvalidOption`.
+- `zzq-broker`: `AuthDecision::Deny` with a code below 0x80, such as
+  `ReasonCode::SUCCESS`, sent a CONNACK that accepted the client and then
+  closed. It now refuses with "not authorized".
 
 ## [0.1.1] - 2026-10-26
 

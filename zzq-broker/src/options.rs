@@ -30,7 +30,8 @@ pub enum AuthDecision {
     /// Lets the client connect.
     Allow,
     /// Rejects with a v5 CONNACK reason code. v3.1.1 clients get the closest
-    /// return code.
+    /// return code. A code below 0x80, which would accept, becomes Not
+    /// authorized.
     Deny(ReasonCode),
 }
 

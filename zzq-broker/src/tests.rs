@@ -623,3 +623,37 @@ async fn options_that_cannot_work_are_refused() {
         );
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_denial_with_a_success_code_still_refuses() {
+    use std::sync::Arc;
+
+    use zzq_proto::encode::ConnectFields;
+    use zzq_proto::{ReasonCode, Version, reason};
+
+    use crate::{AuthDecision, Authenticator, ConnectInfo};
+
+    struct DenyWithSuccess;
+    impl Authenticator for DenyWithSuccess {
+        fn authenticate(&self, _: &ConnectInfo<'_>) -> AuthDecision {
+            AuthDecision::Deny(ReasonCode::SUCCESS)
+        }
+    }
+    let opts = BrokerOptions {
+        authenticator: Some(Arc::new(DenyWithSuccess)),
+        ..BrokerOptions::default()
+    };
+    let (_ctx, _broker, uri) = setup(1, opts).await;
+    let c = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &[],
+        client_id: "x",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (_raw, code) = support::Raw::connect_with(&uri, &c).await;
+    assert_eq!(code, reason::NOT_AUTHORIZED);
+}

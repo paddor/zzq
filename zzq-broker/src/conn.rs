@@ -338,7 +338,14 @@ async fn read_connect<R: AsyncRead + Unpin>(
                         peer_cert,
                     };
                     if let AuthDecision::Deny(code) = auth.authenticate(&info) {
-                        return Err((Some(c.version), code.into()));
+                        // A code below 0x80 would accept the connection.
+                        let code = u8::from(code);
+                        let code = if code < 0x80 {
+                            reason::NOT_AUTHORIZED
+                        } else {
+                            code
+                        };
+                        return Err((Some(c.version), code));
                     }
                 }
                 let owned = OwnedConnect::from_packet(&c);
