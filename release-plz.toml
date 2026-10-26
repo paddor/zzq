@@ -1,0 +1,4 @@
+[workspace]
+# CHANGELOG.md is written by hand.
+changelog_update = false
+git_tag_name = "{{ package }}-v{{ version }}"
