@@ -250,6 +250,12 @@ impl Broker {
         Ok(broker)
     }
 
+    /// The ID that tells this broker's lane state apart on a lane thread.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u64 {
+        self.shared.id
+    }
+
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
     /// endpoint, with the actual port for port 0.
     ///

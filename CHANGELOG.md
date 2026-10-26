@@ -74,6 +74,9 @@ Notable changes to zzq. The format follows
   another lane updated a retained message could keep the older value.
   Retained messages are now read once every lane has the subscription,
   and go out after SUBACK.
+- `zzq-broker`: a delayed will that a reconnect cancelled kept a timer task,
+  holding the lane, until its delay ran out. The lane sweep now publishes
+  due wills, without a task per will.
 
 ## [0.1.1] - 2026-10-26
 

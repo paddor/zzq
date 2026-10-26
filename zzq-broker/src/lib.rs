@@ -51,6 +51,12 @@ mod slab;
 mod sn;
 mod state;
 mod sys;
+#[cfg(test)]
+mod tests;
+
+// The shared test support names the crate.
+#[cfg(test)]
+extern crate self as zzq_broker;
 
 pub use broker::{Broker, Dropped, Stats, lane_for};
 pub use options::{

@@ -2,8 +2,10 @@
 //! index, and the packet handling for its connections.
 
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -83,6 +85,8 @@ pub(crate) struct Lane {
     /// Calls of [`Lane::sweep`] so far.
     sweeps: u32,
     ids: Ids,
+    /// Sessions with a delayed will, by its due time and timer ID.
+    wills: BTreeMap<(Instant, u64), Key>,
     pub(crate) shut_down: bool,
     /// Closing for a state dump: no new connections, no wills on timers.
     pub(crate) closing: bool,
@@ -158,6 +162,7 @@ impl Lane {
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
             ids: Ids::default(),
+            wills: BTreeMap::new(),
             shut_down: false,
             closing: false,
         }

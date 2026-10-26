@@ -22,6 +22,10 @@ impl Lane {
     /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
         self.check_state();
+        // A state dump keeps delayed wills with their due time.
+        if !self.closing {
+            self.fire_wills(now);
+        }
         let part = self.sweeps % SWEEP_PARTS;
         self.sweeps = self.sweeps.wrapping_add(1);
         // The retained store is shared; one lane, once a round, is enough.
@@ -50,6 +54,22 @@ impl Lane {
                 }
             } else if s.expires_at.is_some_and(|t| t <= now) {
                 self.remove_session(key);
+            }
+        }
+    }
+
+    /// Publishes the delayed wills that are due.
+    fn fire_wills(&mut self, now: Instant) {
+        while let Some(next) = self.wills.first_entry()
+            && next.key().0 <= now
+        {
+            let ((_, timer), key) = next.remove_entry();
+            let will = self
+                .sessions
+                .get_mut(key)
+                .and_then(|s| s.delayed_will.take_if(|w| w.timer == timer));
+            if let Some(w) = will {
+                self.publish_will(w.msg);
             }
         }
     }

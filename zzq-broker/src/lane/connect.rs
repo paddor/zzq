@@ -1,5 +1,6 @@
 //! Connections attaching to and leaving sessions, and wills.
 
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -49,8 +50,8 @@ impl Lane {
         if self.by_client.get(&s.client_id) == Some(&key) {
             self.by_client.remove(&s.client_id);
         }
-        if let Some(will) = s.delayed_will.take() {
-            self.publish_will(will.msg);
+        if let Some(msg) = take_delayed_will(&mut self.wills, &mut s) {
+            self.publish_will(msg);
         }
     }
 
@@ -128,7 +129,7 @@ impl Lane {
         // new connection came first and cancels it. So does a will of
         // an earlier connection that waits for its delay.
         let old = s.conn.take();
-        let delayed = s.delayed_will.take().map(|w| w.msg);
+        let delayed = take_delayed_will(&mut self.wills, s);
         let will = match s.will.take() {
             Some(w) if old.is_some() && (w.delay == 0 || ends) => Some(w.msg),
             _ => delayed.filter(|_| ends),
@@ -224,45 +225,21 @@ impl Lane {
     }
 
     /// Publishes `msg` after `delay`, unless a new connection or the end of
-    /// the session takes it first.
+    /// the session takes it first. The sweep publishes due wills.
     pub(super) fn schedule_will(&mut self, key: Key, msg: Msg, delay: Duration) {
-        let Some(lane) = crate::broker::lane_ref(self.shared.id) else {
-            return;
-        };
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
         self.ids.will += 1;
-        let id = self.ids.will;
-        s.delayed_will = Some(DelayedWill {
-            timer: id,
-            due: Instant::now() + delay,
-            msg,
-        });
-        tokio::task::spawn_local(async move {
-            tokio::time::sleep(delay).await;
-            {
-                let mut l = lane.borrow_mut();
-                // A state dump keeps the will with its due time.
-                if l.closing {
-                    return;
-                }
-                let Some(will) = l
-                    .sessions
-                    .get_mut(key)
-                    .and_then(|s| s.delayed_will.take_if(|w| w.timer == id))
-                else {
-                    return;
-                };
-                l.publish_will(will.msg);
-                l.flush();
-            }
-            crate::broker::ship(&lane).await;
-        });
+        let (timer, due) = (self.ids.will, Instant::now() + delay);
+        if let Some(old) = s.delayed_will.replace(DelayedWill { timer, due, msg }) {
+            self.wills.remove(&(old.due, old.timer));
+        }
+        self.wills.insert((due, timer), key);
     }
 
     /// Publishes a will. Its Message Expiry Interval starts now.
-    fn publish_will(&mut self, mut msg: Msg) {
+    pub(super) fn publish_will(&mut self, mut msg: Msg) {
         msg.expires_at = crate::msg::expiry(msg.props());
         self.publish_owned(&msg);
     }
@@ -276,4 +253,11 @@ fn connack_ok(version: Version, present: bool, props: &[u8], out: &mut Vec<u8>) 
         properties: props,
     };
     encode::connack(&ack, version, out);
+}
+
+/// Takes the delayed will of `s` off its timer.
+fn take_delayed_will(wills: &mut BTreeMap<(Instant, u64), Key>, s: &mut Session) -> Option<Msg> {
+    let w = s.delayed_will.take()?;
+    wills.remove(&(w.due, w.timer));
+    Some(w.msg)
 }
