@@ -25,6 +25,8 @@ Notable changes to zzq. The format follows
   from its first byte, without waiting for its body.
 - `zzq-broker`: an ack of the wrong type for a delivery is a protocol
   error. A PUBACK for a QoS 2 delivery dropped the delivery uncounted.
+- `zzq-broker`: a resumed session resends no more messages than the
+  client's new Receive Maximum allows.
 
 ## [0.1.1] - 2026-10-26
 

@@ -106,6 +106,9 @@ pub(crate) struct Session {
     /// Last topic the authorizer was asked about, and its answer.
     pub(crate) last_allowed: Option<(Box<str>, bool)>,
     inflight: VecDeque<Inflight>,
+    /// Entries at the back of `inflight` not resent on this connection yet:
+    /// a resumed client may allow fewer in flight than before.
+    unsent: usize,
     queue: VecDeque<Queued>,
     next_pkid: u16,
     /// Queued messages dropped because they expired.
@@ -145,6 +148,7 @@ impl Session {
             last_topic: None,
             last_allowed: None,
             inflight: VecDeque::new(),
+            unsent: 0,
             queue: VecDeque::new(),
             next_pkid: 0,
             expired: 0,
@@ -314,6 +318,12 @@ impl Session {
     /// written.
     pub(crate) fn pump(&mut self) -> bool {
         let mut wrote = false;
+        if self.unsent > 0 {
+            wrote = self.resend_unsent();
+            if self.unsent > 0 {
+                return wrote;
+            }
+        }
         let mut now = None;
         while self.conn.is_some() && self.inflight.len() < usize::from(self.window) {
             let Some(item) = self.queue.pop_front() else {
@@ -335,6 +345,9 @@ impl Session {
             .inflight
             .iter()
             .position(|f| f.pkid == pkid && f.released == released)?;
+        if i >= self.inflight.len() - self.unsent {
+            self.unsent -= 1;
+        }
         let f = self.inflight.remove(i)?;
         self.free_pkid(pkid);
         Some(f)
@@ -398,18 +411,30 @@ impl Session {
         }
     }
 
-    /// Resends the inflight window after a reconnect.
+    /// Resends the inflight window after a reconnect, as far as the
+    /// client's Receive Maximum allows [MQTT-3.3.4-9]. Acks send the rest.
     pub(crate) fn resend(&mut self) {
+        self.unsent = self.inflight.len();
+        self.pump();
+    }
+
+    /// Resends held back inflight messages while the window has room.
+    fn resend_unsent(&mut self) -> bool {
+        let window = usize::from(self.window);
         let inflight = std::mem::take(&mut self.inflight);
-        for f in &inflight {
+        let mut wrote = false;
+        while self.unsent > 0 && self.conn.is_some() && inflight.len() - self.unsent < window {
+            let f = &inflight[inflight.len() - self.unsent];
             if f.released {
                 self.ack(PacketType::PubRel, f.pkid, 0);
             } else {
                 self.encode(&Fields::of(&f.item, f.pkid, true));
             }
+            self.unsent -= 1;
+            wrote = true;
         }
         self.inflight = inflight;
-        self.pump();
+        wrote
     }
 
     /// Writes an ack.
