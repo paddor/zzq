@@ -91,6 +91,9 @@ pub enum Error {
     /// [`BrokerOptions::state_file`] could not be read or written.
     #[error("state file failed")]
     State(#[source] std::io::Error),
+    /// A [`BrokerOptions`] field has a value the broker cannot work with.
+    #[error("invalid option: {0}")]
+    InvalidOption(&'static str),
 }
 
 /// Broker result.

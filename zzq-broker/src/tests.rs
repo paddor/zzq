@@ -594,3 +594,32 @@ async fn shutdown_returns_once_connections_said_goodbye() {
         assert_eq!(r.await.unwrap(), Some(reason::SERVER_SHUTTING_DOWN));
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn options_that_cannot_work_are_refused() {
+    let ctx = Context::new().unwrap();
+    let cases = [
+        BrokerOptions {
+            sys_interval: Some(Duration::ZERO),
+            ..BrokerOptions::default()
+        },
+        BrokerOptions {
+            sn: crate::SnOptions {
+                retry: Duration::ZERO,
+                ..crate::SnOptions::default()
+            },
+            ..BrokerOptions::default()
+        },
+        BrokerOptions {
+            receive_maximum: 0,
+            ..BrokerOptions::default()
+        },
+    ];
+    for opts in cases {
+        let res = Broker::new(&ctx, opts).await;
+        assert!(
+            matches!(res, Err(crate::Error::InvalidOption(_))),
+            "{res:?}"
+        );
+    }
+}

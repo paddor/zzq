@@ -114,6 +114,10 @@ Notable changes to zzq. The format follows
   `publish_retained` or MQTT-SN QoS -1 sent to one topic could reach
   subscribers out of order, and the retained store could keep an older one.
   They now go through the lane of their topic.
+- `zzq-broker`: a zero `sys_interval` or `sn.retry` made the `$SYS` or
+  MQTT-SN client task panic, and a zero `receive_maximum` refused every v5
+  client. `Broker::new` now refuses them with the new
+  `Error::InvalidOption`.
 
 ## [0.1.1] - 2026-10-26
 
