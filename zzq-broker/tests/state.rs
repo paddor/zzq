@@ -174,16 +174,16 @@ async fn wills_of_connections_open_at_shutdown_go_out() {
     };
     let _now = Client::connect(&ctx, &uri, now).await.unwrap();
     let _later = Client::connect(&ctx, &uri, later).await.unwrap();
+    let started = Instant::now();
     broker.shutdown().await.unwrap();
 
     // One went out at shutdown and waited in the queue, the other is due a
-    // second later.
+    // second after it, however long the restart takes.
     let (_broker, uri) = start(&ctx, opts(&file)).await;
-    let started = Instant::now();
     let mut w = Client::connect(&ctx, &uri, durable("watch")).await.unwrap();
     assert_eq!(next(&mut w).await.topic.to_string(), "will/now");
     assert_eq!(next(&mut w).await.topic.to_string(), "will/later");
-    assert!(started.elapsed() >= Duration::from_millis(500));
+    assert!(started.elapsed() >= Duration::from_millis(900));
     let _ = std::fs::remove_dir_all(&d);
 }
 
