@@ -56,6 +56,8 @@ pub fn stats_hash(s: &Stats) -> RbResult<VALUE> {
         ("dropped_too_large", s.dropped_too_large),
         ("dropped_expired", s.dropped_expired),
         ("retained_rejected", s.retained_rejected),
+        // TODO: add `dropped_session_ended` once Cargo.toml requires the
+        // next zzq-broker release, the first one that has it.
     ] {
         rb::hash_aset(h, rb::symbol(key)?, rb::u64_value(value))?;
     }
