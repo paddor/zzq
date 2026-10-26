@@ -20,6 +20,7 @@
   are gone.
 - `ws://`, `wss://`, `quic://` and `inproc://` are built in; the
   zzq-websocket gem is no longer needed.
+- Dual-licensed under ISC or Apache-2.0, at your option.
 
 ## v0.1.1 — 2026-04-20
 

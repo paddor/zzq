@@ -39,10 +39,20 @@ let message = client.recv().await;
 and `udp://` for MQTT-SN. TLS and QUIC are behind the default `tls` and
 `quic` features.
 
+## Benchmarks
+
+See [BENCHMARKS.md](BENCHMARKS.md).
+
 ## Requirements
 
 Rust 1.93 or newer.
 
 ## License
 
-ISC
+Licensed under either of [ISC](LICENSE-ISC) or
+[Apache-2.0](LICENSE-APACHE), at your option.
+
+Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in the work by you, as defined in the Apache-2.0
+license, shall be dual licensed as above, without any additional terms or
+conditions.

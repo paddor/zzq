@@ -37,3 +37,7 @@ Notable changes to zzq. The format follows
   waits in `recv`, which then returns `None`.
 - Ruby binding: the `zzq` gem in `bindings/ruby`, with the client and the
   broker.
+
+### Changed
+
+- Dual-licensed under ISC or Apache-2.0, at your option.

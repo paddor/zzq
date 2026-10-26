@@ -153,7 +153,7 @@ fn the_chart_tool_draws_every_chart_from_the_cache() {
             [
                 "fixed load",
                 "XMQ v1.0.0",
-                "failed at 20K/s: 70% delivered",
+                "XMQ, 20K/s: 70% delivered",
                 "point to point",
             ],
         ),

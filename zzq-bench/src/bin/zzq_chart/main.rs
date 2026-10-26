@@ -34,6 +34,9 @@ const CYAN: RGBColor = RGBColor(34, 211, 238);
 const GREEN: RGBColor = RGBColor(16, 185, 129);
 const LIME: RGBColor = RGBColor(190, 242, 100);
 const PINK: RGBColor = RGBColor(244, 114, 182);
+const WHITE: RGBColor = RGBColor(243, 244, 246);
+const BROWN: RGBColor = RGBColor(180, 83, 9);
+const INDIGO: RGBColor = RGBColor(99, 102, 241);
 
 const fn rival(
     key: &'static str,
@@ -75,6 +78,9 @@ const BROKERS: &[Impl] = &[
     rival("rumqttd", "rumqttd", "CPUs 0-3", GREEN),
     rival("xmq", "XMQ", "CPUs 0-3", LIME),
     rival("flashmq", "FlashMQ", "CPUs 0-3, 4 threads", PINK),
+    rival("vernemq", "VerneMQ", "CPUs 0-3", WHITE),
+    rival("fluxmq", "FluxMQ", "CPUs 0-3", BROWN),
+    rival("saguin", "Sag\u{fc}in", "CPUs 0-3", INDIGO),
 ];
 
 /// Broker throughput rows: scenario, publishers, subscribers, title.
@@ -173,8 +179,10 @@ fn brokers() -> Result {
              on CPUs 4-5. 1 s warmup (rumqttd 5 s, while its message log grows), then 5 s.",
             "Throughput is delivered messages. QoS 1/2 publishers keep 100 in flight; QoS 0 \
              has no flow control, so it can trail QoS 1 at large sizes.",
-            "Fan-in: rivals drop what the subscriber's queue cannot hold, and at QoS 0 EMQX \
-             closes the subscriber (mailbox overflow).",
+            "Fan-in: most rivals drop what the subscriber's queue cannot hold, and at QoS 0 \
+             EMQX closes the subscriber (mailbox overflow).",
+            "VerneMQ acks QoS 1/2 publishes far faster than it delivers them: delivery nearly \
+             stops until the publishers do.",
             "zzq on 2 IO lanes: the single pair and the round trip cross lanes. rumqttd speaks \
              MQTT 3.1.1, the rest 5.0. Round trips at QoS 0 and 1 only.",
         ],
@@ -367,6 +375,11 @@ const FIXED_NOTES: &[&str] = &[
      Fan-out latency includes the generator reading each burst of 1000 deliveries.",
     "Tuned configs, except NanoMQ keeps its default queue (2048): the tuned 100000 preallocates \
      about 800 KB per connection, and NanoMQ runs out of memory near 18K connections.",
+    "FluxMQ's send queue holds 1000, as it allocates it in full per connection. \
+     VerneMQ gets 128 KiB socket buffers: by default it copies the kernel's, 2.5 MiB on \
+     loopback, and runs out of memory near 6000 connections.",
+    "FluxMQ resets connections that send about once a second: its 1 s read deadline can expire \
+     mid-packet, and the next read starts inside the packet.",
 ];
 
 /// One scenario's steps per impl and offered rate.
