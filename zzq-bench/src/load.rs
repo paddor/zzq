@@ -391,6 +391,7 @@ fn publish_qos0(
             qos: 0,
             pkid: 0,
             v5,
+            retain: false,
         };
         wire::publish(&mut ring, head, payload);
     }
@@ -428,6 +429,7 @@ fn publish_acked(
                     qos: load.qos,
                     pkid,
                     v5: load.v5,
+                    retain: false,
                 };
                 wire::publish(&mut out, head, payload);
                 outstanding += 1;
@@ -512,6 +514,7 @@ pub fn latency(load: &Load, iters: usize) -> io::Result<Latency> {
             qos: load.qos,
             pkid: packet_id,
             v5: load.v5,
+            retain: false,
         };
         wire::publish(&mut out, head, &payload);
         let t0 = Instant::now();

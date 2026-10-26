@@ -5,7 +5,7 @@ use std::net::TcpStream;
 
 use zzq_proto::encode::{self, ConnectFields, PublishHeader};
 use zzq_proto::packet::fixed_header;
-use zzq_proto::property::{self, Properties};
+use zzq_proto::property::{self, Properties, Property};
 use zzq_proto::{QoS, SubscriptionOptions, Version};
 
 /// First byte of PUBACK.
@@ -105,6 +105,8 @@ pub struct Head<'a> {
     pub pkid: u16,
     /// Encode for v5.
     pub v5: bool,
+    /// Retain flag.
+    pub retain: bool,
 }
 
 /// Encodes a PUBLISH.
@@ -113,7 +115,7 @@ pub fn publish(out: &mut Vec<u8>, head: Head<'_>, payload: &[u8]) {
         version: version(head.v5),
         dup: false,
         qos: QoS::try_from(head.qos).unwrap_or_default(),
-        retain: false,
+        retain: head.retain,
         topic: head.topic,
         pkid: head.pkid,
         properties: &[],
@@ -146,14 +148,38 @@ pub fn connect(
     client_id: &str,
     v5: bool,
 ) -> io::Result<(TcpStream, Reader, Option<u16>)> {
+    open(addr, client_id, v5, false)
+}
+
+/// Connects with a session that outlives the connection, and waits for
+/// CONNACK. Returns the v5 Receive Maximum.
+///
+/// # Errors
+///
+/// If a connection fails, the broker closes one, or a reply is malformed.
+pub fn connect_persistent(
+    addr: &str,
+    client_id: &str,
+    v5: bool,
+) -> io::Result<(TcpStream, Reader, Option<u16>)> {
+    open(addr, client_id, v5, true)
+}
+
+fn open(
+    addr: &str,
+    client_id: &str,
+    v5: bool,
+    persistent: bool,
+) -> io::Result<(TcpStream, Reader, Option<u16>)> {
     let mut s = TcpStream::connect(addr)?;
     s.set_nodelay(true)?;
     let mut out = Vec::new();
+    let forever = [Property::U32(property::SESSION_EXPIRY_INTERVAL, u32::MAX)];
     let c = ConnectFields {
         version: version(v5),
-        clean_start: true,
+        clean_start: !persistent,
         keep_alive: 0,
-        properties: &[],
+        properties: if persistent && v5 { &forever } else { &[] },
         client_id,
         will: None,
         username: None,
@@ -213,4 +239,16 @@ pub fn subscribe(
             return Ok(());
         }
     }
+}
+
+/// Sends DISCONNECT and waits for the broker to close the connection, so
+/// the session is offline when this returns.
+///
+/// # Errors
+///
+/// If the connection fails.
+pub fn disconnect(mut s: TcpStream, rd: &mut Reader) -> io::Result<()> {
+    s.write_all(&[0xe0, 0])?;
+    while rd.fill(&mut s)? > 0 {}
+    Ok(())
 }
