@@ -23,6 +23,8 @@ Notable changes to zzq. The format follows
   "bad authentication method", and a v5 CONNECT that does not decode gets
   a CONNACK with the reason. A first packet other than CONNECT is refused
   from its first byte, without waiting for its body.
+- `zzq-broker`: an ack of the wrong type for a delivery is a protocol
+  error. A PUBACK for a QoS 2 delivery dropped the delivery uncounted.
 
 ## [0.1.1] - 2026-10-26
 

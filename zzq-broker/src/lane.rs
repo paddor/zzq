@@ -593,22 +593,13 @@ impl Lane {
     ) -> Result<(), Close> {
         match packet {
             Packet::Publish(p) => self.on_publish(key, &p, raw, chunk),
-            Packet::PubAck(a) => {
-                self.on_ack(key, |s| s.on_puback(a.pkid));
-                Ok(())
-            }
-            Packet::PubRec(a) => {
-                self.on_ack(key, |s| s.on_pubrec(a.pkid, a.reason));
-                Ok(())
-            }
+            Packet::PubAck(a) => self.on_ack(key, |s| s.on_puback(a.pkid)),
+            Packet::PubRec(a) => self.on_ack(key, |s| s.on_pubrec(a.pkid, a.reason)),
             Packet::PubRel(a) => {
                 self.on_pubrel(key, &a);
                 Ok(())
             }
-            Packet::PubComp(a) => {
-                self.on_ack(key, |s| s.on_pubcomp(a.pkid));
-                Ok(())
-            }
+            Packet::PubComp(a) => self.on_ack(key, |s| s.on_pubcomp(a.pkid)),
             Packet::Subscribe(s) => {
                 self.on_subscribe(key, &s);
                 Ok(())
@@ -640,13 +631,23 @@ impl Lane {
         }
     }
 
-    fn on_ack(&mut self, key: Key, f: impl FnOnce(&mut Session) -> bool) {
-        if let Some(s) = self.sessions.get_mut(key)
-            && f(s)
-        {
-            self.mark(key);
+    /// Applies an ack. `f` says whether the session has output, or the
+    /// reason the ack breaks the protocol.
+    fn on_ack(
+        &mut self,
+        key: Key,
+        f: impl FnOnce(&mut Session) -> Result<bool, u8>,
+    ) -> Result<(), Close> {
+        let mut result = Ok(());
+        if let Some(s) = self.sessions.get_mut(key) {
+            match f(s) {
+                Ok(true) => self.mark(key),
+                Ok(false) => {}
+                Err(code) => result = Err(Close::Protocol(code)),
+            }
         }
         self.release_waiters(key);
+        result
     }
 
     fn on_pubrel(&mut self, key: Key, a: &Ack<'_>) {

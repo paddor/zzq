@@ -340,39 +340,62 @@ impl Session {
         Some(f)
     }
 
-    /// PUBACK from the client.
-    pub(crate) fn on_puback(&mut self, pkid: u16) -> bool {
-        if self
-            .take_inflight(pkid, false)
-            .is_some_and(|f| f.item.qos == QoS::AtLeastOnce)
-        {
-            return self.pump();
-        }
-        false
+    /// QoS of the delivery in flight under `pkid`, and whether PUBREC
+    /// released it.
+    fn inflight_state(&self, pkid: u16) -> Option<(QoS, bool)> {
+        self.inflight
+            .iter()
+            .find(|f| f.pkid == pkid)
+            .map(|f| (f.item.qos, f.released))
     }
 
-    /// PUBREC from the client. Answers with PUBREL.
-    pub(crate) fn on_pubrec(&mut self, pkid: u16, reason: u8) -> bool {
+    /// PUBACK from the client. `Err` with a reason code if it acks a QoS 2
+    /// delivery.
+    pub(crate) fn on_puback(&mut self, pkid: u16) -> Result<bool, u8> {
+        match self.inflight_state(pkid) {
+            None => Ok(false),
+            Some((QoS::AtLeastOnce, _)) => {
+                self.take_inflight(pkid, false);
+                Ok(self.pump())
+            }
+            Some(_) => Err(zzq_proto::reason::PROTOCOL_ERROR),
+        }
+    }
+
+    /// PUBREC from the client. Answers with PUBREL. `Err` with a reason
+    /// code if it acks a QoS 1 delivery.
+    pub(crate) fn on_pubrec(&mut self, pkid: u16, reason: u8) -> Result<bool, u8> {
         let Some(f) = self.inflight.iter_mut().find(|f| f.pkid == pkid) else {
             self.ack(
                 PacketType::PubRel,
                 pkid,
                 zzq_proto::reason::PACKET_IDENTIFIER_NOT_FOUND,
             );
-            return true;
+            return Ok(true);
         };
+        if f.item.qos != QoS::ExactlyOnce {
+            return Err(zzq_proto::reason::PROTOCOL_ERROR);
+        }
         if reason >= 0x80 {
             self.take_inflight(pkid, false);
-            return self.pump();
+            return Ok(self.pump());
         }
         f.released = true;
         self.ack(PacketType::PubRel, pkid, 0);
-        true
+        Ok(true)
     }
 
-    /// PUBCOMP from the client.
-    pub(crate) fn on_pubcomp(&mut self, pkid: u16) -> bool {
-        self.take_inflight(pkid, true).is_some() && self.pump()
+    /// PUBCOMP from the client. `Err` with a reason code if it comes before
+    /// PUBREC, or for a QoS 1 delivery.
+    pub(crate) fn on_pubcomp(&mut self, pkid: u16) -> Result<bool, u8> {
+        match self.inflight_state(pkid) {
+            None => Ok(false),
+            Some((_, true)) => {
+                self.take_inflight(pkid, true);
+                Ok(self.pump())
+            }
+            Some(_) => Err(zzq_proto::reason::PROTOCOL_ERROR),
+        }
     }
 
     /// Resends the inflight window after a reconnect.
@@ -504,11 +527,11 @@ mod tests {
             v.dedup();
             assert_eq!(v.len(), s.inflight.len(), "after {n}");
             // Ack the older of the two new ones, out of order.
-            s.on_puback(s.inflight[1].pkid);
-            s.on_puback(s.inflight[1].pkid);
+            assert_eq!(s.on_puback(s.inflight[1].pkid), Ok(false));
+            assert_eq!(s.on_puback(s.inflight[1].pkid), Ok(false));
         }
         assert!(s.in_use.is_some());
-        s.on_puback(stuck);
+        assert_eq!(s.on_puback(stuck), Ok(false));
         s.trim_buffers();
         assert!(s.in_use.is_none());
         s.send_inflight(item());
