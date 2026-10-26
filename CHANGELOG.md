@@ -97,6 +97,10 @@ Notable changes to zzq. The format follows
   had no limit, so a v3.1.1 client flooding QoS 1 grew them without bound. A
   publisher now gets at most `receive_maximum` held acks: a v5 one past it
   breaks the protocol and is disconnected, a v3.1.1 one gets the rest at once.
+- `zzq-broker`: a shared subscription member on another lane that held a
+  message long, offline or behind many unacked ones, kept the publisher's
+  whole read buffer for it. It now gets a copy, like members on the
+  publisher's lane.
 
 ## [0.1.1] - 2026-10-26
 

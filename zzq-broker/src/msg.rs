@@ -185,8 +185,8 @@ pub(crate) struct Publication<'a> {
     pub(crate) packet: Option<(&'a [u8], Version)>,
     /// Buffer the borrowed fields point into, to make owned slices.
     pub(crate) chunk: Option<&'a Bytes>,
-    /// Slices of `chunk` pin a read buffer, so a message held long gets a
-    /// copy instead.
+    /// The message slices a read buffer: `chunk`, or without it the
+    /// publisher's on another lane. A message held long gets a copy instead.
     pub(crate) pins: bool,
     /// Deadline of a stored message. `None` for a live publish, whose
     /// Message Expiry Interval in `props` starts now.

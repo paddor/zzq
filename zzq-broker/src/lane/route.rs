@@ -27,8 +27,9 @@ pub(crate) enum Remote {
         more: Vec<(u32, u32)>,
         origin: Origin,
     },
-    /// A delivery to one session, chosen for a shared subscription.
-    Deliver { key: Key, item: Queued },
+    /// A delivery to one session, chosen for a shared subscription. With
+    /// `pins`, the message slices the publisher's read buffer.
+    Deliver { key: Key, item: Queued, pins: bool },
     /// The last batch the sending lane ships before a state dump.
     Drained(Ticket),
 }
@@ -195,8 +196,10 @@ impl Lane {
                 }
             } else {
                 let msg = owned.msg.get_or_insert_with(|| p.to_msg()).clone();
+                let pins = p.pins && p.chunk.is_some_and(|c| msg.pins(c));
                 self.out.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
                     key: e.sub.key,
+                    pins,
                     item: Queued {
                         msg,
                         qos: p.qos.min(e.opts.qos),
@@ -350,8 +353,11 @@ impl Lane {
             }
             // After what came before it in the batch.
             Remote::Drained(ticket) => drop(ticket),
-            Remote::Deliver { key, item } => {
-                let p = Publication::of(&item.msg);
+            Remote::Deliver { key, item, pins } => {
+                let p = Publication {
+                    pins,
+                    ..Publication::of(&item.msg)
+                };
                 let mut owned = Owned::of(item.msg.clone());
                 let g = Grant {
                     qos: item.qos,
@@ -415,7 +421,7 @@ fn keep(
     let msg = owned.msg.get_or_insert_with(|| p.to_msg());
     // A slow or offline session may hold a message long; do not let it pin
     // read buffers.
-    if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
+    if s.holds_long() && p.pins && p.chunk.is_none_or(|c| msg.pins(c)) {
         *msg = s.copy(msg);
     }
     let share = if g.last && owned.share.is_none() {

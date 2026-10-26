@@ -306,6 +306,12 @@ impl Session {
         }
     }
 
+    /// Room in the block messages are copied into, which a copy allocates.
+    #[cfg(test)]
+    pub(crate) fn arena_room(&self) -> usize {
+        self.flow.arena.room()
+    }
+
     /// Whether `conn_id` is the current connection.
     #[inline]
     pub(crate) fn has_conn(&self, conn_id: u64) -> bool {

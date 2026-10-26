@@ -337,3 +337,49 @@ async fn retained_messages_on_subscribe_queue_past_the_limit_only_by_their_batch
     let stats = stats_until(&broker, |s| s.dropped.queue_full >= 139).await;
     assert_eq!(stats.dropped.queue_full, 139);
 }
+
+/// A client ID that `lane_for` puts on `lane` of `lanes`.
+fn id_on(prefix: &str, lane: usize, lanes: usize) -> String {
+    (0..u32::MAX)
+        .map(|i| format!("{prefix}{i}"))
+        .find(|id| crate::lane_for(id, lanes) == lane)
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_message_for_an_offline_member_on_another_lane_is_copied() {
+    use zzq_proto::encode::ConnectFields;
+    use zzq_proto::property::SESSION_EXPIRY_INTERVAL;
+    use zzq_proto::{Property, SubscriptionOptions, Version};
+
+    let (ctx, broker, uri) = setup(2, BrokerOptions::default()).await;
+    let member = id_on("member", 1, 2);
+    let props = [Property::U32(SESSION_EXPIRY_INTERVAL, 60)];
+    let c = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &props,
+        client_id: &member,
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (mut m, _) = support::Raw::connect_with(&uri, &c).await;
+    m.subscribe("$share/g/t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    m.reset();
+    stats_until(&broker, |s| s.connections == 0).await;
+    let mut publisher = support::Raw::connect(&uri, &id_on("pub", 0, 2), Version::V5, 0).await;
+    publisher.pub_("t", &[1; 100], QoS::AtLeastOnce, 1).await;
+    let _ = publisher.next().await;
+    // Queued for an offline session, it must not pin the read buffer of
+    // the publisher on lane 0.
+    let room = on_lane(&ctx, &broker, 1, move |l| {
+        let s = l.sessions.keys().find_map(|k| l.sessions.get(k)).unwrap();
+        assert_eq!(s.queued(), 1);
+        s.arena_room()
+    })
+    .await;
+    assert!(room > 0, "the message was not copied");
+}
