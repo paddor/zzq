@@ -401,7 +401,13 @@ impl Lane {
             // one; the inflight window is resent below.
             s.out.clear();
             if let Some(old) = old {
-                Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
+                // Before its CONNACK, a connection just closes: CONNACK comes
+                // before any other packet [MQTT-3.2.0-1].
+                if old.connacked.get() {
+                    Self::kick(&old, s.version, reason::SESSION_TAKEN_OVER);
+                } else {
+                    old.close(Vec::new());
+                }
                 self.stats.connections -= 1;
             }
             if let Some(will) = will {

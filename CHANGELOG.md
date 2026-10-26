@@ -27,6 +27,8 @@ Notable changes to zzq. The format follows
   error. A PUBACK for a QoS 2 delivery dropped the delivery uncounted.
 - `zzq-broker`: a resumed session resends no more messages than the
   client's new Receive Maximum allows.
+- `zzq-broker`: a connection taken over before its CONNACK closes without
+  a DISCONNECT, which may only follow CONNACK.
 
 ## [0.1.1] - 2026-10-26
 

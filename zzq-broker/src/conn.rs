@@ -93,6 +93,8 @@ pub(crate) struct ConnShared {
     pub(crate) last_rx: Cell<Instant>,
     /// Keep Alive in seconds.
     pub(crate) keep_alive: Cell<u16>,
+    /// The writer took the CONNACK, so the client knows it connected.
+    pub(crate) connacked: Cell<bool>,
 }
 
 impl ConnShared {
@@ -105,6 +107,7 @@ impl ConnShared {
             farewell: RefCell::new(Vec::new()),
             last_rx: Cell::new(Instant::now()),
             keep_alive: Cell::new(keep_alive),
+            connacked: Cell::new(false),
         }
     }
 
@@ -596,7 +599,10 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             let buf = {
                 let mut l = lane.borrow_mut();
                 match l.sessions.get_mut(key) {
-                    Some(s) if s.has_conn(conn.id) && !s.out.is_empty() => s.take_out(),
+                    Some(s) if s.has_conn(conn.id) && !s.out.is_empty() => {
+                        conn.connacked.set(true);
+                        s.take_out()
+                    }
                     _ => break,
                 }
             };
