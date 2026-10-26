@@ -17,7 +17,7 @@ use zzq_proto::property;
 use zzq_proto::{DecodeError, Packet, PacketType, Version, encode, reason};
 use zzq_tokio::transport::Driver;
 
-use crate::lane::{Close, LaneRef};
+use crate::lane::{Close, LaneRef, Phase};
 use crate::msg::Msg;
 use crate::options::{AuthDecision, Authenticator, ClientInfo, ConnectInfo};
 use crate::session::Will;
@@ -419,7 +419,7 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
             c.server_keep_alive = true;
             conn.keep_alive.set(max);
         }
-        if l.closing {
+        if l.phase != Phase::Open {
             return Err(reason::SERVER_UNAVAILABLE);
         }
         // A new session that outlives its connection needs room in the state

@@ -81,3 +81,52 @@ async fn reconnects_leave_no_will_timers_behind() {
     let pending = on_lane(&ctx, &broker, 0, |l| l.sessions.len()).await;
     assert_eq!(pending, 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_that_shut_down_refuses_connections() {
+    use zzq_proto::encode::ConnectFields;
+    use zzq_proto::{Version, reason};
+
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    // A connection that reached the lane before it shut down, such as one
+    // whose CONNECT comes through a WebSocket, still holds its state.
+    on_lane(&ctx, &broker, 0, Lane::shutdown).await;
+    let c = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &[],
+        client_id: "late",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (_raw, code) = support::Raw::connect_with(&uri, &c).await;
+    assert_eq!(code, reason::SERVER_UNAVAILABLE);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_do_not_expire_while_the_lane_closes_for_a_dump() {
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let clients = Context::new().unwrap();
+    let opts = ClientOptions {
+        clean_start: false,
+        session_expiry: 1,
+        ..ClientOptions::new("brief")
+    };
+    drop(Client::connect(&clients, &uri, opts).await.unwrap());
+    stats_until(&broker, |s| s.connections == 0).await;
+    on_lane(&ctx, &broker, 0, Lane::quiesce).await;
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let left = on_lane(&ctx, &broker, 0, |l| {
+        for _ in 0..crate::lane::SWEEP_PARTS {
+            l.sweep(std::time::Instant::now());
+        }
+        l.sessions.len()
+    })
+    .await;
+    assert_eq!(
+        left, 1,
+        "the dump would miss the session, or send its will twice"
+    );
+}

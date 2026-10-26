@@ -14,7 +14,7 @@ use zzq_tokio::transport::Listener;
 use zzq_tokio::{Context, Endpoint};
 
 use crate::conn::ConnDriver;
-use crate::lane::{Control, Lane, LaneRef, LaneStats, Remote};
+use crate::lane::{Control, Lane, LaneRef, LaneStats, Phase, Remote};
 use crate::mailbox::{self, Mailbox};
 use crate::msg::Msg;
 use crate::options::BrokerOptions;
@@ -467,7 +467,7 @@ fn install(
         while data_rx.recv_all(&mut batches).await {
             {
                 let mut lane = l.borrow_mut();
-                if lane.shut_down {
+                if lane.phase == Phase::ShutDown {
                     break;
                 }
                 for batch in batches.drain(..) {
@@ -487,7 +487,7 @@ fn install(
             tick.tick().await;
             {
                 let mut l = lane.borrow_mut();
-                if l.shut_down {
+                if l.phase == Phase::ShutDown {
                     break;
                 }
                 l.sweep(Instant::now());

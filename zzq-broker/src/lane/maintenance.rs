@@ -15,15 +15,17 @@ use crate::session::Session;
 use crate::slab::Key;
 use crate::state::SessionState;
 
-use super::{Close, Lane, Remote, SWEEP_PARTS, SyncAck};
+use super::{Close, Lane, Phase, Remote, SWEEP_PARTS, SyncAck};
 
 impl Lane {
     /// Keep alive timeouts and session expiry, for the next of
     /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
         self.check_state();
-        // A state dump keeps delayed wills with their due time.
-        if !self.closing {
+        // A state dump keeps sessions and delayed wills with their due
+        // times.
+        let open = self.phase == Phase::Open;
+        if open {
             self.fire_wills(now);
         }
         let part = self.sweeps % SWEEP_PARTS;
@@ -52,7 +54,7 @@ impl Lane {
                 {
                     Self::kick(c, s.version, reason::KEEP_ALIVE_TIMEOUT);
                 }
-            } else if s.expires_at.is_some_and(|t| t <= now) {
+            } else if open && s.expires_at.is_some_and(|t| t <= now) {
                 self.remove_session(key);
             }
         }
@@ -101,8 +103,8 @@ impl Lane {
 
     /// Closes every connection as lost, so wills and session expiry run
     /// as usual, and refuses new ones.
-    pub(super) fn quiesce(&mut self) {
-        self.closing = true;
+    pub(crate) fn quiesce(&mut self) {
+        self.phase = self.phase.max(Phase::Closing);
         let connected: Vec<(Key, Rc<ConnShared>)> = self
             .sessions
             .keys()
@@ -166,8 +168,8 @@ impl Lane {
         self.stats.subscriptions = self.index.len() as u64;
     }
 
-    pub(super) fn shutdown(&mut self) {
-        self.shut_down = true;
+    pub(crate) fn shutdown(&mut self) {
+        self.phase = Phase::ShutDown;
         let keys: Vec<Key> = self.sessions.keys().collect();
         for key in keys {
             if let Some(s) = self.sessions.get_mut(key)

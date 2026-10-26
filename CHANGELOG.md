@@ -77,6 +77,10 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a delayed will that a reconnect cancelled kept a timer task,
   holding the lane, until its delay ran out. The lane sweep now publishes
   due wills, without a task per will.
+- `zzq-broker`: while closing connections for a state file, sessions no
+  longer expire, so the file keeps them with their delayed wills instead of
+  sending a will that the next start sends again. A connection that reached a
+  lane after it shut down is refused with "server unavailable".
 
 ## [0.1.1] - 2026-10-26
 

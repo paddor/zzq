@@ -87,9 +87,18 @@ pub(crate) struct Lane {
     ids: Ids,
     /// Sessions with a delayed will, by its due time and timer ID.
     wills: BTreeMap<(Instant, u64), Key>,
-    pub(crate) shut_down: bool,
-    /// Closing for a state dump: no new connections, no wills on timers.
-    pub(crate) closing: bool,
+    pub(crate) phase: Phase,
+}
+
+/// Whether a lane serves connections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Phase {
+    Open,
+    /// Closing for a state dump: no new connections, and sessions and
+    /// delayed wills wait with their due times.
+    Closing,
+    /// Every connection closed and the lane's loops stopped.
+    ShutDown,
 }
 
 /// What waits to go to other lanes.
@@ -163,8 +172,7 @@ impl Lane {
             sweeps: 0,
             ids: Ids::default(),
             wills: BTreeMap::new(),
-            shut_down: false,
-            closing: false,
+            phase: Phase::Open,
         }
     }
 
