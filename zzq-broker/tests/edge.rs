@@ -373,6 +373,56 @@ async fn full_state_budget_stops_growth_not_traffic() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_fanned_out_message_counts_once() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let durable = |i: usize| ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        ..ClientOptions::new(format!("s{i}"))
+    };
+    let n = 20;
+    for i in 0..n {
+        let c = Client::connect(&ctx, &uri, durable(i)).await.unwrap();
+        c.subscribe("all", QoS::AtLeastOnce).await.unwrap();
+        c.disconnect().await;
+    }
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("p"))
+        .await
+        .unwrap();
+    let before = broker.stats().await.unwrap().state_bytes;
+    let size = 4096;
+    p.publish("all", "x".repeat(size), QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let grown = broker.stats().await.unwrap().state_bytes - before;
+    // The bytes once, and a queue slot for each session.
+    assert!(
+        grown > size as u64 && grown < (n * size / 4) as u64,
+        "{grown}"
+    );
+    p.disconnect().await;
+    for i in 0..n {
+        let ended = ClientOptions {
+            clean_start: true,
+            session_expiry: 0,
+            ..durable(i)
+        };
+        Client::connect(&ctx, &uri, ended)
+            .await
+            .unwrap()
+            .disconnect()
+            .await;
+    }
+    // The last session to go takes the bytes back.
+    stats_until(&broker, |s| s.sessions == 0).await;
+    assert_eq!(broker.stats().await.unwrap().state_bytes, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn state_bytes_return_to_zero() {
     let opts = BrokerOptions {
         sys_interval: None,

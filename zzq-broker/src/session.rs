@@ -51,10 +51,25 @@ pub(crate) struct Queued {
     pub(crate) sub_id: SubIds,
 }
 
+/// A QoS 1/2 message a session keeps. With `share`, other sessions of the
+/// lane hold the same message, and the share counts its bytes once for all.
+#[derive(Debug)]
+pub(crate) struct Kept {
+    pub(crate) item: Queued,
+    pub(crate) share: Option<Rc<Charge>>,
+}
+
+impl Kept {
+    /// A message no other session shares.
+    pub(crate) const fn own(item: Queued) -> Kept {
+        Kept { item, share: None }
+    }
+}
+
 #[derive(Debug)]
 struct Inflight {
     pkid: u16,
-    item: Queued,
+    held: Kept,
     /// PUBREC received, PUBREL sent, waiting for PUBCOMP.
     released: bool,
 }
@@ -135,7 +150,7 @@ pub(crate) struct Session {
     /// Entries at the back of `inflight` not resent on this connection yet:
     /// a resumed client may allow fewer in flight than before.
     unsent: usize,
-    queue: VecDeque<Queued>,
+    queue: VecDeque<Kept>,
     /// Bytes of the messages in `queue`, for `max_queued_bytes`.
     queued_bytes: usize,
     next_pkid: u16,
@@ -317,15 +332,15 @@ impl Session {
 
     /// Delivers a QoS 1 or 2 message: sends it if the window allows, queues
     /// it otherwise. The oldest queued messages make room for it.
-    pub(crate) fn deliver_qos12(&mut self, item: Queued, limit: QueueLimit) -> Outcome {
+    pub(crate) fn deliver_qos12(&mut self, h: Kept, limit: QueueLimit) -> Outcome {
         if !self.would_queue() {
-            self.charge.add(budget::item(&item));
-            return self.send_inflight(item);
+            self.charge.add(budget::held(&h));
+            return self.send_inflight(h);
         }
         if limit.state_full {
             return Outcome::StateFull;
         }
-        let size = item.msg.size();
+        let size = h.item.msg.size();
         if size > limit.bytes {
             return Outcome::QueueFull(1);
         }
@@ -334,12 +349,12 @@ impl Session {
             let Some(old) = self.pop_queued() else {
                 break;
             };
-            self.charge.sub(budget::item(&old));
+            self.charge.sub(budget::held(&old));
             dropped += 1;
         }
-        self.charge.add(budget::item(&item));
+        self.charge.add(budget::held(&h));
         self.queued_bytes += size;
-        self.queue.push_back(item);
+        self.queue.push_back(h);
         if dropped == 0 {
             Outcome::Queued
         } else {
@@ -347,10 +362,10 @@ impl Session {
         }
     }
 
-    fn pop_queued(&mut self) -> Option<Queued> {
-        let item = self.queue.pop_front()?;
-        self.queued_bytes -= item.msg.size();
-        Some(item)
+    fn pop_queued(&mut self) -> Option<Kept> {
+        let h = self.queue.pop_front()?;
+        self.queued_bytes -= h.item.msg.size();
+        Some(h)
     }
 
     /// Whether a QoS 1/2 delivery now would wait in the queue.
@@ -370,17 +385,17 @@ impl Session {
 
     /// Sends a message the session is charged for, and keeps it until the
     /// client acks it.
-    fn send_inflight(&mut self, item: Queued) -> Outcome {
+    fn send_inflight(&mut self, h: Kept) -> Outcome {
         let pkid = self.alloc_pkid();
-        let ok = self.encode(&Fields::of(&item, pkid, false));
+        let ok = self.encode(&Fields::of(&h.item, pkid, false));
         if !ok {
             self.free_pkid(pkid);
-            self.charge.sub(budget::item(&item));
+            self.charge.sub(budget::held(&h));
             return Outcome::TooLarge;
         }
         self.inflight.push_back(Inflight {
             pkid,
-            item,
+            held: h,
             released: false,
         });
         Outcome::Sent
@@ -431,17 +446,16 @@ impl Session {
         }
         let mut now = None;
         while self.conn.is_some() && self.inflight.len() < usize::from(self.window) {
-            let Some(item) = self.pop_queued() else {
+            let Some(h) = self.pop_queued() else {
                 break;
             };
-            if item.msg.expires_at.is_some()
-                && expired(item.msg.expires_at, *now.get_or_insert_with(Instant::now))
-            {
+            let expires_at = h.item.msg.expires_at;
+            if expires_at.is_some() && expired(expires_at, *now.get_or_insert_with(Instant::now)) {
                 self.expired += 1;
-                self.charge.sub(budget::item(&item));
+                self.charge.sub(budget::held(&h));
                 continue;
             }
-            wrote |= self.send_inflight(item) == Outcome::Sent;
+            wrote |= self.send_inflight(h) == Outcome::Sent;
         }
         wrote
     }
@@ -456,7 +470,7 @@ impl Session {
         }
         let f = self.inflight.remove(i)?;
         self.free_pkid(pkid);
-        self.charge.sub(budget::item(&f.item));
+        self.charge.sub(budget::held(&f.held));
         Some(f)
     }
 
@@ -466,7 +480,7 @@ impl Session {
         self.inflight
             .iter()
             .find(|f| f.pkid == pkid)
-            .map(|f| (f.item.qos, f.released))
+            .map(|f| (f.held.item.qos, f.released))
     }
 
     /// PUBACK from the client. `Err` with a reason code if it acks a QoS 2
@@ -493,7 +507,7 @@ impl Session {
             );
             return Ok(true);
         };
-        if f.item.qos != QoS::ExactlyOnce {
+        if f.held.item.qos != QoS::ExactlyOnce {
             return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
         if reason >= 0x80 {
@@ -535,7 +549,7 @@ impl Session {
             if f.released {
                 self.ack(PacketType::PubRel, f.pkid, 0);
             } else {
-                self.encode(&Fields::of(&f.item, f.pkid, true));
+                self.encode(&Fields::of(&f.held.item, f.pkid, true));
             }
             self.unsent -= 1;
             wrote = true;
@@ -603,12 +617,14 @@ impl Session {
     /// Messages sent and not acked: packet ID, message, and whether PUBREC
     /// released it.
     pub(crate) fn inflight(&self) -> impl ExactSizeIterator<Item = (u16, &Queued, bool)> {
-        self.inflight.iter().map(|f| (f.pkid, &f.item, f.released))
+        self.inflight
+            .iter()
+            .map(|f| (f.pkid, &f.held.item, f.released))
     }
 
     /// Messages waiting for the inflight window, oldest first.
     pub(crate) fn queue(&self) -> impl ExactSizeIterator<Item = &Queued> {
-        self.queue.iter()
+        self.queue.iter().map(|h| &h.item)
     }
 
     /// The last packet ID sent.
@@ -634,10 +650,11 @@ impl Session {
         }
         s.awaiting_rel.extend(st.awaiting_rel);
         for (pkid, item, released) in st.inflight {
-            s.charge.add(budget::item(&item));
+            let held = Kept::own(item);
+            s.charge.add(budget::held(&held));
             s.inflight.push_back(Inflight {
                 pkid,
-                item,
+                held,
                 released,
             });
         }
@@ -651,9 +668,10 @@ impl Session {
             s.in_use = Some(bits);
         }
         for item in st.queue {
-            s.charge.add(budget::item(&item));
-            s.queued_bytes += item.msg.size();
-            s.queue.push_back(item);
+            let h = Kept::own(item);
+            s.charge.add(budget::held(&h));
+            s.queued_bytes += h.item.msg.size();
+            s.queue.push_back(h);
         }
         (s, st.delayed_will)
     }
@@ -700,6 +718,10 @@ mod tests {
         }
     }
 
+    fn held() -> Kept {
+        Kept::own(item())
+    }
+
     const fn limit(count: usize, bytes: usize) -> QueueLimit {
         QueueLimit {
             count,
@@ -724,22 +746,50 @@ mod tests {
         let size = item().msg.size();
         let room = limit(usize::MAX, 3 * size);
         for _ in 0..3 {
-            assert_eq!(s.deliver_qos12(item(), room), Outcome::Queued);
+            assert_eq!(s.deliver_qos12(held(), room), Outcome::Queued);
         }
-        assert_eq!(s.deliver_qos12(item(), room), Outcome::QueueFull(1));
+        assert_eq!(s.deliver_qos12(held(), room), Outcome::QueueFull(1));
         assert_eq!(s.queued(), 3);
         // Larger than the limit alone, or no room left in the budget.
         let small = limit(usize::MAX, size - 1);
-        assert_eq!(s.deliver_qos12(item(), small), Outcome::QueueFull(1));
+        assert_eq!(s.deliver_qos12(held(), small), Outcome::QueueFull(1));
         let full = QueueLimit {
             state_full: true,
             ..room
         };
-        assert_eq!(s.deliver_qos12(item(), full), Outcome::StateFull);
-        assert_eq!(total.get(), subscribed + 3 * budget::item(&item()));
+        assert_eq!(s.deliver_qos12(held(), full), Outcome::StateFull);
+        assert_eq!(total.get(), subscribed + 3 * budget::held(&held()));
         assert_eq!(s.charge.get(), total.get());
         assert!(s.unsubscribe("a/#", 2));
         drop(s);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// Sessions that share a message count its bytes once, until the last
+    /// of them lets go.
+    #[test]
+    fn a_shared_message_counts_once() {
+        let total = LaneTotal::default();
+        let mut sessions = ["a", "b"].map(|id| Session::new(id.into(), Version::V5, total.clone()));
+        // Both sessions alike.
+        let base = total.get();
+        let bytes = budget::shared(&item().msg);
+        let share = Rc::new(Charge::new(total.clone(), bytes));
+        let shared = || Kept {
+            item: item(),
+            share: Some(share.clone()),
+        };
+        let slot = budget::held(&shared());
+        assert!(slot < budget::held(&held()));
+        for s in &mut sessions {
+            assert_eq!(s.deliver_qos12(shared(), limit(10, 10)), Outcome::Queued);
+        }
+        drop(share);
+        assert_eq!(total.get(), base + bytes + 2 * slot);
+        let [a, b] = sessions;
+        drop(a);
+        assert_eq!(total.get(), base / 2 + bytes + slot);
+        drop(b);
         assert_eq!(total.get(), 0);
     }
 
@@ -775,9 +825,9 @@ mod tests {
 
     /// Sends a message the session is charged for.
     fn send(s: &mut Session) -> Outcome {
-        let i = item();
-        s.charge.add(budget::item(&i));
-        s.send_inflight(i)
+        let h = held();
+        s.charge.add(budget::held(&h));
+        s.send_inflight(h)
     }
 
     fn ids(s: &Session) -> Vec<u16> {

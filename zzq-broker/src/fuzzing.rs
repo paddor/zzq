@@ -76,7 +76,7 @@ fn state_image_seed() -> Vec<u8> {
 
     use crate::index::SubIds;
     use crate::msg::Msg;
-    use crate::session::{QueueLimit, Queued, Session};
+    use crate::session::{Kept, QueueLimit, Queued, Session};
     use crate::state::{Clock, ImageWriter};
 
     let mut s = Session::new("dev".into(), Version::V5, LaneTotal::default());
@@ -102,7 +102,7 @@ fn state_image_seed() -> Vec<u8> {
             retain: false,
             sub_id: SubIds::one(3),
         };
-        s.deliver_qos12(item, limit);
+        s.deliver_qos12(Kept::own(item), limit);
     }
     let retained = Msg::new("r", b"v", &[], QoS::AtLeastOnce, true);
     let Ok(mut w) = ImageWriter::new(Vec::new(), Clock::now()) else {

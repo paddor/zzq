@@ -20,13 +20,13 @@ use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version, reason};
 
 use crate::broker::Shared;
-use crate::budget::LaneTotal;
+use crate::budget::{self, Charge, LaneTotal};
 use crate::conn::{ConnShared, OwnedConnect, ReadBlocks};
 use crate::dump::Part;
 use crate::index::{Entry, Matches, SubIds, SubIndex, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
-use crate::session::{DelayedWill, Outcome, QueueLimit, Queued, Session, Waiter};
+use crate::session::{DelayedWill, Kept, Outcome, QueueLimit, Queued, Session, Waiter};
 use crate::slab::{Key, Slab};
 use crate::state::SessionState;
 
@@ -158,6 +158,23 @@ pub(crate) struct Dump {
 enum Hit {
     Local(Key),
     Remote(SubRef),
+}
+
+/// The message of one publish once a session holds it, and the charge for
+/// its bytes once more than one session of the lane may hold it.
+#[derive(Debug, Default)]
+struct Owned {
+    msg: Option<Msg>,
+    share: Option<Rc<Charge>>,
+}
+
+impl Owned {
+    const fn of(msg: Msg) -> Owned {
+        Owned {
+            msg: Some(msg),
+            share: None,
+        }
+    }
 }
 
 /// QoS, retain flag and Subscription Identifier of one delivery.
@@ -624,7 +641,7 @@ impl Lane {
                 .set(msg, self.state_full);
         }
         let p = Publication::of(msg);
-        let mut owned = Some(msg.clone());
+        let mut owned = Owned::of(msg.clone());
         self.route(None, &p, &mut owned);
     }
 
@@ -786,7 +803,7 @@ impl Lane {
             pins: true,
             expires_at: None,
         };
-        let mut owned = None;
+        let mut owned = Owned::default();
         if p.retain {
             let msg = publication.to_msg();
             self.shared
@@ -794,7 +811,7 @@ impl Lane {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .set(&msg, self.state_full);
-            owned = Some(msg);
+            owned.msg = Some(msg);
         }
         let m = self.publisher_matches(key, topic);
         self.hit = None;
@@ -888,12 +905,7 @@ impl Lane {
 
     /// Delivers a publication to every matching subscription.
     #[inline]
-    pub(crate) fn route(
-        &mut self,
-        from: Option<Key>,
-        p: &Publication<'_>,
-        owned: &mut Option<Msg>,
-    ) {
+    fn route(&mut self, from: Option<Key>, p: &Publication<'_>, owned: &mut Owned) {
         let (m, _) = self.index.lookup(p.topic);
         self.route_matches(from, &m, p, owned);
     }
@@ -905,7 +917,7 @@ impl Lane {
         from: Option<Key>,
         m: &Matches,
         p: &Publication<'_>,
-        owned: &mut Option<Msg>,
+        owned: &mut Owned,
     ) {
         self.stats.publishes += 1;
         let mut remote_lanes = 0u64;
@@ -935,7 +947,7 @@ impl Lane {
                     self.deliver(e.sub.key, p, owned, g);
                 }
             } else {
-                let msg = owned.get_or_insert_with(|| p.to_msg()).clone();
+                let msg = owned.msg.get_or_insert_with(|| p.to_msg()).clone();
                 self.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
                     key: e.sub.key,
                     item: Queued {
@@ -989,10 +1001,11 @@ impl Lane {
         };
         let from = from.filter(|f| f.lane == self.id).map(|f| f.key);
         let (m, _) = self.index.lookup(p.topic);
-        let mut owned = None;
-        for e in &m.direct {
+        let mut owned = Owned::default();
+        let n = m.direct.len();
+        for (i, e) in m.direct.iter().enumerate() {
             if e.sub.lane == self.id
-                && let Some(g) = Self::grant(from, e, &publication, false)
+                && let Some(g) = Self::grant(from, e, &publication, i + 1 == n)
             {
                 self.deliver(e.sub.key, &publication, &mut owned, g);
             }
@@ -1015,13 +1028,13 @@ impl Lane {
     }
 
     #[inline]
-    fn deliver(&mut self, key: Key, p: &Publication<'_>, owned: &mut Option<Msg>, g: Grant) {
+    fn deliver(&mut self, key: Key, p: &Publication<'_>, owned: &mut Owned, g: Grant) {
         let Grant {
             qos,
             retain,
             sub_id,
-            last,
             on_subscribe,
+            ..
         } = g;
         let o = &self.shared.opts;
         let max_out = o.max_out_bytes;
@@ -1048,22 +1061,8 @@ impl Lane {
                 s.deliver_qos0(p, retain, sub_id, max_out)
             }
         } else {
-            let msg = owned.get_or_insert_with(|| p.to_msg());
-            // A slow or offline session may hold a message long; do not let
-            // it pin read buffers.
-            if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
-                *msg = s.arena.copy(msg);
-            }
-            let msg = if last { owned.take() } else { owned.clone() }.unwrap_or_else(|| p.to_msg());
-            s.deliver_qos12(
-                Queued {
-                    msg,
-                    qos,
-                    retain,
-                    sub_id,
-                },
-                limit,
-            )
+            let kept = keep(s, p, owned, &self.state, g);
+            s.deliver_qos12(kept, limit)
         };
         if matches!(outcome, Outcome::Queued | Outcome::QueueFull(_))
             && s.conn.is_some()
@@ -1113,7 +1112,7 @@ impl Lane {
             Remote::Drained(sync) => sync.done(),
             Remote::Deliver { key, item } => {
                 let p = Publication::of(&item.msg);
-                let mut owned = Some(item.msg.clone());
+                let mut owned = Owned::of(item.msg.clone());
                 let g = Grant {
                     qos: item.qos,
                     retain: item.retain,
@@ -1207,7 +1206,7 @@ impl Lane {
             };
             let mut retained = msg.clone();
             retained.retain = true;
-            let mut owned = Some(retained);
+            let mut owned = Owned::of(retained);
             self.deliver(key, &p, &mut owned, g);
         }
     }
@@ -1582,6 +1581,44 @@ fn forward_packet(
     let out = arena.put(len, |b| encode::publish(&h, p.payload, &mut Block(b)));
     let at = (0, out.len() as u32);
     (out, at, Version::V5, false)
+}
+
+/// What session `s` keeps of `p` at QoS 1/2: the message, copied if it would
+/// pin a read buffer long, and a share of its bytes when more sessions of
+/// the lane may get it.
+fn keep(
+    s: &mut Session,
+    p: &Publication<'_>,
+    owned: &mut Owned,
+    total: &LaneTotal,
+    g: Grant,
+) -> Kept {
+    let msg = owned.msg.get_or_insert_with(|| p.to_msg());
+    // A slow or offline session may hold a message long; do not let it pin
+    // read buffers.
+    if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
+        *msg = s.arena.copy(msg);
+    }
+    let share = if g.last && owned.share.is_none() {
+        None
+    } else {
+        let share = owned
+            .share
+            .get_or_insert_with(|| Rc::new(Charge::new(total.clone(), budget::shared(msg))));
+        Some(share.clone())
+    };
+    let msg = if g.last {
+        owned.msg.take()
+    } else {
+        owned.msg.clone()
+    };
+    let item = Queued {
+        msg: msg.unwrap_or_else(|| p.to_msg()),
+        qos: g.qos,
+        retain: g.retain,
+        sub_id: g.sub_id,
+    };
+    Kept { item, share }
 }
 
 /// Appends a forwarded packet, sharing the last batch entry when it uses

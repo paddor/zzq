@@ -2,15 +2,17 @@
 //!
 //! Sessions charge their lane for what they hold; the retained store keeps
 //! its own count. Charges are estimates: struct sizes plus the bytes of
-//! strings and messages, scaled for hash table and allocator slack. Each
-//! lane adds up all counts on its sweep, so a check costs no atomics.
+//! strings and messages, scaled for hash table and allocator slack. A
+//! message that sessions of one lane share counts once. Each lane adds up
+//! all counts on its sweep, so a check costs no atomics.
 
 use std::cell::Cell;
 use std::mem::size_of;
 use std::rc::Rc;
 
 use crate::index::Entry;
-use crate::session::{Queued, Session};
+use crate::msg::Msg;
+use crate::session::{Kept, Session};
 
 /// Bytes charged to the sessions of one lane.
 pub(crate) type LaneTotal = Rc<Cell<usize>>;
@@ -24,8 +26,12 @@ const SUB: usize = 96;
 /// filter shared it.
 const LEVEL: usize = 384;
 /// A QoS 1/2 message a session holds, besides its bytes: its queue slot, with
-/// room to grow, and the slack of the block its copy went into.
-const ITEM: usize = 2 * size_of::<Queued>() + 32;
+/// room to grow.
+const SLOT: usize = 2 * size_of::<Kept>();
+/// The slack of the block a message copy went into.
+const COPY: usize = 32;
+/// The charge for a shared message, and its reference counts.
+const SHARE: usize = size_of::<Charge>() + 2 * size_of::<usize>();
 /// A level of the retained message tree: the node, its key and hash table
 /// slack.
 pub(crate) const NODE: usize = 320;
@@ -42,9 +48,19 @@ pub(crate) fn subscription(filter: &str, lanes: usize) -> usize {
     SUB + filter.len() + lanes * (size_of::<Entry>() + LEVEL * levels)
 }
 
-/// What a held QoS 1/2 message costs.
-pub(crate) const fn item(q: &Queued) -> usize {
-    ITEM + q.msg.size()
+/// What a held QoS 1/2 message costs the session: its bytes too, unless it
+/// has a share of them.
+pub(crate) const fn held(h: &Kept) -> usize {
+    if h.share.is_some() {
+        SLOT
+    } else {
+        SLOT + COPY + h.item.msg.size()
+    }
+}
+
+/// What the bytes of a message cost once, for all sessions that share it.
+pub(crate) const fn shared(msg: &Msg) -> usize {
+    SHARE + COPY + msg.size()
 }
 
 /// The bytes one session charges its lane. Dropping it takes them back.

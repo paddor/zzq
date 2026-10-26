@@ -16,12 +16,13 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: `BrokerOptions::max_queued_bytes` limits the bytes queued
   per session, dropping the oldest messages like `max_queued`.
 - `zzq-broker`: `BrokerOptions::max_state_bytes` bounds the memory of
-  sessions, subscriptions, held QoS 1/2 messages and retained messages.
-  While it is reached, new sessions that outlive their connection are
-  refused, messages that would queue are dropped and counted in
-  `Stats::dropped_state_full`, and retained messages for new topics are not
-  stored. `Stats::state_bytes` and `$SYS/broker/state/bytes` show the
-  estimate, and `zzq_broker --max-state-mib` sets the limit.
+  sessions, subscriptions, held QoS 1/2 messages and retained messages. A
+  message that sessions of one lane share counts once. While it is reached,
+  new sessions that outlive their connection are refused, messages that
+  would queue are dropped and counted in `Stats::dropped_state_full`, and
+  retained messages for new topics are not stored. `Stats::state_bytes` and
+  `$SYS/broker/state/bytes` show the estimate, and
+  `zzq_broker --max-state-mib` sets the limit.
 - `zzq-broker`: `BrokerOptions::state_file` keeps sessions over a restart.
   `Broker::shutdown` closes every connection as lost, so wills go out, and
   writes the sessions with their subscriptions, queues, unacked messages
