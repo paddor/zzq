@@ -5,6 +5,8 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-26
+
 ### Fixed
 
 - `zzq-broker`: `Stats::subscriptions` no longer counts the subscriptions
