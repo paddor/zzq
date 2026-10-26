@@ -1,6 +1,7 @@
 //! Per-client session state and outgoing QoS flows.
 
 use std::collections::VecDeque;
+use std::mem::size_of;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -165,12 +166,15 @@ pub(crate) struct Session {
     /// oldest. Only then is this built, until the window empties.
     in_use: Option<Box<[u64; 1024]>>,
     /// Copies of messages held long.
-    pub(crate) arena: Arena,
+    arena: Arena,
     /// A connection is attached. Shared subscription entries on every lane
     /// read it to prefer connected members.
     pub(crate) online: Arc<AtomicBool>,
     /// What the session counts against `max_state_bytes`.
     charge: Charge,
+    /// Bytes charged for the slots `queue` and `inflight` have room for, and
+    /// the room left in the arena block.
+    room: usize,
 }
 
 impl Session {
@@ -208,6 +212,7 @@ impl Session {
             arena: Arena::default(),
             online: Arc::default(),
             charge,
+            room: 0,
         }
     }
 
@@ -355,6 +360,7 @@ impl Session {
         self.charge.add(budget::held(&h));
         self.queued_bytes += size;
         self.queue.push_back(h);
+        self.charge_room();
         if dropped == 0 {
             Outcome::Queued
         } else {
@@ -398,7 +404,30 @@ impl Session {
             held: h,
             released: false,
         });
+        self.charge_room();
         Outcome::Sent
+    }
+
+    /// A copy of `msg` in the arena, so a message held long does not pin a
+    /// read buffer.
+    pub(crate) fn copy(&mut self, msg: &Msg) -> Msg {
+        let copy = self.arena.copy(msg);
+        self.charge_room();
+        copy
+    }
+
+    /// Charges the slots the queue and window have room for, which they
+    /// keep as they empty, and the room left in the arena block.
+    fn charge_room(&mut self) {
+        let room = self.queue.capacity() * size_of::<Kept>()
+            + self.inflight.capacity() * size_of::<Inflight>()
+            + self.arena.room();
+        if room > self.room {
+            self.charge.add(room - self.room);
+        } else {
+            self.charge.sub(self.room - room);
+        }
+        self.room = room;
     }
 
     fn alloc_pkid(&mut self) -> u16 {
@@ -673,6 +702,7 @@ impl Session {
             s.queued_bytes += h.item.msg.size();
             s.queue.push_back(h);
         }
+        s.charge_room();
         (s, st.delayed_will)
     }
 }
@@ -758,7 +788,8 @@ mod tests {
             ..room
         };
         assert_eq!(s.deliver_qos12(held(), full), Outcome::StateFull);
-        assert_eq!(total.get(), subscribed + 3 * budget::held(&held()));
+        assert!(s.room >= 3 * size_of::<Kept>());
+        assert_eq!(total.get(), subscribed + 3 * budget::held(&held()) + s.room);
         assert_eq!(s.charge.get(), total.get());
         assert!(s.unsubscribe("a/#", 2));
         drop(s);
@@ -779,17 +810,46 @@ mod tests {
             item: item(),
             share: Some(share.clone()),
         };
-        let slot = budget::held(&shared());
-        assert!(slot < budget::held(&held()));
+        assert_eq!(budget::held(&shared()), 0);
         for s in &mut sessions {
             assert_eq!(s.deliver_qos12(shared(), limit(10, 10)), Outcome::Queued);
         }
         drop(share);
-        assert_eq!(total.get(), base + bytes + 2 * slot);
+        // Each queue has room for a few slots.
+        let room = sessions[0].room;
+        assert!(room >= size_of::<Kept>());
+        assert_eq!(total.get(), base + bytes + 2 * room);
         let [a, b] = sessions;
         drop(a);
-        assert_eq!(total.get(), base / 2 + bytes + slot);
+        assert_eq!(total.get(), base / 2 + bytes + room);
         drop(b);
+        assert_eq!(total.get(), 0);
+    }
+
+    /// A session pays for the slots its queue grew to and the room left in
+    /// its arena block, which outlast the messages.
+    #[test]
+    fn slots_and_arena_room_stay_charged() {
+        let total = LaneTotal::default();
+        let mut s = Session::new("c".into(), Version::V5, total.clone());
+        let base = total.get();
+        let msg = s.copy(&item().msg);
+        let room = s.room;
+        assert!(room > 0 && room == s.arena.room());
+        let copied = Kept::own(Queued { msg, ..item() });
+        let bytes = budget::held(&copied);
+        assert_eq!(
+            s.deliver_qos12(copied, limit(10, usize::MAX)),
+            Outcome::Queued
+        );
+        assert_eq!(total.get(), base + bytes + s.room);
+        assert_eq!(s.room, room + s.queue.capacity() * size_of::<Kept>());
+        let h = s.pop_queued().unwrap();
+        s.charge.sub(budget::held(&h));
+        drop(h);
+        // The queue keeps its slots and the arena its block.
+        assert_eq!(total.get(), base + s.room);
+        drop(s);
         assert_eq!(total.get(), 0);
     }
 

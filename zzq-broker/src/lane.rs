@@ -1597,7 +1597,7 @@ fn keep(
     // A slow or offline session may hold a message long; do not let it pin
     // read buffers.
     if s.holds_long() && p.pins && p.chunk.is_some_and(|c| msg.pins(c)) {
-        *msg = s.arena.copy(msg);
+        *msg = s.copy(msg);
     }
     let share = if g.last && owned.share.is_none() {
         None

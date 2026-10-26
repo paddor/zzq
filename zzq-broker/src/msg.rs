@@ -134,6 +134,12 @@ impl Arena {
         self.block.split().freeze()
     }
 
+    /// Bytes left in the current block, which stays allocated while the
+    /// arena has room in it.
+    pub(crate) fn room(&self) -> usize {
+        self.block.capacity()
+    }
+
     /// A copy of `msg` in the current block.
     pub(crate) fn copy(&mut self, msg: &Msg) -> Msg {
         Msg {
