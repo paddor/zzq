@@ -350,6 +350,7 @@ impl Lane {
         for filter in s.subs.keys() {
             self.unsubscribe_entry(filter, sub, None);
         }
+        self.stats.subscriptions = self.index.len() as u64;
         if self.by_client.get(&s.client_id) == Some(&key) {
             self.by_client.remove(&s.client_id);
         }

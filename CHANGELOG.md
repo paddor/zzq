@@ -5,6 +5,11 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `zzq-broker`: `Stats::subscriptions` no longer counts the subscriptions
+  of sessions that ended.
+
 ## [0.1.0] - 2026-10-26
 
 ### Added
