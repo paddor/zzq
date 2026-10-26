@@ -12,7 +12,7 @@ Gem::Specification.new do |spec|
                      "MQTT-SN gateway, running on Rust IO threads. Works in threads and " \
                      "under fiber schedulers such as Async."
   spec.homepage    = "https://github.com/paddor/zzq/tree/main/bindings/ruby"
-  spec.license     = "ISC"
+  spec.licenses    = ["ISC", "Apache-2.0"]
   spec.metadata["source_code_uri"] = spec.homepage
   spec.metadata["changelog_uri"] = "#{spec.homepage}/CHANGELOG.md"
   spec.metadata["rubygems_mfa_required"] = "true"
@@ -24,7 +24,8 @@ Gem::Specification.new do |spec|
     "ext/**/*.{rs,rb}",
     "ext/**/Cargo.toml",
     "README.md",
-    "LICENSE",
+    "LICENSE-ISC",
+    "LICENSE-APACHE",
     "CHANGELOG.md",
   ]
   spec.require_paths = ["lib"]

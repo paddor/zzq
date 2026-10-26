@@ -3,7 +3,7 @@ name = "zzq_native"
 version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
-license = "ISC"
+license = "ISC OR Apache-2.0"
 authors = ["Patrik Wenger <paddor@gmail.com>"]
 publish = false
 
