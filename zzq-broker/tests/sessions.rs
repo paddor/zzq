@@ -391,7 +391,8 @@ async fn qos0_publisher_keeps_flowing_past_a_stopped_subscriber() {
     let reader = tokio::spawn(async move {
         loop {
             if next(&mut healthy).await.payload == "end" {
-                return;
+                // Still connected for the count below.
+                return healthy;
             }
         }
     });
@@ -407,7 +408,7 @@ async fn qos0_publisher_keeps_flowing_past_a_stopped_subscriber() {
     .expect("the broker stopped reading the publisher");
     tokio::time::sleep(Duration::from_millis(200)).await;
     publ.pub_("flood", b"end", QoS::AtMostOnce, 0).await;
-    tokio::time::timeout(WAIT, reader)
+    let _healthy = tokio::time::timeout(WAIT, reader)
         .await
         .expect("the healthy subscriber starved")
         .unwrap();
