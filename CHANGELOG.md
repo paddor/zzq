@@ -125,6 +125,10 @@ Notable changes to zzq. The format follows
   allocate the whole packet it announced, up to `max_packet_size` in the
   broker and 256 MiB in the client. A read buffer now grows to at most
   twice what arrived.
+- `zzq-broker`: with a disk slower than retained publishes,
+  `FilePersistence` queued every change in memory. A topic now waits for the
+  writer with its latest change only. Compaction writes `<log>.tmp`, so a
+  log `zzq.log` and a state file `zzq` no longer share `zzq.tmp`.
 
 ## [0.1.1] - 2026-10-26
 

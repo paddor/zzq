@@ -1,7 +1,9 @@
 //! State that survives a broker restart: retained messages.
 //!
 //! [`FilePersistence`] keeps them in an append-only log with a versioned
-//! header. A background thread writes, so lanes never wait for the disk.
+//! header. A background thread writes, so lanes never wait for the disk,
+//! and a topic changed again before it wrote waits only with its latest
+//! change.
 //!
 //! Log format, big endian:
 //!
@@ -21,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,8 +36,6 @@ const SET: u8 = 1;
 const REMOVE: u8 = 2;
 /// The log is rewritten once it is this much larger than its live records.
 const COMPACT_SLACK: u64 = 1 << 20;
-/// Changes written before the writer flushes and answers waiters.
-const MAX_BATCH: usize = 1024;
 
 /// A retained message as stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -70,19 +70,68 @@ pub trait Persistence: Send + Sync + 'static {
     fn remove_retained(&self, topic: &str);
 }
 
-enum Op {
-    Set(String, Vec<u8>),
-    Remove(String),
-    Flush(mpsc::Sender<()>),
+/// Changes waiting for the writer: the latest of each topic, so a slow
+/// disk holds back at most one change per retained topic.
+#[derive(Default)]
+struct Pending {
+    /// Topic to its new record body, or `None` to remove it.
+    changes: HashMap<String, Option<Vec<u8>>>,
+    /// Answered once the changes before them are written.
+    flushes: Vec<mpsc::Sender<()>>,
+    closed: bool,
+}
+
+/// The pending changes and the writer's wake.
+#[derive(Default)]
+struct Queue {
+    pending: Mutex<Pending>,
+    ready: Condvar,
+}
+
+impl Queue {
+    fn lock(&self) -> MutexGuard<'_, Pending> {
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces what is pending for `topic`.
+    fn change(&self, topic: String, body: Option<Vec<u8>>) {
+        let mut p = self.lock();
+        if !p.closed {
+            p.changes.insert(topic, body);
+            self.ready.notify_one();
+        }
+    }
+
+    /// Everything pending, once there is something. `None` once closed
+    /// and written.
+    fn take(&self) -> Option<Pending> {
+        let mut p = self.lock();
+        while p.changes.is_empty() && p.flushes.is_empty() && !p.closed {
+            p = self.ready.wait(p).unwrap_or_else(PoisonError::into_inner);
+        }
+        if p.closed && p.changes.is_empty() && p.flushes.is_empty() {
+            return None;
+        }
+        Some(Pending {
+            changes: std::mem::take(&mut p.changes),
+            flushes: std::mem::take(&mut p.flushes),
+            closed: false,
+        })
+    }
+
+    fn close(&self) {
+        self.lock().closed = true;
+        self.ready.notify_one();
+    }
 }
 
 /// Retained messages in a log file.
 pub struct FilePersistence {
     path: PathBuf,
     loaded: Mutex<Vec<Retained>>,
-    tx: Mutex<Option<mpsc::Sender<Op>>>,
+    queue: Arc<Queue>,
     thread: Mutex<Option<JoinHandle<()>>>,
-    errors: std::sync::Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for FilePersistence {
@@ -121,23 +170,27 @@ impl FilePersistence {
         let live = read_log(&path)?;
         let file = compact(&path, &live)?;
         let loaded = live.values().filter_map(|b| decode_set(b)).collect();
-        let errors = std::sync::Arc::new(AtomicU64::new(0));
-        let (tx, rx) = mpsc::channel();
+        let errors = Arc::new(AtomicU64::new(0));
+        let queue = Arc::new(Queue::default());
         let writer = Writer {
             path: path.clone(),
             file: BufWriter::new(file),
             log_len: log_len(&live),
+            live_len: log_len(&live),
             live,
             sync,
             errors: errors.clone(),
         };
         let thread = std::thread::Builder::new()
             .name("zzq-persist".to_owned())
-            .spawn(move || writer.run(&rx))?;
+            .spawn({
+                let queue = queue.clone();
+                move || writer.run(&queue)
+            })?;
         Ok(FilePersistence {
             path,
             loaded: Mutex::new(loaded),
-            tx: Mutex::new(Some(tx)),
+            queue,
             thread: Mutex::new(Some(thread)),
             errors,
         })
@@ -146,7 +199,14 @@ impl FilePersistence {
     /// Waits until every change so far is written.
     pub fn flush(&self) {
         let (ack, done) = mpsc::channel();
-        self.send(Op::Flush(ack));
+        {
+            let mut p = self.queue.lock();
+            if p.closed {
+                return;
+            }
+            p.flushes.push(ack);
+        }
+        self.queue.ready.notify_one();
         let _ = done.recv();
     }
 
@@ -154,20 +214,11 @@ impl FilePersistence {
     pub fn write_errors(&self) -> u64 {
         self.errors.load(Ordering::Relaxed)
     }
-
-    fn send(&self, op: Op) {
-        if let Some(tx) = &*self.tx.lock().unwrap_or_else(PoisonError::into_inner) {
-            let _ = tx.send(op);
-        }
-    }
 }
 
 impl Drop for FilePersistence {
     fn drop(&mut self) {
-        self.tx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        self.queue.close();
         if let Some(t) = self
             .thread
             .lock()
@@ -187,11 +238,11 @@ impl Persistence for FilePersistence {
     }
 
     fn set_retained(&self, msg: &Retained) {
-        self.send(Op::Set(msg.topic.clone(), encode_set(msg)));
+        self.queue.change(msg.topic.clone(), Some(encode_set(msg)));
     }
 
     fn remove_retained(&self, topic: &str) {
-        self.send(Op::Remove(topic.to_owned()));
+        self.queue.change(topic.to_owned(), None);
     }
 }
 
@@ -201,32 +252,18 @@ struct Writer {
     /// Record bodies by topic, for compaction.
     live: HashMap<String, Vec<u8>>,
     log_len: u64,
+    /// The length of a log of only `live`.
+    live_len: u64,
     sync: bool,
-    errors: std::sync::Arc<AtomicU64>,
+    errors: Arc<AtomicU64>,
 }
 
 impl Writer {
-    fn run(mut self, rx: &mpsc::Receiver<Op>) {
-        while let Ok(first) = rx.recv() {
-            let mut acks = Vec::new();
+    fn run(mut self, queue: &Queue) {
+        while let Some(batch) = queue.take() {
             let mut failed = false;
-            for op in std::iter::once(first).chain(rx.try_iter().take(MAX_BATCH - 1)) {
-                let result = match op {
-                    Op::Set(topic, body) => {
-                        let r = self.append(&body);
-                        self.live.insert(topic, body);
-                        r
-                    }
-                    Op::Remove(topic) => {
-                        let r = self.append(&encode_remove(&topic));
-                        self.live.remove(&topic);
-                        r
-                    }
-                    Op::Flush(ack) => {
-                        acks.push(ack);
-                        Ok(())
-                    }
-                };
+            for (topic, body) in batch.changes {
+                let result = self.apply(topic, body);
                 failed |= result.is_err();
                 self.count(result.is_ok());
             }
@@ -241,19 +278,37 @@ impl Writer {
             self.count(r.is_ok());
             // After a failed write the log may end in a torn record that
             // would hide everything after it: rewrite it from memory.
-            if failed || self.log_len > 2 * log_len(&self.live) + COMPACT_SLACK {
+            if failed || self.log_len > 2 * self.live_len + COMPACT_SLACK {
                 match compact(&self.path, &self.live) {
                     Ok(f) => {
                         self.file = BufWriter::new(f);
-                        self.log_len = log_len(&self.live);
+                        self.log_len = self.live_len;
                     }
                     Err(_) => self.count(false),
                 }
             }
-            for a in acks {
+            for a in batch.flushes {
                 let _ = a.send(());
             }
         }
+    }
+
+    /// Appends a change of `topic` and applies it to the live records.
+    fn apply(&mut self, topic: String, body: Option<Vec<u8>>) -> io::Result<()> {
+        let (written, old) = if let Some(body) = body {
+            let r = self.append(&body);
+            self.live_len += record_len(&body);
+            (r, self.live.insert(topic, body))
+        } else {
+            (
+                self.append(&encode_remove(&topic)),
+                self.live.remove(&topic),
+            )
+        };
+        if let Some(old) = old {
+            self.live_len -= record_len(&old);
+        }
+        written
     }
 
     fn append(&mut self, body: &[u8]) -> io::Result<()> {
@@ -288,7 +343,9 @@ fn write_record(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
 /// Writes `live` to a fresh log next to `path`, renames it over `path` and
 /// returns it open for appending.
 fn compact(path: &Path, live: &HashMap<String, Vec<u8>>) -> io::Result<File> {
-    let tmp = path.with_extension("tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     {
         let mut w = BufWriter::new(File::create(&tmp)?);
         w.write_all(MAGIC)?;
@@ -470,6 +527,20 @@ mod tests {
     fn sorted(mut v: Vec<Retained>) -> Vec<Retained> {
         v.sort_by(|a, b| a.topic.cmp(&b.topic));
         v
+    }
+
+    #[test]
+    fn a_topic_waits_for_the_writer_with_its_latest_change_only() {
+        let q = Queue::default();
+        for i in 0..1000u32 {
+            q.change("a".to_owned(), Some(i.to_be_bytes().to_vec()));
+        }
+        q.change("b".to_owned(), None);
+        let batch = q.take().unwrap();
+        assert_eq!(batch.changes.len(), 2);
+        assert_eq!(batch.changes["a"], Some(999u32.to_be_bytes().to_vec()));
+        q.close();
+        assert!(q.take().is_none(), "closed and written");
     }
 
     #[test]
