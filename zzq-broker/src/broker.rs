@@ -134,6 +134,9 @@ pub struct Stats {
     pub dropped_too_large: u64,
     /// Queued messages whose Message Expiry Interval ran out.
     pub dropped_expired: u64,
+    /// QoS 1/2 messages a session still held, queued or unacked, when it
+    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
+    pub dropped_session_ended: u64,
     /// Retained messages not stored because `max_retained` was reached.
     pub retained_rejected: u64,
 }
@@ -332,6 +335,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
         total.dropped_queue_full += s.dropped_queue_full;
         total.dropped_too_large += s.dropped_too_large;
         total.dropped_expired += s.dropped_expired;
+        total.dropped_session_ended += s.dropped_session_ended;
     }
     {
         let r = shared

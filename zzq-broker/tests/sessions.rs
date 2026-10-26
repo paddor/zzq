@@ -813,3 +813,48 @@ async fn clean_start_discards_an_offline_session_and_its_queue() {
     publ.publish("q", "after", QoS::AtLeastOnce).await.unwrap();
     raw.quiet(300).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ended_session_counts_the_messages_it_held() {
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let publ = client(&ctx, &uri, "p", Version::V5).await;
+    let keep = [KEEP];
+    // Queued while offline, then ended by a clean start.
+    let (mut raw, _) = connect(&uri, &fresh("queued", &keep)).await;
+    raw.subscribe("held/q", QoS::AtLeastOnce.into()).await;
+    drop(raw);
+    stats_until(&broker, |s| s.connections == 1).await;
+    for i in 0..50 {
+        publ.publish("held/q", format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    let (_clean, present) = connect(&uri, &fresh("queued", &[])).await;
+    assert!(!present);
+    stats_until(&broker, |s| s.dropped_session_ended == 50).await;
+    // Sent and not acked, then ended by DISCONNECT with expiry 0.
+    let (mut raw, _) = connect(&uri, &fresh("unacked", &keep)).await;
+    raw.subscribe("held/u", QoS::AtLeastOnce.into()).await;
+    for i in 0..3 {
+        publ.publish("held/u", format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        raw.publish().await;
+    }
+    raw.disconnect(0, &[Property::U32(SESSION_EXPIRY_INTERVAL, 0)])
+        .await;
+    raw.closed().await;
+    stats_until(&broker, |s| s.dropped_session_ended == 53).await;
+    // Ended by expiry.
+    let one = [Property::U32(SESSION_EXPIRY_INTERVAL, 1)];
+    let (mut raw, _) = connect(&uri, &fresh("expires", &one)).await;
+    raw.subscribe("held/e", QoS::AtLeastOnce.into()).await;
+    drop(raw);
+    stats_until(&broker, |s| s.connections == 2).await;
+    for i in 0..7 {
+        publ.publish("held/e", format!("{i}"), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    stats_until(&broker, |s| s.dropped_session_ended == 60).await;
+}

@@ -44,6 +44,7 @@ pub(crate) struct LaneStats {
     pub(crate) dropped_queue_full: u64,
     pub(crate) dropped_too_large: u64,
     pub(crate) dropped_expired: u64,
+    pub(crate) dropped_session_ended: u64,
 }
 
 /// A delivery for a session on another lane.
@@ -346,6 +347,7 @@ impl Lane {
             return;
         };
         self.stats.dropped_expired += s.expired;
+        self.stats.dropped_session_ended += s.held();
         let sub = self.sub_ref(key);
         for filter in s.subs.keys() {
             self.unsubscribe_entry(filter, sub, None);

@@ -165,6 +165,12 @@ impl Session {
         self.queue.len()
     }
 
+    /// QoS 1/2 messages not delivered yet: queued, or sent and not acked.
+    /// PUBREC means the client has the message.
+    pub(crate) fn held(&self) -> u64 {
+        (self.queue.len() + self.inflight.iter().filter(|f| !f.released).count()) as u64
+    }
+
     /// Hands the writer the encoded packets, in exchange for its spare
     /// buffer.
     pub(crate) fn take_out(&mut self) -> Vec<u8> {

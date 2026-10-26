@@ -38,7 +38,8 @@ fn values(s: &Stats, uptime: Duration) -> [(&'static str, String); 10] {
         + s.dropped_offline
         + s.dropped_queue_full
         + s.dropped_too_large
-        + s.dropped_expired;
+        + s.dropped_expired
+        + s.dropped_session_ended;
     [
         (
             "$SYS/broker/version",

@@ -5,6 +5,12 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `zzq-broker`: `Stats::dropped_session_ended` counts the QoS 1/2 messages
+  a session still held, queued or unacked, when it ended.
+  `$SYS/broker/messages/dropped` includes them.
+
 ### Changed
 
 - `zzq-proto`: invalid topic filters fail with the new
