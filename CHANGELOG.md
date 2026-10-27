@@ -31,6 +31,9 @@ Notable changes to zzq. The format follows
   them, compressed with Zstandard. `Broker::new` loads the file and
   renames it to `<name>.loaded`. `zzq_broker --state-file` writes it on
   SIGTERM or SIGINT.
+- `zzq-bench`: `zzq_ramprobe` measures the memory of an offline session, a
+  queued and a fanned-out message and a retained message, and
+  `zzq_perf_verify` gates state memory along with throughput and latency.
 
 ### Changed
 
@@ -196,6 +199,9 @@ Notable changes to zzq. The format follows
 - `zzq-proto`: variable byte integers longer than their value needs, a
   CONNACK with bytes after its fields, a SUBACK without a code and a 3.1.1
   UNSUBACK with a payload decoded; they are malformed or a protocol error now.
+- `zzq-broker`: `zzq_broker --cert` without `--key`, or the other way
+  around, was silently ignored, and so was `--client-ca` alone. Such
+  arguments are now an error.
 
 ## [0.1.1] - 2026-10-26
 

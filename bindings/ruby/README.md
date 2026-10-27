@@ -15,8 +15,8 @@ threads.
 gem install zzq
 ```
 
-The gem builds its native extension on install, which needs Rust 1.93 or
-newer.
+The gem needs Ruby 3.4 or newer. It builds its native extension on
+install, which needs Rust 1.93 or newer.
 
 ## Client
 
@@ -36,7 +36,7 @@ end
   `no_local:`, `retain_as_published:`, `retain_handling:`,
   `subscription_id:`.
 - `receive(timeout:)` returns the next `ZZQ::Message`, or nil once the
-  client is closed. `each` yields messages until then.
+  client is closed, and raises `IO::TimeoutError` if none came in time. `each` yields messages until then.
 - Publishing works from any fiber or thread; one fiber at a time
   receives.
 
@@ -58,10 +58,12 @@ broker.stats # => {connections: 0, sessions: 0, ...}
 broker.close
 ```
 
-Options take the limits of zzq-broker's `BrokerOptions`, such as
-`max_connections:` or `max_queued:`, plus `sys_interval:`,
-`connect_timeout:`, `persistence:` and `tls:` (`cert:`, `key:`,
-`client_ca:`).
+Options: the limits `max_packet_size:`, `max_inflight:`, `max_queued:`,
+`receive_maximum:`, `max_subscriptions:`, `max_retained:`,
+`max_topic_levels:`, `topic_alias_maximum:`, `max_session_expiry:`,
+`max_connections:` and `max_keep_alive:` of zzq-broker's `BrokerOptions`,
+plus `sys_interval:`, `connect_timeout:`, `persistence:` and `tls:`
+(`cert:`, `key:`, `client_ca:`).
 
 ## Async
 

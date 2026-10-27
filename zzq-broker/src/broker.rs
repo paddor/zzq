@@ -363,8 +363,9 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// [`Error::State`] if the state file could not be written. The
-    /// broker stops anyway.
+    /// [`Error::State`] if the state file could not be written, and
+    /// [`Error::Closed`] if a lane stopped before it could. The broker stops
+    /// anyway.
     pub async fn shutdown(self) -> Result<()> {
         self.abort_tasks();
         let saved = match &self.shared.opts.state_file {
