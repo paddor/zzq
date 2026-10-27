@@ -7,7 +7,7 @@ the workspace, so AFL's instrumentation stays out of normal builds.
 | --- | --- | --- |
 | `mqtt` | MQTT packets, read as v3.1.1 and v5 | no panic, PUBLISH round trip |
 | `mqtt_sn` | One MQTT-SN datagram | no panic, encode round trip |
-| `websocket` | Upgrade request and client frames | no panic |
+| `websocket` | Upgrade request or response, and the frames after it | no panic |
 | `retained_log` | A retained message log | no panic |
 | `state_image` | A state image | no panic, restored sessions encode and decode again |
 | `endpoint` | An endpoint URI | no panic, print and parse round trip |

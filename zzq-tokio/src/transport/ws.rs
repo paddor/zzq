@@ -216,6 +216,18 @@ pub(crate) async fn fuzz_server(mut data: &[u8]) {
     while let Ok(Some(_)) = read_frame(&mut data, true, &mut payload).await {}
 }
 
+/// Reads an upgrade response and the server frames after it from `data`,
+/// as a client would from a socket. For the fuzz targets.
+#[cfg(feature = "fuzzing")]
+pub(crate) async fn fuzz_client(mut data: &[u8]) {
+    let Ok(head) = read_head(&mut data).await else {
+        return;
+    };
+    let _ = upgrade_accepted(&head, "dGhlIHNhbXBsZSBub25jZQ==");
+    let mut payload = Vec::new();
+    while let Ok(Some(_)) = read_frame(&mut data, false, &mut payload).await {}
+}
+
 async fn upgrade_server<S>(mut s: S, path: &str) -> Result<Stream>
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -247,14 +259,19 @@ where
     s.write_all(request.as_bytes()).await?;
     s.flush().await?;
     let head = read_head(&mut s).await?;
+    if !upgrade_accepted(&head, &key) {
+        return Err(protocol_error("upgrade refused"));
+    }
+    Ok(Stream::Inproc(pump(s, Role::Client)))
+}
+
+/// Whether `head` is a server's yes to the upgrade with `key`.
+fn upgrade_accepted(head: &str, key: &str) -> bool {
     let status_ok = head
         .lines()
         .next()
         .is_some_and(|l| l.split_whitespace().nth(1) == Some("101"));
-    if !status_ok || header(&head, "sec-websocket-accept") != Some(accept_key(&key).as_str()) {
-        return Err(protocol_error("upgrade refused"));
-    }
-    Ok(Stream::Inproc(pump(s, Role::Client)))
+    status_ok && header(head, "sec-websocket-accept") == Some(accept_key(key).as_str())
 }
 
 /// Starts the frame pump on the current lane and returns the byte stream.
