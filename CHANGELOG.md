@@ -178,6 +178,9 @@ Notable changes to zzq. The format follows
   not read grew memory without bound. Control frames over 125 bytes or
   without FIN now close the connection, and one pong waits at most. Once
   either side closes, the pump stops within 2 s instead of reading on.
+- `zzq-tokio`: a lane whose runtime could not be built stopped silently,
+  and `Context::with_config` returned a context whose calls then failed with
+  `Error::Closed`. It now fails with `Error::Io`, as documented.
 
 ## [0.1.1] - 2026-10-26
 
