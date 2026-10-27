@@ -334,9 +334,11 @@ async fn a_v5_publisher_past_the_receive_maximum_is_disconnected() {
 async fn retained_messages_on_subscribe_queue_past_the_limit_only_by_their_batch() {
     use zzq_proto::{SubscriptionOptions, Version};
 
+    // Without $SYS, whose retained topics would make 61.
     let opts = BrokerOptions {
         max_inflight: 1,
         max_queued: 10,
+        sys_interval: None,
         ..BrokerOptions::default()
     };
     let (_ctx, broker, uri) = setup(1, opts).await;
