@@ -313,3 +313,52 @@ async fn publishes_past_the_receive_maximum_hold_back_the_caller() {
     );
     drop(peer);
 }
+
+#[tokio::test]
+async fn a_message_from_a_lost_session_is_not_acked_on_the_next() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("stale")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = Peer::accept(&l).await;
+    let mut c = connecting.await.unwrap();
+    let h = c.handle();
+    let sub = tokio::spawn(async move { h.subscribe("t", QoS::AtLeastOnce).await.unwrap() });
+    let (_, packet) = first.packet().await;
+    first.suback(&packet).await;
+    sub.await.unwrap();
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        topic: "t",
+        pkid: 7,
+        properties: &[],
+    };
+    let mut out = Vec::new();
+    encode::publish(&h, b"old", &mut out);
+    first.s.write_all(&out).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(first);
+    // The broker lost the session: its packet ID 7 may mean another
+    // message now.
+    let mut second = Peer::accept(&l).await;
+    let (_, packet) = second.packet().await;
+    second.suback(&packet).await;
+    let m = timeout(WAIT, c.recv()).await.unwrap().unwrap();
+    assert_eq!(m.payload, "old");
+    let mut chunk = [0u8; 64];
+    let got = timeout(Duration::from_millis(300), second.s.read(&mut chunk)).await;
+    assert!(got.is_err(), "acked on the new connection: {got:?}");
+}

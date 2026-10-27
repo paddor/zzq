@@ -179,6 +179,7 @@ impl Conn<'_> {
             retain: p.retain,
             subscription_ids,
             ack,
+            epoch: 0,
         })
     }
 }

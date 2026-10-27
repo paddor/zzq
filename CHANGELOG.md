@@ -160,6 +160,9 @@ Notable changes to zzq. The format follows
   keep alive intervals lost its connection, and requests and acks waited
   too. It now stops reading only, keeps pinging, and catches up once the
   application takes messages.
+- `zzq-client`: after a reconnect that the broker answered without the
+  session, QoS 1/2 messages received before were still acked by packet ID
+  on the new connection, where the ID may mean another message.
 
 ## [0.1.1] - 2026-10-26
 

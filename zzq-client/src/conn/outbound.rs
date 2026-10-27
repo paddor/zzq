@@ -35,6 +35,8 @@ impl Conn<'_> {
         if !session_present {
             self.s.inbound.awaiting_rel.clear();
             self.s.inbound.unconsumed.clear();
+            self.s.inbox.forget_acks();
+            self.s.scratch.taken.clear();
             let mut by_id: Vec<(u32, Vec<(String, SubscriptionOptions)>)> = Vec::new();
             for (f, o, id) in &self.s.subs {
                 match by_id.iter_mut().find(|(i, _)| i == id) {

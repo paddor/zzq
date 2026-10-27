@@ -208,6 +208,8 @@ pub struct Message {
     pub subscription_ids: Vec<u32>,
     /// Packet ID to ack once the application takes the message.
     pub(crate) ack: Option<u16>,
+    /// The broker session `ack` belongs to, counted by the inbox.
+    pub(crate) epoch: u32,
 }
 
 /// CONNACK details.

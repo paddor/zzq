@@ -44,6 +44,9 @@ struct State {
     queue: VecDeque<Message>,
     /// Packet IDs of taken QoS 1/2 messages, to ack.
     acks: Vec<(u16, QoS)>,
+    /// Bumped when the broker lost the session: packet IDs of messages
+    /// from before mean nothing to it now.
+    epoch: u32,
     /// The session waits for room.
     waiting: bool,
     /// The session is gone.
@@ -70,6 +73,7 @@ pub(crate) fn channel(cap: usize) -> (Sender, Receiver) {
     });
     let tx = Sender {
         shared: shared.clone(),
+        epoch: 0,
         batch: Vec::new(),
         batch_acks: 0,
         batch_bytes: 0,
@@ -84,6 +88,8 @@ pub(crate) fn channel(cap: usize) -> (Sender, Receiver) {
 /// The session side.
 pub(crate) struct Sender {
     shared: Arc<Shared>,
+    /// The epoch new messages get.
+    epoch: u32,
     batch: Vec<Message>,
     /// Messages in `batch` that need an ack, and their payload bytes.
     batch_acks: usize,
@@ -103,7 +109,8 @@ pub(crate) struct Dropped;
 
 impl Sender {
     /// Adds a message to the next batch.
-    pub(crate) fn push(&mut self, m: Message) {
+    pub(crate) fn push(&mut self, mut m: Message) {
+        m.epoch = self.epoch;
         self.batch_acks += usize::from(m.ack.is_some());
         self.batch_bytes += m.payload.len();
         self.batch.push(m);
@@ -168,6 +175,15 @@ impl Sender {
         self.shared.acked.ready().await;
     }
 
+    /// The broker lost the session: messages already received are not
+    /// acked to it.
+    pub(crate) fn forget_acks(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        let mut st = self.shared.lock();
+        st.epoch = self.epoch;
+        st.acks.clear();
+    }
+
     /// Swaps the acks to send into `acks`, which should be empty.
     pub(crate) fn take_acks(&self, acks: &mut Vec<(u16, QoS)>) {
         std::mem::swap(&mut self.shared.lock().acks, acks);
@@ -205,6 +221,9 @@ impl Receiver {
                 if let Some(pkid) = m.ack {
                     let gathered = {
                         let mut st = self.shared.lock();
+                        if m.epoch != st.epoch {
+                            return Some(m);
+                        }
                         st.acks.push((pkid, m.qos));
                         st.acks.len()
                     };
@@ -264,6 +283,7 @@ mod tests {
             retain: false,
             subscription_ids: Vec::new(),
             ack: None,
+            epoch: 0,
         }
     }
 
