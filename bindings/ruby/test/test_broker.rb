@@ -94,6 +94,19 @@ class BrokerTest < Minitest::Spec
     end
   end
 
+  it "writes the state file once a call in flight finishes" do
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "state")
+      b = ZZQ::Broker.new(state_file: path, sys_interval: nil)
+      in_flight = b.send(:native).stats
+      closer = Thread.new { b.close }
+      refute closer.join(0.2), "close went on while a call held the broker"
+      ZZQ::Waiting.await(in_flight)
+      assert closer.join(WAIT), "close did not finish"
+      assert_path_exists path
+    end
+  end
+
   it "raises when it cannot write the state file" do
     Dir.mktmpdir do |dir|
       b = ZZQ::Broker.new(state_file: File.join(dir, "gone", "state"), sys_interval: nil)

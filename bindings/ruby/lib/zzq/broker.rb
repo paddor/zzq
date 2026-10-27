@@ -78,9 +78,10 @@ module ZZQ
       Waiting.await(native.stats)
     end
 
-    # Stops the broker and waits until its connections are closed. With
-    # +state_file:+, it first closes them as lost, so wills go out, and
-    # writes the sessions.
+    # Stops the broker, once calls on other threads such as {#stats} are
+    # done, and waits until its connections are closed. With +state_file:+,
+    # it first closes them as lost, so wills go out, and writes the
+    # sessions.
     #
     # @return [nil]
     # @raise [Error] if the state file could not be written
@@ -90,8 +91,7 @@ module ZZQ
       return if @closed
 
       @closed = true
-      op = @native.shutdown
-      Waiting.await(op) if op
+      Waiting.await(@native.shutdown)
       nil
     end
 

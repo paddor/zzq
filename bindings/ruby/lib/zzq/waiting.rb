@@ -45,21 +45,24 @@ module ZZQ
       WAKES.push(wake) if wake && WAKES.size < KEEP
     end
 
-    # Polls +op+ until it is done and returns its result. An interrupted
-    # wait cancels it.
+    # Polls +op+ until it is done and returns its result. A wait that ends
+    # otherwise, by an exception or a killed thread, cancels it.
     def await(op, timeout = nil)
+      done = false
       with_wake do |wake|
         limit = deadline(timeout)
         loop do
           result = op.poll(wake)
-          return result unless Native::PENDING.equal?(result)
+          unless Native::PENDING.equal?(result)
+            done = true
+            return result
+          end
 
           wake.wait(limit)
         end
       end
-    rescue Exception # rubocop:disable Lint/RescueException
-      op.cancel
-      raise
+    ensure
+      op.cancel unless done
     end
   end
 end

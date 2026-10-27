@@ -4,6 +4,11 @@
 
 - `Broker.new` takes `state_file:`: `#close` writes the sessions there, and
   the next broker started with it resumes them.
+- `Broker#close` during a call on another thread, such as `#stats`,
+  returned at once and left the broker to stop without a shutdown. It now
+  waits for the call and shuts down.
+- A call whose waiting thread was killed kept running until garbage
+  collection. Killing the thread now cancels it.
 
 ## v0.3.0 — 2026-10-27
 

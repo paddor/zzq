@@ -1,8 +1,9 @@
 //! `ZZQ::Native::Broker`: a running broker.
 
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, OnceLock};
 
 use rb_sys::VALUE;
+use tokio::sync::{OwnedRwLockReadGuard, RwLock};
 use zzq_broker::{Broker, FilePersistence, QoS, Stats};
 
 use crate::error::Error;
@@ -15,27 +16,33 @@ static CLASS: OnceLock<usize> = OnceLock::new();
 
 #[derive(Debug)]
 struct NativeBroker {
-    /// `None` once shut down.
-    broker: Mutex<Option<Arc<Broker>>>,
+    /// `None` once shut down. Calls hold a read guard while they use the
+    /// broker, and the shutdown takes the write lock, so it waits for them.
+    broker: Arc<RwLock<Option<Broker>>>,
     /// Flushed after a shutdown, so a broker started next on the same
     /// file finds every retained message.
     store: Option<Arc<FilePersistence>>,
 }
 
-fn get(value: VALUE) -> RbResult<Arc<Broker>> {
+/// The broker, held from shutting down until the guard drops.
+type Held = OwnedRwLockReadGuard<Option<Broker>, Broker>;
+
+/// The broker for one call, or `Closed` once a shutdown has begun.
+fn get(value: VALUE) -> RbResult<Held> {
     let native: &NativeBroker = unsafe { TYPE.get(value) }?;
     native
         .broker
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
         .clone()
+        .try_read_owned()
+        .ok()
+        .and_then(|guard| OwnedRwLockReadGuard::try_map(guard, Option::as_ref).ok())
         .ok_or_else(|| Error::Broker(zzq_broker::Error::Closed).into())
 }
 
 /// A Ruby object for a running broker.
 pub fn wrap(b: Broker, store: Option<Arc<FilePersistence>>) -> RbResult<VALUE> {
     let native = NativeBroker {
-        broker: Mutex::new(Some(Arc::new(b))),
+        broker: Arc::new(RwLock::new(Some(b))),
         store,
     };
     TYPE.wrap(*CLASS.get().expect("registered") as VALUE, native)
@@ -106,27 +113,23 @@ fn stats(this: VALUE) -> RbResult<VALUE> {
     op::new(async move { Ok(Out::Stats(b.stats().await?)) })
 }
 
-/// An op that waits for the shutdown, or nil if an op still holds the
-/// broker: it stops once that op is done.
+/// An op that waits for the calls using the broker to finish, then shuts
+/// it down.
 fn shutdown(this: VALUE) -> RbResult<VALUE> {
     let native: &NativeBroker = unsafe { TYPE.get(this) }?;
-    let taken = native
-        .broker
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take();
+    let broker = native.broker.clone();
     let store = native.store.clone();
-    match taken.map(Arc::try_unwrap) {
-        Some(Ok(b)) => op::new(async move {
-            let res = b.shutdown().await;
-            if let Some(store) = store {
-                store.flush();
-            }
-            res?;
-            Ok(Out::Nil)
-        }),
-        _ => Ok(rb::qnil()),
-    }
+    op::new(async move {
+        let Some(b) = broker.write_owned().await.take() else {
+            return Ok(Out::Nil);
+        };
+        let res = b.shutdown().await;
+        if let Some(store) = store {
+            store.flush();
+        }
+        res?;
+        Ok(Out::Nil)
+    })
 }
 
 unsafe extern "C" fn broker_start(_class: VALUE, opts: VALUE) -> VALUE {
