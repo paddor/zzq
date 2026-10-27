@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+## v0.3.0 — 2026-10-27
+
+- Built on the zzq 0.2 crates, with their fixes and faster QoS 1/2
+  fan-out and fan-in.
+- `Broker.new` takes `max_queued_bytes:` and `max_state_bytes:`.
+- `Broker#stats` adds `dropped_session_ended`, `dropped_state_full` and
+  `state_bytes`.
+- `Broker#close` raises `ClosedError` if a lane stopped before it could
+  close its connections.
+
 ## v0.2.0 — 2026-10-26
 
 - zzq is now a binding to the zzq Rust crates, built as a native

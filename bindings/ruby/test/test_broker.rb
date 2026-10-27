@@ -34,6 +34,26 @@ class BrokerTest < Minitest::Spec
     assert_equal 1, stats[:connections]
     assert_equal 1, stats[:retained]
     assert_equal 2, stats[:deliveries]
+    assert_equal 0, stats[:dropped_session_ended]
+    assert_equal 0, stats[:dropped_state_full]
+    assert_operator stats[:state_bytes], :>, 0
+  end
+
+  it "drops the oldest queued messages past max_queued_bytes" do
+    b = broker(max_queued_bytes: 300, max_state_bytes: 1 << 20)
+    endpoint = tcp_endpoint(b)
+    opts = { client_id: "away", clean_start: false, session_expiry: 60 }
+    ZZQ::Client.connect(endpoint, **opts).then do |c|
+      c.subscribe("q", qos: 1)
+      c.close
+    end
+    eventually { b.stats[:connections].zero? }
+    5.times { |i| b.publish("q", i.to_s * 100, qos: 1) }
+    eventually { b.stats[:dropped_queue_full].positive? }
+    again = client(endpoint, **opts)
+    got = []
+    got << again.receive(timeout: WAIT).payload[0] until got.last == "4"
+    refute_includes got, "0"
   end
 
   it "keeps retained messages across a restart" do
@@ -57,8 +77,9 @@ class BrokerTest < Minitest::Spec
     assert_nil b.close
   end
 
-  it "raises on an unknown option" do
+  it "raises on an unknown or out-of-range option" do
     assert_raises(ArgumentError) { ZZQ::Broker.new(max_clients: 1) }
+    assert_raises(ArgumentError) { ZZQ::Broker.new(max_state_bytes: -1) }
   end
 
   it "serves TLS" do
