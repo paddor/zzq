@@ -5,11 +5,13 @@
 //! per lane on a shared port. Quinn's tasks for a connection stay on the
 //! lane that accepted or dialed it; the stream halves move to any lane.
 
+use std::cell::Cell;
 use std::fmt;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
@@ -33,6 +35,12 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Time a connection attempt has to finish its handshake and open the
 /// MQTT stream.
 const HANDSHAKE: Duration = Duration::from_secs(10);
+
+/// Handshakes a lane runs at once. Past [`RETRY_ABOVE`], a client first
+/// proves its address with a Retry, so spoofed sources cannot hold them;
+/// past [`HANDSHAKES`], connections are refused.
+const HANDSHAKES: usize = 1024;
+const RETRY_ABOVE: usize = 128;
 
 /// How long shutdown waits for the peer to acknowledge the last bytes.
 const LINGER: Duration = Duration::from_secs(5);
@@ -283,16 +291,64 @@ impl QuicListener {
     }
 }
 
+/// What becomes of a connection attempt.
+#[derive(Debug, PartialEq, Eq)]
+enum Admit {
+    Accept,
+    Retry,
+    Refuse,
+}
+
+/// What becomes of an attempt from a `validated` address while
+/// `in_flight` handshakes run.
+const fn admit(in_flight: usize, validated: bool) -> Admit {
+    if in_flight >= HANDSHAKES {
+        Admit::Refuse
+    } else if in_flight >= RETRY_ABOVE && !validated {
+        Admit::Retry
+    } else {
+        Admit::Accept
+    }
+}
+
+/// Counts a handshake of a lane while it runs.
+struct Handshaking(Rc<Cell<usize>>);
+
+impl Handshaking {
+    fn new(count: &Rc<Cell<usize>>) -> Handshaking {
+        count.set(count.get() + 1);
+        Handshaking(count.clone())
+    }
+}
+
+impl Drop for Handshaking {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() - 1);
+    }
+}
+
 /// Accepts on one lane's endpoint. Handshakes run as their own tasks, so a
 /// slow client does not hold up the others.
 async fn accept_on_lane(endpoint: quinn::Endpoint, tx: mpsc::UnboundedSender<Stream>) {
+    let in_flight = Rc::new(Cell::new(0));
     while let Some(incoming) = endpoint.accept().await {
-        let tx = tx.clone();
-        tokio::task::spawn_local(async move {
-            if let Ok(Ok(s)) = tokio::time::timeout(HANDSHAKE, handshake(incoming)).await {
-                let _ = tx.send(s);
+        match admit(in_flight.get(), incoming.remote_address_validated()) {
+            Admit::Refuse => incoming.refuse(),
+            // An attempt that cannot retry is refused when dropped.
+            Admit::Retry => drop(incoming.retry()),
+            Admit::Accept => {
+                let (tx, counted) = (tx.clone(), Handshaking::new(&in_flight));
+                tokio::task::spawn_local(async move {
+                    let _counted = counted;
+                    if let Ok(Ok(s)) = tokio::time::timeout(HANDSHAKE, handshake(incoming)).await {
+                        let _ = tx.send(s);
+                    }
+                });
             }
-        });
+        }
+        // quinn's accept takes nothing from the task budget, so a burst
+        // of attempts would not let the lane's other tasks run.
+        tokio::task::consume_budget().await;
     }
 }
 
@@ -380,6 +436,14 @@ mod tests {
             key_pem: Some(key.signing_key.serialize_pem().into_bytes()),
             ..TlsOptions::default()
         }
+    }
+
+    #[test]
+    fn unproven_sources_retry_and_too_many_handshakes_are_refused() {
+        assert_eq!(admit(0, false), Admit::Accept);
+        assert_eq!(admit(RETRY_ABOVE, true), Admit::Accept);
+        assert_eq!(admit(RETRY_ABOVE, false), Admit::Retry);
+        assert_eq!(admit(HANDSHAKES, true), Admit::Refuse);
     }
 
     #[tokio::test(flavor = "multi_thread")]
