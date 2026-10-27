@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::oneshot;
@@ -164,6 +164,8 @@ struct Scratch {
     finished: Vec<(usize, Result<()>)>,
     /// Woken calls have finished calls to wake.
     chained: bool,
+    /// The read and where in it handling stopped for a full inbox.
+    rest: Option<(Bytes, usize)>,
 }
 
 impl Session {
@@ -265,7 +267,7 @@ where
 impl Conn<'_> {
     /// Reads, runs commands and pings until the connection ends.
     async fn serve<R: AsyncRead + Unpin>(&mut self, r: &mut R, buf: &mut BytesMut) -> Result<()> {
-        self.input(buf).await?;
+        self.input(buf)?;
         // Requests made while offline.
         if !self.requests() {
             return Ok(());
@@ -273,12 +275,15 @@ impl Conn<'_> {
         self.ack_taken();
         let ka = u64::from(self.s.opts.keep_alive);
         let mut ping = tokio::time::interval(Duration::from_secs(ka.max(1)));
+        ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         ping.tick().await;
         let mut last_rx = Instant::now();
         let chain = tokio::time::sleep(CHAIN_WAIT);
         tokio::pin!(chain);
         let mut chain_armed = false;
         loop {
+            // A full inbox stops reading, not pings, requests or acks.
+            let blocked = self.s.inbox.blocked();
             make_room(buf);
             if self.s.scratch.chained && !chain_armed {
                 chain.as_mut().reset((Instant::now() + CHAIN_WAIT).into());
@@ -295,12 +300,17 @@ impl Conn<'_> {
                         return Err(Error::Closed);
                     }
                 }
-                n = r.read_buf(buf) => {
+                n = r.read_buf(buf), if !blocked => {
                     if !matches!(n, Ok(n) if n > 0) {
                         return Err(Error::Closed);
                     }
                     last_rx = Instant::now();
-                    self.input(buf).await?;
+                    self.input(buf)?;
+                }
+                () = self.s.inbox.room(), if blocked => {
+                    self.resume()?;
+                    // Nothing was read meanwhile, not even PINGRESP.
+                    last_rx = Instant::now();
                 }
                 () = self.s.inbox.acked() => self.ack_taken(),
                 () = &mut chain, if chain_armed => {
@@ -309,7 +319,7 @@ impl Conn<'_> {
                     self.s.acks.wake_chained();
                 }
                 _ = ping.tick(), if ka > 0 => {
-                    if last_rx.elapsed() > Duration::from_millis(ka * 1500) {
+                    if !blocked && last_rx.elapsed() > Duration::from_millis(ka * 1500) {
                         return Err(Error::Closed);
                     }
                     self.out.push(encode::pingreq);

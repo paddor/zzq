@@ -119,40 +119,48 @@ impl Sender {
         self.batch.len() >= self.shared.cap
     }
 
-    /// Queues the batch, waiting for room as needed.
-    pub(crate) async fn flush(&mut self) -> Result<(), Dropped> {
-        while !self.batch.is_empty() {
-            let (filled, waiting) = {
-                let mut st = self.shared.lock();
-                if st.dropped {
-                    self.batch.clear();
-                    return Err(Dropped);
-                }
-                let n = self
-                    .shared
-                    .cap
-                    .saturating_sub(st.queue.len())
-                    .min(self.batch.len());
-                let filled = n > 0 && st.queue.is_empty();
-                if n > 0 {
-                    st.queue.extend(self.batch.drain(..n));
-                    self.batch_acks = self.batch.iter().filter(|m| m.ack.is_some()).count();
-                    self.batch_bytes = self.batch.iter().map(|m| m.payload.len()).sum();
-                }
-                st.waiting = !self.batch.is_empty();
-                (filled, st.waiting)
-            };
-            // The lock orders pushes and takes, so only the push into an
-            // empty queue needs to wake the handle.
-            if filled {
-                self.shared.ready.mark();
-            }
-            if !waiting {
-                return Ok(());
-            }
-            self.shared.room.ready().await;
+    /// Queues as much of the batch as there is room for. True once all of it
+    /// is queued; otherwise [`Sender::room`] tells when to try again.
+    pub(crate) fn try_flush(&mut self) -> Result<bool, Dropped> {
+        if self.batch.is_empty() {
+            return Ok(true);
         }
-        Ok(())
+        let filled = {
+            let mut st = self.shared.lock();
+            if st.dropped {
+                self.batch.clear();
+                return Err(Dropped);
+            }
+            let n = self
+                .shared
+                .cap
+                .saturating_sub(st.queue.len())
+                .min(self.batch.len());
+            let filled = n > 0 && st.queue.is_empty();
+            for m in self.batch.drain(..n) {
+                self.batch_acks -= usize::from(m.ack.is_some());
+                self.batch_bytes -= m.payload.len();
+                st.queue.push_back(m);
+            }
+            st.waiting = !self.batch.is_empty();
+            filled
+        };
+        // The lock orders pushes and takes, so only the push into an empty
+        // queue needs to wake the handle.
+        if filled {
+            self.shared.ready.mark();
+        }
+        Ok(self.batch.is_empty())
+    }
+
+    /// Whether messages wait for room in the queue.
+    pub(crate) const fn blocked(&self) -> bool {
+        !self.batch.is_empty()
+    }
+
+    /// Waits until the handle took a full queue, or is gone.
+    pub(crate) async fn room(&self) {
+        self.shared.room.ready().await;
     }
 
     /// Waits until there may be acks to send.
@@ -259,6 +267,14 @@ mod tests {
         }
     }
 
+    /// Queues the whole batch, waiting for room as the session does.
+    async fn flush(tx: &mut Sender) -> Result<(), Dropped> {
+        while !tx.try_flush()? {
+            tx.room().await;
+        }
+        Ok(())
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn batches_larger_than_the_queue_wait_and_keep_order() {
         let (mut tx, mut rx) = channel(3);
@@ -267,7 +283,7 @@ mod tests {
                 tx.push(msg(i));
             }
             assert!(tx.full());
-            assert!(tx.flush().await.is_ok());
+            assert!(flush(&mut tx).await.is_ok());
         });
         for i in 0..10 {
             assert_eq!(rx.recv().await.unwrap().topic, i.to_string());
@@ -293,7 +309,7 @@ mod tests {
                 ..msg(i)
             });
         }
-        assert!(tx.flush().await.is_ok());
+        assert!(flush(&mut tx).await.is_ok());
         let mut ids = Vec::new();
 
         for _ in 1..ACK_LWM {
@@ -321,6 +337,6 @@ mod tests {
         let (mut tx, rx) = channel(1);
         drop(rx);
         tx.push(msg(0));
-        assert!(tx.flush().await.is_err());
+        assert!(flush(&mut tx).await.is_err());
     }
 }

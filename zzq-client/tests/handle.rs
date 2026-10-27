@@ -69,3 +69,29 @@ async fn a_handle_disconnects_a_receiving_client() {
         Err(zzq_client::Error::Closed)
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_stops_receiving_keeps_its_connection() {
+    let (ctx, broker, uri) = setup("handle-full").await;
+    let opts = ClientOptions {
+        keep_alive: 1,
+        inbox: 10,
+        reconnect: None,
+        ..ClientOptions::new("slow")
+    };
+    let mut c = Client::connect(&ctx, &uri, opts).await.unwrap();
+    c.subscribe("t", QoS::AtMostOnce).await.unwrap();
+    for _ in 0..100 {
+        broker.publish("t", "x", QoS::AtMostOnce).unwrap();
+    }
+    // Longer than the broker waits for a ping, without taking a message.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    for _ in 0..100 {
+        let m = timeout(WAIT, c.recv()).await.unwrap().unwrap();
+        assert_eq!(m.payload, "x");
+    }
+    // Still the same connection: without reconnect, a lost one ends the
+    // client.
+    let published = timeout(WAIT, c.publish("u", "y", QoS::AtLeastOnce)).await;
+    assert!(matches!(published, Ok(Ok(()))), "{published:?}");
+}

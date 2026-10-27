@@ -155,6 +155,11 @@ Notable changes to zzq. The format follows
   waited in the session without a limit, so `Handle::enqueue` callers that
   did not await the acks were never held back. Publishing now waits once
   1 MiB of them waits.
+- `zzq-client`: with a full inbox, the session waited for room and did
+  nothing else, so an application that paused `recv` for longer than 1.5
+  keep alive intervals lost its connection, and requests and acks waited
+  too. It now stops reading only, keeps pinging, and catches up once the
+  application takes messages.
 
 ## [0.1.1] - 2026-10-26
 

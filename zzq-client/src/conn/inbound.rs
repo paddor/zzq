@@ -38,9 +38,10 @@ impl Conn<'_> {
         self.s.scratch.taken = acks;
     }
 
-    /// Handles the whole packets in `buf`, then hands their messages to
-    /// the client handle.
-    pub(super) async fn input(&mut self, buf: &mut BytesMut) -> Result<()> {
+    /// Handles the whole packets in `buf`, then hands their messages to the
+    /// client handle. Stops at a full inbox, keeping the rest of the read
+    /// until the handle makes room.
+    pub(super) fn input(&mut self, buf: &mut BytesMut) -> Result<()> {
         let n = complete_len(buf)?;
         if n == 0 {
             return Ok(());
@@ -48,38 +49,59 @@ impl Conn<'_> {
         let chunk = buf.split_to(n).freeze();
         // Acks the handle gathered go out without a wake of their own.
         self.ack_taken();
-        let res = self.packets(&chunk).await;
-        self.finish_acks();
-        // Messages before a bad packet still go out.
-        self.deliver().await?;
-        res
+        self.packets(chunk, 0)
     }
 
-    async fn packets(&mut self, chunk: &Bytes) -> Result<()> {
-        let mut at = 0;
+    /// Queues what waited once the handle made room, then handles the rest
+    /// of the read.
+    pub(super) fn resume(&mut self) -> Result<()> {
+        if !self.deliver()? {
+            return Ok(());
+        }
+        match self.s.scratch.rest.take() {
+            Some((chunk, at)) => self.packets(chunk, at),
+            None => Ok(()),
+        }
+    }
+
+    /// Handles the packets of `chunk` from `at`.
+    fn packets(&mut self, chunk: Bytes, mut at: usize) -> Result<()> {
+        let mut res = Ok(());
         while at < chunk.len() {
             let Ok(Some((packet, n))) = decode(&chunk[at..], self.s.opts.version, MAX_PACKET)
             else {
-                return Err(Error::Protocol("malformed packet"));
+                res = Err(Error::Protocol("malformed packet"));
+                break;
             };
             at += n;
-            if let Some(m) = self.packet(packet, chunk)? {
-                self.s.inbox.push(m);
-                if self.s.inbox.hand_off() {
-                    self.deliver().await?;
+            match self.packet(packet, &chunk) {
+                Ok(Some(m)) => {
+                    self.s.inbox.push(m);
+                    if self.s.inbox.hand_off() && !self.deliver()? {
+                        self.s.scratch.rest = Some((chunk, at));
+                        break;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    res = Err(e);
+                    break;
                 }
             }
         }
-        Ok(())
+        self.finish_acks();
+        // Messages before a bad packet still go out.
+        self.deliver()?;
+        res
     }
 
-    /// Queues the decoded messages for the handle.
-    async fn deliver(&mut self) -> Result<()> {
-        if self.s.inbox.flush().await.is_err() {
+    /// Queues the decoded messages for the handle. False while some wait for
+    /// room.
+    fn deliver(&mut self) -> Result<bool> {
+        self.s.inbox.try_flush().map_err(|_| {
             self.s.ended = true;
-            return Err(Error::Closed);
-        }
-        Ok(())
+            Error::Closed
+        })
     }
 
     /// Handles one packet of `chunk`. A PUBLISH becomes a message.
