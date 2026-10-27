@@ -6,12 +6,13 @@
 
 use std::hash::{BuildHasher, RandomState};
 use std::io;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::task::{self, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::endpoint::Endpoint;
 use crate::transport::{Stream, tcp};
@@ -247,7 +248,7 @@ where
     );
     s.write_all(response.as_bytes()).await?;
     s.flush().await?;
-    Ok(Stream::Inproc(pump(s, Role::Server)))
+    Ok(Stream::Ws(pump(s, Role::Server)))
 }
 
 async fn upgrade_client<S>(mut s: S, host: &str, path: &str) -> Result<Stream>
@@ -264,7 +265,7 @@ where
     if !upgrade_accepted(&head, &key) {
         return Err(protocol_error("upgrade refused"));
     }
-    Ok(Stream::Inproc(pump(s, Role::Client)))
+    Ok(Stream::Ws(pump(s, Role::Client)))
 }
 
 /// Whether `head` is a server's yes to the upgrade with `key`.
@@ -276,10 +277,49 @@ fn upgrade_accepted(head: &str, key: &str) -> bool {
     status_ok && header(head, "sec-websocket-accept") == Some(accept_key(key).as_str())
 }
 
+/// The byte stream of a WebSocket connection. Dropping it gives the pump
+/// [`CLOSE_LINGER`] to write what is left, so a peer that stopped reading
+/// does not keep the socket.
+#[derive(Debug)]
+pub struct WsStream {
+    pipe: DuplexStream,
+    /// Tells the pump once the stream is dropped.
+    _closed: oneshot::Sender<()>,
+}
+
+impl AsyncRead for WsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().pipe).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for WsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().pipe).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().pipe).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().pipe).poll_shutdown(cx)
+    }
+}
+
 /// Starts the frame pump on the current lane and returns the byte stream.
-/// Once the byte stream closes, the pump stops reading the socket; once the
-/// peer closes, what is left to write gets [`CLOSE_LINGER`].
-fn pump<S>(ws: S, role: Role) -> DuplexStream
+/// Once the byte stream closes or is dropped, the pump stops reading the
+/// socket; once either side closes, what is left to write gets
+/// [`CLOSE_LINGER`].
+fn pump<S>(ws: S, role: Role) -> WsStream
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
@@ -289,6 +329,7 @@ where
     // One control frame waits to be written. While a pong waits, newer
     // pings get none [RFC 6455 5.5.3].
     let (ctl_tx, ctl_rx) = mpsc::channel(1);
+    let (closed_tx, closed_rx) = oneshot::channel();
     tokio::task::spawn_local(async move {
         let mut inbound = pin!(frames_in(ws_r, pipe_w, ctl_tx, role));
         let mut outbound = pin!(frames_out(ws_w, pipe_r, ctl_rx, role));
@@ -297,9 +338,17 @@ where
                 let _ = tokio::time::timeout(CLOSE_LINGER, outbound).await;
             }
             () = &mut outbound => {}
+            // A writer stuck on a peer that does not read would never see
+            // the byte stream end.
+            _ = closed_rx => {
+                let _ = tokio::time::timeout(CLOSE_LINGER, outbound).await;
+            }
         }
     });
-    remote
+    WsStream {
+        pipe: remote,
+        _closed: closed_tx,
+    }
 }
 
 /// WebSocket frames to bytes. Control frames go to the writer.
@@ -326,8 +375,10 @@ where
             break;
         }
     }
-    let _ = ctl.send((OP_CLOSE, Vec::new())).await;
+    // The byte stream ends first: with a pong waiting, the close may wait
+    // for a writer that is stuck.
     let _ = pipe.shutdown().await;
+    let _ = ctl.send((OP_CLOSE, Vec::new())).await;
 }
 
 /// Copies the payload of data frame `h` to `pipe`, unmasked, as it comes,
@@ -595,7 +646,7 @@ mod tests {
 
     /// A server pump over an in-memory socket: the client's end, and the byte
     /// stream for MQTT.
-    fn server() -> (DuplexStream, DuplexStream) {
+    fn server() -> (DuplexStream, WsStream) {
         let (client, socket) = tokio::io::duplex(1 << 20);
         (client, pump(socket, Role::Server))
     }
@@ -659,6 +710,30 @@ mod tests {
                 })
                 .await;
                 assert!(gone.is_ok(), "the socket is still read");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stopped_reading_is_let_go_once_the_byte_stream_closes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Room for little more than one frame header.
+                let (mut client, socket) = tokio::io::duplex(64);
+                let mut mqtt = pump(socket, Role::Server);
+                mqtt.write_all(&[1; 4096]).await.unwrap();
+                tokio::task::yield_now().await;
+                drop(mqtt);
+                // The client never reads. Once the pump lets go of the
+                // socket, writes to it fail.
+                let gone = tokio::time::timeout(CLOSE_LINGER * 2, async {
+                    while client.write_all(&ping(4, true)).await.is_ok() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(gone.is_ok(), "the pump still holds the socket");
             })
             .await;
     }

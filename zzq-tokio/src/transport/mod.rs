@@ -50,6 +50,8 @@ pub enum Stream {
     /// QUIC after the handshake.
     #[cfg(feature = "quic")]
     Quic(Box<quic::QuicStream>),
+    /// WebSocket after the upgrade.
+    Ws(ws::WsStream),
     /// Accepted TCP connection whose WebSocket upgrade has not run yet.
     WsAccept(std::net::TcpStream, std::sync::Arc<ws::WsServer>),
 }
@@ -65,7 +67,7 @@ impl std::fmt::Debug for Stream {
             Stream::Tls(_) | Stream::TlsAccept(..) => "tls",
             #[cfg(feature = "quic")]
             Stream::Quic(_) => "quic",
-            Stream::WsAccept(..) => "ws",
+            Stream::Ws(_) | Stream::WsAccept(..) => "ws",
         };
         f.debug_tuple("Stream").field(&kind).finish()
     }
@@ -132,6 +134,10 @@ impl Stream {
             Stream::Quic(mut s) => {
                 fill(s.recv_mut(), buf, &mut done).await?;
                 Ok(Stream::Quic(s))
+            }
+            Stream::Ws(mut s) => {
+                fill(&mut s, buf, &mut done).await?;
+                Ok(Stream::Ws(s))
             }
             Stream::WsAccept(s, server) => {
                 Box::pin(async move { ws::accept(s, &server).await?.prefetch(buf, done).await })
@@ -201,6 +207,10 @@ impl Stream {
                 // Boxed: QUIC halves are larger, and would size the future
                 // of every connection.
                 Ok(Box::pin(driver.run(r, w)).await)
+            }
+            Stream::Ws(s) => {
+                let (r, w) = tokio::io::split(s);
+                Ok(driver.run(r, w).await)
             }
             Stream::WsAccept(s, server) => {
                 Box::pin(async move { ws::accept(s, &server).await?.drive(driver).await }).await
