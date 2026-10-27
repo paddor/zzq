@@ -37,6 +37,10 @@ const MAX_PACKET: usize = 256 << 20;
 /// Read buffer size. Received payloads are slices of it.
 const READ_BUF: usize = 64 << 10;
 
+/// Bytes read on while the inbox is full, for the acks of the client's own
+/// requests among them.
+const READ_AHEAD: usize = 4 << 20;
+
 /// Spare room below which a read gets a fresh buffer first.
 const READ_MIN: usize = 8 << 10;
 
@@ -173,8 +177,11 @@ struct Scratch {
     finished: Vec<(usize, Result<()>)>,
     /// Woken calls have finished calls to wake.
     chained: bool,
-    /// The read and where in it handling stopped for a full inbox.
-    rest: Option<(Bytes, usize)>,
+    /// What a full inbox left to handle, in order: the rest of the read
+    /// where handling stopped, then later reads without their acks.
+    parked: VecDeque<Bytes>,
+    /// Bytes in `parked`.
+    parked_bytes: usize,
 }
 
 impl Session {
@@ -274,7 +281,8 @@ where
     // Packets a full inbox left unread belong to this connection: with the
     // session, the broker sends its messages again; without, their packet
     // IDs mean other messages on the next.
-    s.scratch.rest = None;
+    s.scratch.parked.clear();
+    s.scratch.parked_bytes = 0;
     // A DISCONNECT gets a while to go out. A lost connection's output is
     // not worth waiting for: its unacked requests go again on the next.
     if s.ended {
@@ -307,7 +315,8 @@ impl Conn<'_> {
             if let Some(end) = self.between(&mut deferred) {
                 return end;
             }
-            // A full inbox stops reading, not pings, requests or acks.
+            // A full inbox stops reading past READ_AHEAD, not pings, requests
+            // or acks.
             let blocked = self.s.inbox.blocked();
             make_room(buf);
             if self.s.scratch.chained && !chain_armed {
@@ -321,7 +330,7 @@ impl Conn<'_> {
                     }
                 }
                 () = self.out.drained.notified(), if !self.out.has_room() => {}
-                n = r.read_buf(buf), if !blocked => {
+                n = r.read_buf(buf), if self.s.scratch.parked_bytes < READ_AHEAD => {
                     if !matches!(n, Ok(n) if n > 0) {
                         return Err(Error::Closed);
                     }

@@ -669,3 +669,64 @@ async fn packets_left_unread_by_a_lost_connection_do_not_reach_the_next() {
     assert!(got.contains(&"new".into()), "got {got:?}");
     assert!(!got.contains(&"old".into()), "got {got:?}");
 }
+
+#[tokio::test]
+async fn a_full_inbox_still_reads_the_acks_of_the_clients_requests() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        inbox: 10,
+        ..ClientOptions::new("busy")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let mut c = connecting.await.unwrap();
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        topic: "t",
+        pkid: 0,
+        properties: &[],
+    };
+    let mut out = Vec::new();
+    for _ in 0..100 {
+        encode::publish(&h, b"x", &mut out);
+    }
+    peer.s.write_all(&out).await.unwrap();
+    // A receive loop that answers each message with a QoS 1 publish, with
+    // the rest of the burst behind.
+    assert_eq!(timeout(WAIT, c.recv()).await.unwrap().unwrap().payload, "x");
+    let broker = tokio::spawn(async move {
+        loop {
+            let (byte1, packet) = peer.packet().await;
+            match byte1 >> 4 {
+                3 => {
+                    let pkid = u16::from_be_bytes([packet[5], packet[6]]);
+                    peer.ack(PacketType::PubAck, pkid).await;
+                }
+                8 => {
+                    peer.suback(&packet).await;
+                    return peer;
+                }
+                _ => {}
+            }
+        }
+    });
+    let published = timeout(
+        Duration::from_secs(2),
+        c.publish("u", "y", QoS::AtLeastOnce),
+    )
+    .await;
+    assert!(matches!(published, Ok(Ok(()))), "{published:?}");
+    let subscribed = timeout(Duration::from_secs(2), c.subscribe("v", QoS::AtMostOnce)).await;
+    assert!(matches!(subscribed, Ok(Ok(_))), "{subscribed:?}");
+    let _peer = broker.await.unwrap();
+    for _ in 1..100 {
+        assert_eq!(timeout(WAIT, c.recv()).await.unwrap().unwrap().payload, "x");
+    }
+}

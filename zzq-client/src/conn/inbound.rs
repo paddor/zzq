@@ -39,7 +39,7 @@ impl Conn<'_> {
     }
 
     /// Handles the whole packets in `buf`, then hands their messages to the
-    /// client handle. Stops at a full inbox, keeping the rest of the read
+    /// client handle. Stops at a full inbox, parking the rest of the read
     /// until the handle makes room.
     pub(super) fn input(&mut self, buf: &mut BytesMut) -> Result<()> {
         let n = complete_len(buf)?;
@@ -49,23 +49,76 @@ impl Conn<'_> {
         let chunk = buf.split_to(n).freeze();
         // Acks the handle gathered go out without a wake of their own.
         self.ack_taken();
-        self.packets(chunk, 0)
+        if self.s.inbox.blocked() {
+            self.read_ahead(&chunk)
+        } else {
+            self.packets(&chunk)
+        }
     }
 
-    /// Queues what waited once the handle made room, then handles the rest
-    /// of the read.
+    /// Queues what waited once the handle made room, then handles what was
+    /// parked.
     pub(super) fn resume(&mut self) -> Result<()> {
         if !self.deliver()? {
             return Ok(());
         }
-        match self.s.scratch.rest.take() {
-            Some((chunk, at)) => self.packets(chunk, at),
-            None => Ok(()),
+        while let Some(chunk) = self.s.scratch.parked.pop_front() {
+            self.s.scratch.parked_bytes -= chunk.len();
+            self.packets(&chunk)?;
+            if self.s.inbox.blocked() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Handles the acks of the client's own requests in `chunk`, read while
+    /// the inbox is full, so a call waiting for one does not wait for
+    /// `recv`. Parks the other packets, in order, behind what waits.
+    fn read_ahead(&mut self, chunk: &Bytes) -> Result<()> {
+        let mut res = Ok(());
+        let mut at = 0;
+        // Start of the packets to park.
+        let mut run = 0;
+        while at < chunk.len() {
+            let Ok(Some((packet, n))) = decode(&chunk[at..], self.s.opts.version, MAX_PACKET)
+            else {
+                res = Err(Error::Protocol("malformed packet"));
+                break;
+            };
+            if is_reply(&packet) {
+                self.park(chunk.slice(run..at), false);
+                if let Err(e) = self.packet(packet, chunk) {
+                    res = Err(e);
+                    break;
+                }
+                run = at + n;
+            }
+            at += n;
+        }
+        if res.is_ok() {
+            self.park(chunk.slice(run..), false);
+        }
+        self.finish_acks();
+        res
+    }
+
+    /// Parks packets for once the inbox has room, at the front or the back.
+    fn park(&mut self, packets: Bytes, front: bool) {
+        if packets.is_empty() {
+            return;
+        }
+        self.s.scratch.parked_bytes += packets.len();
+        if front {
+            self.s.scratch.parked.push_front(packets);
+        } else {
+            self.s.scratch.parked.push_back(packets);
         }
     }
 
-    /// Handles the packets of `chunk` from `at`.
-    fn packets(&mut self, chunk: Bytes, mut at: usize) -> Result<()> {
+    /// Handles the packets of `chunk`.
+    fn packets(&mut self, chunk: &Bytes) -> Result<()> {
+        let mut at = 0;
         let mut res = Ok(());
         while at < chunk.len() {
             let Ok(Some((packet, n))) = decode(&chunk[at..], self.s.opts.version, MAX_PACKET)
@@ -74,11 +127,11 @@ impl Conn<'_> {
                 break;
             };
             at += n;
-            match self.packet(packet, &chunk) {
+            match self.packet(packet, chunk) {
                 Ok(Some(m)) => {
                     self.s.inbox.push(m);
                     if self.s.inbox.hand_off() && !self.deliver()? {
-                        self.s.scratch.rest = Some((chunk, at));
+                        self.park(chunk.slice(at..), true);
                         break;
                     }
                 }
@@ -182,4 +235,18 @@ impl Conn<'_> {
             epoch: 0,
         })
     }
+}
+
+/// Whether `packet` answers a request of the client, so it may be handled
+/// ahead of messages that wait for room.
+const fn is_reply(packet: &Packet<'_>) -> bool {
+    matches!(
+        packet,
+        Packet::PubAck(_)
+            | Packet::PubRec(_)
+            | Packet::PubComp(_)
+            | Packet::SubAck(_)
+            | Packet::UnsubAck(_)
+            | Packet::PingResp
+    )
 }
