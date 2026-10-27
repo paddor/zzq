@@ -177,9 +177,8 @@ impl AsyncWrite for QuicWriter {
 /// sockets, so the kernel spreads connections over the lanes. Each lane
 /// runs the handshakes and the quinn tasks of its own connections.
 pub struct QuicListener {
-    endpoints: Box<[quinn::Endpoint]>,
+    lanes: Lanes,
     accepted: mpsc::UnboundedReceiver<Stream>,
-    tasks: Box<[tokio::task::AbortHandle]>,
     host: String,
     port: u16,
 }
@@ -189,12 +188,20 @@ impl fmt::Debug for QuicListener {
         f.debug_struct("QuicListener")
             .field("host", &self.host)
             .field("port", &self.port)
-            .field("lanes", &self.endpoints.len())
+            .field("lanes", &self.lanes.endpoints.len())
             .finish_non_exhaustive()
     }
 }
 
-impl Drop for QuicListener {
+/// The lanes' endpoints and accept tasks, stopped when dropped, also those
+/// a bind that fails on a later lane started already.
+#[derive(Default)]
+struct Lanes {
+    endpoints: Vec<quinn::Endpoint>,
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl Drop for Lanes {
     fn drop(&mut self) {
         for e in &self.endpoints {
             e.set_server_config(None);
@@ -232,8 +239,7 @@ impl QuicListener {
         // client round trips, and the listener's owner takes them as they
         // come.
         let (tx, accepted) = mpsc::unbounded_channel();
-        let mut endpoints = Vec::with_capacity(lanes);
-        let mut tasks = Vec::with_capacity(lanes);
+        let mut started = Lanes::default();
         for (i, socket) in sockets.into_iter().enumerate() {
             let (config, tx) = (config.clone(), tx.clone());
             let (endpoint, task) = ctx
@@ -250,13 +256,12 @@ impl QuicListener {
                     Ok((ep, task.abort_handle()))
                 })
                 .await??;
-            endpoints.push(endpoint);
-            tasks.push(task);
+            started.endpoints.push(endpoint);
+            started.tasks.push(task);
         }
         Ok(QuicListener {
-            endpoints: endpoints.into_boxed_slice(),
+            lanes: started,
             accepted,
-            tasks: tasks.into_boxed_slice(),
             host: host.to_owned(),
             port: bound.port(),
         })
@@ -359,4 +364,47 @@ pub(crate) async fn connect(host: &str, port: u16, o: &TlsOptions) -> Result<Str
         }
     }
     Err(last.unwrap_or(Error::Closed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tls() -> TlsOptions {
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+        TlsOptions {
+            cert_chain_pem: Some(key.cert.pem().into_bytes()),
+            key_pem: Some(key.signing_key.serialize_pem().into_bytes()),
+            ..TlsOptions::default()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bind_that_fails_on_a_later_lane_lets_go_of_the_port() {
+        let ctx = crate::Context::with_config(&crate::Config {
+            io_threads: 2,
+            ..crate::Config::default()
+        })
+        .unwrap();
+        ctx.stop_lane(1);
+        while ctx.lane(1).call(|| ()).await.is_ok() {
+            tokio::task::yield_now().await;
+        }
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let bound = QuicListener::bind(&ctx, "127.0.0.1", port, &tls()).await;
+        assert!(bound.is_err(), "lane 1 is stopped");
+        // Lane 0 lets go once it ran the aborts.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::net::UdpSocket::bind(("127.0.0.1", port)).is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "lane 0 holds the port"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
 }

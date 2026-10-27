@@ -226,6 +226,12 @@ impl Context {
     pub(crate) fn inproc(&self) -> &Arc<Registry> {
         &self.inner.inproc
     }
+
+    /// Stops lane `index`, as a lane that failed would be.
+    #[cfg(test)]
+    pub(crate) fn stop_lane(&self, index: usize) {
+        self.inner.lanes[index].stop.mark();
+    }
 }
 
 /// A lane's runtime. Dropping it does not wait for blocking work, such as
