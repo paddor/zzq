@@ -1,27 +1,15 @@
-//! The result cache: JSONL rows that `tmp/mqtt-bench/run.rb` appends.
+//! The result cache: JSONL rows that `zzq_suite` appends.
 
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
-use std::path::PathBuf;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
-/// `$XDG_CACHE_HOME/zzq`, else `~/.cache/zzq`.
-pub(crate) fn cache_dir() -> PathBuf {
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|dir| !dir.is_empty())
-        .map_or_else(
-            || PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".cache"),
-            PathBuf::from,
-        )
-        .join("zzq")
-}
-
 /// The rows of one cache file, in file order. A missing file has none, and
 /// lines that do not parse are reported and skipped.
 pub(crate) fn load<T: DeserializeOwned>(name: &str) -> Vec<T> {
-    let path = cache_dir().join(name);
+    let path = zzq_bench::cache::dir().join(name);
     let Ok(text) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };

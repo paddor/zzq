@@ -1,0 +1,40 @@
+# Per-client caps raised like the other tuned rivals. MQTT 5 on 1883; the
+# 3.1.1-only listener, WebSocket, AMQP and admin API are off. A full in-flight
+# window blocks the publisher (the default): the pending queue mode drops
+# silently when full. The send queue batches writes.
+server:
+  mqtt:
+    tcp:
+      v3:
+        addr: ""
+      v5:
+        addr: ":1883"
+        max_connections: 0
+    websocket:
+      v3:
+        addr: ""
+      v5:
+        addr: ""
+  amqp:
+    plain:
+      addr: ""
+  amqp091:
+    plain:
+      addr: ""
+  admin_api_addr: ""
+  health_addr: "127.0.0.1:8081"
+  shutdown_timeout: "5s"
+session:
+  max_sessions: 1000000
+  max_inflight_messages: 1000
+  max_send_queue_size: 100000
+  max_offline_queue_size: 100000
+storage:
+  type: "badger"
+  badger_dir: "fluxmq-data"
+ratelimit:
+  enabled: false
+log:
+  level: "warn"
+cluster:
+  enabled: false

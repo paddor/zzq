@@ -1076,11 +1076,13 @@ dependencies = [
 name = "zzq-bench"
 version = "0.3.0"
 dependencies = [
+ "bytes",
  "plotters",
  "serde",
  "serde_json",
  "tokio",
  "zzq-broker",
+ "zzq-client",
  "zzq-proto",
 ]
 

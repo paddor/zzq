@@ -1,0 +1,39 @@
+# Rival MQTT clients against zzq_fakebroker. A workspace of its own, so the
+# main workspace never builds rumqttc or ntex.
+[package]
+name = "zzq-rival-clients"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "rumqttc and ntex-mqtt throughput against zzq_fakebroker."
+
+[dependencies]
+bytes = "1"
+ntex = { version = "=4.4.0", features = ["tokio"] }
+ntex-mqtt = "=9.3.0"
+rumqttc = "=0.25.1"
+tokio = { version = "1", features = ["rt", "macros", "time"] }
+
+# As in the main workspace.
+[lints.rust]
+missing_debug_implementations = "deny"
+unsafe_code = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+cast_precision_loss = "allow"
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+missing_const_for_fn = "warn"
+
+[profile.release]
+debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
+
+[workspace]

@@ -1,0 +1,17 @@
+# The least that runs: one TCP listener and the memory store it requires.
+# Everything else is the built-in default.
+broker:
+  id: bench
+  mqtt:
+    listen:
+      tcp:
+        - name: plain
+          address: 0.0.0.0:1883
+  storage:
+    default: ram
+    default_retention_period: none
+    default_retention_bytes: none
+    providers:
+      - ram:
+          type: memory
+          snapshot_dir: none

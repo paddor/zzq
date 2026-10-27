@@ -1,0 +1,78 @@
+{
+  "connections": {
+    "listener": [
+      {
+        "id": 1,
+        "name": "Not Encrypted",
+        "bind_ip": "0.0.0.0",
+        "port": 1883,
+        "threads": 4,
+        "protocol": "MQTT",
+        "enable": true
+      },
+      {
+        "id": 2,
+        "name": "Encrypted",
+        "bind_ip": "0.0.0.0",
+        "port": 8883,
+        "threads": 4,
+        "protocol": "MQTT+SSL",
+        "enable": true
+      }
+    ],
+    "ssl_keys": {
+      "cafile": "",
+      "keyfile": "/etc/xmq/certs/node.key",
+      "certfile": "/etc/xmq/certs/node.crt",
+      "verify_depth": 0
+    }
+  },
+  "queue_limits": {
+    "max_size": 100000,
+    "max_inflight_messages": 32768
+  },
+  "server_limits": {
+    "send_threads": 3,
+    "receive_threads": 4,
+    "max_topic_alias": 128
+  },
+  "authentication": {
+    "allow_anonymous": true
+  },
+  "persistence": {
+    "redis_uri": "redis://redis_server:6379",
+    "clean_start": true,
+    "enabled": false,
+    "max_redis_connections": 2,
+    "max_queued_writes": 1000
+  },
+  "logging": {
+    "log_to": "xmq_server.log",
+    "keep_logs": 7,
+    "min_log_level": "WARNING",
+    "log_level": {
+      "ack": "WARNING",
+      "connect": "WARNING",
+      "disconnect": "WARNING",
+      "publish": "WARNING",
+      "subscribe": "WARNING",
+      "unsubscribe": "WARNING",
+      "server_connections": "WARNING",
+      "server_events": "WARNING",
+      "cluster_connections": "WARNING",
+      "cluster_events": "WARNING"
+    }
+  },
+  "web_service": {
+    "listener_port": 18883,
+    "encrypted": true
+  },
+  "bridges": [],
+  "cluster": {
+    "this_node": {
+      "node_name": "primary",
+      "host_port": "localhost:1883"
+    },
+    "nodes": []
+  }
+}

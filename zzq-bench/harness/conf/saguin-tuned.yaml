@@ -1,0 +1,25 @@
+# Memory store only, logs at warning, no connect rate limit. QoS 2 in-flight
+# 1000 (default 20 refuses 100 in flight). Session queue 160 MiB, about 100000
+# queued 1 KiB QoS 1 messages. Anonymous is the default without a password file.
+broker:
+  id: bench
+  log_level: warn
+  mqtt:
+    listen:
+      tcp:
+        - name: plain
+          address: 0.0.0.0:1883
+  storage:
+    default: ram
+    default_retention_period: none
+    default_retention_bytes: none
+    providers:
+      - ram:
+          type: memory
+          snapshot_dir: none
+  qos2:
+    max_inflight_per_client: 1000
+  limits:
+    max_connect_rate: none
+    max_connections: 100000
+    session_queue_bytes: 160MiB

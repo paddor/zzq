@@ -1,0 +1,38 @@
+# fluxmq-tuned.yaml for many connections: the send queue holds 1000, since
+# it is allocated in full per connection.
+server:
+  mqtt:
+    tcp:
+      v3:
+        addr: ""
+      v5:
+        addr: ":1883"
+        max_connections: 0
+    websocket:
+      v3:
+        addr: ""
+      v5:
+        addr: ""
+  amqp:
+    plain:
+      addr: ""
+  amqp091:
+    plain:
+      addr: ""
+  admin_api_addr: ""
+  health_addr: "127.0.0.1:8081"
+  shutdown_timeout: "5s"
+session:
+  max_sessions: 1000000
+  max_inflight_messages: 1000
+  max_send_queue_size: 1000
+  max_offline_queue_size: 100000
+storage:
+  type: "badger"
+  badger_dir: "fluxmq-data"
+ratelimit:
+  enabled: false
+log:
+  level: "warn"
+cluster:
+  enabled: false
