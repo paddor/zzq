@@ -70,9 +70,11 @@ pub fn mqtt_sn(data: &[u8]) {
     assert_eq!(again, Ok(packet), "MQTT-SN message does not round-trip");
 }
 
-/// A WebSocket upgrade request and frames, as the server reads them.
+/// WebSocket bytes, read as a server reads an upgrade request and client
+/// frames, and as a client reads an upgrade response and server frames.
 pub fn websocket(data: &[u8]) {
     zzq_tokio::fuzzing::websocket_server(data);
+    zzq_tokio::fuzzing::websocket_client(data);
 }
 
 /// A retained message log, as the broker replays it on start.

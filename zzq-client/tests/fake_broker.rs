@@ -432,3 +432,175 @@ async fn disconnect_returns_while_the_broker_stops_reading() {
     );
     drop(peer);
 }
+
+/// Accepts a connection and answers its CONNECT with a CONNACK that has
+/// `session_present` and Receive Maximum `max`.
+async fn accept_with(l: &TcpListener, session_present: bool, max: u16) -> Peer {
+    use zzq_proto::Property;
+    use zzq_proto::property::{self, RECEIVE_MAXIMUM};
+
+    let s = timeout(WAIT, l.accept()).await.unwrap().unwrap().0;
+    let mut peer = Peer { s, buf: Vec::new() };
+    assert_eq!(peer.packet().await.0 >> 4, 1, "CONNECT");
+    let mut props = Vec::new();
+    property::encode_all(&[Property::U16(RECEIVE_MAXIMUM, max)], &mut props);
+    let ack = ConnAckFields {
+        session_present,
+        properties: &props,
+        ..ConnAckFields::default()
+    };
+    let mut out = Vec::new();
+    encode::connack(&ack, Version::V5, &mut out);
+    peer.s.write_all(&out).await.unwrap();
+    peer
+}
+
+#[tokio::test]
+async fn a_resume_resends_no_more_than_the_new_receive_maximum() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("quota")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = accept_with(&l, false, 10).await;
+    let client = connecting.await.unwrap();
+    let handle = client.handle();
+    let mut acks = Vec::new();
+    for i in 0..5u8 {
+        acks.push(
+            handle
+                .enqueue("t", vec![i], QoS::AtLeastOnce, false)
+                .await
+                .unwrap(),
+        );
+    }
+    for _ in 0..5 {
+        assert_eq!(first.packet().await.0 >> 4, 3, "PUBLISH");
+    }
+    drop(first);
+    // The broker kept the session, but takes two in flight now.
+    let mut second = accept_with(&l, true, 2).await;
+    let mut resent = Vec::new();
+    for _ in 0..2 {
+        let (byte1, packet) = second.packet().await;
+        assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
+        resent.push(u16::from_be_bytes([packet[5], packet[6]]));
+    }
+    let mut more = [0u8; 1];
+    assert!(
+        second.buf.is_empty()
+            && timeout(Duration::from_millis(200), second.s.read(&mut more))
+                .await
+                .is_err(),
+        "resent past the Receive Maximum"
+    );
+    // Each ack makes room for one more.
+    second.ack(PacketType::PubAck, resent[0]).await;
+    let (byte1, _) = second.packet().await;
+    assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
+}
+
+/// Another client with the same ID takes the session over right after each
+/// CONNACK: the reconnects back off instead of starting over each time.
+#[tokio::test]
+async fn reconnects_after_a_quick_takeover_back_off() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(400),
+        }),
+        ..ClientOptions::new("twin")
+    };
+    let client = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut taken_over = Vec::new();
+    encode::reason_only(
+        PacketType::Disconnect,
+        Version::V5,
+        0x8E,
+        &[],
+        &mut taken_over,
+    );
+    let mut connects = 0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+    while let Ok(accepted) = tokio::time::timeout_at(end, l.accept()).await {
+        let s = accepted.unwrap().0;
+        let mut peer = Peer { s, buf: Vec::new() };
+        assert_eq!(peer.packet().await.0 >> 4, 1, "CONNECT");
+        let mut out = Vec::new();
+        encode::connack(&ConnAckFields::default(), Version::V5, &mut out);
+        out.extend_from_slice(&taken_over);
+        peer.s.write_all(&out).await.unwrap();
+        connects += 1;
+    }
+    // 10, 20, 40, ... ms apart: about 7 in a second, not one per 10 ms.
+    assert!(connects <= 12, "{connects} connects in 1 s");
+    drop(client);
+}
+
+/// A resumed QoS 2 flow past PUBREC sends its PUBREL at once, and it counts
+/// against the room for resent publishes.
+#[tokio::test]
+async fn a_resumed_pubrel_goes_at_once_and_takes_room() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("pubrel")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = accept_with(&l, false, 10).await;
+    let client = connecting.await.unwrap();
+    let handle = client.handle();
+    let two = handle
+        .enqueue("t", "2", QoS::ExactlyOnce, false)
+        .await
+        .unwrap();
+    let (_, packet) = first.packet().await;
+    let released = u16::from_be_bytes([packet[5], packet[6]]);
+    first.ack(PacketType::PubRec, released).await;
+    assert_eq!(first.packet().await.0 >> 4, 6, "PUBREL");
+    let one = handle
+        .enqueue("t", "1", QoS::AtLeastOnce, false)
+        .await
+        .unwrap();
+    assert_eq!(first.packet().await.0 >> 4, 3, "PUBLISH");
+    drop(first);
+    // One in flight: the released flow takes it.
+    let mut second = accept_with(&l, true, 1).await;
+    let (byte1, packet) = second.packet().await;
+    assert_eq!(byte1 >> 4, 6, "PUBREL first");
+    assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), released);
+    let mut more = [0u8; 1];
+    assert!(
+        second.buf.is_empty()
+            && timeout(Duration::from_millis(200), second.s.read(&mut more))
+                .await
+                .is_err(),
+        "a PUBLISH went past the Receive Maximum"
+    );
+    second.ack(PacketType::PubComp, released).await;
+    let (byte1, _) = second.packet().await;
+    assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
+    drop((one, two));
+}

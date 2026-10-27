@@ -24,6 +24,32 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let out = connect_packet(opts, resume);
+    // A TLS stream may hold what it got until a flush.
+    let sent = async {
+        w.write_all(&out).await?;
+        w.flush().await
+    };
+    sent.await.map_err(|e| Error::Transport(e.into()))?;
+    loop {
+        match decode(buf, opts.version, MAX_PACKET) {
+            Ok(Some((Packet::ConnAck(c), n))) => {
+                let res = connack(&c, opts.version);
+                buf.advance(n);
+                return res;
+            }
+            Ok(Some(_)) | Err(_) => return Err(Error::Protocol("expected CONNACK")),
+            Ok(None) => {}
+        }
+        match r.read_buf(buf).await {
+            Ok(0) | Err(_) => return Err(Error::Closed),
+            Ok(_) => {}
+        }
+    }
+}
+
+/// The CONNECT packet for `opts`.
+fn connect_packet(opts: &ClientOptions, resume: bool) -> Vec<u8> {
     let mut props = Vec::new();
     if opts.session_expiry > 0 {
         props.push(Property::U32(
@@ -64,24 +90,7 @@ where
     };
     let mut out = Vec::new();
     encode::connect(&fields, &mut out);
-    w.write_all(&out)
-        .await
-        .map_err(|e| Error::Transport(e.into()))?;
-    loop {
-        match decode(buf, opts.version, MAX_PACKET) {
-            Ok(Some((Packet::ConnAck(c), n))) => {
-                let res = connack(&c, opts.version);
-                buf.advance(n);
-                return res;
-            }
-            Ok(Some(_)) | Err(_) => return Err(Error::Protocol("expected CONNACK")),
-            Ok(None) => {}
-        }
-        match r.read_buf(buf).await {
-            Ok(0) | Err(_) => return Err(Error::Closed),
-            Ok(_) => {}
-        }
-    }
+    out
 }
 
 /// CONNACK details and the broker's Receive Maximum.
@@ -107,4 +116,53 @@ fn connack(c: &ConnAck<'_>, version: Version) -> Result<(Connected, u16)> {
         .get_int(property::RECEIVE_MAXIMUM)
         .map_or(u16::MAX, |v| u16::try_from(v).unwrap_or(u16::MAX));
     Ok((connected, quota))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use bytes::BytesMut;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+    use zzq_proto::Version;
+    use zzq_proto::encode::{self, ConnAckFields};
+
+    use super::handshake;
+    use crate::ClientOptions;
+
+    /// A writer that buffers, as a TLS stream may, still sends CONNECT.
+    #[tokio::test]
+    async fn connect_leaves_a_buffering_writer() {
+        let (client, mut broker) = tokio::io::duplex(1024);
+        let (mut r, w) = tokio::io::split(client);
+        let mut w = BufWriter::new(w);
+        let opts = ClientOptions::default();
+        let broker = async move {
+            let mut first = [0u8; 1];
+            broker.read_exact(&mut first).await.unwrap();
+            assert_eq!(first[0] >> 4, 1, "CONNECT");
+            let mut out = Vec::new();
+            encode::connack(&ConnAckFields::default(), Version::V5, &mut out);
+            broker.write_all(&out).await.unwrap();
+            broker
+        };
+        let mut buf = BytesMut::new();
+        let both =
+            async { tokio::join!(handshake(&opts, false, &mut r, &mut w, &mut buf), broker) };
+        let (res, _broker) = tokio::time::timeout(Duration::from_secs(2), both)
+            .await
+            .expect("CONNECT stayed in the writer");
+        assert!(res.is_ok(), "{res:?}");
+    }
+
+    #[tokio::test]
+    async fn a_reply_other_than_connack_is_a_protocol_error() {
+        let (client, mut broker) = tokio::io::duplex(1024);
+        let (mut r, mut w) = tokio::io::split(client);
+        // PINGRESP.
+        broker.write_all(&[0xd0, 0x00]).await.unwrap();
+        let mut buf = BytesMut::new();
+        let res = handshake(&ClientOptions::default(), false, &mut r, &mut w, &mut buf).await;
+        assert!(matches!(res, Err(crate::Error::Protocol(_))), "{res:?}");
+    }
 }

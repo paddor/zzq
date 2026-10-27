@@ -46,9 +46,7 @@ impl Client {
                 topic,
             } => self.subscribe_in(flags, msg_id, topic, out).await,
             sn::Packet::Unsubscribe { msg_id, topic, .. } => {
-                if let Some(filter) = self.filter_name(topic) {
-                    encode::unsubscribe(v, msg_id.max(1), &[], &[&filter], out);
-                }
+                self.unsubscribe_in(msg_id, topic, out).await;
             }
             sn::Packet::PingReq { .. } => encode::pingreq(out),
             sn::Packet::Disconnect {
@@ -167,6 +165,15 @@ impl Client {
         let opts = SubscriptionOptions::from(flags.qos.mqtt());
         encode::subscribe(Version::V311, msg_id.max(1), &[], &[(&filter, opts)], out);
         self.replies.sub_filter.insert(msg_id.max(1), filter);
+    }
+
+    /// Translates an UNSUBSCRIBE. One for a filter that is not valid gets
+    /// its UNSUBACK at once: nothing can be subscribed to it.
+    async fn unsubscribe_in(&mut self, msg_id: u16, topic: Filter<'_>, out: &mut Vec<u8>) {
+        match self.filter_name(topic) {
+            Some(filter) => encode::unsubscribe(Version::V311, msg_id.max(1), &[], &[&filter], out),
+            None => self.send(&sn::Packet::UnsubAck { msg_id }).await,
+        }
     }
 
     /// SUBACK fields for the client: granted QoS, the topic ID of a plain

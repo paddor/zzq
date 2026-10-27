@@ -146,7 +146,7 @@ pub struct Stats {
 pub struct Dropped {
     /// QoS 0 messages dropped because a connection's write buffer was full.
     pub buffer_full: u64,
-    /// QoS 0 messages for offline sessions.
+    /// QoS 0 messages for offline or ended sessions.
     pub offline: u64,
     /// QoS 1/2 messages dropped from a full session queue.
     pub queue_full: u64,
@@ -155,7 +155,9 @@ pub struct Dropped {
     /// Queued messages whose Message Expiry Interval ran out.
     pub expired: u64,
     /// QoS 1/2 messages a session still held, queued or unacked, when it
-    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
+    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0. Also
+    /// those a share group sent to a member on another lane whose session
+    /// ended on the way.
     pub session_ended: u64,
     /// QoS 1/2 messages dropped instead of queued because
     /// `max_state_bytes` was reached.
@@ -224,6 +226,7 @@ impl Broker {
         )
         .map_err(Error::Persistence)?;
         let shared = Arc::new(Shared {
+            // Relaxed: only unique, no data rides on it.
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             opts,
@@ -385,7 +388,7 @@ impl Broker {
         saved
     }
 
-    fn abort_tasks(&self) {
+    pub(crate) fn abort_tasks(&self) {
         for a in self
             .shared
             .tasks

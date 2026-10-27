@@ -1,3 +1,6 @@
+//! Broker options: limits, storage, the authentication and authorization
+//! hooks, and the MQTT-SN gateway.
+
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -17,3 +17,8 @@ fn ready<F: Future>(f: F) -> Option<F::Output> {
 pub fn websocket_server(data: &[u8]) {
     let _ = ready(crate::transport::ws::fuzz_server(data));
 }
+
+/// Reads `data` as a WebSocket upgrade response and the frames after it.
+pub fn websocket_client(data: &[u8]) {
+    let _ = ready(crate::transport::ws::fuzz_client(data));
+}

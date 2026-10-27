@@ -206,7 +206,8 @@ impl Lane {
         s.out.buf.clear();
         s.inbound.aliases.clear();
         self.stats.connections -= 1;
-        self.shared.connections.fetch_sub(1, Ordering::AcqRel);
+        // Relaxed: see `conn::establish`.
+        self.shared.connections.fetch_sub(1, Ordering::Relaxed);
         let send_will = !matches!(close, Close::Graceful { will: false });
         let will = s.will.take().filter(|_| send_will);
         let expiry = s.expiry;

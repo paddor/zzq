@@ -1,28 +1,34 @@
 //! Topic names, topic IDs and their registration.
 
 use zzq_proto::sn::{self, Filter, Topic};
+use zzq_proto::topic::{validate_filter, validate_name};
 
 use super::{Client, MAX_SEND, predefined};
 
 impl Client {
-    /// The topic name a PUBLISH refers to.
+    /// The topic name a PUBLISH refers to, if it is a valid one.
     pub(super) fn topic_name(&self, topic: Topic) -> Option<String> {
         match topic {
             Topic::Id(id) => self.topics.by_id.get(&id).cloned(),
             Topic::Predefined(id) => predefined(&self.shared, id).map(str::to_owned),
-            Topic::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
+            Topic::Short(s) => std::str::from_utf8(&s)
+                .ok()
+                .filter(|t| validate_name(t).is_ok())
+                .map(str::to_owned),
             _ => None,
         }
     }
 
-    /// The topic or filter a SUBSCRIBE or UNSUBSCRIBE refers to.
+    /// The topic or filter a SUBSCRIBE or UNSUBSCRIBE refers to, if it is a
+    /// valid one. The broker would close the connection for any other.
     pub(super) fn filter_name(&self, filter: Filter<'_>) -> Option<String> {
-        match filter {
+        let name = match filter {
             Filter::Name(n) => Some(n.to_owned()),
             Filter::Predefined(id) => predefined(&self.shared, id).map(str::to_owned),
             Filter::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
             _ => None,
-        }
+        };
+        name.filter(|f| validate_filter(f).is_ok())
     }
 
     /// The topic ID of `name`, assigning one if needed. `None` once the

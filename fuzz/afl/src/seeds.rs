@@ -168,9 +168,14 @@ fn websocket() -> Vec<Vec<u8>> {
     let mut long = vec![0x82, 0x80 | 0x7e, 0, 200];
     long.extend_from_slice(&mask);
     long.extend(std::iter::repeat_n(0, 200));
+    let response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\
+                    Connection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\
+                    Sec-WebSocket-Protocol: mqtt\r\n\r\n";
+    let server = [response.as_bytes(), &[0x82, 4], b"ping", &[0x89, 0]].concat();
     [frame, long]
         .into_iter()
         .map(|f| [upgrade.as_bytes(), &f].concat())
+        .chain([server])
         .collect()
 }
 

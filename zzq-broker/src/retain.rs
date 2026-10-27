@@ -326,7 +326,8 @@ fn to_stored(m: &Msg) -> Retained {
 /// A stored message, unless it expired while the broker was down.
 fn from_stored(r: &Retained, now: Instant, wall: SystemTime) -> Option<Msg> {
     let expires_at = match r.expires_at {
-        Some(t) => Some(now + t.duration_since(wall).ok()?),
+        // Past what an `Instant` holds on some platforms: as good as never.
+        Some(t) => now.checked_add(t.duration_since(wall).ok()?),
         None => None,
     };
     let mut m = Msg::new(&r.topic, &r.payload, &r.properties, r.qos, true);
@@ -374,6 +375,20 @@ mod tests {
             format!("{store:?}"),
             "RetainedStore { len: 1, persist: true, .. }"
         );
+    }
+
+    /// A stored deadline as far ahead as a log can say loads, without one.
+    #[test]
+    fn a_deadline_too_far_ahead_loads_as_none() {
+        let r = Retained {
+            topic: "far".into(),
+            payload: bytes::Bytes::from_static(b"x"),
+            qos: QoS::AtMostOnce,
+            properties: bytes::Bytes::new(),
+            expires_at: Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(u64::MAX)),
+        };
+        let m = from_stored(&r, Instant::now(), SystemTime::now()).unwrap();
+        assert!(m.expires_at.is_none_or(|t| t > Instant::now()));
     }
 
     /// The tree agrees with matching every topic against the filter.

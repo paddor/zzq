@@ -287,8 +287,15 @@ impl Lane {
         })
     }
 
+    /// Delivers to session `key`: false if it is gone.
     #[inline]
-    pub(super) fn deliver(&mut self, key: Key, p: &Publication<'_>, owned: &mut Owned, g: Grant) {
+    pub(super) fn deliver(
+        &mut self,
+        key: Key,
+        p: &Publication<'_>,
+        owned: &mut Owned,
+        g: Grant,
+    ) -> bool {
         let Grant {
             qos,
             retain,
@@ -297,7 +304,7 @@ impl Lane {
         } = g;
         let o = &self.shared.opts;
         let Some(s) = self.sessions.get_mut(key) else {
-            return;
+            return false;
         };
         let outcome = if qos == QoS::AtMostOnce {
             if s.conn.is_none() {
@@ -330,6 +337,7 @@ impl Lane {
             self.congestion.hit.get_or_insert(Hit::Local(key));
         }
         self.count(outcome);
+        true
     }
 
     #[inline]
@@ -373,7 +381,14 @@ impl Lane {
                     sub_id: item.sub_id,
                     last: true,
                 };
-                self.deliver(key, &p, &mut owned, g);
+                // The member's session ended after another lane picked it.
+                if !self.deliver(key, &p, &mut owned, g) {
+                    if item.qos == QoS::AtMostOnce {
+                        self.stats.dropped.offline += 1;
+                    } else {
+                        self.stats.dropped.session_ended += 1;
+                    }
+                }
             }
         }
     }
@@ -490,11 +505,45 @@ mod tests {
     use bytes::Bytes;
     use zzq_proto::{QoS, Version};
 
+    use super::super::Remote;
     use super::{Grant, Owned, keep};
+    use crate::BrokerOptions;
     use crate::budget::LaneTotal;
     use crate::index::SubIds;
-    use crate::msg::Publication;
-    use crate::session::{KeptMsg, Session, SharedMsg};
+    use crate::msg::{Msg, Publication};
+    use crate::session::{KeptMsg, Queued, Session, SharedMsg};
+    use crate::slab::Key;
+    use crate::tests::on_lane;
+    use crate::tests::support::setup;
+
+    /// A share group member on another lane whose session ended before
+    /// the message arrived: the message is counted as dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_delivery_to_an_ended_session_is_counted() {
+        let (ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+        let dropped = on_lane(&ctx, &broker, 0, |l| {
+            let gone = Key {
+                slot: 1000,
+                generation: 0,
+            };
+            for qos in [QoS::AtMostOnce, QoS::AtLeastOnce] {
+                let msg = Msg::new("t", b"x", &[], qos, false);
+                l.deliver_remote(Remote::Deliver {
+                    key: gone,
+                    pins: false,
+                    item: Queued {
+                        msg,
+                        qos,
+                        retain: false,
+                        sub_id: SubIds::default(),
+                    },
+                });
+            }
+            (l.stats.dropped.offline, l.stats.dropped.session_ended)
+        })
+        .await;
+        assert_eq!(dropped, (1, 1));
+    }
 
     /// A session that holds messages long does not share one that pins the
     /// read buffer, which sessions before it share: it and the sessions

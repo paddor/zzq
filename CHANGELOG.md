@@ -5,6 +5,35 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `zzq-broker`: a share group message sent to a member on another lane
+  whose session ended on the way was dropped uncounted. It now counts in
+  `Dropped::session_ended`, or `Dropped::offline` at QoS 0.
+- `zzq-broker`: an MQTT-SN short topic or a filter that is not valid, such
+  as `a#`, made the broker close the client's connection, and its will went
+  out. PUBLISH and SUBSCRIBE now get "invalid topic ID", and UNSUBSCRIBE an
+  UNSUBACK.
+- `zzq-tokio`: a refused TCP connect under `tls://`, `ws://` or `wss://`
+  failed with `Error::Io` instead of `Error::Refused`, as `tcp://` does.
+- `zzq-client`: CONNECT was written without a flush, so a transport that
+  buffers writes could hold it back and the connect time out.
+- `zzq-client`: after a reconnect, the client resent all its unacked
+  publishes, even past a smaller Receive Maximum from the broker, which a
+  v5 broker answers with a disconnect, on every reconnect. The rest now go
+  as acks make room.
+- `zzq-client`: the reconnect backoff started over after every CONNACK, so
+  two clients with one client ID took the session from each other about 10
+  times a second, forever. A connection lost within `Reconnect::max` of its
+  CONNACK now keeps backing off.
+- `zzq-broker`: a retained message whose stored deadline lay further ahead
+  than `Instant` reaches, as a damaged log or a custom `Persistence` can
+  give, made the broker panic on start where `Instant` is narrow, such as
+  macOS. It now loads without a deadline.
+- `zzq-broker`: after a spike of sessions, each lane kept a slot the size
+  of a session, about 750 bytes, for every session it ever held at once.
+  Lanes now reuse the lowest free slots and give back the rest.
+
 ## [0.2.0] - 2026-10-27
 
 ### Added

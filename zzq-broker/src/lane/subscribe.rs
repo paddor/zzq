@@ -24,9 +24,9 @@ pub(crate) struct Held {
     /// The connection the ack is for.
     pub(crate) conn: u64,
     pub(crate) sync: Arc<SyncAck>,
-    pub(crate) packet: Vec<u8>,
+    pub(crate) packet: Box<[u8]>,
     /// New subscriptions that get retained messages after the ack.
-    pub(crate) retained: Vec<Wanted>,
+    pub(crate) retained: Box<[Wanted]>,
 }
 
 /// A subscription that gets the retained messages it matches: filter,
@@ -203,8 +203,8 @@ impl Lane {
                 key,
                 conn,
                 sync,
-                packet,
-                retained,
+                packet: packet.into(),
+                retained: retained.into(),
             });
         } else {
             if let Some(s) = self.sessions.get_mut(key) {
@@ -373,8 +373,8 @@ mod tests {
                 key,
                 conn,
                 sync,
-                packet,
-                retained: Vec::new(),
+                packet: packet.into(),
+                retained: Box::default(),
             });
             ticket
         })

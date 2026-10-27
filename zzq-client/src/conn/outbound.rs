@@ -33,42 +33,98 @@ impl Conn<'_> {
         if !session_present {
             self.finish_released();
         }
-        let mut resend: Vec<(u64, Vec<u8>)> = self.s.requests.unacked.values().cloned().collect();
-        resend.sort_by_key(|(seq, _)| *seq);
+        let order = self.unacked_in_order();
         if !session_present {
             self.s.inbound.awaiting_rel.clear();
             self.s.inbound.unconsumed.clear();
             self.s.inbox.forget_acks();
             self.s.scratch.taken.clear();
-            let mut by_id: Vec<(u32, Vec<(String, SubscriptionOptions)>)> = Vec::new();
-            for (f, o, id) in &self.s.subs {
-                match by_id.iter_mut().find(|(i, _)| i == id) {
-                    Some((_, list)) => list.push((f.clone(), *o)),
-                    None => by_id.push((*id, vec![(f.clone(), *o)])),
-                }
-            }
-            for (id, filters) in by_id {
-                let Some(pkid) = self.pkid() else {
-                    // Every packet ID is taken: send it once one is free.
-                    self.s.requests.waiting.push_front(Cmd::Subscribe {
-                        filters,
-                        sub_id: id,
-                        done: oneshot::channel().0,
-                    });
-                    continue;
-                };
-                let packet = self.subscribe_packet(pkid, &filters, id);
-                self.send_tracked(pkid, packet, Pending::Restore);
-            }
+            self.restore_subscriptions();
         }
-        for (_, mut packet) in resend {
-            if packet.first().is_some_and(|b| b >> 4 == 3) {
-                packet[0] |= 0x08;
-            }
-            self.out.push(|b| b.extend_from_slice(&packet));
-        }
+        self.resend_unacked(order);
         // Finished flows may have made room for waiting requests.
         self.send_waiting();
+    }
+
+    /// Packet IDs of the unacked requests, in the order they were sent.
+    fn unacked_in_order(&self) -> Vec<u16> {
+        let mut order: Vec<(u64, u16)> = self
+            .s
+            .requests
+            .unacked
+            .iter()
+            .map(|(&pkid, (seq, _))| (*seq, pkid))
+            .collect();
+        order.sort_unstable();
+        order.into_iter().map(|(_, pkid)| pkid).collect()
+    }
+
+    /// Subscribes again, one SUBSCRIBE per Subscription Identifier.
+    fn restore_subscriptions(&mut self) {
+        let mut by_id: Vec<(u32, Vec<(String, SubscriptionOptions)>)> = Vec::new();
+        for (f, o, id) in &self.s.subs {
+            match by_id.iter_mut().find(|(i, _)| i == id) {
+                Some((_, list)) => list.push((f.clone(), *o)),
+                None => by_id.push((*id, vec![(f.clone(), *o)])),
+            }
+        }
+        for (id, filters) in by_id {
+            let Some(pkid) = self.pkid() else {
+                // Every packet ID is taken: send it once one is free.
+                self.s.requests.waiting.push_front(Cmd::Subscribe {
+                    filters,
+                    sub_id: id,
+                    done: oneshot::channel().0,
+                });
+                continue;
+            };
+            let packet = self.subscribe_packet(pkid, &filters, id);
+            self.send_tracked(pkid, packet, Pending::Restore);
+        }
+    }
+
+    /// Sends the requests in `order` again: PUBREL and SUBSCRIBE packets at
+    /// once, PUBLISH packets as the broker's Receive Maximum allows, which
+    /// counts the released flows too. The other PUBLISH packets wait in
+    /// `resend`.
+    fn resend_unacked(&mut self, order: Vec<u16>) {
+        self.s.requests.resend.clear();
+        let released = self
+            .s
+            .requests
+            .unacked
+            .values()
+            .filter(|(_, p)| is(p, 6))
+            .count();
+        let mut room = self.s.requests.quota.saturating_sub(released);
+        for pkid in order {
+            let publish = self
+                .s
+                .requests
+                .unacked
+                .get(&pkid)
+                .is_some_and(|(_, p)| is(p, 3));
+            if !publish {
+                self.resend_one(pkid);
+            } else if room > 0 {
+                room -= 1;
+                self.resend_one(pkid);
+            } else {
+                self.s.requests.resend.push_back(pkid);
+            }
+        }
+    }
+
+    /// Sends an unacked request again, a PUBLISH with DUP.
+    fn resend_one(&mut self, pkid: u16) {
+        if let Some((_, packet)) = self.s.requests.unacked.get(&pkid) {
+            let dup = if is(packet, 3) { 0x08 } else { 0 };
+            self.out.push(|b| {
+                let at = b.len();
+                b.extend_from_slice(packet);
+                b[at] |= dup;
+            });
+        }
     }
 
     /// Finishes the QoS 2 publishes that got PUBREC, for a broker that lost
@@ -79,7 +135,7 @@ impl Conn<'_> {
             .requests
             .unacked
             .iter()
-            .filter(|(_, (_, p))| p.first().is_some_and(|b| b >> 4 == 6))
+            .filter(|(_, (_, p))| is(p, 6))
             .map(|(id, _)| *id)
             .collect();
         for pkid in released {
@@ -132,8 +188,20 @@ impl Conn<'_> {
         self.out.has_room() && self.s.requests.waiting_bytes < QUEUED
     }
 
-    /// Sends waiting commands that may go now, in order.
+    /// Sends what waits for room, in order: publishes to resend after a
+    /// reconnect, then waiting commands.
     pub(super) fn send_waiting(&mut self) {
+        while let Some(&pkid) = self.s.requests.resend.front()
+            && self
+                .s
+                .requests
+                .inflight
+                .saturating_sub(self.s.requests.resend.len())
+                < self.s.requests.quota
+        {
+            self.s.requests.resend.pop_front();
+            self.resend_one(pkid);
+        }
         while let Some(cmd) = self.s.requests.waiting.front()
             && !self.blocked(cmd)
         {
@@ -304,6 +372,11 @@ impl Conn<'_> {
         self.s.requests.inflight = self.s.requests.inflight.saturating_sub(1);
         self.send_waiting();
     }
+}
+
+/// Whether `packet` is of control packet type `kind`.
+fn is(packet: &[u8], kind: u8) -> bool {
+    packet.first().is_some_and(|b| b >> 4 == kind)
 }
 
 /// Sets the packet ID of an encoded QoS 1/2 PUBLISH.

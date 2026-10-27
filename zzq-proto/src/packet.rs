@@ -627,4 +627,24 @@ mod tests {
         assert!(decode(&[0xb0, 0x03, 0x00, 0x01, 0x00], Version::V311, usize::MAX).is_err());
         assert!(decode(&[0xb0, 0x02, 0x00, 0x01], Version::V311, usize::MAX).is_ok());
     }
+
+    /// The ASCII fast path ends where ASCII does, and the checks after it
+    /// still see NUL and wildcards next to other characters.
+    #[test]
+    fn topic_names_at_the_edges_of_the_ascii_path() {
+        assert_eq!(topic_name(b""), Ok(""));
+        assert_eq!(topic_name(b"a/\x7f"), Ok("a/\x7f"));
+        assert_eq!(topic_name("a/\u{e9}".as_bytes()), Ok("a/\u{e9}"));
+        assert_eq!(topic_name(b"a/\x80"), Err(DecodeError::InvalidUtf8));
+        assert_eq!(topic_name(b"a\0"), Err(DecodeError::InvalidUtf8));
+        assert_eq!(
+            topic_name("\u{e9}\0".as_bytes()),
+            Err(DecodeError::InvalidUtf8)
+        );
+        assert_eq!(topic_name(b"a/+"), Err(DecodeError::InvalidTopic));
+        assert_eq!(
+            topic_name("\u{e9}#".as_bytes()),
+            Err(DecodeError::InvalidTopic)
+        );
+    }
 }

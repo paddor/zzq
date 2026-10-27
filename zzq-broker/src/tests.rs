@@ -899,3 +899,44 @@ async fn publishes_waiting_for_a_register_are_bounded() {
         "{got} publishes held for one REGISTER"
     );
 }
+
+/// The MQTT-SN client tasks stop with their gateway, and so do their
+/// broker connections.
+#[tokio::test(flavor = "multi_thread")]
+async fn mqtt_sn_clients_stop_with_their_gateway() {
+    use tokio::net::UdpSocket;
+    use zzq_proto::sn::{self, Flags, Packet};
+
+    let (_ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+    let addr = broker
+        .bind("udp://127.0.0.1:0")
+        .await
+        .unwrap()
+        .socket_addr_string()
+        .unwrap();
+    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    s.connect(&addr).await.unwrap();
+    let connect = Packet::Connect {
+        flags: Flags {
+            clean_session: true,
+            ..Flags::default()
+        },
+        duration: 60,
+        client_id: "sn",
+    };
+    let mut out = Vec::new();
+    sn::encode(&connect, &mut out);
+    s.send(&out).await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(WAIT, s.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sn::decode(&buf[..n]).unwrap().0,
+        Packet::ConnAck { code: sn::ACCEPTED }
+    );
+    stats_until(&broker, |s| s.connections == 1).await;
+    broker.abort_tasks();
+    stats_until(&broker, |s| s.connections == 0).await;
+}
