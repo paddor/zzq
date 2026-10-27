@@ -154,4 +154,15 @@ mod tests {
             .expect("CONNECT stayed in the writer");
         assert!(res.is_ok(), "{res:?}");
     }
+
+    #[tokio::test]
+    async fn a_reply_other_than_connack_is_a_protocol_error() {
+        let (client, mut broker) = tokio::io::duplex(1024);
+        let (mut r, mut w) = tokio::io::split(client);
+        // PINGRESP.
+        broker.write_all(&[0xd0, 0x00]).await.unwrap();
+        let mut buf = BytesMut::new();
+        let res = handshake(&ClientOptions::default(), false, &mut r, &mut w, &mut buf).await;
+        assert!(matches!(res, Err(crate::Error::Protocol(_))), "{res:?}");
+    }
 }

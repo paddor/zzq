@@ -106,3 +106,32 @@ async fn a_refused_connect_is_refused_under_tls_and_websocket() {
         assert_eq!(e.to_string(), format!("connection refused: {endpoint}"));
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_websocket_upgrade_says_so() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let ctx = Context::new().unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (mut s, _) = l.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = s.read(&mut request).await.unwrap();
+        s.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+            .await
+            .unwrap();
+        s
+    });
+    let endpoint: Endpoint = format!("ws://127.0.0.1:{port}/mqtt").parse().unwrap();
+    let Err(e) = connect(&ctx, &endpoint, &TransportOptions::default()).await else {
+        panic!("upgrade succeeded");
+    };
+    assert!(
+        matches!(&e, Error::Io(io) if io.kind() == io::ErrorKind::InvalidData),
+        "{e:?}"
+    );
+    let why = e.source().map(ToString::to_string).unwrap_or_default();
+    assert!(why.contains("upgrade refused"), "{e:?}");
+    drop(server.await.unwrap());
+}

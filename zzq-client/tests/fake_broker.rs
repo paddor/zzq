@@ -550,3 +550,57 @@ async fn reconnects_after_a_quick_takeover_back_off() {
     assert!(connects <= 12, "{connects} connects in 1 s");
     drop(client);
 }
+
+/// A resumed QoS 2 flow past PUBREC sends its PUBREL at once, and it counts
+/// against the room for resent publishes.
+#[tokio::test]
+async fn a_resumed_pubrel_goes_at_once_and_takes_room() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("pubrel")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = accept_with(&l, false, 10).await;
+    let client = connecting.await.unwrap();
+    let handle = client.handle();
+    let two = handle
+        .enqueue("t", "2", QoS::ExactlyOnce, false)
+        .await
+        .unwrap();
+    let (_, packet) = first.packet().await;
+    let released = u16::from_be_bytes([packet[5], packet[6]]);
+    first.ack(PacketType::PubRec, released).await;
+    assert_eq!(first.packet().await.0 >> 4, 6, "PUBREL");
+    let one = handle
+        .enqueue("t", "1", QoS::AtLeastOnce, false)
+        .await
+        .unwrap();
+    assert_eq!(first.packet().await.0 >> 4, 3, "PUBLISH");
+    drop(first);
+    // One in flight: the released flow takes it.
+    let mut second = accept_with(&l, true, 1).await;
+    let (byte1, packet) = second.packet().await;
+    assert_eq!(byte1 >> 4, 6, "PUBREL first");
+    assert_eq!(u16::from_be_bytes([packet[2], packet[3]]), released);
+    let mut more = [0u8; 1];
+    assert!(
+        second.buf.is_empty()
+            && timeout(Duration::from_millis(200), second.s.read(&mut more))
+                .await
+                .is_err(),
+        "a PUBLISH went past the Receive Maximum"
+    );
+    second.ack(PacketType::PubComp, released).await;
+    let (byte1, _) = second.packet().await;
+    assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
+    drop((one, two));
+}

@@ -972,6 +972,17 @@ mod mqtt_sn {
             sn::decode(&recv(&s).await).unwrap().0,
             Packet::UnsubAck { msg_id: 9 }
         );
+        // A valid one goes to the broker and back.
+        let unsubscribe = Packet::Unsubscribe {
+            flags: Flags::default(),
+            msg_id: 10,
+            topic: Filter::Short(*b"ab"),
+        };
+        send(&s, &unsubscribe).await;
+        assert_eq!(
+            sn::decode(&recv(&s).await).unwrap().0,
+            Packet::UnsubAck { msg_id: 10 }
+        );
         // The client's broker connection is still there.
         send(&s, &Packet::PingReq { client_id: None }).await;
         assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
