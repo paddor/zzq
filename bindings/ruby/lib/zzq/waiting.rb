@@ -27,6 +27,10 @@ module ZZQ
     WAKES = []
     KEEP = 64
 
+    # The process the kept wakes belong to. A forked child shares their
+    # pipes with its parent, where one would take the other's wakes.
+    @pid = Process.pid
+
     module_function
 
     def now
@@ -39,6 +43,10 @@ module ZZQ
 
     # Yields a wake for this call's waits.
     def with_wake
+      unless @pid == Process.pid
+        WAKES.clear
+        @pid = Process.pid
+      end
       wake = WAKES.pop || Native::Wake.new
       yield wake
     ensure

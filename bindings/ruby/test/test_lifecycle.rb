@@ -53,6 +53,23 @@ class LifecycleTest < Minitest::Spec
     assert_predicate status, :success?
   end
 
+  it "gives a forked child wake pipes of its own" do
+    skip "needs fork" unless Process.respond_to?(:fork)
+    parent = ZZQ::Waiting.with_wake { |w| w }
+    rd, wr = IO.pipe
+    pid = fork do
+      rd.close
+      child = ZZQ::Waiting.with_wake { |w| w }
+      wr.write(child.equal?(parent) ? "shared" : "own")
+      wr.close
+      exit!(0)
+    end
+    wr.close
+    got = rd.read
+    Process.wait(pid)
+    assert_equal "own", got
+  end
+
   it "takes io_threads only before first use" do
     client(tcp_endpoint)
     assert_raises(ZZQ::Error) { ZZQ.io_threads = 2 }
