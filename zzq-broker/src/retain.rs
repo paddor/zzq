@@ -99,7 +99,10 @@ impl RetainedStore {
     /// change.
     pub(crate) fn set(&mut self, msg: &Msg, full: bool) {
         if msg.payload().is_empty() {
-            self.remove(msg.topic());
+            // Nothing to persist for a topic that held nothing.
+            if !self.remove(msg.topic()) {
+                return;
+            }
         } else if (full || self.len >= self.max) && self.stored(msg.topic()).is_none() {
             self.rejected += 1;
             return;
@@ -174,13 +177,15 @@ impl RetainedStore {
 
     /// Removes the message of `topic`, its expiry entry and the tree nodes
     /// left empty.
-    fn remove(&mut self, topic: &str) {
+    /// Clears `topic`. False if it held no message.
+    fn remove(&mut self, topic: &str) -> bool {
         let Some(old) = remove(&mut self.root, topic.split('/'), &mut self.bytes) else {
-            return;
+            return false;
         };
         self.len -= 1;
         reschedule(&mut self.expiring, topic, old.expires_at, None);
         self.release(old);
+        true
     }
 
     /// Takes a message the store let go off the count, unless a session
@@ -345,9 +350,12 @@ mod tests {
         Msg::new(topic, b"x", &[], QoS::AtMostOnce, true)
     }
 
-    /// Keeps what the store persists.
+    /// Keeps what the store persists: messages set, topics removed.
     #[derive(Default)]
-    struct Recorded(std::sync::Mutex<Vec<Retained>>);
+    struct Recorded(
+        std::sync::Mutex<Vec<Retained>>,
+        std::sync::Mutex<Vec<String>>,
+    );
 
     impl Persistence for Recorded {
         fn load_retained(&self) -> std::io::Result<Vec<Retained>> {
@@ -358,7 +366,9 @@ mod tests {
             self.0.lock().unwrap().push(msg.clone());
         }
 
-        fn remove_retained(&self, _: &str) {}
+        fn remove_retained(&self, topic: &str) {
+            self.1.lock().unwrap().push(topic.to_owned());
+        }
     }
 
     #[test]
@@ -375,6 +385,18 @@ mod tests {
             format!("{store:?}"),
             "RetainedStore { len: 1, persist: true, .. }"
         );
+    }
+
+    #[test]
+    fn clearing_a_topic_never_stored_persists_nothing() {
+        let p = Arc::new(Recorded::default());
+        let persist: Arc<dyn Persistence> = p.clone();
+        let mut store = RetainedStore::new(Some(persist), usize::MAX, usize::MAX).unwrap();
+        store.set(&msg("kept"), false);
+        for t in ["kept", "never"] {
+            store.set(&Msg::new(t, &[], &[], QoS::AtMostOnce, true), false);
+        }
+        assert_eq!(*p.1.lock().unwrap(), ["kept"]);
     }
 
     /// A stored deadline as far ahead as a log can say loads, without one.
