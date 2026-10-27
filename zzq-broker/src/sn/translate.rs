@@ -48,6 +48,9 @@ impl Client {
             sn::Packet::Unsubscribe { msg_id, topic, .. } => {
                 if let Some(filter) = self.filter_name(topic) {
                     encode::unsubscribe(v, msg_id.max(1), &[], &[&filter], out);
+                } else {
+                    // Nothing can be subscribed to it.
+                    self.send(&sn::Packet::UnsubAck { msg_id }).await;
                 }
             }
             sn::Packet::PingReq { .. } => encode::pingreq(out),

@@ -10,6 +10,10 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a share group message sent to a member on another lane
   whose session ended on the way was dropped uncounted. It now counts in
   `Dropped::session_ended`, or `Dropped::offline` at QoS 0.
+- `zzq-broker`: an MQTT-SN short topic or a filter that is not valid, such
+  as `a#`, made the broker close the client's connection, and its will went
+  out. PUBLISH and SUBSCRIBE now get "invalid topic ID", and UNSUBSCRIBE an
+  UNSUBACK.
 
 ## [0.2.0] - 2026-10-27
 

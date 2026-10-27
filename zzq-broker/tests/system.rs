@@ -933,6 +933,50 @@ mod mqtt_sn {
         (ctx, broker, uri, addr)
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_short_topics_are_refused_and_the_client_stays() {
+        let (_ctx, _broker, _uri, addr) = bind_sn(BrokerOptions::default()).await;
+        let s = sn_client(&addr, "short").await;
+        let publish = Packet::Publish {
+            flags: qos(SnQoS::AtLeastOnce),
+            topic: Topic::Short(*b"a#"),
+            msg_id: 7,
+            data: b"x",
+        };
+        send(&s, &publish).await;
+        let bytes = recv(&s).await;
+        let ack = sn::decode(&bytes).unwrap().0;
+        assert!(
+            matches!(ack, Packet::PubAck { msg_id: 7, code, .. } if code == sn::REJECTED_INVALID_TOPIC_ID),
+            "{ack:?}"
+        );
+        let subscribe = Packet::Subscribe {
+            flags: qos(SnQoS::AtLeastOnce),
+            msg_id: 8,
+            topic: Filter::Short(*b"a#"),
+        };
+        send(&s, &subscribe).await;
+        let bytes = recv(&s).await;
+        let ack = sn::decode(&bytes).unwrap().0;
+        assert!(
+            matches!(ack, Packet::SubAck { msg_id: 8, code, .. } if code == sn::REJECTED_INVALID_TOPIC_ID),
+            "{ack:?}"
+        );
+        let unsubscribe = Packet::Unsubscribe {
+            flags: Flags::default(),
+            msg_id: 9,
+            topic: Filter::Short(*b"a#"),
+        };
+        send(&s, &unsubscribe).await;
+        assert_eq!(
+            sn::decode(&recv(&s).await).unwrap().0,
+            Packet::UnsubAck { msg_id: 9 }
+        );
+        // The client's broker connection is still there.
+        send(&s, &Packet::PingReq { client_id: None }).await;
+        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
+    }
+
     async fn register(s: &UdpSocket, msg_id: u16, topic: &str) -> (u16, u8) {
         send(
             s,
