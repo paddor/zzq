@@ -40,6 +40,10 @@ const READ_BUF: usize = 64 << 10;
 /// Spare room below which a read gets a fresh buffer first.
 const READ_MIN: usize = 8 << 10;
 
+/// How long a session that ends gives its writer to send what is left,
+/// such as DISCONNECT, to a broker that does not read.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
+
 /// How long the call woken for a batch of publish acks has to wake the
 /// others before the session does.
 const CHAIN_WAIT: Duration = Duration::from_millis(1);
@@ -254,13 +258,19 @@ where
         }
     };
     let out = Rc::new(Out::default());
-    tokio::task::spawn_local(writer(out.clone(), w));
+    let mut writer = tokio::task::spawn_local(writer(out.clone(), w));
     let mut c = Conn { s: &mut s, out };
     if resume {
         c.restore(session_present);
     }
     let _ = c.serve(&mut r, &mut buf).await;
     c.out.close();
+    // A DISCONNECT gets a while to go out. A lost connection's output is
+    // not worth waiting for: its unacked requests go again on the next.
+    if s.ended {
+        let _ = tokio::time::timeout(CLOSE_LINGER, &mut writer).await;
+    }
+    writer.abort();
     s
 }
 
@@ -281,7 +291,12 @@ impl Conn<'_> {
         let chain = tokio::time::sleep(CHAIN_WAIT);
         tokio::pin!(chain);
         let mut chain_armed = false;
+        // Requests are queued that the session had no room for.
+        let mut deferred = false;
         loop {
+            if let Some(end) = self.between(&mut deferred) {
+                return end;
+            }
             // A full inbox stops reading, not pings, requests or acks.
             let blocked = self.s.inbox.blocked();
             make_room(buf);
@@ -290,16 +305,12 @@ impl Conn<'_> {
                 chain_armed = true;
             }
             tokio::select! {
-                () = self.s.submit.ready(), if self.takes_requests() => {
-                    if !self.requests() {
+                () = self.s.submit.ready() => {
+                    if !self.on_requests(&mut deferred) {
                         return Ok(());
                     }
                 }
-                () = self.out.drained.notified(), if !self.out.has_room() => {
-                    if self.out.broken.get() {
-                        return Err(Error::Closed);
-                    }
-                }
+                () = self.out.drained.notified(), if !self.out.has_room() => {}
                 n = r.read_buf(buf), if !blocked => {
                     if !matches!(n, Ok(n) if n > 0) {
                         return Err(Error::Closed);
@@ -327,6 +338,40 @@ impl Conn<'_> {
             }
         }
     }
+
+    /// Checks between events: a broken writer ends the connection, and
+    /// `deferred` requests run once there is room. `Some` to stop.
+    fn between(&mut self, deferred: &mut bool) -> Option<Result<()>> {
+        if self.out.broken.get() {
+            return Some(Err(Error::Closed));
+        }
+        if *deferred && self.takes_requests() {
+            *deferred = false;
+            if !self.requests() {
+                return Some(Ok(()));
+            }
+        }
+        None
+    }
+
+    /// Runs queued requests, or without room for them only a DISCONNECT,
+    /// and marks the rest `deferred`. False once the session ends.
+    fn on_requests(&mut self, deferred: &mut bool) -> bool {
+        if self.takes_requests() {
+            return self.requests();
+        }
+        if let Some((reason, done)) = self.s.submit.take_disconnect() {
+            self.say_bye(reason, done);
+            self.s.ended = true;
+            return false;
+        }
+        if self.s.submit.dropped() {
+            self.s.ended = true;
+            return false;
+        }
+        *deferred = true;
+        true
+    }
 }
 
 impl Session {
@@ -339,7 +384,7 @@ impl Session {
             tokio::select! {
                 () = &mut sleep => return true,
                 () = self.submit.ready() => {
-                    if let Some(done) = self.submit.take_disconnect() {
+                    if let Some((_, done)) = self.submit.take_disconnect() {
                         let _ = done.send(());
                         self.ended = true;
                         return false;

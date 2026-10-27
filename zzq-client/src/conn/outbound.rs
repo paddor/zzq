@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use zzq_proto::encode;
 use zzq_proto::packet::fixed_header;
 use zzq_proto::property::{self, Property};
-use zzq_proto::{PacketType, QoS, SubscriptionOptions};
+use zzq_proto::{PacketType, QoS, ReasonCode, SubscriptionOptions};
 
 use crate::submit::Op;
 use crate::submit::QUEUED;
@@ -238,11 +238,7 @@ impl Conn<'_> {
                     }
                 }
                 Op::Cmd(Cmd::Disconnect { reason, done }) => {
-                    let v = self.s.opts.version;
-                    self.out.push(|b| {
-                        encode::reason_only(PacketType::Disconnect, v, reason.into(), &[], b);
-                    });
-                    *self.out.bye.borrow_mut() = Some(done);
+                    self.say_bye(reason, done);
                     // The requests after it fail with the session.
                     open = false;
                     break;
@@ -260,6 +256,15 @@ impl Conn<'_> {
             return false;
         }
         true
+    }
+
+    /// Queues DISCONNECT, and answers `done` once it is written.
+    pub(super) fn say_bye(&mut self, reason: ReasonCode, done: oneshot::Sender<()>) {
+        let v = self.s.opts.version;
+        self.out.push(|b| {
+            encode::reason_only(PacketType::Disconnect, v, reason.into(), &[], b);
+        });
+        *self.out.bye.borrow_mut() = Some(done);
     }
 
     /// Hands the publish acks gathered so far to the waiting calls.

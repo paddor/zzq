@@ -166,6 +166,10 @@ Notable changes to zzq. The format follows
 - `zzq-client`: a QoS 2 publish that got PUBREC before the connection
   dropped resent its PUBREL to a broker that lost the session, and failed
   with "packet identifier not found". It now completes.
+- `zzq-client`: `disconnect` could wait forever on a broker that stopped
+  reading, as could the session after its writer failed to flush. A
+  DISCONNECT now goes through a full session and gets 2 s to be written, and
+  a failed writer ends the connection.
 
 ## [0.1.1] - 2026-10-26
 

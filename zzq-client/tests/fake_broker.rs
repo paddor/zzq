@@ -400,3 +400,35 @@ async fn a_released_qos2_publish_is_done_when_the_broker_lost_the_session() {
     let got = timeout(Duration::from_millis(300), second.s.read(&mut chunk)).await;
     assert!(got.is_err(), "resent on the new connection: {got:?}");
 }
+
+#[tokio::test]
+async fn disconnect_returns_while_the_broker_stops_reading() {
+    let l = tokio::net::TcpSocket::new_v4().unwrap();
+    l.set_recv_buffer_size(4096).unwrap();
+    l.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = l.listen(1).unwrap();
+    let uri = format!("tcp://{}", l.local_addr().unwrap());
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("stuck"))
+                .await
+                .unwrap()
+        }
+    });
+    // Accepts, then reads nothing more.
+    let peer = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    for _ in 0..4000 {
+        c.publish("t", vec![0u8; 1024], QoS::AtMostOnce)
+            .await
+            .unwrap();
+    }
+    let done = timeout(WAIT, c.disconnect()).await;
+    assert!(
+        done.is_ok(),
+        "disconnect waits for a broker that does not read"
+    );
+    drop(peer);
+}

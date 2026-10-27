@@ -101,6 +101,8 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
             spare = buf;
             // TLS may only have buffered the last bytes.
             if w.flush().await.is_err() {
+                out.broken.set(true);
+                out.drained.notify_one();
                 return;
             }
             out.wake.notified().await;
