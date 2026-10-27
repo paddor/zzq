@@ -19,12 +19,12 @@ default = ["tls", "quic"]
 # `tls://` with rustls and ring.
 tls = ["dep:rustls", "dep:tokio-rustls"]
 # `quic://` with quinn. Certificates come from the TLS options.
-quic = ["tls", "dep:quinn", "dep:socket2"]
+quic = ["tls", "dep:quinn"]
 # Entry points for the fuzz targets in `fuzz/afl`.
 fuzzing = []
 
 [dependencies]
-socket2 = { workspace = true, optional = true, features = ["all"] }
+socket2 = { workspace = true, features = ["all"] }
 quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring", "tls12"] }

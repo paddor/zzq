@@ -77,9 +77,28 @@ impl IpcListener {
 fn stale_socket(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::FileTypeExt;
     let socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
-    let refused = socket
-        && StdStream::connect(path).is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused);
-    if refused { file_id(path) } else { None }
+    if socket && refuses(path) {
+        file_id(path)
+    } else {
+        None
+    }
+}
+
+/// Whether nobody listens on socket file `path`. Probes without blocking:
+/// a listener that stopped with its backlog full is live, and must not
+/// make the lane wait.
+fn refuses(path: &Path) -> bool {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let Ok(addr) = SockAddr::unix(path) else {
+        return false;
+    };
+    let Ok(probe) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+        return false;
+    };
+    probe.set_nonblocking(true).is_ok()
+        && probe
+            .connect(&addr)
+            .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
 }
 
 impl Drop for IpcListener {
@@ -170,6 +189,44 @@ mod tests {
         drop(first);
         assert!(path.exists(), "the first removed the second's socket");
         drop(second);
+        assert!(!path.exists());
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_does_not_wait_on_a_listener_that_does_not_accept() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+
+        let path = std::env::temp_dir().join(format!("zzq-ipc-hung-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let addr = SockAddr::unix(&path).unwrap();
+        // A listener that stopped, such as an old broker under SIGSTOP,
+        // with its backlog full.
+        let hung = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        hung.bind(&addr).unwrap();
+        hung.listen(0).unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            let s = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            s.set_nonblocking(true).unwrap();
+            if s.connect(&addr).is_err() {
+                break;
+            }
+            queued.push(s);
+        }
+        let name = path.to_str().unwrap().to_owned();
+        let bind = tokio::task::spawn_blocking(move || IpcListener::bind(&name).is_err());
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(2), bind).await;
+        assert!(matches!(refused, Ok(Ok(true))), "{refused:?}");
+        drop(hung);
+        let _ = std::fs::remove_file(&path);
+    }
+    #[tokio::test]
+    async fn bind_takes_over_a_socket_file_nobody_listens_on() {
+        let path = std::env::temp_dir().join(format!("zzq-ipc-stale-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // A listener that died leaves its file.
+        drop(StdListener::bind(&path).unwrap());
+        let listener = IpcListener::bind(path.to_str().unwrap()).unwrap();
+        drop(listener);
         assert!(!path.exists());
     }
 }
