@@ -52,9 +52,10 @@ impl LaneStats {
     /// Adds what session `s` counts itself: messages it sent from its
     /// queue, and those it dropped.
     pub(crate) const fn add_session(&mut self, s: &Session) {
-        self.deliveries += s.flow.sent;
-        self.dropped.expired += s.flow.expired;
-        self.dropped.too_large += s.flow.too_large;
+        let c = &s.flow.counts;
+        self.deliveries += c.sent;
+        self.dropped.expired += c.expired;
+        self.dropped.too_large += c.too_large;
     }
 }
 
