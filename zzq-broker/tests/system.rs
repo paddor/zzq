@@ -574,6 +574,13 @@ mod mqtt_sn {
         buf
     }
 
+    /// MQTT-SN settings changed by `f`.
+    fn sn_with(f: impl FnOnce(&mut SnOptions)) -> SnOptions {
+        let mut sn = SnOptions::default();
+        f(&mut sn);
+        sn
+    }
+
     fn qos(q: SnQoS) -> Flags {
         Flags {
             qos: q,
@@ -875,10 +882,7 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn unacked_publish_is_resent_with_dup() {
         let opts = BrokerOptions {
-            sn: SnOptions {
-                retry: Duration::from_millis(200),
-                ..SnOptions::default()
-            },
+            sn: sn_with(|sn| sn.retry = Duration::from_millis(200)),
             ..BrokerOptions::default()
         };
         let (ctx, broker, uri) = setup_with(1, opts).await;
@@ -1008,10 +1012,7 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn topic_ids_run_out_without_stalling() {
         let opts = BrokerOptions {
-            sn: SnOptions {
-                max_topics: 2,
-                ..SnOptions::default()
-            },
+            sn: sn_with(|sn| sn.max_topics = 2),
             max_inflight: 1,
             ..BrokerOptions::default()
         };
@@ -1072,14 +1073,13 @@ mod mqtt_sn {
     async fn connectionless_publishes_are_authorized() {
         let opts = BrokerOptions {
             authorizer: Some(Arc::new(NoValve)),
-            sn: SnOptions {
-                predefined: vec![
+            sn: sn_with(|sn| {
+                sn.predefined = vec![
                     (5, "plant/valve".to_owned()),
                     (6, "$SYS/x".to_owned()),
                     (7, "plant/ok".to_owned()),
-                ],
-                ..SnOptions::default()
-            },
+                ];
+            }),
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
@@ -1117,10 +1117,7 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn publish_after_register_is_retransmitted() {
         let opts = BrokerOptions {
-            sn: SnOptions {
-                retry: Duration::from_millis(200),
-                ..SnOptions::default()
-            },
+            sn: sn_with(|sn| sn.retry = Duration::from_millis(200)),
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
@@ -1205,10 +1202,7 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn predefined_topics_and_publishes_held_for_register() {
         let opts = BrokerOptions {
-            sn: SnOptions {
-                predefined: vec![(9, "pre/t".to_owned())],
-                ..SnOptions::default()
-            },
+            sn: sn_with(|sn| sn.predefined = vec![(9, "pre/t".to_owned())]),
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
@@ -1295,6 +1289,125 @@ mod mqtt_sn {
         send(&s, &Packet::PingReq { client_id: None }).await;
         assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
         nothing(&mut watch).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn publishes_held_for_registers_are_capped_per_client() {
+        let (ctx, broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
+        let s = sn_client(&addr, "held").await;
+        let sub = Packet::Subscribe {
+            flags: qos(SnQoS::AtMostOnce),
+            msg_id: 1,
+            topic: Filter::Name("h/#"),
+        };
+        send(&s, &sub).await;
+        recv(&s).await;
+        // 8 topics with 100 messages each wait for REGACKs.
+        let publ = client(&ctx, &uri, "p", Version::V5).await;
+        for t in 0..8 {
+            for _ in 0..100 {
+                publ.publish(&format!("h/{t}"), "x", QoS::AtMostOnce)
+                    .await
+                    .unwrap();
+            }
+        }
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while broker.stats().await.unwrap().deliveries < 800 {
+            assert!(tokio::time::Instant::now() < deadline, "not delivered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut registers = Vec::new();
+        while registers.len() < 8 {
+            if let Packet::Register {
+                topic_id, msg_id, ..
+            } = sn::decode(&recv(&s).await).unwrap().0
+                && !registers.iter().any(|&(t, _)| t == topic_id)
+            {
+                registers.push((topic_id, msg_id));
+            }
+        }
+        for (topic_id, msg_id) in registers {
+            let regack = Packet::RegAck {
+                topic_id,
+                msg_id,
+                code: sn::ACCEPTED,
+            };
+            send(&s, &regack).await;
+        }
+        let mut held = 0;
+        let mut buf = vec![0; 2048];
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(500), s.recv(&mut buf)).await {
+            if matches!(sn::decode(&buf[..n]), Ok((Packet::Publish { .. }, _))) {
+                held += 1;
+            }
+        }
+        assert!(held <= 256, "{held} publishes held");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clients_past_the_cap_are_refused_until_one_leaves() {
+        let mut opts = BrokerOptions::default();
+        opts.sn.max_clients = 2;
+        let (_ctx, broker, _uri, addr) = bind_sn(opts).await;
+        let first = sn_client(&addr, "one").await;
+        let _second = sn_client(&addr, "two").await;
+        let third = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        third.connect(&addr).await.unwrap();
+        let connect = Packet::Connect {
+            flags: Flags {
+                clean_session: true,
+                ..Flags::default()
+            },
+            duration: 30,
+            client_id: "three",
+        };
+        send(&third, &connect).await;
+        assert_eq!(
+            sn::decode(&recv(&third).await).unwrap().0,
+            Packet::ConnAck {
+                code: sn::REJECTED_CONGESTION
+            }
+        );
+        send(&first, &Packet::Disconnect { duration: None }).await;
+        recv(&first).await;
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while broker.stats().await.unwrap().connections > 1 {
+            assert!(tokio::time::Instant::now() < deadline, "first stays");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        send(&third, &connect).await;
+        assert_eq!(
+            sn::decode(&recv(&third).await).unwrap().0,
+            Packet::ConnAck { code: sn::ACCEPTED }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sleep_lasts_no_longer_than_the_keep_alive_cap() {
+        let opts = BrokerOptions {
+            sn: sn_with(|sn| sn.max_keep_alive = 1),
+            ..BrokerOptions::default()
+        };
+        let (_ctx, broker, _uri, addr) = bind_sn(opts).await;
+        let s = sn_client(&addr, "sleepy").await;
+        send(
+            &s,
+            &Packet::Disconnect {
+                duration: Some(u16::MAX),
+            },
+        )
+        .await;
+        assert_eq!(
+            sn::decode(&recv(&s).await).unwrap().0,
+            Packet::Disconnect { duration: None }
+        );
+        // Without a ping, the gateway lets go once 1.5 times the cap passed.
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while broker.stats().await.unwrap().connections > 0 {
+            assert!(tokio::time::Instant::now() < deadline, "still asleep");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
 

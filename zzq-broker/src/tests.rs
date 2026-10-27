@@ -940,3 +940,160 @@ async fn mqtt_sn_clients_stop_with_their_gateway() {
     broker.abort_tasks();
     stats_until(&broker, |s| s.connections == 0).await;
 }
+
+/// A client that sends and never reads its replies stops being read once
+/// they reach `max_out_bytes`, instead of growing them without bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_does_not_read_its_replies_is_not_read_either() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zzq_proto::Version;
+
+    let opts = BrokerOptions {
+        max_out_bytes: 64 << 10,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut deaf = socket
+        .connect(uri.trim_start_matches("tcp://").parse().unwrap())
+        .await
+        .unwrap();
+    deaf.write_all(&support::connect_bytes(Version::V5, "deaf", &[]))
+        .await
+        .unwrap();
+    let mut connack = [0u8; 64];
+    let _ = deaf.read(&mut connack).await.unwrap();
+    // 32 MiB of PINGREQ asks for 32 MiB of PINGRESP.
+    let pings = [0xc0u8, 0x00].repeat(16 << 20);
+    let _ = tokio::time::timeout(Duration::from_secs(2), deaf.write_all(&pings)).await;
+    let waiting = on_lane(&ctx, &broker, 0, |l| {
+        l.sessions
+            .keys()
+            .filter_map(|k| l.sessions.get(k))
+            .map(|s| s.out.buf.len())
+            .max()
+    })
+    .await;
+    assert!(
+        waiting.is_some_and(|n| n < 1 << 20),
+        "replies waiting: {waiting:?}"
+    );
+}
+
+/// Acks held for a congested subscriber do not pile up for publisher
+/// connections that ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_acks_of_ended_connections_do_not_pile_up() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        qos_queue_high: 2,
+        receive_maximum: 8,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    // Never acks, so it stays congested.
+    let mut sub = support::Raw::connect(&uri, "sub", Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    for round in 1..=40 {
+        let mut p = support::Raw::connect(&uri, "pub", Version::V311, 0).await;
+        for pkid in 1..=8 {
+            p.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+        }
+        stats_until(&broker, |s| s.publishes >= round * 8).await;
+        drop(p);
+        stats_until(&broker, |s| s.connections == 1).await;
+    }
+    let held = on_lane(&ctx, &broker, 0, |l| {
+        l.sessions
+            .keys()
+            .filter_map(|k| l.sessions.get(k))
+            .find(|s| &*s.client_id == "sub")
+            .map(|s| s.backpressure.waiters.len())
+    })
+    .await;
+    assert!(held.is_some_and(|n| n <= 32), "held acks: {held:?}");
+}
+
+/// A SUBACK held for a connection that was taken over meanwhile sends
+/// neither the ack nor the retained messages of its subscriptions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_suback_of_a_replaced_connection_sends_no_retained() {
+    use zzq_proto::Version;
+
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    broker
+        .publish_retained("r/t", "kept", QoS::AtMostOnce)
+        .unwrap();
+    stats_until(&broker, |s| s.retained == 1).await;
+    let _s = support::Raw::connect(&uri, "s", Version::V5, 0).await;
+    let sent = on_lane(&ctx, &broker, 0, |l| {
+        let key = l
+            .sessions
+            .keys()
+            .find(|&k| l.sessions.get(k).is_some_and(|s| &*s.client_id == "s"))?;
+        let conn = l.sessions.get(key)?.conn.as_ref()?.id;
+        let held = crate::lane::Held {
+            key,
+            // An earlier connection of the session.
+            conn: conn - 1,
+            sync: std::sync::Arc::default(),
+            packet: Box::new([]),
+            retained: vec![("r/#".into(), QoS::AtMostOnce, 0)].into(),
+        };
+        l.release(&held);
+        Some(l.sessions.get(key)?.out.buf.len())
+    })
+    .await;
+    assert_eq!(sent, Some(0), "retained sent to the new connection");
+}
+
+/// An accept loop that starts after the broker stopped its tasks, as a
+/// cancelled bind's can, stops at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bind_that_lands_after_the_stop_does_not_keep_accepting() {
+    let (_ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+    broker.abort_tasks();
+    let ep = broker.bind("tcp://127.0.0.1:0").await.unwrap();
+    let addr = ep.to_string();
+    let addr = addr.trim_start_matches("tcp://");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while tokio::net::TcpStream::connect(addr).await.is_ok() {
+        assert!(tokio::time::Instant::now() < deadline, "still accepting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// A connection that waits with its lane to ship before its read loop
+/// starts is not kicked for keep alive meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_held_back_at_connect_is_not_kicked_for_keep_alive() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let (ctx, _broker, uri) = setup(2, BrokerOptions::default()).await;
+    let mut sub = support::Raw::connect(&uri, &id_on("sub", 1, 2), Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtMostOnce))
+        .await;
+    let mut publisher = support::Raw::connect(&uri, &id_on("pub", 0, 2), Version::V5, 0).await;
+    // Lane 1 stops taking deliveries, so lane 0 waits for room to ship.
+    ctx.lane(1)
+        .run(|| std::thread::sleep(Duration::from_secs(3)))
+        .unwrap();
+    for _ in 0..100 {
+        publisher.pub_("t", b"x", QoS::AtMostOnce, 0).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // A second publisher's batch waits behind the first in the lane's
+    // outbox, so a new connection waits for it too.
+    let mut second = support::Raw::connect(&uri, &id_on("pub2", 0, 2), Version::V5, 0).await;
+    second.pub_("t", b"y", QoS::AtMostOnce, 0).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut late = support::Raw::connect(&uri, &id_on("late", 0, 2), Version::V5, 1).await;
+    let mut ping = Vec::new();
+    zzq_proto::encode::pingreq(&mut ping);
+    late.send(&ping).await;
+    assert_eq!(late.next().await, support::Got::PingResp);
+}

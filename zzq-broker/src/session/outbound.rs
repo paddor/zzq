@@ -181,16 +181,16 @@ impl Session {
             };
             let expires_at = h.msg.expires_at;
             if expires_at.is_some() && expired(expires_at, *now.get_or_insert_with(Instant::now)) {
-                self.flow.expired += 1;
+                self.flow.counts.expired += 1;
                 self.charge.sub(budget::held(&h));
                 continue;
             }
             match self.send_inflight(h) {
                 Outcome::Sent => {
-                    self.flow.sent += 1;
+                    self.flow.counts.sent += 1;
                     wrote = true;
                 }
-                _ => self.flow.too_large += 1,
+                _ => self.flow.counts.too_large += 1,
             }
         }
         wrote
@@ -298,7 +298,7 @@ impl Session {
                 if let Some(f) = inflight.remove(at) {
                     self.free_pkid(f.pkid);
                     self.charge.sub(budget::held(&f.held));
-                    self.flow.too_large += 1;
+                    self.flow.counts.too_large += 1;
                 }
                 continue;
             }

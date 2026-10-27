@@ -53,6 +53,40 @@ class LifecycleTest < Minitest::Spec
     assert_predicate status, :success?
   end
 
+  it "gives a forked child wake pipes of its own" do
+    skip "needs fork" unless Process.respond_to?(:fork)
+    parent = ZZQ::Waiting.with_wake { |w| w }
+    rd, wr = IO.pipe
+    pid = fork do
+      rd.close
+      child = ZZQ::Waiting.with_wake { |w| w }
+      wr.write(child.equal?(parent) ? "shared" : "own")
+      wr.close
+      exit!(0)
+    end
+    wr.close
+    got = rd.read
+    Process.wait(pid)
+    assert_equal "own", got
+  end
+
+  it "frees what a raised native error was built from" do
+    skip "needs /proc" unless File.exist?("/proc/self/status")
+    rss = -> { File.read("/proc/self/status")[/VmRSS:\s+(\d+)/, 1].to_i }
+    raises = lambda do |n|
+      n.times do
+        ZZQ.io_threads = -1
+      rescue ArgumentError
+        nil
+      end
+      GC.start
+    end
+    raises.call(20_000)
+    before = rss.call
+    raises.call(200_000)
+    assert_operator rss.call - before, :<, 8 * 1024, "KiB more"
+  end
+
   it "takes io_threads only before first use" do
     client(tcp_endpoint)
     assert_raises(ZZQ::Error) { ZZQ.io_threads = 2 }

@@ -14,9 +14,10 @@
 //! on its own line, then runs until SIGTERM or SIGINT.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
-use zzq_broker::{Broker, BrokerOptions, Config, Context};
+use zzq_broker::{Broker, BrokerOptions, Config, Context, FilePersistence};
 
 struct Args {
     lanes: usize,
@@ -70,18 +71,23 @@ fn parse() -> Option<Args> {
     Some(a)
 }
 
-fn options(a: &Args) -> Result<BrokerOptions, String> {
+/// The broker's options, and the retained log to flush before exiting.
+fn options(a: &Args) -> Result<(BrokerOptions, Option<Arc<FilePersistence>>), String> {
     let mut opts = BrokerOptions::default();
-    if let Some(path) = &a.retained_file {
-        let store = zzq_broker::FilePersistence::open(path).map_err(|e| format!("{path}: {e}"))?;
-        opts.persistence = Some(std::sync::Arc::new(store));
-    }
+    let store = match &a.retained_file {
+        Some(path) => {
+            let store = FilePersistence::open(path).map_err(|e| format!("{path}: {e}"))?;
+            Some(Arc::new(store))
+        }
+        None => None,
+    };
+    opts.persistence = store.clone().map(|s| s as Arc<dyn zzq_broker::Persistence>);
     opts.state_file = a.state_file.as_ref().map(Into::into);
     if let Some(mib) = a.max_state_mib {
         opts.max_state_bytes = mib.saturating_mul(1 << 20);
     }
     tls(a, &mut opts)?;
-    Ok(opts)
+    Ok((opts, store))
 }
 
 #[cfg(feature = "tls")]
@@ -178,12 +184,18 @@ fn main() -> ExitCode {
         );
         return ExitCode::FAILURE;
     };
-    let result = options(&args).and_then(|opts| {
+    let result = options(&args).and_then(|(opts, store)| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
-        rt.block_on(serve(args, opts))
+        let served = rt.block_on(serve(args, opts));
+        // Retained changes up to the shutdown, such as wills it published,
+        // reach the log before the process exits.
+        if let Some(store) = store {
+            store.flush();
+        }
+        served
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

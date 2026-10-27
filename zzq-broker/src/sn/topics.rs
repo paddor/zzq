@@ -3,7 +3,34 @@
 use zzq_proto::sn::{self, Filter, Topic};
 use zzq_proto::topic::{validate_filter, validate_name};
 
-use super::{Client, MAX_SEND, predefined};
+use super::{Client, MAX_SEND, Topics, predefined};
+
+/// Publishes a client gets held while REGISTERs wait for the REGACK, over
+/// all its topics, and their bytes.
+const HELD_MAX: usize = 256;
+const HELD_BYTES: usize = 1 << 20;
+
+impl Topics {
+    /// Holds datagram `d` until topic `id` is registered. False past
+    /// [`HELD_MAX`] or [`HELD_BYTES`] for the client.
+    pub(super) fn hold(&mut self, id: u16, d: Vec<u8>) -> bool {
+        if self.held_count >= HELD_MAX || self.held_bytes + d.len() > HELD_BYTES {
+            return false;
+        }
+        self.held_count += 1;
+        self.held_bytes += d.len();
+        self.held.entry(id).or_default().push(d);
+        true
+    }
+
+    /// The datagrams held for topic `id`.
+    pub(super) fn release(&mut self, id: u16) -> Vec<Vec<u8>> {
+        let held = self.held.remove(&id).unwrap_or_default();
+        self.held_count -= held.len();
+        self.held_bytes -= held.iter().map(Vec::len).sum::<usize>();
+        held
+    }
+}
 
 impl Client {
     /// The topic name a PUBLISH refers to, if it is a valid one.

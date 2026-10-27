@@ -61,12 +61,22 @@ where
 }
 
 pub fn raise(err: RubyErr) -> ! {
+    let exc = exception(err);
+    // SAFETY: `exc` is a live exception object. The raise jumps past this
+    // frame, which holds nothing to drop.
+    unsafe { rb_sys::rb_exc_raise(exc) }
+}
+
+/// The exception object for `err`. Built apart from [`raise`], so its
+/// message is freed before the raise jumps past the frame that holds it.
+fn exception(err: RubyErr) -> VALUE {
     match err {
-        RubyErr::Exception(exc) => unsafe { rb_sys::rb_exc_raise(exc) },
+        RubyErr::Exception(exc) => exc,
         RubyErr::Error { class, message } => {
             let message = CString::new(message.replace('\0', "\\0")).unwrap_or_default();
-            let exc = unsafe { rb_sys::rb_exc_new_cstr(class, message.as_ptr()) };
-            unsafe { rb_sys::rb_exc_raise(exc) }
+            // SAFETY: `class` is an exception class and `message` a C string
+            // that outlives the call, which copies it.
+            unsafe { rb_sys::rb_exc_new_cstr(class, message.as_ptr()) }
         }
     }
 }

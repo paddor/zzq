@@ -307,6 +307,7 @@ name = "zzq-tokio"
 version = "0.2.1"
 dependencies = [
  "bytes",
+ "socket2",
  "thiserror",
  "tokio",
  "zzq-proto",

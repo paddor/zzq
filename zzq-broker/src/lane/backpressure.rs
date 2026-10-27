@@ -4,8 +4,8 @@ use zzq_proto::packet::Publish;
 use zzq_proto::{PacketType, QoS, reason};
 
 use crate::index::SubRef;
-use crate::session::Waiter;
-use crate::slab::Key;
+use crate::session::{Session, Waiter};
+use crate::slab::{Key, Slab};
 
 use super::{Close, Control, Lane};
 
@@ -59,11 +59,19 @@ impl Lane {
         };
         match hit {
             Hit::Local(sub) => {
+                let Some(s) = self.sessions.get_mut(sub) else {
+                    return Ok(());
+                };
+                let mut waiters = std::mem::take(&mut s.backpressure.waiters);
+                push_waiter(&self.sessions, &mut waiters, waiter);
                 if let Some(s) = self.sessions.get_mut(sub) {
-                    s.backpressure.waiters.push(waiter);
+                    s.backpressure.waiters = waiters;
                 }
             }
-            Hit::Remote(sub) => self.congestion.waiters.entry(sub).or_default().push(waiter),
+            Hit::Remote(sub) => {
+                let waiters = self.congestion.waiters.entry(sub).or_default();
+                push_waiter(&self.sessions, waiters, waiter);
+            }
         }
         Ok(())
     }
@@ -97,4 +105,20 @@ impl Lane {
             }
         }
     }
+}
+
+/// Adds `w` to the acks held for a congested session. A full list first
+/// drops those of publisher connections that ended, which a reconnecting
+/// publisher would otherwise pile up until the session drains, and keeps
+/// room for as many again, so this costs O(1) per ack.
+fn push_waiter(sessions: &Slab<Session>, waiters: &mut Vec<Waiter>, w: Waiter) {
+    if waiters.len() == waiters.capacity() {
+        waiters.retain(|w| {
+            sessions
+                .get(w.publisher)
+                .is_some_and(|p| p.has_conn(w.conn))
+        });
+        waiters.reserve(waiters.len());
+    }
+    waiters.push(w);
 }

@@ -609,3 +609,197 @@ async fn a_resumed_pubrel_goes_at_once_and_takes_room() {
     assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
     drop((one, two));
 }
+
+#[tokio::test]
+async fn packets_left_unread_by_a_lost_connection_do_not_reach_the_next() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        inbox: 2,
+        keep_alive: 1,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("rest")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = Peer::accept(&l).await;
+    let mut c = connecting.await.unwrap();
+    let h = c.handle();
+    let sub = tokio::spawn(async move { h.subscribe("t", QoS::ExactlyOnce).await.unwrap() });
+    let (_, packet) = first.packet().await;
+    first.suback(&packet).await;
+    sub.await.unwrap();
+    let publish = |out: &mut Vec<u8>, qos, pkid, payload: &[u8]| {
+        let h = PublishHeader {
+            version: Version::V5,
+            dup: false,
+            qos,
+            retain: false,
+            topic: "t",
+            pkid,
+            properties: &[],
+        };
+        encode::publish(&h, payload, out);
+    };
+    // A full inbox leaves the QoS 2 message unread.
+    let mut out = Vec::new();
+    for _ in 0..10 {
+        publish(&mut out, QoS::AtMostOnce, 0, b"q0");
+    }
+    publish(&mut out, QoS::ExactlyOnce, 9, b"old");
+    first.s.write_all(&out).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(first);
+    // The broker lost the session: packet ID 9 is a new message now.
+    let mut second = Peer::accept(&l).await;
+    let (_, packet) = second.packet().await;
+    second.suback(&packet).await;
+    let mut out = Vec::new();
+    publish(&mut out, QoS::ExactlyOnce, 9, b"new");
+    second.s.write_all(&out).await.unwrap();
+    let mut got = Vec::new();
+    while let Ok(Some(m)) = timeout(Duration::from_millis(1500), c.recv()).await {
+        got.push(m.payload);
+    }
+    assert!(got.contains(&"new".into()), "got {got:?}");
+    assert!(!got.contains(&"old".into()), "got {got:?}");
+}
+
+#[tokio::test]
+async fn a_full_inbox_still_reads_the_acks_of_the_clients_requests() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        inbox: 10,
+        ..ClientOptions::new("busy")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let mut c = connecting.await.unwrap();
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtMostOnce,
+        retain: false,
+        topic: "t",
+        pkid: 0,
+        properties: &[],
+    };
+    let mut out = Vec::new();
+    for _ in 0..100 {
+        encode::publish(&h, b"x", &mut out);
+    }
+    peer.s.write_all(&out).await.unwrap();
+    // A receive loop that answers each message with a QoS 1 publish, with
+    // the rest of the burst behind.
+    assert_eq!(timeout(WAIT, c.recv()).await.unwrap().unwrap().payload, "x");
+    let broker = tokio::spawn(async move {
+        loop {
+            let (byte1, packet) = peer.packet().await;
+            match byte1 >> 4 {
+                3 => {
+                    let pkid = u16::from_be_bytes([packet[5], packet[6]]);
+                    peer.ack(PacketType::PubAck, pkid).await;
+                }
+                8 => {
+                    peer.suback(&packet).await;
+                    return peer;
+                }
+                _ => {}
+            }
+        }
+    });
+    let published = timeout(
+        Duration::from_secs(2),
+        c.publish("u", "y", QoS::AtLeastOnce),
+    )
+    .await;
+    assert!(matches!(published, Ok(Ok(()))), "{published:?}");
+    let subscribed = timeout(Duration::from_secs(2), c.subscribe("v", QoS::AtMostOnce)).await;
+    assert!(matches!(subscribed, Ok(Ok(_))), "{subscribed:?}");
+    let _peer = broker.await.unwrap();
+    for i in 1..100 {
+        let m = timeout(WAIT, c.recv()).await;
+        assert!(matches!(m, Ok(Some(_))), "stalled after {i}: {m:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_broker_that_does_not_read_its_replies_is_not_read_either() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("deaf"))
+                .await
+                .unwrap()
+        }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let _c = connecting.await.unwrap();
+    // Every PUBREL asks for a PUBCOMP, which the broker never reads.
+    let mut rels = Vec::new();
+    for pkid in 1..=16_384 {
+        encode::ack(
+            &AckFields::new(PacketType::PubRel, pkid),
+            Version::V5,
+            &mut rels,
+        );
+    }
+    let mut sent = 0usize;
+    let end = tokio::time::Instant::now() + Duration::from_secs(3);
+    while sent < 256 << 20 {
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(
+            left.min(Duration::from_millis(500)),
+            peer.s.write_all(&rels),
+        )
+        .await
+        {
+            Ok(Ok(())) => sent += rels.len(),
+            _ => break,
+        }
+    }
+    assert!(sent < 64 << 20, "the client read {} MiB", sent >> 20);
+}
+
+#[tokio::test]
+async fn an_ack_of_the_wrong_kind_fails_the_request_it_names() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("wrong"))
+                .await
+                .unwrap()
+        }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    let publish = tokio::spawn(async move { c.publish("t", "x", QoS::AtLeastOnce).await });
+    let (byte1, packet) = peer.packet().await;
+    assert_eq!(byte1 >> 4, 3, "PUBLISH");
+    let pkid = u16::from_be_bytes([packet[5], packet[6]]);
+    // A SUBACK for the publish's packet ID.
+    let mut out = Vec::new();
+    let fields = encode::SubAckFields {
+        kind: PacketType::SubAck,
+        pkid,
+        properties: &[],
+        codes: &[0],
+    };
+    encode::suback(&fields, Version::V5, &mut out);
+    peer.s.write_all(&out).await.unwrap();
+    let done = timeout(Duration::from_secs(2), publish).await;
+    assert!(matches!(done, Ok(Ok(Err(_)))), "{done:?}");
+}

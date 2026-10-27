@@ -37,11 +37,12 @@ impl Client {
                 },
             );
         }
-        if self.asleep.is_some() {
-            if self.buffered.len() >= self.shared.opts.sn.sleep_buffer {
-                self.buffered.pop_front();
+        if self.sleep.is_asleep() {
+            let buffered = &mut self.sleep.buffered;
+            if buffered.len() >= self.shared.opts.sn.sleep_buffer {
+                buffered.pop_front();
             }
-            self.buffered.push_back(datagram);
+            buffered.push_back(datagram);
         } else {
             let _ = self.socket.send_to(&datagram, self.addr).await;
         }
@@ -60,9 +61,14 @@ impl Client {
         self.retry.unacked.remove(&key);
     }
 
-    pub(super) fn sleep(&mut self, seconds: u16) {
-        let duration = Duration::from_secs(u64::from(seconds.max(1)));
-        self.asleep = Some((Instant::now() + duration.mul_f32(1.5), duration));
+    /// Starts a sleep of `seconds`, at most `max_keep_alive`: over UDP,
+    /// nothing else tells the gateway that a sleeping client is gone.
+    pub(super) fn fall_asleep(&mut self, seconds: u16) {
+        let max = self.shared.opts.sn.max_keep_alive.max(1);
+        let duration = Duration::from_secs(u64::from(seconds.clamp(1, max)));
+        let now = Instant::now();
+        self.sleep.until = Some((now + duration.mul_f32(1.5), duration));
+        self.sleep.pinged = Some(now);
     }
 
     /// Handles a datagram from a sleeping client. Returns false if the
@@ -71,19 +77,19 @@ impl Client {
         let sn::Packet::PingReq { client_id: Some(_) } = packet else {
             return false;
         };
-        for d in std::mem::take(&mut self.buffered) {
+        for d in std::mem::take(&mut self.sleep.buffered) {
             let _ = self.socket.send_to(&d, self.addr).await;
         }
         self.send(&sn::Packet::PingResp).await;
-        if let Some((deadline, duration)) = &mut self.asleep {
+        if let Some((deadline, duration)) = &mut self.sleep.until {
             *deadline = Instant::now() + duration.mul_f32(1.5);
         }
         true
     }
 
     pub(super) async fn wake(&mut self) {
-        self.asleep = None;
-        for d in std::mem::take(&mut self.buffered) {
+        self.sleep.until = None;
+        for d in std::mem::take(&mut self.sleep.buffered) {
             let _ = self.socket.send_to(&d, self.addr).await;
         }
     }
@@ -92,10 +98,19 @@ impl Client {
     /// Returns false when the client is gone.
     pub(super) async fn on_tick(&mut self, pipe: &mut DuplexStream) -> bool {
         let now = Instant::now();
-        if let Some((deadline, _)) = self.asleep {
+        if let Some((deadline, _)) = self.sleep.until {
             if now > deadline {
                 return false;
             }
+            // Often enough that the broker's keep alive holds.
+            let due = self
+                .sleep
+                .pinged
+                .is_none_or(|at| now.duration_since(at) >= self.keep_alive / 2);
+            if !due || self.keep_alive.is_zero() {
+                return true;
+            }
+            self.sleep.pinged = Some(now);
             let mut ping = Vec::new();
             encode::pingreq(&mut ping);
             return pipe.write_all(&ping).await.is_ok();

@@ -5,6 +5,72 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `zzq-broker`: `SnOptions::max_clients` caps the clients the MQTT-SN
+  gateway serves at once, 10000 by default. A CONNECT beyond it gets
+  "rejected: congestion".
+
+### Changed
+
+- `zzq-broker`: `SnOptions` is `#[non_exhaustive]`. Start from
+  `SnOptions::default()` and set fields.
+- `zzq-broker`: a connection whose unwritten output is over
+  `max_out_bytes` is not read until its writer catches up, so a client
+  that sends and never reads cannot grow its acks and PINGRESPs without
+  bound.
+- `zzq-broker`: an MQTT-SN client sleeps at most `SnOptions::max_keep_alive`
+  seconds, and the gateway pings the broker for it at half the keep alive
+  instead of every second.
+- `zzq-client`: while the inbox is full, the client reads on up to 4 MiB
+  and handles the acks of its own requests, so a task that takes messages
+  and then publishes at QoS 1/2 or subscribes no longer waits for itself.
+- `zzq-tokio`: `socket2` is a dependency without the `quic` feature too.
+
+### Fixed
+
+- `zzq-tokio`: a WebSocket peer that stopped reading kept its socket and
+  buffers after the broker or client was done with the connection.
+- `zzq-tokio`: a WebSocket frame header made the reader allocate the
+  frame's length, up to 16 MiB, before any payload came. Payloads now go
+  through in pieces of at most 64 KiB.
+- `zzq-client`: packets a full inbox left unread were decoded on the next
+  connection, where a QoS 2 message of a lost session could take the
+  packet ID of a new one, which was then dropped.
+- `zzq-client`: with the inbox full, parked packets could wait for the
+  next read instead of the room the application made.
+- `zzq-client`: an ack of the wrong kind, such as a SUBACK for a publish,
+  left the request it named waiting for good. It is now a protocol error.
+- `zzq-client`: a broker that sent PUBREL without reading could grow the
+  client's output without bound, and one large publish kept its buffers
+  until the connection ended.
+- `zzq-broker`: acks held for a congested subscriber piled up for the
+  ended connections of a publisher that reconnected.
+- `zzq-broker`: an empty retained publish to a topic that held nothing
+  was persisted, so the persist queue could outgrow `max_retained`.
+- `zzq-broker`: MQTT-SN publishes waiting for a REGACK were capped per
+  topic only. A client now gets at most 256 held, and 1 MiB.
+- `zzq-broker`: the retained messages of a held SUBACK went to a
+  connection that took the session over meanwhile.
+- `zzq-broker`: the accept loop of a bind that landed after the broker
+  stopped, as a cancelled one can, kept running.
+- `zzq-broker`: a connection held back by cross-lane backpressure at
+  connect could be kicked for keep alive before its CONNACK.
+- `zzq-broker`: a retained log compaction that failed after a failed
+  write was not retried, so later changes behind a torn record were lost
+  on restart.
+- `zzq-broker`: `zzq_broker` flushes the retained log before it exits.
+- `zzq-tokio`: dropping a `Context` waited for blocking work such as a
+  DNS lookup, and a lane thread that failed to start panicked instead of
+  returning `Error::Io`.
+- `zzq-tokio`: a QUIC bind that failed on a later lane left the earlier
+  lanes accepting. A second QUIC listener could bind a port another one
+  held. Handshakes in flight per lane are now bounded, with a Retry for
+  unvalidated addresses past 128.
+- `zzq-tokio`: an IPC listener removed the socket file another listener
+  had bound at its path, and the stale-socket check could block a lane on
+  a listener that stopped with its backlog full.
+
 ## [0.2.1] - 2026-10-27
 
 ### Fixed

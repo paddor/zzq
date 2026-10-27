@@ -3,7 +3,7 @@
 
 use std::io;
 use std::os::unix::net::{UnixListener as StdListener, UnixStream as StdStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::endpoint::Endpoint;
 use crate::transport::Stream;
@@ -14,7 +14,19 @@ use crate::{Error, Result};
 pub struct IpcListener {
     inner: tokio::net::UnixListener,
     name: String,
-    file: Option<PathBuf>,
+    /// The socket file and its identity, so the drop removes no file that
+    /// another listener bound there since.
+    file: Option<(PathBuf, FileId)>,
+}
+
+/// Device and inode of a file.
+type FileId = (u64, u64);
+
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
 }
 
 impl IpcListener {
@@ -30,10 +42,16 @@ impl IpcListener {
             (bind_abstract(abs).map_err(in_use)?, None)
         } else {
             let path = PathBuf::from(name);
-            if stale_socket(&path) {
+            // Only the file found stale: another listener may have bound
+            // a new one meanwhile.
+            if let Some(stale) = stale_socket(&path)
+                && file_id(&path) == Some(stale)
+            {
                 let _ = std::fs::remove_file(&path);
             }
-            (StdListener::bind(&path).map_err(in_use)?, Some(path))
+            let std = StdListener::bind(&path).map_err(in_use)?;
+            let id = file_id(&path).ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
+            (std, Some((path, id)))
         };
         std.set_nonblocking(true)?;
         Ok(IpcListener {
@@ -53,17 +71,41 @@ impl IpcListener {
     }
 }
 
-/// Whether `path` is a socket file nobody listens on, as one left by a
-/// listener that died. Anything else stays, and binding over it fails.
-fn stale_socket(path: &std::path::Path) -> bool {
+/// The identity of `path` if it is a socket file nobody listens on, as one
+/// left by a listener that died. Anything else stays, and binding over it
+/// fails.
+fn stale_socket(path: &Path) -> Option<FileId> {
     use std::os::unix::fs::FileTypeExt;
     let socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
-    socket && StdStream::connect(path).is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
+    if socket && refuses(path) {
+        file_id(path)
+    } else {
+        None
+    }
+}
+
+/// Whether nobody listens on socket file `path`. Probes without blocking:
+/// a listener that stopped with its backlog full is live, and must not
+/// make the lane wait.
+fn refuses(path: &Path) -> bool {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let Ok(addr) = SockAddr::unix(path) else {
+        return false;
+    };
+    let Ok(probe) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+        return false;
+    };
+    probe.set_nonblocking(true).is_ok()
+        && probe
+            .connect(&addr)
+            .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
 }
 
 impl Drop for IpcListener {
     fn drop(&mut self) {
-        if let Some(path) = &self.file {
+        if let Some((path, id)) = &self.file
+            && file_id(path) == Some(*id)
+        {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -135,5 +177,56 @@ mod tests {
         assert!(bound.is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"data");
         std::fs::remove_file(&path).unwrap();
+    }
+    #[tokio::test]
+    async fn a_listener_removes_only_its_own_socket_file() {
+        let path = std::env::temp_dir().join(format!("zzq-ipc-own-{}", std::process::id()));
+        let name = path.to_str().unwrap();
+        let first = IpcListener::bind(name).unwrap();
+        // Another listener takes the path over, as one that found it stale.
+        std::fs::remove_file(&path).unwrap();
+        let second = IpcListener::bind(name).unwrap();
+        drop(first);
+        assert!(path.exists(), "the first removed the second's socket");
+        drop(second);
+        assert!(!path.exists());
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bind_does_not_wait_on_a_listener_that_does_not_accept() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+
+        let path = std::env::temp_dir().join(format!("zzq-ipc-hung-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let addr = SockAddr::unix(&path).unwrap();
+        // A listener that stopped, such as an old broker under SIGSTOP,
+        // with its backlog full.
+        let hung = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        hung.bind(&addr).unwrap();
+        hung.listen(0).unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..64 {
+            let s = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            s.set_nonblocking(true).unwrap();
+            if s.connect(&addr).is_err() {
+                break;
+            }
+            queued.push(s);
+        }
+        let name = path.to_str().unwrap().to_owned();
+        let bind = tokio::task::spawn_blocking(move || IpcListener::bind(&name).is_err());
+        let refused = tokio::time::timeout(std::time::Duration::from_secs(2), bind).await;
+        assert!(matches!(refused, Ok(Ok(true))), "{refused:?}");
+        drop(hung);
+        let _ = std::fs::remove_file(&path);
+    }
+    #[tokio::test]
+    async fn bind_takes_over_a_socket_file_nobody_listens_on() {
+        let path = std::env::temp_dir().join(format!("zzq-ipc-stale-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // A listener that died leaves its file.
+        drop(StdListener::bind(&path).unwrap());
+        let listener = IpcListener::bind(path.to_str().unwrap()).unwrap();
+        drop(listener);
+        assert!(!path.exists());
     }
 }

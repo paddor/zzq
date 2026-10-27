@@ -160,6 +160,11 @@ async fn tls_and_quic_options_and_listeners_print_without_keys() {
     {
         let quic = bind(&ctx, "quic://127.0.0.1:0", &opts).await.unwrap();
         assert!(format!("{quic:?}").contains("Quic"));
+        // Not even another QUIC listener, which shares ports between lanes.
+        let Err(e) = bind(&ctx, &quic.endpoint().to_string(), &opts).await else {
+            panic!("two quic listeners on one port");
+        };
+        assert!(matches!(e, Error::AddressInUse { .. }), "{e:?}");
         // A plain UDP socket without SO_REUSEPORT blocks the port.
         let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let port = held.local_addr().unwrap().port();

@@ -236,13 +236,7 @@ pub(crate) struct Outbound {
     /// them in order and the next ID is free unless it wraps around to the
     /// oldest. Only then is this built, until the window empties.
     in_use: Option<Box<[u64; 1024]>>,
-    /// Queued messages dropped because they expired.
-    pub(crate) expired: u64,
-    /// Held messages dropped because they outgrew the client's Maximum
-    /// Packet Size.
-    pub(crate) too_large: u64,
-    /// Queued messages sent once the window had room.
-    pub(crate) sent: u64,
+    pub(crate) counts: Counts,
     /// Copies of messages held long.
     arena: Arena,
     /// Bytes charged for the slots `queue` and `inflight` have room for, and
@@ -260,13 +254,23 @@ impl Default for Outbound {
             queued_bytes: 0,
             next_pkid: 0,
             in_use: None,
-            expired: 0,
-            too_large: 0,
-            sent: 0,
+            counts: Counts::default(),
             arena: Arena::default(),
             room: 0,
         }
     }
+}
+
+/// What a session counts itself, for the lane's stats.
+#[derive(Debug, Default)]
+pub(crate) struct Counts {
+    /// Queued messages dropped because they expired.
+    pub(crate) expired: u64,
+    /// Held messages dropped because they outgrew the client's Maximum
+    /// Packet Size.
+    pub(crate) too_large: u64,
+    /// Queued messages sent once the window had room.
+    pub(crate) sent: u64,
 }
 
 /// Publisher acks held while this session is congested.

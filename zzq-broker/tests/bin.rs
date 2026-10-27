@@ -87,6 +87,74 @@ async fn sigterm_keeps_sessions_in_the_state_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigterm_writes_every_retained_change_first() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    use zzq_broker::Context;
+    use zzq_client::{Client, ClientOptions, QoS};
+
+    const N: usize = 50_000;
+    let dir = std::env::temp_dir().join(format!("zzq-bin-retained-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("retained.log");
+    let start = || {
+        let mut child = Command::new(EXE)
+            .args(["--lanes", "1", "--bind", "tcp://127.0.0.1:0"])
+            .args(["--retained-file", file.to_str().unwrap()])
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut uri = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut uri)
+            .unwrap();
+        (Running(child), uri.trim().to_owned())
+    };
+    let ctx = Context::new().unwrap();
+    let (mut broker, uri) = start();
+    let c = Client::connect(&ctx, &uri, ClientOptions::new("pub"))
+        .await
+        .unwrap();
+    for i in 0..N {
+        c.publish_retained(&format!("r/{i}"), "x", QoS::AtMostOnce)
+            .await
+            .unwrap();
+    }
+    // In order behind the others: once acked, all are stored.
+    c.publish_retained("r/last", "x", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    let pid = broker.0.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(broker.0.wait().unwrap().success());
+    drop(c);
+    let (_broker, uri) = start();
+    let mut c = Client::connect(&ctx, &uri, ClientOptions::new("sub"))
+        .await
+        .unwrap();
+    c.subscribe("r/#", QoS::AtMostOnce).await.unwrap();
+    let mut got = 0;
+    while tokio::time::timeout(Duration::from_secs(1), c.recv())
+        .await
+        .is_ok_and(|m| m.is_some())
+    {
+        got += 1;
+    }
+    assert_eq!(got, N + 1, "retained messages after the restart");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[cfg(feature = "tls")]
 mod tls {
     use std::io::{BufRead, BufReader};

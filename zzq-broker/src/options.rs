@@ -93,8 +93,9 @@ pub struct BrokerOptions {
     /// QoS 1/2 messages queued for a connected session before publishers that
     /// feed it get their acks held back. Acks resume at half of this.
     pub qos_queue_high: usize,
-    /// Bytes waiting to be written per connection before QoS 0 messages to it
-    /// are dropped and counted.
+    /// Bytes waiting to be written per connection. Beyond it, QoS 0 messages
+    /// to the connection are dropped and counted, and the connection is not
+    /// read until its writer catches up.
     pub max_out_bytes: usize,
     /// QoS 2 messages from one client awaiting PUBREL, and the Receive
     /// Maximum advertised to v5 clients.
@@ -214,8 +215,10 @@ impl fmt::Debug for BrokerOptions {
     }
 }
 
-/// MQTT-SN gateway settings.
+/// MQTT-SN gateway settings. Start from [`SnOptions::default`] and set
+/// fields, as later versions may add more.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SnOptions {
     /// Gateway ID, sent in GWINFO.
     pub gateway_id: u8,
@@ -227,13 +230,17 @@ pub struct SnOptions {
     pub retries: u8,
     /// Datagrams held for a sleeping client; the oldest is dropped.
     pub sleep_buffer: usize,
-    /// Keep alive, in seconds, for a client that asks for none or for more.
-    /// Over UDP nothing else tells the gateway that a client is gone.
+    /// Keep alive, in seconds, for a client that asks for none or for more,
+    /// and the longest a client may sleep. Over UDP nothing else tells the
+    /// gateway that a client is gone.
     pub max_keep_alive: u16,
     /// Topic IDs per client, registered by it or assigned by the gateway.
     /// More REGISTERs get Rejected: congestion, and messages on further
     /// topics are dropped.
     pub max_topics: usize,
+    /// Clients served at once. Anyone can send a CONNECT over UDP, so more
+    /// get Rejected: congestion.
+    pub max_clients: usize,
 }
 
 impl Default for SnOptions {
@@ -246,6 +253,7 @@ impl Default for SnOptions {
             sleep_buffer: 1000,
             max_keep_alive: 3600,
             max_topics: 4096,
+            max_clients: 10_000,
         }
     }
 }

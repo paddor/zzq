@@ -6,12 +6,13 @@
 
 use std::hash::{BuildHasher, RandomState};
 use std::io;
-use std::pin::pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
+use std::task::{self, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio::sync::mpsc;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::endpoint::Endpoint;
 use crate::transport::{Stream, tcp};
@@ -22,6 +23,8 @@ const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HEADERS: usize = 8 << 10;
 /// Largest frame payload accepted.
 const MAX_FRAME: usize = 16 << 20;
+/// Largest piece of a frame payload read at once.
+const PAYLOAD_CHUNK: usize = 64 << 10;
 /// Buffer of the in-memory stream, each way.
 const PIPE_BYTES: usize = 256 << 10;
 /// How long the writer may finish once the peer closed.
@@ -212,8 +215,8 @@ pub(crate) async fn fuzz_server(mut data: &[u8]) {
     if let Some((key, _)) = check_upgrade(&head, "/mqtt") {
         let _ = accept_key(key);
     }
-    let mut payload = Vec::new();
-    while let Ok(Some(_)) = read_frame(&mut data, true, &mut payload).await {}
+    let (ctl, _writer) = mpsc::channel(1);
+    frames_in(data, tokio::io::sink(), ctl, Role::Server).await;
 }
 
 /// Reads an upgrade response and the server frames after it from `data`,
@@ -224,8 +227,8 @@ pub(crate) async fn fuzz_client(mut data: &[u8]) {
         return;
     };
     let _ = upgrade_accepted(&head, "dGhlIHNhbXBsZSBub25jZQ==");
-    let mut payload = Vec::new();
-    while let Ok(Some(_)) = read_frame(&mut data, false, &mut payload).await {}
+    let (ctl, _writer) = mpsc::channel(1);
+    frames_in(data, tokio::io::sink(), ctl, Role::Client).await;
 }
 
 async fn upgrade_server<S>(mut s: S, path: &str) -> Result<Stream>
@@ -245,7 +248,7 @@ where
     );
     s.write_all(response.as_bytes()).await?;
     s.flush().await?;
-    Ok(Stream::Inproc(pump(s, Role::Server)))
+    Ok(Stream::Ws(pump(s, Role::Server)))
 }
 
 async fn upgrade_client<S>(mut s: S, host: &str, path: &str) -> Result<Stream>
@@ -262,7 +265,7 @@ where
     if !upgrade_accepted(&head, &key) {
         return Err(protocol_error("upgrade refused"));
     }
-    Ok(Stream::Inproc(pump(s, Role::Client)))
+    Ok(Stream::Ws(pump(s, Role::Client)))
 }
 
 /// Whether `head` is a server's yes to the upgrade with `key`.
@@ -274,10 +277,49 @@ fn upgrade_accepted(head: &str, key: &str) -> bool {
     status_ok && header(head, "sec-websocket-accept") == Some(accept_key(key).as_str())
 }
 
+/// The byte stream of a WebSocket connection. Dropping it gives the pump
+/// [`CLOSE_LINGER`] to write what is left, so a peer that stopped reading
+/// does not keep the socket.
+#[derive(Debug)]
+pub struct WsStream {
+    pipe: DuplexStream,
+    /// Tells the pump once the stream is dropped.
+    _closed: oneshot::Sender<()>,
+}
+
+impl AsyncRead for WsStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().pipe).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for WsStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.get_mut().pipe).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().pipe).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().pipe).poll_shutdown(cx)
+    }
+}
+
 /// Starts the frame pump on the current lane and returns the byte stream.
-/// Once the byte stream closes, the pump stops reading the socket; once the
-/// peer closes, what is left to write gets [`CLOSE_LINGER`].
-fn pump<S>(ws: S, role: Role) -> DuplexStream
+/// Once the byte stream closes or is dropped, the pump stops reading the
+/// socket; once either side closes, what is left to write gets
+/// [`CLOSE_LINGER`].
+fn pump<S>(ws: S, role: Role) -> WsStream
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
 {
@@ -287,6 +329,7 @@ where
     // One control frame waits to be written. While a pong waits, newer
     // pings get none [RFC 6455 5.5.3].
     let (ctl_tx, ctl_rx) = mpsc::channel(1);
+    let (closed_tx, closed_rx) = oneshot::channel();
     tokio::task::spawn_local(async move {
         let mut inbound = pin!(frames_in(ws_r, pipe_w, ctl_tx, role));
         let mut outbound = pin!(frames_out(ws_w, pipe_r, ctl_rx, role));
@@ -295,9 +338,17 @@ where
                 let _ = tokio::time::timeout(CLOSE_LINGER, outbound).await;
             }
             () = &mut outbound => {}
+            // A writer stuck on a peer that does not read would never see
+            // the byte stream end.
+            _ = closed_rx => {
+                let _ = tokio::time::timeout(CLOSE_LINGER, outbound).await;
+            }
         }
     });
-    remote
+    WsStream {
+        pipe: remote,
+        _closed: closed_tx,
+    }
 }
 
 /// WebSocket frames to bytes. Control frames go to the writer.
@@ -306,23 +357,64 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut payload = Vec::new();
-    while let Ok(Some(opcode)) = read_frame(&mut ws, role == Role::Server, &mut payload).await {
-        match opcode {
-            OP_BINARY | OP_CONTINUATION => {
-                if pipe.write_all(&payload).await.is_err() {
-                    break;
+    let mut buf = Vec::new();
+    while let Ok(Some(h)) = read_header(&mut ws, role == Role::Server).await {
+        let more = match h.opcode {
+            OP_BINARY | OP_CONTINUATION => forward(&mut ws, &h, &mut buf, &mut pipe).await,
+            OP_PING => match read_control(&mut ws, &h).await {
+                Ok(data) => {
+                    let _ = ctl.try_send((OP_PONG, data));
+                    true
                 }
-            }
-            OP_PING => {
-                let _ = ctl.try_send((OP_PONG, std::mem::take(&mut payload)));
-            }
-            OP_PONG => {}
-            _ => break,
+                Err(_) => false,
+            },
+            OP_PONG => read_control(&mut ws, &h).await.is_ok(),
+            _ => false,
+        };
+        if !more {
+            break;
         }
     }
-    let _ = ctl.send((OP_CLOSE, Vec::new())).await;
+    // The byte stream ends first: with a pong waiting, the close may wait
+    // for a writer that is stuck.
     let _ = pipe.shutdown().await;
+    let _ = ctl.send((OP_CLOSE, Vec::new())).await;
+}
+
+/// Copies the payload of data frame `h` to `pipe`, unmasked, as it comes,
+/// so a large frame needs no buffer of its size. False if either side
+/// fails.
+async fn forward<R, W>(ws: &mut R, h: &Header, buf: &mut Vec<u8>, pipe: &mut W) -> bool
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut at = 0;
+    while at < h.len {
+        let want = (h.len - at).min(PAYLOAD_CHUNK);
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        let chunk = &mut buf[..want];
+        let n = match ws.read(chunk).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+        h.unmask(&mut chunk[..n], at);
+        if pipe.write_all(&chunk[..n]).await.is_err() {
+            return false;
+        }
+        at += n;
+    }
+    true
+}
+
+/// The payload of control frame `h`, unmasked. At most 125 bytes.
+async fn read_control<R: AsyncRead + Unpin>(ws: &mut R, h: &Header) -> io::Result<Vec<u8>> {
+    let mut data = vec![0u8; h.len];
+    ws.read_exact(&mut data).await?;
+    h.unmask(&mut data, 0);
+    Ok(data)
 }
 
 /// Bytes to binary frames, plus control frames from the reader.
@@ -369,12 +461,30 @@ async fn frames_out<W, R>(
     let _ = ws.shutdown().await;
 }
 
-/// Reads one frame into `payload`, unmasked. `Ok(None)` at a clean end.
-async fn read_frame<R: AsyncRead + Unpin>(
+/// A frame header.
+struct Header {
+    opcode: u8,
+    /// Payload length.
+    len: usize,
+    mask: Option<[u8; 4]>,
+}
+
+impl Header {
+    /// Unmasks `data`, which starts `at` bytes into the payload.
+    fn unmask(&self, data: &mut [u8], at: usize) {
+        if let Some(mask) = self.mask {
+            for (i, b) in data.iter_mut().enumerate() {
+                *b ^= mask[(at + i) & 3];
+            }
+        }
+    }
+}
+
+/// Reads a frame header. `Ok(None)` at a clean end.
+async fn read_header<R: AsyncRead + Unpin>(
     r: &mut R,
     want_masked: bool,
-    payload: &mut Vec<u8>,
-) -> io::Result<Option<u8>> {
+) -> io::Result<Option<Header>> {
     let mut h = [0u8; 2];
     match r.read_exact(&mut h).await {
         Ok(_) => {}
@@ -400,18 +510,14 @@ async fn read_frame<R: AsyncRead + Unpin>(
     if len > MAX_FRAME {
         return Err(bad("frame too large"));
     }
-    let mut mask = [0u8; 4];
-    if masked {
+    let mask = if masked {
+        let mut mask = [0u8; 4];
         r.read_exact(&mut mask).await?;
-    }
-    payload.resize(len, 0);
-    r.read_exact(payload).await?;
-    if masked {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i & 3];
-        }
-    }
-    Ok(Some(opcode))
+        Some(mask)
+    } else {
+        None
+    };
+    Ok(Some(Header { opcode, len, mask }))
 }
 
 fn write_frame(out: &mut Vec<u8>, opcode: u8, payload: &[u8], masked: bool) {
@@ -540,9 +646,24 @@ mod tests {
 
     /// A server pump over an in-memory socket: the client's end, and the byte
     /// stream for MQTT.
-    fn server() -> (DuplexStream, DuplexStream) {
+    fn server() -> (DuplexStream, WsStream) {
         let (client, socket) = tokio::io::duplex(1 << 20);
         (client, pump(socket, Role::Server))
+    }
+
+    /// Reads one frame into `payload`, unmasked. `Ok(None)` at a clean end.
+    async fn read_frame<R: AsyncRead + Unpin>(
+        r: &mut R,
+        want_masked: bool,
+        payload: &mut Vec<u8>,
+    ) -> io::Result<Option<u8>> {
+        let Some(h) = read_header(r, want_masked).await? else {
+            return Ok(None);
+        };
+        payload.resize(h.len, 0);
+        r.read_exact(payload).await?;
+        h.unmask(payload, 0);
+        Ok(Some(h.opcode))
     }
 
     fn ping(len: usize, fin: bool) -> Vec<u8> {
@@ -589,6 +710,52 @@ mod tests {
                 })
                 .await;
                 assert!(gone.is_ok(), "the socket is still read");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_stopped_reading_is_let_go_once_the_byte_stream_closes() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                // Room for little more than one frame header.
+                let (mut client, socket) = tokio::io::duplex(64);
+                let mut mqtt = pump(socket, Role::Server);
+                mqtt.write_all(&[1; 4096]).await.unwrap();
+                tokio::task::yield_now().await;
+                drop(mqtt);
+                // The client never reads. Once the pump lets go of the
+                // socket, writes to it fail.
+                let gone = tokio::time::timeout(CLOSE_LINGER * 2, async {
+                    while client.write_all(&ping(4, true)).await.is_ok() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                assert!(gone.is_ok(), "the pump still holds the socket");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_large_frame_reaches_the_byte_stream_before_it_is_complete() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, mut mqtt) = server();
+                let mut frame = Vec::new();
+                write_frame(&mut frame, OP_BINARY, &vec![7u8; 1 << 20], true);
+                // Header, mask and the first 1000 bytes of the payload.
+                client.write_all(&frame[..14 + 1000]).await.unwrap();
+                let mut got = vec![0u8; 1000];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    mqtt.read_exact(&mut got),
+                )
+                .await;
+                assert!(read.is_ok(), "nothing before the whole frame came");
+                assert!(got.iter().all(|&b| b == 7), "unmasked");
             })
             .await;
     }
