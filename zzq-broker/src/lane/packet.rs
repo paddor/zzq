@@ -39,7 +39,11 @@ impl Lane {
         Ok(())
     }
 
-    #[inline]
+    #[expect(
+        clippy::inline_always,
+        reason = "one caller, the per-packet loop; `#[inline]` left a call of ~20 instructions per packet"
+    )]
+    #[inline(always)]
     fn handle_packet(
         &mut self,
         key: Key,

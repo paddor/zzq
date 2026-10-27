@@ -287,12 +287,6 @@ impl Lane {
             ..
         } = g;
         let o = &self.shared.opts;
-        let max_out = o.max_out_bytes;
-        let limit = QueueLimit {
-            count: o.max_queued.saturating_add(extra.count),
-            bytes: o.max_queued_bytes.saturating_add(extra.bytes),
-            state_full: self.budget.full,
-        };
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -300,9 +294,14 @@ impl Lane {
             if s.conn.is_none() {
                 Outcome::Offline
             } else {
-                s.deliver_qos0(p, retain, sub_id, max_out)
+                s.deliver_qos0(p, retain, sub_id, o.max_out_bytes)
             }
         } else {
+            let limit = QueueLimit {
+                count: o.max_queued.saturating_add(extra.count),
+                bytes: o.max_queued_bytes.saturating_add(extra.bytes),
+                state_full: self.budget.full,
+            };
             let kept = keep(s, p, owned, &self.budget.total, g);
             s.deliver_qos12(kept, limit)
         };
