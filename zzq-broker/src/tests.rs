@@ -1050,3 +1050,19 @@ async fn a_held_suback_of_a_replaced_connection_sends_no_retained() {
     .await;
     assert_eq!(sent, Some(0), "retained sent to the new connection");
 }
+
+/// An accept loop that starts after the broker stopped its tasks, as a
+/// cancelled bind's can, stops at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bind_that_lands_after_the_stop_does_not_keep_accepting() {
+    let (_ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+    broker.abort_tasks();
+    let ep = broker.bind("tcp://127.0.0.1:0").await.unwrap();
+    let addr = ep.to_string();
+    let addr = addr.trim_start_matches("tcp://");
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while tokio::net::TcpStream::connect(addr).await.is_ok() {
+        assert!(tokio::time::Instant::now() < deadline, "still accepting");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
+use tokio::task::AbortHandle;
 use zzq_proto::QoS;
 use zzq_proto::topic::validate_name;
 use zzq_tokio::transport::Listener;
@@ -111,8 +112,20 @@ pub(crate) struct Shared {
     pub(crate) lanes: Box<[LaneTx]>,
     /// Connected clients on all lanes, for `max_connections`.
     pub(crate) connections: AtomicUsize,
-    /// Accept loops and other tasks stopped when the broker is dropped.
-    tasks: Mutex<Vec<tokio::task::AbortHandle>>,
+    /// Accept loops and other tasks stopped when the broker is dropped;
+    /// `None` once stopped.
+    tasks: Mutex<Option<Vec<AbortHandle>>>,
+}
+
+impl Shared {
+    /// Stops `task` with the broker, or now if the broker stopped already,
+    /// as a bind cancelled before its listener was up may find it.
+    fn own_task(&self, task: AbortHandle) {
+        match &mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner) {
+            Some(tasks) => tasks.push(task),
+            None => task.abort(),
+        }
+    }
 }
 
 /// Broker counters.
@@ -233,7 +246,7 @@ impl Broker {
             retained: Mutex::new(retained),
             lanes: lanes.into_boxed_slice(),
             connections: AtomicUsize::new(0),
-            tasks: Mutex::default(),
+            tasks: Mutex::new(Some(Vec::new())),
         });
         // Stops the lanes again when a later step fails.
         let broker = Broker {
@@ -253,10 +266,7 @@ impl Broker {
             ctx.lane(0)
                 .call(move || {
                     let task = tokio::task::spawn_local(crate::sys::run(s.clone(), every));
-                    s.tasks
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .push(task.abort_handle());
+                    s.own_task(task.abort_handle());
                 })
                 .await?;
         }
@@ -296,11 +306,7 @@ impl Broker {
                 };
             let bound = listener.endpoint();
             let task = tokio::task::spawn_local(accept_loop(shared.clone(), listener));
-            shared
-                .tasks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(task.abort_handle());
+            shared.own_task(task.abort_handle());
             let _ = tx.send(Ok(bound));
         })?;
         Ok(rx.await.map_err(|_| Error::Closed)??)
@@ -389,13 +395,13 @@ impl Broker {
     }
 
     pub(crate) fn abort_tasks(&self) {
-        for a in self
+        let tasks = self
             .shared
             .tasks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .drain(..)
-        {
+            .take();
+        for a in tasks.into_iter().flatten() {
             a.abort();
         }
     }
@@ -571,11 +577,7 @@ async fn bind_udp(
         _ => endpoint.clone(),
     };
     let task = tokio::task::spawn_local(crate::sn::gateway(shared.clone(), socket));
-    shared
-        .tasks
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .push(task.abort_handle());
+    shared.own_task(task.abort_handle());
     let _ = tx.send(Ok(bound));
 }
 
