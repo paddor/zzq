@@ -5,6 +5,25 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `zzq-bench`: `zzq_loadbench` runs the fixed-load test against any broker:
+  up to tens of thousands of connections, each publishing on a schedule,
+  in steps of offered load, with latency from each send to its delivery.
+- `zzq-bench`: `zzq_brokerbench` reports the broker's CPU and memory
+  (`cpu_pid`), v5 nacks, why connections closed, and publishers still
+  blocked 10 s after a run, and places `rtt` clients on zzq lanes.
+- `zzq-bench`: `zzq_suite` runs the suites behind `BENCHMARKS.md` and
+  records them into the result cache, with `zzq_fakebroker`,
+  `zzq_client_bench`, the rival broker configs in `zzq-bench/harness`, and
+  rumqttc and ntex-mqtt benches in a workspace of their own.
+  `RUNNING_BENCHMARKS.md` shows how to run them.
+
+### Fixed
+
+- `zzq-bench`: the raw load generator asks for a 300 s keep alive instead
+  of none, which rumqttd refused.
+
 ## [0.3.0] - 2026-10-27
 
 ### Added

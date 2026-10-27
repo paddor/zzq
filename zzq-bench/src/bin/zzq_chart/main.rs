@@ -1,6 +1,6 @@
 //! Comparison charts from the result cache.
 //!
-//! Reads the rows `tmp/mqtt-bench/run.rb` appends to `brokers.jsonl`,
+//! Reads the rows `zzq_suite` appends to `brokers.jsonl`,
 //! `clients.jsonl` and `fixed.jsonl` in `$XDG_CACHE_HOME/zzq`
 //! (`~/.cache/zzq`), and writes `doc/charts/brokers.svg`, `clients.svg` and
 //! `fixed-load.svg` under the current directory. Per cell, the newest run

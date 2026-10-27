@@ -1,0 +1,13 @@
+# Built-in defaults, except MQTT 5 on 1883 (default 1884, with 3.1.1 on
+# 1883) and Badger in the suite's working directory under $TMPDIR (default
+# /tmp/fluxmq/data).
+server:
+  mqtt:
+    tcp:
+      v3:
+        addr: ":1882"
+      v5:
+        addr: ":1883"
+storage:
+  type: "badger"
+  badger_dir: "fluxmq-data"

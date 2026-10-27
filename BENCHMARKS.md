@@ -1,7 +1,8 @@
 # Benchmarks
 
 zzq against other MQTT brokers and clients on one machine, over TCP
-loopback.
+loopback. [RUNNING_BENCHMARKS.md](RUNNING_BENCHMARKS.md) shows how to run
+them.
 
 ## Setup
 
@@ -41,8 +42,9 @@ loopback.
 
 ![Broker throughput and latency](doc/charts/brokers.svg)
 
-- Load generator: `zzq_brokerbench`, raw sockets, one thread per connection,
-  pre-encoded batches. MQTT 5.0, except 3.1.1 for rumqttd.
+- Load generator: `zzq_brokerbench` from `zzq-bench`, raw sockets, one
+  thread per connection, pre-encoded batches. MQTT 5.0, except 3.1.1 for
+  rumqttd.
 - 1 s warmup (5 s for rumqttd, whose memory grows for a few seconds
   first), then a 5 s window. The rate is deliveries at the subscribers.
   Loss compares all deliveries with all sends once 2 s pass without a
@@ -58,9 +60,9 @@ loopback.
 
 ![Brokers at fixed load](doc/charts/fixed-load.svg)
 
-- Load generator: `zzq_loadbench` from the benchmark harness, which is not
-  part of this repository, on two current-thread runtimes on CPUs 4-5,
-  up to 20K connections from 127.0.0.1-8. QoS 1, 16 B payloads.
+- Load generator: `zzq_loadbench` from `zzq-bench`, on two current-thread
+  runtimes on CPUs 4-5, up to 20K connections from 127.0.0.1-8. QoS 1,
+  16 B payloads.
 - Each publisher sends on a fixed schedule. A step ramps for 2 s, then
   measures for 8 s on the same connections. The offered rate counts
   deliveries.
@@ -76,8 +78,7 @@ loopback.
 
 ![MQTT clients](doc/charts/clients.svg)
 
-- One client connection against `zzq_fakebroker` from the same harness,
-  which acks at once. The
-  receiving side measures: the fake broker for publishing, the client for
-  subscribing.
+- One client connection against `zzq_fakebroker` from `zzq-bench`, which
+  acks at once. The receiving side measures: the fake broker for
+  publishing, the client for subscribing.
 - QoS 1 and 2 publishers keep up to 100 messages in flight.

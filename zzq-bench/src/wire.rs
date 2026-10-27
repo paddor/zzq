@@ -8,6 +8,9 @@ use zzq_proto::packet::fixed_header;
 use zzq_proto::property::{self, Properties, Property};
 use zzq_proto::{QoS, SubscriptionOptions, Version};
 
+/// Keep alive the raw clients ask for: long enough that no run needs a
+/// PINGREQ. Some brokers (rumqttd) close a connection that asks for 0.
+pub const KEEP_ALIVE: u16 = 300;
 /// First byte of PUBACK.
 pub const PUBACK: u8 = 0x40;
 /// First byte of PUBREC.
@@ -27,21 +30,34 @@ pub struct Reader {
 
 impl Default for Reader {
     fn default() -> Self {
-        Reader {
-            buf: vec![0; 1 << 20],
-            len: 0,
-            pos: 0,
-        }
+        Reader::with_capacity(1 << 20)
     }
 }
 
 impl Reader {
+    /// A reader that starts with `n` bytes of buffer.
+    pub fn with_capacity(n: usize) -> Reader {
+        Reader {
+            buf: vec![0; n.max(1)],
+            len: 0,
+            pos: 0,
+        }
+    }
+
     /// Reads more bytes. `Ok(0)` means the peer closed.
     ///
     /// # Errors
     ///
     /// If the read fails.
     pub fn fill<R: Read>(&mut self, s: &mut R) -> io::Result<usize> {
+        let k = s.read(self.space())?;
+        self.filled(k);
+        Ok(k)
+    }
+
+    /// Free space to read into, after moving unread bytes to the front.
+    /// Grows when full.
+    pub fn space(&mut self) -> &mut [u8] {
         if self.pos > 0 {
             self.buf.copy_within(self.pos..self.len, 0);
             self.len -= self.pos;
@@ -50,9 +66,12 @@ impl Reader {
         if self.len == self.buf.len() {
             self.buf.resize(self.buf.len() * 2, 0);
         }
-        let k = s.read(&mut self.buf[self.len..])?;
+        &mut self.buf[self.len..]
+    }
+
+    /// Marks `k` bytes read into [`Reader::space`].
+    pub const fn filled(&mut self, k: usize) {
         self.len += k;
-        Ok(k)
     }
 
     /// Fixed header byte and body of the next whole packet.
@@ -138,6 +157,34 @@ fn invalid(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
+/// Encodes a CONNECT. A `persistent` session outlives the connection.
+pub fn connect_packet(
+    out: &mut Vec<u8>,
+    client_id: &str,
+    v5: bool,
+    keep_alive: u16,
+    persistent: bool,
+) {
+    let forever = [Property::U32(property::SESSION_EXPIRY_INTERVAL, u32::MAX)];
+    let c = ConnectFields {
+        version: version(v5),
+        clean_start: !persistent,
+        keep_alive,
+        properties: if persistent && v5 { &forever } else { &[] },
+        client_id,
+        will: None,
+        username: None,
+        password: None,
+    };
+    encode::connect(&c, out);
+}
+
+/// Encodes a SUBSCRIBE of one filter, packet ID 1.
+pub fn subscribe_packet(out: &mut Vec<u8>, filter: &str, qos: u8, v5: bool) {
+    let opts = SubscriptionOptions::from(QoS::try_from(qos).unwrap_or_default());
+    encode::subscribe(version(v5), 1, &[], &[(filter, opts)], out);
+}
+
 /// Connects and waits for CONNACK. Returns the v5 Receive Maximum.
 ///
 /// # Errors
@@ -174,18 +221,7 @@ fn open(
     let mut s = TcpStream::connect(addr)?;
     s.set_nodelay(true)?;
     let mut out = Vec::new();
-    let forever = [Property::U32(property::SESSION_EXPIRY_INTERVAL, u32::MAX)];
-    let c = ConnectFields {
-        version: version(v5),
-        clean_start: !persistent,
-        keep_alive: 0,
-        properties: if persistent && v5 { &forever } else { &[] },
-        client_id,
-        will: None,
-        username: None,
-        password: None,
-    };
-    encode::connect(&c, &mut out);
+    connect_packet(&mut out, client_id, v5, KEEP_ALIVE, persistent);
     s.write_all(&out)?;
     let mut rd = Reader::default();
     loop {
@@ -224,8 +260,7 @@ pub fn subscribe(
     v5: bool,
 ) -> io::Result<()> {
     let mut out = Vec::new();
-    let opts = SubscriptionOptions::from(QoS::try_from(qos).unwrap_or_default());
-    encode::subscribe(version(v5), 1, &[], &[(filter, opts)], &mut out);
+    subscribe_packet(&mut out, filter, qos, v5);
     s.write_all(&out)?;
     loop {
         if rd.fill(s)? == 0 {
@@ -251,4 +286,28 @@ pub fn disconnect(mut s: TcpStream, rd: &mut Reader) -> io::Result<()> {
     s.write_all(&[0xe0, 0])?;
     while rd.fill(&mut s)? > 0 {}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    use super::*;
+
+    #[test]
+    fn a_connect_asks_for_a_keep_alive() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = std::thread::spawn(move || {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut connect = [0; 12];
+            s.read_exact(&mut connect).unwrap();
+            connect
+        });
+        assert!(connect(&addr, "c", false).is_err());
+        let connect = server.join().unwrap();
+        assert_eq!(connect[..10], *b"\x10\x0d\x00\x04MQTT\x04\x02");
+        assert_eq!(u16::from_be_bytes([connect[10], connect[11]]), 300);
+    }
 }

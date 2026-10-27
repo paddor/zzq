@@ -7,7 +7,18 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::cpu::{CpuUse, CpuWindow};
 use crate::wire::{self, Head, PUBACK, PUBCOMP, PUBREC, PUBREL, Reader};
+
+/// Time stopped publishers have to finish their last write before the run
+/// shuts the sockets down.
+#[cfg(not(test))]
+const STALL: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STALL: Duration = Duration::from_millis(200);
+
+/// Connection notes a run keeps.
+const NOTES: usize = 32;
 
 /// Traffic shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +60,9 @@ pub struct Load {
     /// Topics per publisher, cycled message by message. Above 1,
     /// subscribers use `/#` filters.
     pub topics: usize,
+    /// The broker's PID. Its CPU and memory, with its descendants', go into
+    /// the results.
+    pub broker_pid: Option<u32>,
 }
 
 impl Default for Load {
@@ -66,6 +80,7 @@ impl Default for Load {
             lanes: 1,
             cross: false,
             topics: 1,
+            broker_pid: None,
         }
     }
 }
@@ -81,8 +96,18 @@ pub struct Throughput {
     pub loss: f64,
     /// Connections the broker closed.
     pub closed: u64,
+    /// QoS 1/2 acks with a v5 failure reason code.
+    pub nacks: u64,
+    /// A publisher was still blocked in a write 10 s after the publishers
+    /// were told to stop, so the run shut its sockets down.
+    pub stalled: bool,
+    /// Closed and disconnected connections, as `client ID: reason`. The
+    /// first 32.
+    pub notes: Vec<String>,
     /// Deliveries per second for each second of the run.
     pub per_second: Vec<f64>,
+    /// Broker and load generator CPU over the measured window.
+    pub cpu: CpuUse,
 }
 
 #[derive(Default, Debug)]
@@ -90,12 +115,32 @@ struct Run {
     sent: AtomicU64,
     recv: AtomicU64,
     closed: AtomicU64,
+    nacks: AtomicU64,
     pub_stop: AtomicBool,
     sub_stop: AtomicBool,
     sockets: Mutex<Vec<TcpStream>>,
+    notes: Mutex<Vec<String>>,
 }
 
 impl Run {
+    /// Keeps a note about connection `id`, up to [`NOTES`].
+    fn note(&self, id: &str, what: &str) {
+        let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+        if notes.len() < NOTES {
+            notes.push(format!("{id}: {what}"));
+        }
+    }
+
+    /// Counts a connection the broker closed or failed.
+    fn lost(&self, id: &str, e: &io::Error) {
+        self.closed.fetch_add(1, Relaxed);
+        if e.kind() == ErrorKind::UnexpectedEof {
+            self.note(id, "broker closed");
+        } else {
+            self.note(id, &e.to_string());
+        }
+    }
+
     fn register(&self, s: &TcpStream) -> io::Result<()> {
         let clone = s.try_clone()?;
         self.sockets
@@ -164,20 +209,36 @@ impl Shape {
     }
 }
 
-type SubConn = (TcpStream, Reader);
-type PubConn = (String, TcpStream, Reader, Option<u16>);
+/// A connected client.
+struct Conn {
+    id: String,
+    s: TcpStream,
+    rd: Reader,
+    /// The broker's Receive Maximum.
+    rmax: Option<u16>,
+}
+
+impl Conn {
+    fn open(addr: &str, id: String, v5: bool) -> io::Result<Conn> {
+        let (s, rd, rmax) = wire::connect(addr, &id, v5)?;
+        Ok(Conn { id, s, rd, rmax })
+    }
+}
+
+/// Subscribers, and publishers with their topics.
+type Conns = (Vec<Conn>, Vec<(String, Conn)>);
 
 /// Connects all subscribers, then all publishers.
-fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<(Vec<SubConn>, Vec<PubConn>)> {
+fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<Conns> {
     let pid = shape.pid;
     let mut subs = Vec::new();
     for i in 0..shape.subs {
         let id = client_id(&format!("zb-{pid}-s{i}"), i, load.lanes);
-        let (mut s, mut rd, _) = wire::connect(&load.addr, &id, load.v5)?;
-        wire::subscribe(&mut s, &mut rd, &shape.filter(i), load.qos, load.v5)?;
-        s.set_read_timeout(Some(Duration::from_millis(100)))?;
-        run.register(&s)?;
-        subs.push((s, rd));
+        let mut c = Conn::open(&load.addr, id, load.v5)?;
+        wire::subscribe(&mut c.s, &mut c.rd, &shape.filter(i), load.qos, load.v5)?;
+        c.s.set_read_timeout(Some(Duration::from_millis(100)))?;
+        run.register(&c.s)?;
+        subs.push(c);
     }
     let mut pubs = Vec::new();
     for i in 0..shape.pubs {
@@ -186,9 +247,9 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<(Vec<SubConn
             i + usize::from(load.cross),
             load.lanes,
         );
-        let (s, rd, rmax) = wire::connect(&load.addr, &id, load.v5)?;
-        run.register(&s)?;
-        pubs.push((shape.topic(i), s, rd, rmax));
+        let c = Conn::open(&load.addr, id, load.v5)?;
+        run.register(&c.s)?;
+        pubs.push((shape.topic(i), c));
     }
     Ok((subs, pubs))
 }
@@ -204,30 +265,20 @@ pub fn throughput(scenario: Scenario, load: &Load) -> io::Result<Throughput> {
     let (subs, pubs) = connect_all(&shape, load, &run)?;
     let subs: Vec<_> = subs
         .into_iter()
-        .map(|(s, rd)| {
+        .map(|c| {
             let run = run.clone();
-            thread::spawn(move || subscriber(s, rd, &run))
+            thread::spawn(move || subscriber(c, &run))
         })
         .collect();
     let pubs: Vec<_> = pubs
         .into_iter()
-        .map(|(topic, s, rd, rmax)| {
+        .map(|(topic, c)| {
             let (load, run) = (load.clone(), run.clone());
-            thread::spawn(move || publisher(&load, &topic, (s, rd, rmax), &run))
+            thread::spawn(move || publisher(&load, &topic, c, &run))
         })
         .collect();
-    let samples = sample(&run, load.warmup, load.measure);
-    run.pub_stop.store(true, Relaxed);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    for p in pubs {
-        while !p.is_finished() && Instant::now() < deadline {
-            thread::sleep(Duration::from_millis(10));
-        }
-        if !p.is_finished() {
-            run.shutdown_all();
-        }
-        let _ = p.join();
-    }
+    let (samples, cpu) = sample(&run, load);
+    let stalled = stop_publishers(&run, pubs);
     let expected = run.sent.load(Relaxed) * shape.fan;
     drain(&run, expected);
     run.sub_stop.store(true, Relaxed);
@@ -235,7 +286,30 @@ pub fn throughput(scenario: Scenario, load: &Load) -> io::Result<Throughput> {
     for t in subs {
         let _ = t.join();
     }
-    Ok(summarize(&run, &samples, expected))
+    Ok(Throughput {
+        stalled,
+        cpu,
+        ..summarize(&run, &samples, expected)
+    })
+}
+
+/// Stops the publishers and waits up to [`STALL`] for them. Returns whether
+/// one was still blocked, after shutting all sockets down to free it.
+fn stop_publishers(run: &Run, pubs: Vec<thread::JoinHandle<()>>) -> bool {
+    run.pub_stop.store(true, Relaxed);
+    let deadline = Instant::now() + STALL;
+    let mut stalled = false;
+    for p in pubs {
+        while !p.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !p.is_finished() {
+            stalled = true;
+            run.shutdown_all();
+        }
+        let _ = p.join();
+    }
+    stalled
 }
 
 fn summarize(run: &Run, samples: &[(u64, u64, f64)], expected: u64) -> Throughput {
@@ -257,7 +331,15 @@ fn summarize(run: &Run, samples: &[(u64, u64, f64)], expected: u64) -> Throughpu
             0.0
         },
         closed: run.closed.load(Relaxed),
+        nacks: run.nacks.load(Relaxed),
+        stalled: false,
+        notes: run
+            .notes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone(),
         per_second,
+        cpu: CpuUse::default(),
     }
 }
 
@@ -273,10 +355,12 @@ fn client_id(prefix: &str, lane: usize, lanes: usize) -> String {
         .unwrap_or_else(|| prefix.to_owned())
 }
 
-/// (sent, received, seconds) at the window start, each second, and the end.
-fn sample(run: &Run, warmup: Duration, measure: Duration) -> Vec<(u64, u64, f64)> {
+/// (sent, received, seconds) at the window start, each second, and the end,
+/// and the CPU over the window.
+fn sample(run: &Run, load: &Load) -> (Vec<(u64, u64, f64)>, CpuUse) {
     let start = Instant::now();
-    thread::sleep(warmup);
+    thread::sleep(load.warmup);
+    let window = CpuWindow::start(load.broker_pid);
     let snap = || {
         (
             run.sent.load(Relaxed),
@@ -285,13 +369,13 @@ fn sample(run: &Run, warmup: Duration, measure: Duration) -> Vec<(u64, u64, f64)
         )
     };
     let mut samples = vec![snap()];
-    let end = start + warmup + measure;
+    let end = start + load.warmup + load.measure;
     loop {
         let next = (Instant::now() + Duration::from_secs(1)).min(end);
         thread::sleep(next.saturating_duration_since(Instant::now()));
         samples.push(snap());
         if Instant::now() >= end {
-            return samples;
+            return (samples, window.finish());
         }
     }
 }
@@ -313,22 +397,36 @@ fn timed_out(e: &io::Error) -> bool {
     matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
 }
 
-fn subscriber(mut s: TcpStream, mut rd: Reader, run: &Run) {
+/// `DISCONNECT 0x8e` for the body of a DISCONNECT.
+fn disconnect(body: &[u8]) -> String {
+    format!("DISCONNECT {:#04x}", body.first().copied().unwrap_or(0))
+}
+
+fn subscriber(mut c: Conn, run: &Run) {
+    if let Err(e) = deliveries(&mut c, run)
+        && !run.sub_stop.load(Relaxed)
+    {
+        run.lost(&c.id, &e);
+    }
+}
+
+/// Reads and acks deliveries until the run stops.
+fn deliveries(c: &mut Conn, run: &Run) -> io::Result<()> {
     let mut out = Vec::new();
     loop {
-        match rd.fill(&mut s) {
-            Ok(0) => break,
+        match c.rd.fill(&mut c.s) {
+            Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
             Ok(_) => {}
             Err(e) if timed_out(&e) => {
                 if run.sub_stop.load(Relaxed) {
-                    return;
+                    return Ok(());
                 }
                 continue;
             }
-            Err(_) => break,
+            Err(e) => return Err(e),
         }
         let mut k = 0;
-        while let Some((h, body)) = rd.next_packet() {
+        while let Some((h, body)) = c.rd.next_packet() {
             match h >> 4 {
                 3 => {
                     k += 1;
@@ -339,6 +437,7 @@ fn subscriber(mut s: TcpStream, mut rd: Reader, run: &Run) {
                     }
                 }
                 6 => wire::ack(&mut out, PUBCOMP, body),
+                14 => run.note(&c.id, &disconnect(body)),
                 _ => {}
             }
         }
@@ -346,19 +445,13 @@ fn subscriber(mut s: TcpStream, mut rd: Reader, run: &Run) {
             run.recv.fetch_add(k, Relaxed);
         }
         if !out.is_empty() {
-            if s.write_all(&out).is_err() {
-                break;
-            }
+            c.s.write_all(&out)?;
             out.clear();
         }
     }
-    if !run.sub_stop.load(Relaxed) {
-        run.closed.fetch_add(1, Relaxed);
-    }
 }
 
-fn publisher(load: &Load, topic: &str, conn: (TcpStream, Reader, Option<u16>), run: &Run) {
-    let (mut s, mut rd, rmax) = conn;
+fn publisher(load: &Load, topic: &str, mut c: Conn, run: &Run) {
     let payload = vec![b'x'; load.size];
     let topics: Vec<String> = if load.topics > 1 {
         (0..load.topics).map(|j| format!("{topic}/{j}")).collect()
@@ -366,13 +459,15 @@ fn publisher(load: &Load, topic: &str, conn: (TcpStream, Reader, Option<u16>), r
         vec![topic.to_owned()]
     };
     let result = if load.qos == 0 {
-        publish_qos0(&mut s, &topics, &payload, load.v5, run)
+        publish_qos0(&mut c.s, &topics, &payload, load.v5, run)
     } else {
-        let window = load.window.min(usize::from(rmax.unwrap_or(u16::MAX)));
-        publish_acked((&mut s, &mut rd), (&topics, &payload), load, window, run)
+        let window = load.window.min(usize::from(c.rmax.unwrap_or(u16::MAX)));
+        publish_acked(&mut c, (&topics, &payload), load, window, run)
     };
-    if result.is_err() && !run.pub_stop.load(Relaxed) {
-        run.closed.fetch_add(1, Relaxed);
+    if let Err(e) = result
+        && !run.pub_stop.load(Relaxed)
+    {
+        run.lost(&c.id, &e);
     }
 }
 
@@ -406,13 +501,13 @@ fn publish_qos0(
 }
 
 fn publish_acked(
-    (s, rd): (&mut TcpStream, &mut Reader),
+    c: &mut Conn,
     (topics, payload): (&[String], &[u8]),
     load: &Load,
     window: usize,
     run: &Run,
 ) -> io::Result<()> {
-    s.set_read_timeout(Some(Duration::from_millis(100)))?;
+    c.s.set_read_timeout(Some(Duration::from_millis(100)))?;
     let mut out = Vec::new();
     let mut outstanding = 0;
     let mut pkid: u16 = 0;
@@ -442,23 +537,40 @@ fn publish_acked(
             return Ok(());
         }
         if !out.is_empty() {
-            s.write_all(&out)?;
+            c.s.write_all(&out)?;
             out.clear();
         }
-        match rd.fill(s) {
+        match c.rd.fill(&mut c.s) {
             Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
             Ok(_) => {}
             Err(e) if timed_out(&e) => continue,
             Err(e) => return Err(e),
         }
-        while let Some((h, body)) = rd.next_packet() {
-            match h >> 4 {
-                4 | 7 => outstanding -= 1,
-                5 => wire::ack(&mut out, PUBREL, body),
-                _ => {}
-            }
+        outstanding -= take_acks(c, &mut out, load.v5, run);
+    }
+}
+
+/// Handles the broker's acks and returns how many flows they ended. A v5
+/// ack with a failure reason code is a nack, and a failed PUBREC ends its
+/// flow without a PUBREL.
+fn take_acks(c: &mut Conn, out: &mut Vec<u8>, v5: bool, run: &Run) -> usize {
+    let (mut done, mut nacks) = (0, 0);
+    while let Some((h, body)) = c.rd.next_packet() {
+        let kind = h >> 4;
+        let failed = v5 && matches!(kind, 4 | 5 | 7) && body.get(2).is_some_and(|&r| r >= 0x80);
+        nacks += u64::from(failed);
+        match kind {
+            4 | 7 => done += 1,
+            5 if failed => done += 1,
+            5 => wire::ack(out, PUBREL, body),
+            14 => run.note(&c.id, &disconnect(body)),
+            _ => {}
         }
     }
+    if nacks > 0 {
+        run.nacks.fetch_add(nacks, Relaxed);
+    }
+    done
 }
 
 /// Latency result in microseconds.
@@ -476,10 +588,14 @@ pub struct Latency {
     pub max: f64,
     /// Messages not delivered within one second.
     pub lost: u64,
+    /// Broker and load generator CPU over the measured round trips.
+    pub cpu: CpuUse,
 }
 
 /// One message in flight between two connections of one thread, QoS 0 or 1.
 /// The payload carries a sequence number, so `size` must be at least 8.
+/// With [`Load::lanes`], the subscriber is on lane 0 and the publisher too,
+/// or on lane 1 with [`Load::cross`].
 ///
 /// # Errors
 ///
@@ -493,11 +609,12 @@ pub fn latency(load: &Load, iters: usize) -> io::Result<Latency> {
     }
     let pid = std::process::id();
     let topic = format!("zb/{pid}/rtt");
-    let (mut sub, mut sub_rd, _) = wire::connect(&load.addr, &format!("zb-{pid}-rs"), load.v5)?;
+    let sub_client = client_id(&format!("zb-{pid}-rs"), 0, load.lanes);
+    let (mut sub, mut sub_rd, _) = wire::connect(&load.addr, &sub_client, load.v5)?;
     wire::subscribe(&mut sub, &mut sub_rd, &topic, load.qos, load.v5)?;
     sub.set_read_timeout(Some(Duration::from_secs(1)))?;
-    let (mut publisher, mut pub_rd, _) =
-        wire::connect(&load.addr, &format!("zb-{pid}-rp"), load.v5)?;
+    let pub_client = client_id(&format!("zb-{pid}-rp"), usize::from(load.cross), load.lanes);
+    let (mut publisher, mut pub_rd, _) = wire::connect(&load.addr, &pub_client, load.v5)?;
     let mut payload = vec![b'x'; load.size];
     let warm = iters / 10;
     let mut rtts = Vec::with_capacity(iters);
@@ -505,7 +622,11 @@ pub fn latency(load: &Load, iters: usize) -> io::Result<Latency> {
     let mut out = Vec::new();
     let mut acks = Vec::new();
     let mut packet_id: u16 = 0;
+    let mut window = CpuWindow::start(load.broker_pid);
     for i in 0..(warm + iters) as u64 {
+        if i == warm as u64 {
+            window = CpuWindow::start(load.broker_pid);
+        }
         packet_id = packet_id.wrapping_add(1).max(1);
         payload[..8].copy_from_slice(&i.to_le_bytes());
         out.clear();
@@ -532,7 +653,10 @@ pub fn latency(load: &Load, iters: usize) -> io::Result<Latency> {
         }
         discard_ready(&mut publisher, &mut pub_rd)?;
     }
-    Ok(percentiles(rtts, lost))
+    Ok(Latency {
+        cpu: window.finish(),
+        ..percentiles(rtts, lost)
+    })
 }
 
 /// Reads and drops whatever the broker sent, without blocking.
@@ -561,6 +685,7 @@ fn percentiles(mut rtts: Vec<Duration>, lost: u64) -> Latency {
         p999: at(0.999),
         max: rtts.last().map_or(0.0, |d| us(*d)),
         lost,
+        cpu: CpuUse::default(),
     }
 }
 
@@ -591,5 +716,81 @@ fn wait_for(
                 return Ok(true);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    use super::*;
+
+    /// A client connection named `id` and the server end of it.
+    fn pair(id: &str) -> (Conn, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let c = Conn {
+            id: id.to_owned(),
+            s,
+            rd: Reader::with_capacity(1 << 10),
+            rmax: None,
+        };
+        (c, server)
+    }
+
+    #[test]
+    fn a_publisher_still_blocked_after_the_stop_is_stalled_and_freed() {
+        let run = Run::default();
+        assert!(!stop_publishers(&run, vec![thread::spawn(|| {})]));
+        let (mut c, _server) = pair("p");
+        run.register(&c.s).unwrap();
+        let blocked = thread::spawn(move || {
+            let _ = c.s.read(&mut [0; 1]);
+        });
+        assert!(stop_publishers(&run, vec![blocked]));
+    }
+
+    #[test]
+    fn acks_end_flows_and_failed_ones_count_as_nacks() {
+        let run = Run::default();
+        let (mut c, _server) = pair("p");
+        let mut acks: &[u8] = &[
+            0x40, 3, 0, 1, 0x87, // PUBACK, not authorized
+            0x40, 2, 0, 2, // PUBACK
+            0x50, 3, 0, 3, 0x80, // PUBREC, failed
+            0x50, 2, 0, 4, // PUBREC
+            0x70, 2, 0, 4, // PUBCOMP
+            0xe0, 1, 0x8e, // DISCONNECT, session taken over
+        ];
+        c.rd.fill(&mut acks).unwrap();
+        let mut out = Vec::new();
+        assert_eq!(take_acks(&mut c, &mut out, true, &run), 4);
+        assert_eq!(run.nacks.load(Relaxed), 2);
+        assert_eq!(out, [0x62, 2, 0, 4]);
+        assert_eq!(*run.notes.lock().unwrap(), ["p: DISCONNECT 0x8e"]);
+    }
+
+    #[test]
+    fn connections_the_broker_closes_are_counted_and_noted() {
+        let run = Run::default();
+        let (c, mut server) = pair("s");
+        server.write_all(&[0xe0, 1, 0x8b]).unwrap();
+        drop(server);
+        subscriber(c, &run);
+        let (c, server) = pair("p");
+        drop(server);
+        let load = Load {
+            qos: 1,
+            ..Load::default()
+        };
+        publisher(&load, "t", c, &run);
+        run.lost("x", &io::Error::other("reset"));
+        assert_eq!(run.closed.load(Relaxed), 3);
+        let notes = run.notes.lock().unwrap();
+        assert_eq!(notes[..2], ["s: DISCONNECT 0x8b", "s: broker closed"]);
+        assert!(notes[2].starts_with("p: "), "{notes:?}");
+        assert_eq!(notes[3], "x: reset");
     }
 }

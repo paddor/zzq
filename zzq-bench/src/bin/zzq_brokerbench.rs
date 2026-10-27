@@ -4,8 +4,17 @@
 //!
 //! Keys (defaults): addr=127.0.0.1:1883 v=5 qos=0 size=16 pubs=1 subs=1
 //! warmup=1 secs=5 window=100 iters=20000 lanes=1 cross=0 topics=1
+//! `cpu_pid`=0
 //!
-//! `lanes` and `cross` place clients on the lanes of a zzq broker.
+//! - pairs: `pubs` publishers, each to its own topic with its own subscriber.
+//! - fanout: one publisher, `subs` subscribers on the same topic.
+//! - fanin: `pubs` publishers on distinct topics, one wildcard subscriber.
+//! - rtt: one message in flight between two connections, QoS 0 or 1.
+//!
+//! `lanes` and `cross` place clients on the lanes of a zzq broker. `cpu_pid`
+//! names the broker process: its CPU over the measured window and its
+//! memory at the end go on the result line, next to the load generator's
+//! own CPU. Closed connections and a stalled publisher go to stderr.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -65,13 +74,14 @@ fn parse(args: &[String]) -> Option<(String, Load, usize)> {
         lanes: num("lanes", "1")? as usize,
         cross: get("cross", "0") == "1",
         topics: num("topics", "1")? as usize,
+        broker_pid: Some(get("cpu_pid", "0").parse::<u32>().ok()?).filter(|&p| p > 0),
     };
     Some((scenario.clone(), cfg, num("iters", "20000")? as usize))
 }
 
 fn print_latency(cfg: &Load, iters: usize, l: &Latency) {
     println!(
-        "   rtt v{} qos={} size={:>5} iters={iters}  p50 {:.1}us  p90 {:.1}us  p99 {:.1}us  p99.9 {:.1}us  max {:.1}us  lost {}",
+        "   rtt v{} qos={} size={:>5} iters={iters}  p50 {:.1}us  p90 {:.1}us  p99 {:.1}us  p99.9 {:.1}us  max {:.1}us  lost {}  {}",
         if cfg.v5 { 5 } else { 4 },
         cfg.qos,
         cfg.size,
@@ -80,11 +90,18 @@ fn print_latency(cfg: &Load, iters: usize, l: &Latency) {
         l.p99,
         l.p999,
         l.max,
-        l.lost
+        l.lost,
+        l.cpu
     );
 }
 
 fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
+    for note in &t.notes {
+        eprintln!("{note}");
+    }
+    if t.stalled {
+        eprintln!("warning: publisher stuck, shutting sockets down");
+    }
     let (pubs, subs) = match name {
         "pairs" => (cfg.pubs, cfg.pubs),
         "fanout" => (1, cfg.subs),
@@ -96,7 +113,7 @@ fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
         .map(|r| format!("{:.2}M", r / 1e6))
         .collect();
     println!(
-        "{name:>6} v{} qos={} size={:>5} pubs={} subs={}  pub {:>9.0}/s  delivered {:>9.0}/s {:>7.1} MB/s  loss {:>5.1}%  closed {}  per-sec [{}]",
+        "{name:>6} v{} qos={} size={:>5} pubs={} subs={}  pub {:>9.0}/s  delivered {:>9.0}/s {:>7.1} MB/s  loss {:>5.1}%  closed {} nacks {}  {}  per-sec [{}]",
         if cfg.v5 { 5 } else { 4 },
         cfg.qos,
         cfg.size,
@@ -107,6 +124,8 @@ fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
         t.delivered * cfg.size as f64 / 1e6,
         t.loss,
         t.closed,
+        t.nacks,
+        t.cpu,
         secs.join(" ")
     );
 }

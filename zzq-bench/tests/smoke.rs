@@ -4,14 +4,20 @@
 #![expect(clippy::unwrap_used, reason = "tests fail loudly")]
 
 use std::process::Command;
+use std::sync::Arc;
 use std::time::Duration;
 
+use zzq_bench::fixed::{self, Fixed, Report};
 use zzq_bench::load::{self, Load, Scenario};
-use zzq_broker::{Broker, BrokerOptions, Context};
+use zzq_broker::{Authorizer, Broker, BrokerOptions, ClientInfo, Context};
 
 async fn broker() -> (Context, Broker, String) {
+    broker_with(BrokerOptions::default()).await
+}
+
+async fn broker_with(opts: BrokerOptions) -> (Context, Broker, String) {
     let ctx = Context::new().unwrap();
-    let broker = Broker::new(&ctx, BrokerOptions::default()).await.unwrap();
+    let broker = Broker::new(&ctx, opts).await.unwrap();
     let endpoint = broker.bind("tcp://127.0.0.1:0").await.unwrap();
     let addr = endpoint.socket_addr_string().unwrap();
     (ctx, broker, addr)
@@ -65,27 +71,171 @@ async fn every_scenario_moves_messages() {
     assert!(l.p50 > 0.0 && l.lost == 0, "{l:?}");
 }
 
+/// Lets no one publish.
+struct NoPublish;
+
+impl Authorizer for NoPublish {
+    fn may_publish(&self, _: &ClientInfo<'_>, _: &str) -> bool {
+        false
+    }
+
+    fn may_subscribe(&self, _: &ClientInfo<'_>, _: &str) -> bool {
+        true
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publishes_the_broker_refuses_count_as_nacks() {
+    let opts = BrokerOptions {
+        authorizer: Some(Arc::new(NoPublish)),
+        ..BrokerOptions::default()
+    };
+    let (_ctx, _broker, addr) = broker_with(opts).await;
+    for qos in [1, 2] {
+        let load = Load {
+            qos,
+            ..short(&addr)
+        };
+        let t = tokio::task::spawn_blocking(move || load::throughput(Scenario::Pairs, &load))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            t.nacks > 100 && t.delivered == 0.0 && t.closed == 0,
+            "qos {qos}: {t:?}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_load_generator_runs_from_the_command_line() {
     let (_ctx, _broker, addr) = broker().await;
     let exe = env!("CARGO_BIN_EXE_zzq_brokerbench");
+    let pid = format!("cpu_pid={}", std::process::id());
     let out = Command::new(exe)
-        .args(["rtt", &format!("addr={addr}"), "iters=50"])
+        .args(["rtt", &format!("addr={addr}"), "iters=50", "lanes=2"])
+        .args(["cross=1", &pid])
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        out.status.success() && stdout.contains("rtt v5"),
+        out.status.success() && stdout.contains("rtt v5") && stdout.contains("lost 0  cpu "),
         "{stdout}"
     );
     let out = Command::new(exe)
         .args(["pairs", &format!("addr={addr}"), "warmup=0", "secs=1"])
+        .arg(&pid)
         .output()
         .unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(out.status.success() && stdout.contains("pairs"), "{stdout}");
+    assert!(
+        out.status.success() && stdout.contains("closed 0 nacks 0  cpu "),
+        "{stdout}"
+    );
     let out = Command::new(exe).arg("nope").output().unwrap();
     assert!(!out.status.success());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_fixed_load_test_runs_every_scenario_from_the_command_line() {
+    let (_ctx, _broker, addr) = broker().await;
+    let port = addr.rsplit_once(':').unwrap().1.to_owned();
+    let exe = env!("CARGO_BIN_EXE_zzq_loadbench");
+    let pid = std::process::id().to_string();
+    let runs: Vec<_> = [
+        ("p2p", "pubs=10", "subs=0", "trace=1"),
+        ("fanin", "pubs=10", "subs=2", "trace=0"),
+        ("fanout", "pubs=2", "subs=5", "trace=0"),
+    ]
+    .into_iter()
+    .map(|(scenario, pubs, subs, trace)| {
+        let child = Command::new(exe)
+            .args([scenario, pubs, subs, trace, "rates=200,400", "warmup=1.2"])
+            .args(["secs=1", "addrs=1", "connect_rate=1000"])
+            .arg(format!("port={port}"))
+            .arg(format!("cpu_pid={pid}"))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        (scenario, child)
+    })
+    .collect();
+    for (scenario, child) in runs {
+        let out = tokio::task::spawn_blocking(move || child.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{scenario}: {stdout}{stderr}");
+        let lines: Vec<&str> = stdout.lines().collect();
+        assert_eq!(lines.len(), 2, "{scenario}: {stdout}{stderr}");
+        for (line, rate) in lines.iter().zip(["200", "400"]) {
+            assert!(
+                line.starts_with(&format!("fixed {scenario} v5 qos=1 size=16")),
+                "{line}"
+            );
+            assert!(line.contains(&format!("offered {rate}/s")), "{line}");
+            assert!(line.contains("  cpu ") && line.contains(" rss "), "{line}");
+            assert!(line.ends_with("  ok"), "{line}");
+        }
+        assert!(stderr.contains("connected "), "{stderr}");
+        assert_eq!(stderr.contains("sends late"), scenario == "p2p", "{stderr}");
+    }
+    let out = Command::new(exe).arg("nope").output().unwrap();
+    assert!(!out.status.success());
+}
+
+#[test]
+fn a_fixed_load_run_without_a_broker_fails_its_first_step() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let cfg = Fixed {
+        port,
+        addrs: 1,
+        pubs: 3,
+        rates: vec![100.0],
+        ..Fixed::default()
+    };
+    let (mut connect, mut steps) = (None, Vec::new());
+    fixed::run(fixed::Scenario::P2p, &cfg, |r| match r {
+        Report::Connect(c) => connect = Some(c.clone()),
+        Report::Step(s) => steps.push(s.clone()),
+    })
+    .unwrap();
+    let connect = connect.unwrap();
+    assert!(!connect.ok() && connect.connected == 0, "{connect:?}");
+    assert_eq!(connect.clients, 6);
+    assert!(
+        connect.retries > 0 && connect.error.is_some(),
+        "{connect:?}"
+    );
+    assert_eq!(steps.len(), 1);
+    assert!(steps[0].failed && steps[0].closed == 6, "{:?}", steps[0]);
+    assert!(steps[0].to_string().ends_with("samples 0  failed"));
+}
+
+#[test]
+fn a_fixed_load_run_rejects_settings_it_cannot_measure() {
+    let short = Fixed {
+        warmup: Duration::from_secs(1),
+        ..Fixed::default()
+    };
+    let no_subs = Fixed {
+        subs: 0,
+        ..Fixed::default()
+    };
+    for (scenario, cfg) in [
+        (fixed::Scenario::P2p, short),
+        (fixed::Scenario::Fanin, no_subs),
+    ] {
+        let e = fixed::run(scenario, &cfg, |_| panic!("ran")).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+    }
 }
 
 #[test]
@@ -197,4 +347,86 @@ fn the_chart_tool_draws_every_chart_from_the_cache() {
         }
     }
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A port nothing listens on right now.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+#[test]
+fn the_fake_broker_measures_a_client_at_every_qos() {
+    let fake = env!("CARGO_BIN_EXE_zzq_fakebroker");
+    let client = env!("CARGO_BIN_EXE_zzq_client_bench");
+    for qos in ["0", "1", "2"] {
+        for (role, mode) in [("sink", "pub"), ("source", "sub")] {
+            let port = free_port().to_string();
+            let args = [&port, qos, "16", "2000"];
+            let server = Command::new(fake).arg(role).args(args).spawn().unwrap();
+            let mut tries = 0;
+            let out = loop {
+                let out = Command::new(client).arg(mode).args(args).output().unwrap();
+                tries += 1;
+                if out.status.success() || tries == 50 {
+                    break out;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            };
+            let measured = server.wait_with_output().unwrap();
+            assert!(
+                out.status.success() && measured.status.success(),
+                "{qos} {mode}"
+            );
+            if mode == "sub" {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                assert!(stdout.contains(&format!("zzq-sub qos={qos}")), "{stdout}");
+            }
+        }
+    }
+    for exe in [fake, client] {
+        assert!(!Command::new(exe).arg("nope").status().unwrap().success());
+    }
+}
+
+#[test]
+fn the_suite_smoke_runs_a_suite_and_records_nothing() {
+    let suite = env!("CARGO_BIN_EXE_zzq_suite");
+    let cache = std::env::temp_dir().join(format!("zzq-suite-smoke-{}", std::process::id()));
+    let run = |args: &[&str]| {
+        Command::new(suite)
+            .args(args)
+            .env("XDG_CACHE_HOME", &cache)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--smoke", "zzqclient"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{stdout}");
+    assert!(
+        stdout.contains(r#""kind":"pub""#) && stdout.contains(r#""kind":"sub""#),
+        "{stdout}"
+    );
+    assert!(!cache.join("zzq/clients.jsonl").exists());
+
+    let out = run(&["--smoke", "all", "zzqclient"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let logs: Vec<_> = std::fs::read_dir(cache.join("zzq/logs"))
+        .unwrap()
+        .flatten()
+        .collect();
+    let log = std::fs::read_to_string(logs[0].path().join("zzqclient.log")).unwrap();
+    assert!(log.contains("row {"), "{log}");
+
+    assert!(!run(&["nope"]).status.success());
+    assert!(!run(&["all", "nope"]).status.success());
+    assert!(!run(&["fixed", "nope"]).status.success());
+    std::fs::remove_dir_all(&cache).unwrap();
 }
