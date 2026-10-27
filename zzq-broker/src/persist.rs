@@ -172,15 +172,7 @@ impl FilePersistence {
         let loaded = live.values().filter_map(|b| decode_set(b)).collect();
         let errors = Arc::new(AtomicU64::new(0));
         let queue = Arc::new(Queue::default());
-        let writer = Writer {
-            path: path.clone(),
-            file: BufWriter::new(file),
-            log_len: log_len(&live),
-            live_len: log_len(&live),
-            live,
-            sync,
-            errors: errors.clone(),
-        };
+        let writer = Writer::new(path.clone(), file, live, sync, errors.clone());
         let thread = std::thread::Builder::new()
             .name("zzq-persist".to_owned())
             .spawn({
@@ -257,39 +249,69 @@ struct Writer {
     live_len: u64,
     sync: bool,
     errors: Arc<AtomicU64>,
+    /// A write or compaction failed: the log may end in a torn record, or
+    /// be an old file renamed away. Set until a compaction succeeds.
+    needs_compact: bool,
 }
 
 impl Writer {
+    fn new(
+        path: PathBuf,
+        file: File,
+        live: HashMap<String, Vec<u8>>,
+        sync: bool,
+        errors: Arc<AtomicU64>,
+    ) -> Writer {
+        Writer {
+            path,
+            file: BufWriter::new(file),
+            log_len: log_len(&live),
+            live_len: log_len(&live),
+            live,
+            sync,
+            errors,
+            needs_compact: false,
+        }
+    }
+
     fn run(mut self, queue: &Queue) {
         while let Some(batch) = queue.take() {
-            let mut failed = false;
-            for (topic, body) in batch.changes {
-                let result = self.apply(topic, body);
-                failed |= result.is_err();
-                self.count(result.is_ok());
-            }
-            let r = self.file.flush().and_then(|()| {
-                if self.sync {
-                    self.file.get_ref().sync_data()
-                } else {
-                    Ok(())
-                }
-            });
-            failed |= r.is_err();
-            self.count(r.is_ok());
-            // After a failed write the log may end in a torn record that
-            // would hide everything after it: rewrite it from memory.
-            if failed || self.log_len > 2 * self.live_len + COMPACT_SLACK {
-                match compact(&self.path, &self.live) {
-                    Ok(f) => {
-                        self.file = BufWriter::new(f);
-                        self.log_len = self.live_len;
-                    }
-                    Err(_) => self.count(false),
-                }
-            }
+            self.write(batch.changes);
             for a in batch.flushes {
                 let _ = a.send(());
+            }
+        }
+    }
+
+    /// Writes a batch of changes and syncs them as configured.
+    fn write(&mut self, changes: HashMap<String, Option<Vec<u8>>>) {
+        let mut failed = false;
+        for (topic, body) in changes {
+            let result = self.apply(topic, body);
+            failed |= result.is_err();
+            self.count(result.is_ok());
+        }
+        let r = self.file.flush().and_then(|()| {
+            if self.sync {
+                self.file.get_ref().sync_data()
+            } else {
+                Ok(())
+            }
+        });
+        failed |= r.is_err();
+        self.count(r.is_ok());
+        // After a failed write the log may end in a torn record that
+        // would hide everything after it: rewrite it from memory, until
+        // that works.
+        self.needs_compact |= failed;
+        if self.needs_compact || self.log_len > 2 * self.live_len + COMPACT_SLACK {
+            match compact(&self.path, &self.live) {
+                Ok(f) => {
+                    self.file = BufWriter::new(f);
+                    self.log_len = self.live_len;
+                    self.needs_compact = false;
+                }
+                Err(_) => self.count(false),
             }
         }
     }
@@ -595,6 +617,43 @@ mod tests {
         drop(p);
         fs::write(&path, b"garbage").unwrap();
         assert!(FilePersistence::open(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A compaction that failed after a failed write is tried again with the
+    /// next batch, so the changes after a torn record are not lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_compaction_is_tried_again() {
+        let dir = std::env::temp_dir().join(format!("zzq-persist-retry-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("retained.log");
+        // A log that ends in a torn record, as a write to a full disk leaves.
+        let mut torn = MAGIC.to_vec();
+        torn.extend_from_slice(&VERSION.to_be_bytes());
+        torn.extend_from_slice(&[0, 0, 0, 40, 1, 2, 3]);
+        fs::write(&path, torn).unwrap();
+        // Compaction fails while something is in the way of its new file.
+        let blocker = dir.join("retained.log.tmp");
+        fs::create_dir(&blocker).unwrap();
+        let full = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        let mut w = Writer::new(path.clone(), full, HashMap::new(), false, Arc::default());
+        w.write(HashMap::from([(
+            "a".to_owned(),
+            Some(encode_set(&msg("a", "1"))),
+        )]));
+        // The disk has room again: appends land behind the torn record.
+        fs::remove_dir(&blocker).unwrap();
+        w.file = BufWriter::new(OpenOptions::new().append(true).open(&path).unwrap());
+        w.write(HashMap::from([(
+            "b".to_owned(),
+            Some(encode_set(&msg("b", "2"))),
+        )]));
+        let live = read_log(&path).unwrap();
+        let mut topics: Vec<_> = live.keys().cloned().collect();
+        topics.sort();
+        assert_eq!(topics, ["a", "b"]);
         let _ = fs::remove_dir_all(&dir);
     }
 }
