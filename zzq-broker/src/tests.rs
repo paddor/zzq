@@ -690,3 +690,35 @@ async fn stored_topics_deeper_than_allowed_are_not_loaded() {
     assert_eq!(broker.stats().await.unwrap().retained, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_publisher_lets_go_of_stale_matches() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    let mut publisher = support::Raw::connect(&uri, "pub", Version::V5, 0).await;
+    for _ in 0..2 {
+        publisher.pub_("t", b"x", QoS::AtMostOnce, 0).await;
+    }
+    let held = |l: &mut Lane| {
+        let key = l.sessions.keys().next()?;
+        Some(l.sessions.get(key)?.inbound.last_topic.is_some())
+    };
+    assert!(lane_until(&ctx, &broker, 0, move |l| held(l).filter(|&h| h)).await);
+    // A new subscription makes the cached matches stale.
+    let mut sub = support::Raw::connect(&uri, "sub", Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtMostOnce))
+        .await;
+    let still = on_lane(&ctx, &broker, 0, move |l| {
+        for _ in 0..crate::lane::SWEEP_PARTS {
+            l.sweep(std::time::Instant::now());
+        }
+        let key = l
+            .sessions
+            .keys()
+            .find(|&k| l.sessions.get(k).is_some_and(|s| &*s.client_id == "pub"))?;
+        Some(l.sessions.get(key)?.inbound.last_topic.is_some())
+    })
+    .await;
+    assert_eq!(still, Some(false));
+}

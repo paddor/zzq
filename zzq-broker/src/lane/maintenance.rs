@@ -38,6 +38,7 @@ impl Lane {
                 .unwrap_or_else(PoisonError::into_inner)
                 .sweep(now);
         }
+        let generation = self.index.generation();
         for slot in sweep_part(part, self.sessions.slots()) {
             let Some(key) = self.sessions.key_at(slot) else {
                 continue;
@@ -46,6 +47,15 @@ impl Lane {
                 continue;
             };
             s.trim_buffers();
+            // Matches the index replaced since: an idle publisher would keep
+            // them until it publishes again.
+            if s.inbound
+                .last_topic
+                .as_ref()
+                .is_some_and(|(_, g, _)| *g != generation)
+            {
+                s.inbound.last_topic = None;
+            }
             if let Some(c) = &s.conn {
                 let ka = c.keep_alive.get();
                 if ka > 0

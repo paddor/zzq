@@ -133,6 +133,10 @@ Notable changes to zzq. The format follows
   persistence or the state file skipped the `max_topic_levels` check, though
   the store and the index walk topics a level at a time. Deeper ones are now
   left out.
+- `zzq-broker`: the match cache of a lane was bounded by topics only, so
+  topics with many matching subscriptions could fill gigabytes outside the
+  state budget, and idle publishers kept matches the index had replaced. The
+  cache now holds at most 262144 entries, and the sweep drops stale matches.
 
 ## [0.1.1] - 2026-10-26
 
