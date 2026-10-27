@@ -142,8 +142,11 @@ struct Requests {
     /// Bytes of the publishes in `waiting`. At `submit::QUEUED`, the session takes
     /// no more requests, so callers wait as on a full queue.
     waiting_bytes: usize,
-    /// QoS 1/2 publishes sent and not yet acked.
+    /// QoS 1/2 publishes sent and not yet acked, with those in `resend`.
     inflight: usize,
+    /// Unacked publishes to send again after a reconnect, once the broker's
+    /// Receive Maximum has room: their packet IDs, oldest first.
+    resend: VecDeque<u16>,
     /// The broker's Receive Maximum.
     quota: usize,
 }
@@ -194,6 +197,7 @@ impl Session {
                 waiting: VecDeque::new(),
                 waiting_bytes: 0,
                 inflight: 0,
+                resend: VecDeque::new(),
                 quota: usize::from(u16::MAX),
             },
             inbound: Inbound::default(),

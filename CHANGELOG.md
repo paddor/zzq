@@ -18,6 +18,10 @@ Notable changes to zzq. The format follows
   failed with `Error::Io` instead of `Error::Refused`, as `tcp://` does.
 - `zzq-client`: CONNECT was written without a flush, so a transport that
   buffers writes could hold it back and the connect time out.
+- `zzq-client`: after a reconnect, the client resent all its unacked
+  publishes, even past a smaller Receive Maximum from the broker, which a
+  v5 broker answers with a disconnect, on every reconnect. The rest now go
+  as acks make room.
 
 ## [0.2.0] - 2026-10-27
 
