@@ -362,6 +362,15 @@ impl Lane {
             // After what came before it in the batch.
             Remote::Drained(ticket) => drop(ticket),
             Remote::Deliver { key, item, pins } => {
+                // The member's session ended after another lane picked it.
+                if self.sessions.get(key).is_none() {
+                    if item.qos == QoS::AtMostOnce {
+                        self.stats.dropped.offline += 1;
+                    } else {
+                        self.stats.dropped.session_ended += 1;
+                    }
+                    return;
+                }
                 let p = Publication {
                     pins,
                     ..Publication::of(&item.msg)
@@ -490,11 +499,45 @@ mod tests {
     use bytes::Bytes;
     use zzq_proto::{QoS, Version};
 
+    use super::super::Remote;
     use super::{Grant, Owned, keep};
+    use crate::BrokerOptions;
     use crate::budget::LaneTotal;
     use crate::index::SubIds;
-    use crate::msg::Publication;
-    use crate::session::{KeptMsg, Session, SharedMsg};
+    use crate::msg::{Msg, Publication};
+    use crate::session::{KeptMsg, Queued, Session, SharedMsg};
+    use crate::slab::Key;
+    use crate::tests::on_lane;
+    use crate::tests::support::setup;
+
+    /// A share group member on another lane whose session ended before
+    /// the message arrived: the message is counted as dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shared_delivery_to_an_ended_session_is_counted() {
+        let (ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+        let dropped = on_lane(&ctx, &broker, 0, |l| {
+            let gone = Key {
+                slot: 1000,
+                generation: 0,
+            };
+            for qos in [QoS::AtMostOnce, QoS::AtLeastOnce] {
+                let msg = Msg::new("t", b"x", &[], qos, false);
+                l.deliver_remote(Remote::Deliver {
+                    key: gone,
+                    pins: false,
+                    item: Queued {
+                        msg,
+                        qos,
+                        retain: false,
+                        sub_id: SubIds::default(),
+                    },
+                });
+            }
+            (l.stats.dropped.offline, l.stats.dropped.session_ended)
+        })
+        .await;
+        assert_eq!(dropped, (1, 1));
+    }
 
     /// A session that holds messages long does not share one that pins the
     /// read buffer, which sessions before it share: it and the sessions

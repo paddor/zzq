@@ -5,6 +5,12 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `zzq-broker`: a share group message sent to a member on another lane
+  whose session ended on the way was dropped uncounted. It now counts in
+  `Dropped::session_ended`, or `Dropped::offline` at QoS 0.
+
 ## [0.2.0] - 2026-10-27
 
 ### Added
