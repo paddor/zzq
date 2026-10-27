@@ -45,19 +45,23 @@ pub(crate) struct Origin {
     pins: bool,
 }
 
-/// The message of one publish once a session holds it, and the charge for
-/// its bytes once more than one session of the lane may hold it.
+/// The message of one publish once a session holds it, the charge for its
+/// bytes once more than one session of the lane may hold it, and what its
+/// sessions may queue beyond the limits.
 #[derive(Debug, Default)]
 pub(super) struct Owned {
     pub(super) msg: Option<Msg>,
     pub(super) share: Option<Rc<Charge>>,
+    /// Beyond `max_queued` and `max_queued_bytes`: the batch of retained
+    /// messages a SUBSCRIBE sends.
+    pub(super) extra: Extra,
 }
 
 impl Owned {
-    pub(super) const fn of(msg: Msg) -> Owned {
+    pub(super) fn of(msg: Msg) -> Owned {
         Owned {
             msg: Some(msg),
-            share: None,
+            ..Owned::default()
         }
     }
 }
@@ -71,9 +75,6 @@ pub(super) struct Grant {
     /// The last delivery of this publish: it may take the owned message
     /// instead of cloning it.
     pub(super) last: bool,
-    /// What the session may queue beyond `max_queued` and
-    /// `max_queued_bytes`: the batch of retained messages a SUBSCRIBE sends.
-    pub(super) extra: Extra,
 }
 
 /// Messages and bytes a delivery may queue beyond the limits.
@@ -273,7 +274,6 @@ impl Lane {
             retain: e.opts.retain_as_published && p.retain,
             sub_id: e.sub_id,
             last,
-            extra: Extra::default(),
         })
     }
 
@@ -283,7 +283,6 @@ impl Lane {
             qos,
             retain,
             sub_id,
-            extra,
             ..
         } = g;
         let o = &self.shared.opts;
@@ -298,14 +297,17 @@ impl Lane {
             }
         } else {
             let limit = QueueLimit {
-                count: o.max_queued.saturating_add(extra.count),
-                bytes: o.max_queued_bytes.saturating_add(extra.bytes),
+                count: o.max_queued.saturating_add(owned.extra.count),
+                bytes: o.max_queued_bytes.saturating_add(owned.extra.bytes),
                 state_full: self.budget.full,
             };
             let kept = keep(s, p, owned, &self.budget.total, g);
             s.deliver_qos12(kept, limit)
         };
-        if matches!(outcome, Outcome::Queued | Outcome::QueueFull(_))
+        if outcome == Outcome::Sent {
+            // The session is at hand: no second lookup.
+            Self::mark_in(&mut self.dirty, s, key);
+        } else if matches!(outcome, Outcome::Queued | Outcome::QueueFull(_))
             && s.conn.is_some()
             && s.queued() >= self.shared.opts.qos_queue_high
         {
@@ -317,16 +319,13 @@ impl Lane {
             }
             self.congestion.hit.get_or_insert(Hit::Local(key));
         }
-        self.count(key, outcome);
+        self.count(outcome);
     }
 
     #[inline]
-    fn count(&mut self, key: Key, outcome: Outcome) {
+    fn count(&mut self, outcome: Outcome) {
         match outcome {
-            Outcome::Sent => {
-                self.stats.deliveries += 1;
-                self.mark(key);
-            }
+            Outcome::Sent => self.stats.deliveries += 1,
             Outcome::Queued => {}
             Outcome::QueueFull(n) => self.stats.dropped.queue_full += u64::from(n),
             Outcome::StateFull => self.stats.dropped.state_full += 1,
@@ -363,7 +362,6 @@ impl Lane {
                     retain: item.retain,
                     sub_id: item.sub_id,
                     last: true,
-                    extra: Extra::default(),
                 };
                 self.deliver(key, &p, &mut owned, g);
             }

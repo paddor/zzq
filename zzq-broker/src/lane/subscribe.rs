@@ -165,13 +165,13 @@ impl Lane {
                 retain: true,
                 sub_id: SubIds::one(sub_id),
                 last: true,
-                extra,
             };
             let mut retained = msg.clone();
             retained.retain = true;
             let mut owned = Owned {
                 msg: Some(retained),
                 share: Some(self.budget.retained_share.clone()),
+                extra,
             };
             self.deliver(key, &p, &mut owned, g);
         }
