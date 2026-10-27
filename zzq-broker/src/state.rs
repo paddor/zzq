@@ -36,7 +36,7 @@ use zzq_proto::{Properties, QoS, SubscriptionOptions, Version};
 
 use crate::index::SubIds;
 use crate::msg::Msg;
-use crate::session::{Queued, Session, Will};
+use crate::session::{Kept, Queued, Session, Will};
 
 const MAGIC: &[u8; 8] = b"ZZQSTATE";
 /// Format version. A reader refuses any other.
@@ -363,7 +363,7 @@ fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
         b.push(opts.to_byte(Version::V5));
         put_u32(b, *sub_id);
     }
-    let mut rel: Vec<u16> = s.awaiting_rel.iter().copied().collect();
+    let mut rel: Vec<u16> = s.inbound.awaiting_rel.iter().copied().collect();
     rel.sort_unstable();
     put_count(b, rel.len());
     for pkid in rel {
@@ -381,7 +381,7 @@ fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
     }
 }
 
-fn put_item(b: &mut Vec<u8>, q: &Queued, clock: Clock) {
+fn put_item(b: &mut Vec<u8>, q: &Kept, clock: Clock) {
     b.push(q.qos as u8);
     b.push(u8::from(q.retain));
     for slot in q.sub_id.slots() {
@@ -662,7 +662,7 @@ mod tests {
                         qos: QoS::ExactlyOnce,
                         no_local: true,
                         retain_as_published: true,
-                        retain_handling: 2,
+                        retain_handling: zzq_proto::RetainHandling::Never,
                     },
                     9,
                 ),

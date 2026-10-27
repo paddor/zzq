@@ -16,7 +16,7 @@ use std::rc::Rc;
 
 use crate::index::Entry;
 use crate::msg::Msg;
-use crate::session::{Kept, Session};
+use crate::session::{Kept, Session, SharedMsg};
 
 /// Bytes charged to the sessions of one lane.
 pub(crate) type LaneTotal = Rc<Cell<usize>>;
@@ -32,8 +32,8 @@ const LEVEL: usize = 384;
 /// A QoS 1/2 message a session holds, besides its bytes and its queue slot:
 /// allocator overhead.
 const MSG: usize = 16;
-/// The charge for a shared message, and its reference counts.
-const SHARE: usize = size_of::<Charge>() + 2 * size_of::<usize>();
+/// A shared message with its charge, and its reference counts.
+const SHARE: usize = size_of::<SharedMsg>() + 2 * size_of::<usize>();
 /// A level of the retained message tree: the node, its key and hash table
 /// slack.
 pub(crate) const NODE: usize = 320;
@@ -51,14 +51,11 @@ pub(crate) fn subscription(filter: &str, lanes: usize) -> usize {
 }
 
 /// What a held QoS 1/2 message costs the session besides its slot: its
-/// bytes, unless it has a share of them. The session charges the slots its
-/// queues have room for itself.
-pub(crate) const fn held(h: &Kept) -> usize {
-    if h.share.is_some() {
-        0
-    } else {
-        MSG + h.item.msg.size()
-    }
+/// bytes, unless the lane shares them or the retained store counts them.
+/// The session charges the slots its queues have room for itself.
+#[inline]
+pub(crate) fn held(h: &Kept) -> usize {
+    if h.charged { MSG + h.msg.size() } else { 0 }
 }
 
 /// What the bytes of a message cost once, for all sessions that share it.

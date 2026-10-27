@@ -51,10 +51,16 @@ mod slab;
 mod sn;
 mod state;
 mod sys;
+#[cfg(test)]
+mod tests;
 
-pub use broker::{Broker, Stats, lane_for};
+// The shared test support names the crate.
+#[cfg(test)]
+extern crate self as zzq_broker;
+
+pub use broker::{Broker, Dropped, Stats, lane_for};
 pub use options::{
-    AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo,
+    AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo, SnOptions,
 };
 pub use persist::{FilePersistence, Persistence, Retained};
 pub use zzq_proto::{QoS, ReasonCode};
@@ -85,6 +91,9 @@ pub enum Error {
     /// [`BrokerOptions::state_file`] could not be read or written.
     #[error("state file failed")]
     State(#[source] std::io::Error),
+    /// A [`BrokerOptions`] field has a value the broker cannot work with.
+    #[error("invalid option: {0}")]
+    InvalidOption(&'static str),
 }
 
 /// Broker result.

@@ -113,8 +113,39 @@ pub struct SubscriptionOptions {
     pub no_local: bool,
     /// v5: keep the publisher's retain flag on forwarded messages.
     pub retain_as_published: bool,
-    /// v5: 0 send retained on subscribe, 1 only if new, 2 never.
-    pub retain_handling: u8,
+    /// v5: when the subscription gets the retained messages it matches.
+    pub retain_handling: RetainHandling,
+}
+
+/// v5: when a subscription gets the retained messages it matches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum RetainHandling {
+    /// On every SUBSCRIBE.
+    #[default]
+    OnSubscribe = 0,
+    /// Only on a SUBSCRIBE that adds the subscription.
+    OnNewSubscription = 1,
+    /// Never.
+    Never = 2,
+}
+
+impl TryFrom<u8> for RetainHandling {
+    type Error = DecodeError;
+
+    /// The Retain Handling value `v`.
+    ///
+    /// # Errors
+    ///
+    /// [`DecodeError::Malformed`] for 3 and above.
+    fn try_from(v: u8) -> Result<Self, DecodeError> {
+        match v {
+            0 => Ok(RetainHandling::OnSubscribe),
+            1 => Ok(RetainHandling::OnNewSubscription),
+            2 => Ok(RetainHandling::Never),
+            _ => Err(DecodeError::Malformed),
+        }
+    }
 }
 
 impl From<QoS> for SubscriptionOptions {
@@ -136,14 +167,14 @@ impl SubscriptionOptions {
     /// handling, or v5 bits in a v3.1.1 byte.
     pub fn from_byte(b: u8, version: Version) -> Result<Self, DecodeError> {
         if version.is_v5() {
-            if b & 0xc0 != 0 || (b >> 4) & 0x03 == 3 {
+            if b & 0xc0 != 0 {
                 return Err(DecodeError::Malformed);
             }
             Ok(SubscriptionOptions {
                 qos: QoS::try_from(b & 0x03)?,
                 no_local: b & 0x04 != 0,
                 retain_as_published: b & 0x08 != 0,
-                retain_handling: (b >> 4) & 0x03,
+                retain_handling: RetainHandling::try_from((b >> 4) & 0x03)?,
             })
         } else {
             if b & 0xfc != 0 {
@@ -163,8 +194,33 @@ impl SubscriptionOptions {
             if self.retain_as_published {
                 b |= 0x08;
             }
-            b |= (self.retain_handling & 0x03) << 4;
+            b |= (self.retain_handling as u8) << 4;
         }
         b
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subscription_options_round_trip_and_reserved_retain_handling_fails() {
+        for rh in [
+            RetainHandling::OnSubscribe,
+            RetainHandling::OnNewSubscription,
+            RetainHandling::Never,
+        ] {
+            let opts = SubscriptionOptions {
+                qos: QoS::ExactlyOnce,
+                no_local: true,
+                retain_as_published: true,
+                retain_handling: rh,
+            };
+            let b = opts.to_byte(Version::V5);
+            assert_eq!(SubscriptionOptions::from_byte(b, Version::V5), Ok(opts));
+        }
+        assert!(RetainHandling::try_from(3).is_err());
+        assert!(SubscriptionOptions::from_byte(0x30, Version::V5).is_err());
     }
 }

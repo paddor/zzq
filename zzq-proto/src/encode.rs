@@ -153,7 +153,8 @@ impl PublishHeader<'_> {
     #[inline]
     pub const fn byte1(&self) -> u8 {
         let mut b = 0x30 | ((self.qos as u8) << 1);
-        if self.dup {
+        // DUP is for QoS 1 and 2 only [MQTT-3.3.1-2].
+        if self.dup && !matches!(self.qos, QoS::AtMostOnce) {
             b |= 0x08;
         }
         if self.retain {
@@ -494,6 +495,25 @@ mod tests {
     use std::vec::Vec;
 
     #[test]
+    fn qos0_publishes_never_carry_dup() {
+        let h = PublishHeader {
+            version: Version::V5,
+            dup: true,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "t",
+            pkid: 0,
+            properties: &[],
+        };
+        assert_eq!(h.byte1() & 0x08, 0);
+        let h = PublishHeader {
+            qos: QoS::AtLeastOnce,
+            ..h
+        };
+        assert_eq!(h.byte1() & 0x08, 0x08);
+    }
+
+    #[test]
     fn a_sink_needs_only_put() {
         struct Count(usize);
         impl Sink for Count {
@@ -596,7 +616,7 @@ mod tests {
             qos: QoS::ExactlyOnce,
             no_local: true,
             retain_as_published: true,
-            retain_handling: 2,
+            retain_handling: crate::RetainHandling::Never,
         };
         for version in [Version::V311, Version::V5] {
             let mut out = Vec::new();

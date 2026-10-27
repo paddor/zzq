@@ -27,6 +27,7 @@ use zrip::{CompressContext, FrameDecoder};
 use crate::broker::{LaneTx, Shared, lane_for};
 use crate::lane::{Control, Dump, SyncAck};
 use crate::msg::Msg;
+use crate::msg::too_deep;
 use crate::session::Session;
 use crate::state::{Clock, ImageReader, ImageWriter, Record, SessionState};
 use crate::{Error, Result};
@@ -125,11 +126,10 @@ async fn quiesce(shared: &Shared) -> Result<()> {
     for rx in closed {
         rx.await.map_err(|_| Error::Closed)?;
     }
-    let n = shared.lanes.len();
+    // Each lane passes its share on to the markers it queues for the others.
     let drained = Arc::new(SyncAck::default());
-    drained.expect(n * (n - 1));
     for lane in &shared.lanes {
-        push(lane, Control::Drain(drained.clone()))?;
+        push(lane, Control::Drain(drained.ticket()))?;
     }
     drained.wait().await;
     Ok(())
@@ -198,10 +198,17 @@ pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
             .retained
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        // Topics deeper than clients may use now are left out: the store and
+        // the index walk them a level at a time.
+        let max = shared.opts.max_topic_levels;
         for r in records {
             match r {
-                Record::Session(st) => sessions[lane_for(&st.client_id, n)].push(*st),
-                Record::Retained(m) => store.set(&m, false),
+                Record::Session(mut st) => {
+                    st.subs.retain(|(filter, _, _)| !too_deep(filter, max));
+                    sessions[lane_for(&st.client_id, n)].push(*st);
+                }
+                Record::Retained(m) if !too_deep(m.topic(), max) => store.set(&m, false),
+                Record::Retained(_) => {}
             }
         }
     }

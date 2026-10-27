@@ -265,3 +265,170 @@ async fn a_dropped_ack_wait_keeps_its_publish() {
     let acked = h.enqueue("t", "z", QoS::AtMostOnce, false).await.unwrap();
     acked.await.unwrap();
 }
+
+#[tokio::test]
+async fn publishes_past_the_receive_maximum_hold_back_the_caller() {
+    use zzq_proto::Property;
+    use zzq_proto::property::{self, RECEIVE_MAXIMUM};
+
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("rm"))
+                .await
+                .unwrap()
+        }
+    });
+    // A broker that allows one QoS 1 publish in flight and never acks.
+    let s = timeout(WAIT, l.accept()).await.unwrap().unwrap().0;
+    let mut peer = Peer { s, buf: Vec::new() };
+    assert_eq!(peer.packet().await.0 >> 4, 1, "CONNECT");
+    let mut props = Vec::new();
+    property::encode_all(&[Property::U16(RECEIVE_MAXIMUM, 1)], &mut props);
+    let ack = ConnAckFields {
+        properties: &props,
+        ..ConnAckFields::default()
+    };
+    let mut out = Vec::new();
+    encode::connack(&ack, Version::V5, &mut out);
+    peer.s.write_all(&out).await.unwrap();
+    let client = connecting.await.unwrap();
+    let handle = client.handle();
+    // The acks are never awaited: only room in the session may stop this.
+    let queued = timeout(Duration::from_secs(1), async {
+        for _ in 0..10_000 {
+            let acked = handle
+                .enqueue("t", vec![0u8; 1024], QoS::AtLeastOnce, false)
+                .await
+                .unwrap();
+            drop(acked);
+        }
+    })
+    .await;
+    assert!(
+        queued.is_err(),
+        "10 MB waited in the session for the broker"
+    );
+    drop(peer);
+}
+
+#[tokio::test]
+async fn a_message_from_a_lost_session_is_not_acked_on_the_next() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("stale")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = Peer::accept(&l).await;
+    let mut c = connecting.await.unwrap();
+    let h = c.handle();
+    let sub = tokio::spawn(async move { h.subscribe("t", QoS::AtLeastOnce).await.unwrap() });
+    let (_, packet) = first.packet().await;
+    first.suback(&packet).await;
+    sub.await.unwrap();
+    let h = PublishHeader {
+        version: Version::V5,
+        dup: false,
+        qos: QoS::AtLeastOnce,
+        retain: false,
+        topic: "t",
+        pkid: 7,
+        properties: &[],
+    };
+    let mut out = Vec::new();
+    encode::publish(&h, b"old", &mut out);
+    first.s.write_all(&out).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(first);
+    // The broker lost the session: its packet ID 7 may mean another
+    // message now.
+    let mut second = Peer::accept(&l).await;
+    let (_, packet) = second.packet().await;
+    second.suback(&packet).await;
+    let m = timeout(WAIT, c.recv()).await.unwrap().unwrap();
+    assert_eq!(m.payload, "old");
+    let mut chunk = [0u8; 64];
+    let got = timeout(Duration::from_millis(300), second.s.read(&mut chunk)).await;
+    assert!(got.is_err(), "acked on the new connection: {got:?}");
+}
+
+#[tokio::test]
+async fn a_released_qos2_publish_is_done_when_the_broker_lost_the_session() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("rel")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    let h = c.handle();
+    let publish = tokio::spawn(async move { h.publish("t", "x", QoS::ExactlyOnce).await });
+    let (byte1, packet) = first.packet().await;
+    assert_eq!(byte1 >> 4, 3, "PUBLISH");
+    let Ok(Some((Packet::Publish(p), _))) = decode(&packet, Version::V5, usize::MAX) else {
+        panic!("expected PUBLISH");
+    };
+    first.ack(PacketType::PubRec, p.pkid).await;
+    assert_eq!(first.packet().await.0 >> 4, 6, "PUBREL");
+    drop(first);
+    // PUBREC said the broker had it; the new connection has no flow to
+    // finish.
+    let mut second = Peer::accept(&l).await;
+    let done = timeout(WAIT, publish).await.unwrap().unwrap();
+    assert!(done.is_ok(), "{done:?}");
+    let mut chunk = [0u8; 64];
+    let got = timeout(Duration::from_millis(300), second.s.read(&mut chunk)).await;
+    assert!(got.is_err(), "resent on the new connection: {got:?}");
+}
+
+#[tokio::test]
+async fn disconnect_returns_while_the_broker_stops_reading() {
+    let l = tokio::net::TcpSocket::new_v4().unwrap();
+    l.set_recv_buffer_size(4096).unwrap();
+    l.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let l = l.listen(1).unwrap();
+    let uri = format!("tcp://{}", l.local_addr().unwrap());
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("stuck"))
+                .await
+                .unwrap()
+        }
+    });
+    // Accepts, then reads nothing more.
+    let peer = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    for _ in 0..4000 {
+        c.publish("t", vec![0u8; 1024], QoS::AtMostOnce)
+            .await
+            .unwrap();
+    }
+    let done = timeout(WAIT, c.disconnect()).await;
+    assert!(
+        done.is_ok(),
+        "disconnect waits for a broker that does not read"
+    );
+    drop(peer);
+}

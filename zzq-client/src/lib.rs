@@ -56,7 +56,7 @@ pub use zzq_tokio::transport::TransportOptions;
 pub use zzq_tokio::transport::tls::TlsOptions;
 pub use zzq_tokio::{Config, Context, Endpoint};
 
-pub use zzq_proto::{QoS, ReasonCode, SubscriptionOptions, Version, reason};
+pub use zzq_proto::{QoS, ReasonCode, RetainHandling, SubscriptionOptions, Version, reason};
 
 /// Client errors.
 #[derive(Debug, thiserror::Error)]
@@ -89,6 +89,9 @@ pub enum Error {
     /// A blocking call ran inside an async runtime.
     #[error("blocking call inside an async runtime")]
     InAsync,
+    /// [`ClientOptions`] that MQTT cannot express.
+    #[error("invalid option: {0}")]
+    InvalidOption(&'static str),
 }
 
 /// Client result.
@@ -208,6 +211,8 @@ pub struct Message {
     pub subscription_ids: Vec<u32>,
     /// Packet ID to ack once the application takes the message.
     pub(crate) ack: Option<u16>,
+    /// The broker session `ack` belongs to, counted by the inbox.
+    pub(crate) epoch: u32,
 }
 
 /// CONNACK details.
@@ -485,9 +490,11 @@ impl Client {
     /// # Errors
     ///
     /// [`Error::Transport`] if the URI is invalid or the connection or TLS
-    /// fails, [`Error::Refused`] if the broker refuses it, and
-    /// [`Error::InvalidTopic`] or [`Error::TooLong`] for options MQTT cannot
-    /// carry.
+    /// fails, [`Error::Refused`] if the broker refuses it,
+    /// [`Error::Protocol`] if it answers with something other than CONNACK,
+    /// [`Error::Closed`] if it closes or no CONNACK comes within
+    /// `connect_timeout`, and [`Error::InvalidTopic`], [`Error::TooLong`] or
+    /// [`Error::InvalidOption`] for options MQTT cannot carry.
     pub async fn connect(ctx: &Context, uri: &str, opts: ClientOptions) -> Result<Client> {
         let st = start(ctx, uri, opts)?;
         let connected = st.connack.await.map_err(|_| Error::Closed)??;

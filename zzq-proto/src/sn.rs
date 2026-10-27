@@ -64,41 +64,68 @@ impl SnQoS {
     }
 }
 
-/// How a topic is referenced.
+/// How a PUBLISH names its topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub enum Topic<'a> {
+pub enum Topic {
     /// A topic ID from REGISTER.
     Id(u16),
     /// A topic ID both sides know in advance.
     Predefined(u16),
     /// A two-character topic name.
     Short([u8; 2]),
-    /// A full topic name or filter (SUBSCRIBE, UNSUBSCRIBE).
-    Name(&'a str),
 }
 
-impl Topic<'_> {
-    const fn id_type(&self) -> u8 {
+impl Topic {
+    const fn id_type(self) -> u8 {
         match self {
-            Topic::Id(_) | Topic::Name(_) => 0,
+            Topic::Id(_) => 0,
             Topic::Predefined(_) => 1,
             Topic::Short(_) => 2,
         }
     }
 
+    fn put<S: Sink + ?Sized>(self, out: &mut S) {
+        match self {
+            Topic::Id(id) | Topic::Predefined(id) => out.put_u16(id),
+            Topic::Short(s) => out.put(&s),
+        }
+    }
+}
+
+/// How a SUBSCRIBE or UNSUBSCRIBE names its topic or filter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Filter<'a> {
+    /// A topic name or filter.
+    Name(&'a str),
+    /// A topic ID both sides know in advance.
+    Predefined(u16),
+    /// A two-character topic name.
+    Short([u8; 2]),
+}
+
+impl Filter<'_> {
+    const fn id_type(&self) -> u8 {
+        match self {
+            Filter::Name(_) => 0,
+            Filter::Predefined(_) => 1,
+            Filter::Short(_) => 2,
+        }
+    }
+
     const fn encoded_len(&self) -> usize {
         match self {
-            Topic::Name(n) => n.len(),
+            Filter::Name(n) => n.len(),
             _ => 2,
         }
     }
 
     fn put<S: Sink + ?Sized>(&self, out: &mut S) {
         match self {
-            Topic::Id(id) | Topic::Predefined(id) => out.put_u16(*id),
-            Topic::Short(s) => out.put(s),
-            Topic::Name(n) => out.put(n.as_bytes()),
+            Filter::Name(n) => out.put(n.as_bytes()),
+            Filter::Predefined(id) => out.put_u16(*id),
+            Filter::Short(s) => out.put(s),
         }
     }
 }
@@ -189,12 +216,10 @@ pub enum Packet<'a> {
     },
     /// The gateway asks for the will topic.
     WillTopicReq,
-    /// The will topic. `None` flags and an empty topic delete the will.
+    /// The will topic. `None` deletes the will.
     WillTopic {
-        /// Will QoS and retain flag.
-        flags: Option<Flags>,
-        /// Will topic name.
-        topic: &'a str,
+        /// Will QoS and retain flag, and the will topic name.
+        will: Option<(Flags, &'a str)>,
     },
     /// The gateway asks for the will message.
     WillMsgReq,
@@ -226,7 +251,7 @@ pub enum Packet<'a> {
         /// DUP, QoS and retain flags.
         flags: Flags,
         /// The topic.
-        topic: Topic<'a>,
+        topic: Topic,
         /// Message ID, 0 for QoS 0 and -1.
         msg_id: u16,
         /// Payload.
@@ -263,7 +288,7 @@ pub enum Packet<'a> {
         /// Message ID.
         msg_id: u16,
         /// The topic or filter.
-        topic: Topic<'a>,
+        topic: Filter<'a>,
     },
     /// Answers SUBSCRIBE.
     SubAck {
@@ -283,7 +308,7 @@ pub enum Packet<'a> {
         /// Message ID.
         msg_id: u16,
         /// The topic or filter.
-        topic: Topic<'a>,
+        topic: Filter<'a>,
     },
     /// Answers UNSUBSCRIBE.
     UnsubAck {
@@ -302,12 +327,10 @@ pub enum Packet<'a> {
         /// Seconds to sleep.
         duration: Option<u16>,
     },
-    /// Changes the will topic.
+    /// Changes the will topic. `None` deletes the will.
     WillTopicUpd {
-        /// Will QoS and retain flag.
-        flags: Option<Flags>,
-        /// Will topic name.
-        topic: &'a str,
+        /// Will QoS and retain flag, and the will topic name.
+        will: Option<(Flags, &'a str)>,
     },
     /// Answers WILLTOPICUPD.
     WillTopicResp {
@@ -405,9 +428,8 @@ pub fn decode(datagram: &[u8]) -> Result<(Packet<'_>, usize), DecodeError> {
     Ok((body_of(kind, body)?, len))
 }
 
-fn topic_of<'a>(id_type: u8, c: &mut Cursor<'a>, name_ok: bool) -> Result<Topic<'a>, DecodeError> {
+fn topic_of(id_type: u8, c: &mut Cursor<'_>) -> Result<Topic, DecodeError> {
     Ok(match id_type {
-        0 if name_ok => Topic::Name(utf8(c.rest())?),
         0 => Topic::Id(c.u16()?),
         1 => Topic::Predefined(c.u16()?),
         2 => {
@@ -418,12 +440,24 @@ fn topic_of<'a>(id_type: u8, c: &mut Cursor<'a>, name_ok: bool) -> Result<Topic<
     })
 }
 
-fn optional_flags<'a>(c: &mut Cursor<'a>) -> Result<(Option<Flags>, &'a str), DecodeError> {
+fn filter_of<'a>(id_type: u8, c: &mut Cursor<'a>) -> Result<Filter<'a>, DecodeError> {
+    Ok(match id_type {
+        0 => Filter::Name(utf8(c.rest())?),
+        1 => Filter::Predefined(c.u16()?),
+        2 => {
+            let b = c.bytes(2)?;
+            Filter::Short([b[0], b[1]])
+        }
+        _ => return Err(DecodeError::Malformed),
+    })
+}
+
+fn will_of<'a>(c: &mut Cursor<'a>) -> Result<Option<(Flags, &'a str)>, DecodeError> {
     if c.is_empty() {
-        return Ok((None, ""));
+        return Ok(None);
     }
     let (flags, _) = Flags::parse(c.u8()?);
-    Ok((Some(flags), utf8(c.rest())?))
+    Ok(Some((flags, utf8(c.rest())?)))
 }
 
 #[expect(clippy::too_many_lines, reason = "one arm per message type")]
@@ -452,10 +486,9 @@ fn body_of(kind: u8, body: &[u8]) -> Result<Packet<'_>, DecodeError> {
         }
         kind::CONNACK => Packet::ConnAck { code: c.u8()? },
         kind::WILLTOPICREQ => Packet::WillTopicReq,
-        kind::WILLTOPIC => {
-            let (flags, topic) = optional_flags(&mut c)?;
-            Packet::WillTopic { flags, topic }
-        }
+        kind::WILLTOPIC => Packet::WillTopic {
+            will: will_of(&mut c)?,
+        },
         kind::WILLMSGREQ => Packet::WillMsgReq,
         kind::WILLMSG => Packet::WillMsg { message: c.rest() },
         kind::REGISTER => Packet::Register {
@@ -470,7 +503,7 @@ fn body_of(kind: u8, body: &[u8]) -> Result<Packet<'_>, DecodeError> {
         },
         kind::PUBLISH => {
             let (flags, id_type) = Flags::parse(c.u8()?);
-            let topic = topic_of(id_type, &mut c, false)?;
+            let topic = topic_of(id_type, &mut c)?;
             Packet::Publish {
                 flags,
                 topic,
@@ -489,7 +522,7 @@ fn body_of(kind: u8, body: &[u8]) -> Result<Packet<'_>, DecodeError> {
         kind::SUBSCRIBE | kind::UNSUBSCRIBE => {
             let (flags, id_type) = Flags::parse(c.u8()?);
             let msg_id = c.u16()?;
-            let topic = topic_of(id_type, &mut c, true)?;
+            let topic = filter_of(id_type, &mut c)?;
             if kind == kind::SUBSCRIBE {
                 Packet::Subscribe {
                     flags,
@@ -522,10 +555,9 @@ fn body_of(kind: u8, body: &[u8]) -> Result<Packet<'_>, DecodeError> {
         kind::DISCONNECT => Packet::Disconnect {
             duration: if c.is_empty() { None } else { Some(c.u16()?) },
         },
-        kind::WILLTOPICUPD => {
-            let (flags, topic) = optional_flags(&mut c)?;
-            Packet::WillTopicUpd { flags, topic }
-        }
+        kind::WILLTOPICUPD => Packet::WillTopicUpd {
+            will: will_of(&mut c)?,
+        },
         kind::WILLTOPICRESP => Packet::WillTopicResp { code: c.u8()? },
         kind::WILLMSGUPD => Packet::WillMsgUpd { message: c.rest() },
         kind::WILLMSGRESP => Packet::WillMsgResp { code: c.u8()? },
@@ -547,13 +579,13 @@ fn body_len(p: &Packet<'_>) -> usize {
         Packet::GwInfo { address, .. } => 1 + address.len(),
         Packet::Connect { client_id, .. } => 4 + client_id.len(),
         Packet::WillTopicReq | Packet::WillMsgReq | Packet::PingResp => 0,
-        Packet::WillTopic { flags, topic } | Packet::WillTopicUpd { flags, topic } => {
-            usize::from(flags.is_some()) + topic.len()
+        Packet::WillTopic { will } | Packet::WillTopicUpd { will } => {
+            will.map_or(0, |(_, topic)| 1 + topic.len())
         }
         Packet::WillMsg { message } | Packet::WillMsgUpd { message } => message.len(),
         Packet::Register { topic, .. } => 4 + topic.len(),
         Packet::RegAck { .. } | Packet::PubAck { .. } => 5,
-        Packet::Publish { topic, data, .. } => 3 + topic.encoded_len() + data.len(),
+        Packet::Publish { data, .. } => 5 + data.len(),
         Packet::PubRec { .. }
         | Packet::PubRel { .. }
         | Packet::PubComp { .. }
@@ -630,11 +662,11 @@ pub fn encode<S: Sink + ?Sized>(p: &Packet<'_>, out: &mut S) {
         | Packet::WillTopicResp { code }
         | Packet::WillMsgResp { code } => out.put_u8(code),
         Packet::WillTopicReq | Packet::WillMsgReq | Packet::PingResp => {}
-        Packet::WillTopic { flags, topic } | Packet::WillTopicUpd { flags, topic } => {
-            if let Some(f) = flags {
+        Packet::WillTopic { will } | Packet::WillTopicUpd { will } => {
+            if let Some((f, topic)) = will {
                 out.put_u8(f.byte(0));
+                out.put(topic.as_bytes());
             }
-            out.put(topic.as_bytes());
         }
         Packet::WillMsg { message } | Packet::WillMsgUpd { message } => out.put(message),
         Packet::Register {
@@ -807,13 +839,9 @@ mod tests {
             Packet::ConnAck { code: ACCEPTED },
             Packet::WillTopicReq,
             Packet::WillTopic {
-                flags: Some(flags),
-                topic: "w/t",
+                will: Some((flags, "w/t")),
             },
-            Packet::WillTopic {
-                flags: None,
-                topic: "",
-            },
+            Packet::WillTopic { will: None },
             Packet::WillMsgReq,
             Packet::WillMsg { message: b"bye" },
             Packet::Register {
@@ -855,12 +883,12 @@ mod tests {
             Packet::Subscribe {
                 flags,
                 msg_id: 4,
-                topic: Topic::Name("a/+"),
+                topic: Filter::Name("a/+"),
             },
             Packet::Subscribe {
                 flags,
                 msg_id: 4,
-                topic: Topic::Predefined(7),
+                topic: Filter::Predefined(7),
             },
             Packet::SubAck {
                 flags: Flags::default(),
@@ -871,7 +899,7 @@ mod tests {
             Packet::Unsubscribe {
                 flags: Flags::default(),
                 msg_id: 8,
-                topic: Topic::Short(*b"zz"),
+                topic: Filter::Short(*b"zz"),
             },
             Packet::UnsubAck { msg_id: 8 },
             Packet::PingReq {
@@ -884,8 +912,7 @@ mod tests {
             },
             Packet::Disconnect { duration: None },
             Packet::WillTopicUpd {
-                flags: Some(Flags::default()),
-                topic: "w",
+                will: Some((Flags::default(), "w")),
             },
             Packet::WillTopicResp { code: ACCEPTED },
             Packet::WillMsgUpd { message: b"m" },

@@ -44,6 +44,9 @@ struct State {
     queue: VecDeque<Message>,
     /// Packet IDs of taken QoS 1/2 messages, to ack.
     acks: Vec<(u16, QoS)>,
+    /// Bumped when the broker lost the session: packet IDs of messages
+    /// from before mean nothing to it now.
+    epoch: u32,
     /// The session waits for room.
     waiting: bool,
     /// The session is gone.
@@ -70,6 +73,7 @@ pub(crate) fn channel(cap: usize) -> (Sender, Receiver) {
     });
     let tx = Sender {
         shared: shared.clone(),
+        epoch: 0,
         batch: Vec::new(),
         batch_acks: 0,
         batch_bytes: 0,
@@ -84,6 +88,8 @@ pub(crate) fn channel(cap: usize) -> (Sender, Receiver) {
 /// The session side.
 pub(crate) struct Sender {
     shared: Arc<Shared>,
+    /// The epoch new messages get.
+    epoch: u32,
     batch: Vec<Message>,
     /// Messages in `batch` that need an ack, and their payload bytes.
     batch_acks: usize,
@@ -103,7 +109,8 @@ pub(crate) struct Dropped;
 
 impl Sender {
     /// Adds a message to the next batch.
-    pub(crate) fn push(&mut self, m: Message) {
+    pub(crate) fn push(&mut self, mut m: Message) {
+        m.epoch = self.epoch;
         self.batch_acks += usize::from(m.ack.is_some());
         self.batch_bytes += m.payload.len();
         self.batch.push(m);
@@ -119,45 +126,62 @@ impl Sender {
         self.batch.len() >= self.shared.cap
     }
 
-    /// Queues the batch, waiting for room as needed.
-    pub(crate) async fn flush(&mut self) -> Result<(), Dropped> {
-        while !self.batch.is_empty() {
-            let (filled, waiting) = {
-                let mut st = self.shared.lock();
-                if st.dropped {
-                    self.batch.clear();
-                    return Err(Dropped);
-                }
-                let n = self
-                    .shared
-                    .cap
-                    .saturating_sub(st.queue.len())
-                    .min(self.batch.len());
-                let filled = n > 0 && st.queue.is_empty();
-                if n > 0 {
-                    st.queue.extend(self.batch.drain(..n));
-                    self.batch_acks = self.batch.iter().filter(|m| m.ack.is_some()).count();
-                    self.batch_bytes = self.batch.iter().map(|m| m.payload.len()).sum();
-                }
-                st.waiting = !self.batch.is_empty();
-                (filled, st.waiting)
-            };
-            // The lock orders pushes and takes, so only the push into an
-            // empty queue needs to wake the handle.
-            if filled {
-                self.shared.ready.mark();
-            }
-            if !waiting {
-                return Ok(());
-            }
-            self.shared.room.ready().await;
+    /// Queues as much of the batch as there is room for. True once all of it
+    /// is queued; otherwise [`Sender::room`] tells when to try again.
+    pub(crate) fn try_flush(&mut self) -> Result<bool, Dropped> {
+        if self.batch.is_empty() {
+            return Ok(true);
         }
-        Ok(())
+        let filled = {
+            let mut st = self.shared.lock();
+            if st.dropped {
+                self.batch.clear();
+                return Err(Dropped);
+            }
+            let n = self
+                .shared
+                .cap
+                .saturating_sub(st.queue.len())
+                .min(self.batch.len());
+            let filled = n > 0 && st.queue.is_empty();
+            for m in self.batch.drain(..n) {
+                self.batch_acks -= usize::from(m.ack.is_some());
+                self.batch_bytes -= m.payload.len();
+                st.queue.push_back(m);
+            }
+            st.waiting = !self.batch.is_empty();
+            filled
+        };
+        // The lock orders pushes and takes, so only the push into an empty
+        // queue needs to wake the handle.
+        if filled {
+            self.shared.ready.mark();
+        }
+        Ok(self.batch.is_empty())
+    }
+
+    /// Whether messages wait for room in the queue.
+    pub(crate) const fn blocked(&self) -> bool {
+        !self.batch.is_empty()
+    }
+
+    /// Waits until the handle took a full queue, or is gone.
+    pub(crate) async fn room(&self) {
+        self.shared.room.ready().await;
     }
 
     /// Waits until there may be acks to send.
     pub(crate) async fn acked(&self) {
         self.shared.acked.ready().await;
+    }
+
+    /// The broker lost the session: messages already received are not
+    /// acked to it.
+    pub(crate) fn forget_acks(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        let mut st = self.shared.lock();
+        st.epoch = self.epoch;
+        st.acks.clear();
     }
 
     /// Swaps the acks to send into `acks`, which should be empty.
@@ -197,6 +221,9 @@ impl Receiver {
                 if let Some(pkid) = m.ack {
                     let gathered = {
                         let mut st = self.shared.lock();
+                        if m.epoch != st.epoch {
+                            return Some(m);
+                        }
                         st.acks.push((pkid, m.qos));
                         st.acks.len()
                     };
@@ -256,7 +283,16 @@ mod tests {
             retain: false,
             subscription_ids: Vec::new(),
             ack: None,
+            epoch: 0,
         }
+    }
+
+    /// Queues the whole batch, waiting for room as the session does.
+    async fn flush(tx: &mut Sender) -> Result<(), Dropped> {
+        while !tx.try_flush()? {
+            tx.room().await;
+        }
+        Ok(())
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -267,7 +303,7 @@ mod tests {
                 tx.push(msg(i));
             }
             assert!(tx.full());
-            assert!(tx.flush().await.is_ok());
+            assert!(flush(&mut tx).await.is_ok());
         });
         for i in 0..10 {
             assert_eq!(rx.recv().await.unwrap().topic, i.to_string());
@@ -293,7 +329,7 @@ mod tests {
                 ..msg(i)
             });
         }
-        assert!(tx.flush().await.is_ok());
+        assert!(flush(&mut tx).await.is_ok());
         let mut ids = Vec::new();
 
         for _ in 1..ACK_LWM {
@@ -321,6 +357,6 @@ mod tests {
         let (mut tx, rx) = channel(1);
         drop(rx);
         tx.push(msg(0));
-        assert!(tx.flush().await.is_err());
+        assert!(flush(&mut tx).await.is_err());
     }
 }

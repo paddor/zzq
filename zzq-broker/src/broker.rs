@@ -14,7 +14,7 @@ use zzq_tokio::transport::Listener;
 use zzq_tokio::{Context, Endpoint};
 
 use crate::conn::ConnDriver;
-use crate::lane::{Control, Lane, LaneRef, LaneStats, Remote};
+use crate::lane::{Control, Lane, LaneRef, LaneStats, Phase, Remote};
 use crate::mailbox::{self, Mailbox};
 use crate::msg::Msg;
 use crate::options::BrokerOptions;
@@ -23,6 +23,8 @@ use crate::{Error, Result};
 
 /// Batches in flight to one lane before senders wait.
 const DATA_BATCHES: usize = 64;
+/// Controls a lane handles before it lets its connections run.
+const CONTROL_RUN: usize = 64;
 /// Interval of keep alive and session expiry checks, each over a part of
 /// the sessions, so a lane with many does not stall for one long sweep.
 const SWEEP: Duration = Duration::from_millis(1000 / crate::lane::SWEEP_PARTS as u64);
@@ -35,11 +37,13 @@ thread_local! {
 
 /// Sends batches for other lanes collected on `lane`. Waits while a target
 /// lane is full, which slows the caller down instead of dropping.
-pub(crate) async fn ship(lane: &LaneRef) {
-    if !try_ship(lane) {
-        // Boxed, so the rare wait does not size every connection's future.
-        Box::pin(ship_waiting(lane)).await;
+pub(crate) async fn ship(lane: &LaneRef) -> bool {
+    if try_ship(lane) {
+        return false;
     }
+    // Boxed, so the rare wait does not size every connection's future.
+    Box::pin(ship_waiting(lane)).await;
+    true
 }
 
 /// Ships what goes without waiting. False if a batch is left that must
@@ -49,7 +53,7 @@ fn try_ship(lane: &LaneRef) -> bool {
     if !l.has_remote() {
         return true;
     }
-    let shipping = l.shipping.clone();
+    let shipping = l.out.shipping.clone();
     let Ok(_turn) = shipping.try_lock() else {
         return false;
     };
@@ -69,7 +73,7 @@ async fn ship_waiting(lane: &LaneRef) {
         if !l.has_remote() {
             return;
         }
-        (l.shared.clone(), l.shipping.clone())
+        (l.shared.clone(), l.out.shipping.clone())
     };
     let _turn = shipping.lock().await;
     loop {
@@ -127,27 +131,60 @@ pub struct Stats {
     pub publishes: u64,
     /// Messages written to subscribers.
     pub deliveries: u64,
-    /// QoS 0 messages dropped because a connection's write buffer was full.
-    pub dropped_buffer_full: u64,
-    /// QoS 0 messages for offline sessions.
-    pub dropped_offline: u64,
-    /// QoS 1/2 messages dropped from a full session queue.
-    pub dropped_queue_full: u64,
-    /// Messages larger than the subscriber's Maximum Packet Size.
-    pub dropped_too_large: u64,
-    /// Queued messages whose Message Expiry Interval ran out.
-    pub dropped_expired: u64,
-    /// QoS 1/2 messages a session still held, queued or unacked, when it
-    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
-    pub dropped_session_ended: u64,
-    /// QoS 1/2 messages dropped instead of queued because
-    /// `max_state_bytes` was reached.
-    pub dropped_state_full: u64,
+    /// Messages dropped, by reason.
+    pub dropped: Dropped,
     /// Retained messages not stored because `max_retained` or
     /// `max_state_bytes` was reached.
     pub retained_rejected: u64,
     /// Approximate bytes of state counted against `max_state_bytes`.
     pub state_bytes: u64,
+}
+
+/// Messages the broker dropped, by reason.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Dropped {
+    /// QoS 0 messages dropped because a connection's write buffer was full.
+    pub buffer_full: u64,
+    /// QoS 0 messages for offline sessions.
+    pub offline: u64,
+    /// QoS 1/2 messages dropped from a full session queue.
+    pub queue_full: u64,
+    /// Messages larger than the subscriber's Maximum Packet Size.
+    pub too_large: u64,
+    /// Queued messages whose Message Expiry Interval ran out.
+    pub expired: u64,
+    /// QoS 1/2 messages a session still held, queued or unacked, when it
+    /// ended: by expiry, a clean start, or DISCONNECT with expiry 0.
+    pub session_ended: u64,
+    /// QoS 1/2 messages dropped instead of queued because
+    /// `max_state_bytes` was reached.
+    pub state_full: u64,
+}
+
+impl Dropped {
+    /// All dropped messages.
+    pub const fn total(&self) -> u64 {
+        self.buffer_full
+            + self.offline
+            + self.queue_full
+            + self.too_large
+            + self.expired
+            + self.session_ended
+            + self.state_full
+    }
+}
+
+impl std::ops::AddAssign for Dropped {
+    fn add_assign(&mut self, o: Dropped) {
+        self.buffer_full += o.buffer_full;
+        self.offline += o.offline;
+        self.queue_full += o.queue_full;
+        self.too_large += o.too_large;
+        self.expired += o.expired;
+        self.session_ended += o.session_ended;
+        self.state_full += o.state_full;
+    }
 }
 
 /// An MQTT broker. Dropping it stops listening and closes all connections.
@@ -161,10 +198,12 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// [`Error::Persistence`] if stored retained messages cannot be loaded,
-    /// [`Error::State`] if the state file cannot be read, and
-    /// [`Error::Transport`] if the lanes have stopped.
+    /// [`Error::InvalidOption`] for a zero `sys_interval`, `sn.retry`,
+    /// `sn.max_keep_alive` or `receive_maximum`, [`Error::Persistence`] if stored retained messages
+    /// cannot be loaded, [`Error::State`] if the state file cannot be read,
+    /// and [`Error::Transport`] if the lanes have stopped.
     pub async fn new(ctx: &Context, opts: BrokerOptions) -> Result<Broker> {
+        check(&opts)?;
         let n = ctx.lanes();
         let mut lanes = Vec::with_capacity(n);
         let mut receivers = Vec::with_capacity(n);
@@ -178,8 +217,12 @@ impl Broker {
             });
             receivers.push((ctl_rx, data_rx));
         }
-        let retained = RetainedStore::new(opts.persistence.clone(), opts.max_retained)
-            .map_err(Error::Persistence)?;
+        let retained = RetainedStore::new(
+            opts.persistence.clone(),
+            opts.max_retained,
+            opts.max_topic_levels,
+        )
+        .map_err(Error::Persistence)?;
         let shared = Arc::new(Shared {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
@@ -215,6 +258,12 @@ impl Broker {
                 .await?;
         }
         Ok(broker)
+    }
+
+    /// The ID that tells this broker's lane state apart on a lane thread.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> u64 {
+        self.shared.id
     }
 
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
@@ -254,12 +303,14 @@ impl Broker {
         Ok(rx.await.map_err(|_| Error::Closed)??)
     }
 
-    /// Publishes a message as the broker itself.
+    /// Publishes a message as the broker itself. Messages to one topic
+    /// reach subscribers in the order they were published.
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidTopic`] for a topic clients could not publish to, and
-    /// [`Error::TooLarge`] for a message MQTT cannot carry.
+    /// [`Error::InvalidTopic`] for a topic clients could not publish to,
+    /// [`Error::TooLarge`] for a message MQTT cannot carry, and
+    /// [`Error::Closed`] once the broker has shut down.
     pub fn publish(&self, topic: &str, payload: impl AsRef<[u8]>, qos: QoS) -> Result<()> {
         self.send_publish(topic, payload.as_ref(), qos, false)
     }
@@ -312,8 +363,9 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// [`Error::State`] if the state file could not be written. The
-    /// broker stops anyway.
+    /// [`Error::State`] if the state file could not be written, and
+    /// [`Error::Closed`] if a lane stopped before it could. The broker stops
+    /// anyway.
     pub async fn shutdown(self) -> Result<()> {
         self.abort_tasks();
         let saved = match &self.shared.opts.state_file {
@@ -360,13 +412,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
         total.subscriptions = total.subscriptions.max(s.subscriptions);
         total.publishes += s.publishes;
         total.deliveries += s.deliveries;
-        total.dropped_buffer_full += s.dropped_buffer_full;
-        total.dropped_offline += s.dropped_offline;
-        total.dropped_queue_full += s.dropped_queue_full;
-        total.dropped_too_large += s.dropped_too_large;
-        total.dropped_expired += s.dropped_expired;
-        total.dropped_session_ended += s.dropped_session_ended;
-        total.dropped_state_full += s.dropped_state_full;
+        total.dropped += s.dropped;
         total.state_bytes += s.state_bytes;
     }
     {
@@ -381,9 +427,28 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
     Ok(total)
 }
 
-/// Routes a message from the broker itself on the next lane.
+/// Refuses options the broker cannot work with.
+fn check(o: &BrokerOptions) -> Result<()> {
+    if o.sys_interval.is_some_and(|d| d.is_zero()) {
+        return Err(Error::InvalidOption("sys_interval"));
+    }
+    if o.sn.retry.is_zero() {
+        return Err(Error::InvalidOption("sn.retry"));
+    }
+    if o.sn.max_keep_alive == 0 {
+        return Err(Error::InvalidOption("sn.max_keep_alive"));
+    }
+    // A v5 client must not get a Receive Maximum of 0.
+    if o.receive_maximum == 0 {
+        return Err(Error::InvalidOption("receive_maximum"));
+    }
+    Ok(())
+}
+
+/// Routes a message from the broker itself. Messages to one topic go
+/// through one lane, so they keep their order.
 pub(crate) fn publish(shared: &Shared, msg: Msg) -> Result<()> {
-    let lane = shared.ctx.next_lane().index();
+    let lane = lane_for(msg.topic(), shared.lanes.len());
     shared.lanes[lane]
         .control
         .push(Control::Publish(msg))
@@ -413,10 +478,13 @@ fn install(
     tokio::task::spawn_local(async move {
         let mut controls = Vec::new();
         while ctl_rx.recv_all(&mut controls).await {
-            for c in controls.drain(..) {
+            for (i, c) in controls.drain(..).enumerate() {
                 let last = matches!(c, Control::Shutdown(_));
                 l.borrow_mut().control(c);
                 ship(&l).await;
+                if i % CONTROL_RUN == CONTROL_RUN - 1 {
+                    tokio::task::yield_now().await;
+                }
                 if last {
                     LANES.with(|lanes| lanes.borrow_mut().remove(&broker));
                     // Ends the data loop, which would otherwise keep the
@@ -434,12 +502,12 @@ fn install(
         while data_rx.recv_all(&mut batches).await {
             {
                 let mut lane = l.borrow_mut();
-                if lane.shut_down {
+                if lane.phase == Phase::ShutDown {
                     break;
                 }
                 for batch in batches.drain(..) {
                     for r in batch {
-                        lane.deliver_remote(&r);
+                        lane.deliver_remote(r);
                     }
                 }
                 lane.flush();
@@ -454,7 +522,7 @@ fn install(
             tick.tick().await;
             {
                 let mut l = lane.borrow_mut();
-                if l.shut_down {
+                if l.phase == Phase::ShutDown {
                     break;
                 }
                 l.sweep(Instant::now());

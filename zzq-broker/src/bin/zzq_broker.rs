@@ -4,7 +4,8 @@
 //! [--client-ca PEM] [--retained-file PATH] [--state-file PATH]
 //! [--max-state-mib N] [--busy-poll] [--spin-us N]`
 //!
-//! `--cert` and `--key` enable `tls://`, `wss://` and `quic://` binds.
+//! Without `--bind`, it binds `tcp://0.0.0.0:1883`. `--cert` and `--key`,
+//! which go together, enable `tls://`, `wss://` and `quic://` binds.
 //! `--client-ca` makes them require client certificates. `--retained-file`
 //! keeps retained messages across restarts. `--state-file` keeps sessions
 //! across a restart: SIGTERM or SIGINT write it, and the next start loads
@@ -86,6 +87,9 @@ fn options(a: &Args) -> Result<BrokerOptions, String> {
 #[cfg(feature = "tls")]
 fn tls(a: &Args, opts: &mut BrokerOptions) -> Result<(), String> {
     let read = |p: &str| std::fs::read(p).map_err(|e| format!("{p}: {e}"));
+    if a.cert.is_some() != a.key.is_some() || (a.client_ca.is_some() && a.cert.is_none()) {
+        return Err("--cert and --key go together, and --client-ca needs them".to_owned());
+    }
     if let (Some(cert), Some(key)) = (&a.cert, &a.key) {
         opts.transport.tls = Some(zzq_broker::TlsOptions {
             cert_chain_pem: Some(read(cert)?),

@@ -1,8 +1,9 @@
-//! Sans-I/O MQTT 3.1.1 and 5.0 codec.
+//! Sans-I/O MQTT 3.1.1 and 5.0 codec, and MQTT-SN 1.2 in [`sn`].
 //!
 //! The core is `no_std` and allocation-free: packets decode into borrowed
 //! views over the input buffer and encode into any [`Sink`]. The `alloc`
-//! feature adds owned helpers such as the [`trie::TopicTrie`].
+//! feature adds owned helpers such as the [`trie::TopicTrie`]; `std`, the
+//! default, turns it on.
 //!
 //! # Examples
 //!
@@ -59,4 +60,4 @@ pub use error::DecodeError;
 pub use packet::{Packet, decode, fixed_header};
 pub use property::{Properties, Property};
 pub use reason::ReasonCode;
-pub use types::{PacketType, QoS, SubscriptionOptions, Version};
+pub use types::{PacketType, QoS, RetainHandling, SubscriptionOptions, Version};

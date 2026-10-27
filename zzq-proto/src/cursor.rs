@@ -80,10 +80,16 @@ impl<'a> Cursor<'a> {
     /// against the packet's `rules`.
     #[inline]
     pub(crate) fn properties(&mut self, rules: Rules) -> Result<Properties<'a>, DecodeError> {
-        let n = self.varint()?;
-        if n == 0 {
+        // Most packets have none: a length of 0 takes no call.
+        if let [0, rest @ ..] = self.buf {
+            self.buf = rest;
             return Ok(Properties::EMPTY);
         }
+        self.some_properties(rules)
+    }
+
+    fn some_properties(&mut self, rules: Rules) -> Result<Properties<'a>, DecodeError> {
+        let n = self.varint()?;
         Properties::parse(self.bytes(n)?, rules)
     }
 }

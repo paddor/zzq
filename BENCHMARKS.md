@@ -11,8 +11,8 @@ loopback.
   Brokers shipped as container images run in podman with host networking.
 - Before each run, the runner waits for 90% idle CPU and no compiler
   processes. A run that overlaps a compiler is repeated.
-- Each cell is one run. The charts show the newest run per cell, all from
-  2026-10-26.
+- Each cell is one run. The charts show the newest run per cell: zzq from
+  2026-10-27, the rest from 2026-10-26.
 - Rivals run tuned configs: in-flight windows of about 1000, queues of about
   100000, no rate limits, and Nagle off where they have the knob. Several
   defaults drop messages or pace subscribers, which would measure the
@@ -43,8 +43,10 @@ loopback.
 
 - Load generator: `zzq_brokerbench`, raw sockets, one thread per connection,
   pre-encoded batches. MQTT 5.0, except 3.1.1 for rumqttd.
-- 1 s warmup, then a 5 s window. The rate is deliveries at the subscribers.
-  Loss compares all deliveries with all sends after a 2 s drain.
+- 1 s warmup (5 s for rumqttd, whose memory grows for a few seconds
+  first), then a 5 s window. The rate is deliveries at the subscribers.
+  Loss compares all deliveries with all sends once 2 s pass without a
+  delivery.
 - QoS 1 and 2 publishers keep up to 100 messages in flight. QoS 0 has no flow
   control, so it shows how a broker handles a subscriber that falls behind.
 - Round trip: one message in flight between two connections. The dot is
@@ -56,7 +58,8 @@ loopback.
 
 ![Brokers at fixed load](doc/charts/fixed-load.svg)
 
-- Load generator: `zzq_loadbench`, two current-thread runtimes on CPUs 4-5,
+- Load generator: `zzq_loadbench` from the benchmark harness, which is not
+  part of this repository, on two current-thread runtimes on CPUs 4-5,
   up to 20K connections from 127.0.0.1-8. QoS 1, 16 B payloads.
 - Each publisher sends on a fixed schedule. A step ramps for 2 s, then
   measures for 8 s on the same connections. The offered rate counts
@@ -73,7 +76,8 @@ loopback.
 
 ![MQTT clients](doc/charts/clients.svg)
 
-- One client connection against `zzq_fakebroker`, which acks at once. The
+- One client connection against `zzq_fakebroker` from the same harness,
+  which acks at once. The
   receiving side measures: the fake broker for publishing, the client for
   subscribing.
 - QoS 1 and 2 publishers keep up to 100 messages in flight.

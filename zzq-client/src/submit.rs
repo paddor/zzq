@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use tokio::sync::oneshot;
-use zzq_proto::QoS;
 use zzq_proto::encode::{self, PublishHeader};
+use zzq_proto::{QoS, ReasonCode};
 use zzq_tokio::signal::{DataSignal, StateSignal};
 
 use crate::{Cmd, Error, Result};
@@ -219,17 +219,17 @@ impl Receiver {
 
     /// Takes a queued DISCONNECT out of the queue. The other requests stay
     /// for the next connection and wake no one until it takes them.
-    pub(crate) fn take_disconnect(&self) -> Option<oneshot::Sender<()>> {
+    pub(crate) fn take_disconnect(&self) -> Option<(ReasonCode, oneshot::Sender<()>)> {
         Self::remove_disconnect(&mut self.shared.lock())
     }
 
-    fn remove_disconnect(st: &mut State) -> Option<oneshot::Sender<()>> {
+    fn remove_disconnect(st: &mut State) -> Option<(ReasonCode, oneshot::Sender<()>)> {
         let ops = &mut st.batch.ops;
         let at = ops
             .iter()
             .position(|op| matches!(op, Op::Cmd(Cmd::Disconnect { .. })))?;
         match ops.remove(at) {
-            Some(Op::Cmd(Cmd::Disconnect { done, .. })) => Some(done),
+            Some(Op::Cmd(Cmd::Disconnect { reason, done })) => Some((reason, done)),
             _ => None,
         }
     }

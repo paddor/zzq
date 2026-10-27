@@ -1,0 +1,100 @@
+//! Publisher acks held while a subscriber they went to is congested.
+
+use zzq_proto::packet::Publish;
+use zzq_proto::{PacketType, QoS, reason};
+
+use crate::index::SubRef;
+use crate::session::Waiter;
+use crate::slab::Key;
+
+use super::{Close, Control, Lane};
+
+/// A congested session a QoS 1/2 publish was routed to.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum Hit {
+    Local(Key),
+    Remote(SubRef),
+}
+
+impl Lane {
+    /// Acks a routed QoS 1/2 publish, or holds the ack while a subscriber it
+    /// went to is congested. A publisher gets at most Receive Maximum acks
+    /// held: a v5 one breaks the protocol past it, a v3.1.1 one, which has no
+    /// such limit, gets the rest at once.
+    pub(super) fn ack_or_hold(&mut self, key: Key, p: &Publish<'_>) -> Result<(), Close> {
+        let kind = match p.qos {
+            QoS::AtMostOnce => return Ok(()),
+            QoS::AtLeastOnce => PacketType::PubAck,
+            QoS::ExactlyOnce => PacketType::PubRec,
+        };
+        let max = u32::from(self.shared.opts.receive_maximum);
+        let hit = match self.congestion.hit.take() {
+            Some(Hit::Local(sub)) if sub != key && self.sessions.get(sub).is_some() => {
+                Some(Hit::Local(sub))
+            }
+            remote @ Some(Hit::Remote(_)) => remote,
+            _ => None,
+        };
+        let Some(s) = self.sessions.get_mut(key) else {
+            return Ok(());
+        };
+        let hit = match hit {
+            Some(_) if s.inbound.held_acks >= max && s.version.is_v5() => {
+                return Err(Close::Protocol(reason::RECEIVE_MAXIMUM_EXCEEDED));
+            }
+            Some(_) if s.inbound.held_acks >= max => None,
+            hit => hit,
+        };
+        let Some(hit) = hit else {
+            s.ack(kind, p.pkid, 0);
+            self.mark(key);
+            return Ok(());
+        };
+        s.inbound.held_acks += 1;
+        let waiter = Waiter {
+            publisher: key,
+            conn: s.conn.as_ref().map_or(0, |c| c.id),
+            kind,
+            pkid: p.pkid,
+        };
+        match hit {
+            Hit::Local(sub) => {
+                if let Some(s) = self.sessions.get_mut(sub) {
+                    s.backpressure.waiters.push(waiter);
+                }
+            }
+            Hit::Remote(sub) => self.congestion.waiters.entry(sub).or_default().push(waiter),
+        }
+        Ok(())
+    }
+
+    /// Sends held acks once a congested session drained or went away.
+    pub(super) fn release_waiters(&mut self, key: Key) {
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let low = self.shared.opts.qos_queue_high / 2;
+        let drained = s.conn.is_none() || s.queued() <= low;
+        if !s.backpressure.congested || !drained {
+            return;
+        }
+        s.backpressure.congested = false;
+        let waiters = std::mem::take(&mut s.backpressure.waiters);
+        let sub = self.sub_ref(key);
+        self.broadcast(&|| Control::Congested(sub, false));
+        self.send_acks(&waiters);
+    }
+
+    pub(super) fn send_acks(&mut self, waiters: &[Waiter]) {
+        for w in waiters {
+            // A publisher that reconnected sends the publish again.
+            if let Some(p) = self.sessions.get_mut(w.publisher)
+                && p.has_conn(w.conn)
+            {
+                p.ack(w.kind, w.pkid, 0);
+                p.inbound.held_acks = p.inbound.held_acks.saturating_sub(1);
+                self.mark(w.publisher);
+            }
+        }
+    }
+}

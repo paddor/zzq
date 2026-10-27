@@ -34,13 +34,6 @@ pub(crate) async fn run(shared: Arc<Shared>, every: Duration) {
 }
 
 fn values(s: &Stats, uptime: Duration) -> [(&'static str, String); 11] {
-    let dropped = s.dropped_buffer_full
-        + s.dropped_offline
-        + s.dropped_queue_full
-        + s.dropped_too_large
-        + s.dropped_expired
-        + s.dropped_session_ended
-        + s.dropped_state_full;
     [
         (
             "$SYS/broker/version",
@@ -62,10 +55,13 @@ fn values(s: &Stats, uptime: Duration) -> [(&'static str, String); 11] {
         ),
         ("$SYS/broker/messages/received", s.publishes.to_string()),
         ("$SYS/broker/messages/sent", s.deliveries.to_string()),
-        ("$SYS/broker/messages/dropped", dropped.to_string()),
+        (
+            "$SYS/broker/messages/dropped",
+            s.dropped.total().to_string(),
+        ),
         (
             "$SYS/broker/messages/expired",
-            s.dropped_expired.to_string(),
+            s.dropped.expired.to_string(),
         ),
         ("$SYS/broker/state/bytes", s.state_bytes.to_string()),
     ]

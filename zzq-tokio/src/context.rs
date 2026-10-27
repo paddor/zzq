@@ -1,6 +1,7 @@
 //! IO lanes.
 
 use std::fmt;
+use std::io;
 use std::pin::{Pin, pin};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -18,7 +19,7 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 /// Context settings.
 #[derive(Debug, Clone)]
 pub struct Config {
-    /// Number of IO lanes, each on its own thread.
+    /// Number of IO lanes, each on its own thread. 0 counts as 1.
     pub io_threads: usize,
     /// Thread name prefix.
     pub name: String,
@@ -176,9 +177,11 @@ impl Context {
             let stop = Arc::new(Notify::new());
             let stop2 = stop.clone();
             let (busy, spin) = (config.busy_poll, config.spin);
+            // Built here, so a failure to build reaches the caller.
+            let rt = runtime(busy)?;
             let handle = thread::Builder::new()
                 .name(format!("{}-io-{index}", config.name))
-                .spawn(move || lane_main(rx, &stop2, busy, spin))?;
+                .spawn(move || lane_main(&rt, rx, &stop2, busy, spin))?;
             threads.push((handle.thread().id(), handle));
             lanes.push(Lane {
                 handle: LaneHandle { index, tx },
@@ -217,15 +220,23 @@ impl Context {
     }
 }
 
-fn lane_main(mut rx: mpsc::UnboundedReceiver<Job>, stop: &Notify, busy: bool, spin: Duration) {
+/// A lane's runtime. A busy lane checks for IO after every task.
+fn runtime(busy: bool) -> io::Result<tokio::runtime::Runtime> {
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder.enable_all();
     if busy {
         builder.event_interval(1);
     }
-    let Ok(rt) = builder.build() else {
-        return;
-    };
+    builder.build()
+}
+
+fn lane_main(
+    rt: &tokio::runtime::Runtime,
+    mut rx: mpsc::UnboundedReceiver<Job>,
+    stop: &Notify,
+    busy: bool,
+    spin: Duration,
+) {
     let local = tokio::task::LocalSet::new();
     let lane = pin!(local.run_until(async move {
         if busy {

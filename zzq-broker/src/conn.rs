@@ -7,17 +7,18 @@ use std::pin::pin;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 use std::task::{Poll, ready};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use zzq_proto::packet::{Connect, decode, fixed_header};
 use zzq_proto::property;
 use zzq_proto::{DecodeError, Packet, PacketType, Version, encode, reason};
 use zzq_tokio::transport::Driver;
 
-use crate::lane::{Close, LaneRef};
+use crate::lane::{Close, LaneRef, Phase};
 use crate::msg::Msg;
 use crate::options::{AuthDecision, Authenticator, ClientInfo, ConnectInfo};
 use crate::session::Will;
@@ -27,6 +28,10 @@ use crate::slab::Key;
 /// small and doubles while reads fill the buffer.
 const MIN_CHUNK: usize = 1 << 10;
 const READ_CHUNK: usize = 256 << 10;
+
+/// How long a closed connection's writer may take to write what is left,
+/// such as to a peer that stopped reading, before it is stopped.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
 
 /// A connection without a buffer of its own reads into a block of its
 /// lane, so an idle connection holds no read buffer. Packets are sliced out
@@ -91,6 +96,9 @@ pub(crate) struct ConnShared {
     /// Last packet to write before closing.
     farewell: RefCell<Vec<u8>>,
     pub(crate) last_rx: Cell<Instant>,
+    /// The read loop waits for the broker, for room to ship or for other
+    /// lanes, so the client may be sending while nothing is read.
+    pub(crate) held: Cell<bool>,
     /// Keep Alive in seconds.
     pub(crate) keep_alive: Cell<u16>,
     /// The writer took the CONNACK, so the client knows it connected.
@@ -106,6 +114,7 @@ impl ConnShared {
             closed: Cell::new(false),
             farewell: RefCell::new(Vec::new()),
             last_rx: Cell::new(Instant::now()),
+            held: Cell::new(false),
             keep_alive: Cell::new(keep_alive),
             connacked: Cell::new(false),
         }
@@ -223,7 +232,7 @@ where
     // Boxed, so the handshake's state is freed once it is done instead of
     // sizing every connection's future.
     let started = Box::pin(start(&lane, d.initial, d.peer_cert, &mut r, w)).await;
-    let Some((key, conn, version, buf)) = started else {
+    let Some((key, conn, version, buf, mut writer)) = started else {
         return;
     };
     let close = read_loop(&lane, key, &conn, &mut r, buf).await;
@@ -242,6 +251,12 @@ where
         l.flush();
     }
     crate::broker::ship(&lane).await;
+    if tokio::time::timeout(CLOSE_LINGER, &mut writer)
+        .await
+        .is_err()
+    {
+        writer.abort();
+    }
 }
 
 /// Reads CONNECT, attaches the session and starts the writer.
@@ -251,7 +266,7 @@ async fn start<R, W>(
     peer_cert: Option<Vec<u8>>,
     r: &mut R,
     w: W,
-) -> Option<(Key, Rc<ConnShared>, Version, BytesMut)>
+) -> Option<(Key, Rc<ConnShared>, Version, BytesMut, JoinHandle<()>)>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
@@ -293,8 +308,8 @@ where
     lane.borrow_mut().flush();
     // A will published on takeover may go to other lanes.
     crate::broker::ship(lane).await;
-    tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
-    Some((key, conn, version, buf))
+    let writer = tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
+    Some((key, conn, version, buf, writer))
 }
 
 type ConnectError = (Option<Version>, u8);
@@ -327,7 +342,14 @@ async fn read_connect<R: AsyncRead + Unpin>(
                         peer_cert,
                     };
                     if let AuthDecision::Deny(code) = auth.authenticate(&info) {
-                        return Err((Some(c.version), code.into()));
+                        // A code below 0x80 would accept the connection.
+                        let code = u8::from(code);
+                        let code = if code < 0x80 {
+                            reason::NOT_AUTHORIZED
+                        } else {
+                            code
+                        };
+                        return Err((Some(c.version), code));
                     }
                 }
                 let owned = OwnedConnect::from_packet(&c);
@@ -419,12 +441,12 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
             c.server_keep_alive = true;
             conn.keep_alive.set(max);
         }
-        if l.closing {
+        if l.phase != Phase::Open {
             return Err(reason::SERVER_UNAVAILABLE);
         }
         // A new session that outlives its connection needs room in the state
         // budget.
-        if l.state_full
+        if l.budget.full
             && c.session_expiry.min(o.max_session_expiry) != 0
             && !l.has_session(&c.client_id)
         {
@@ -465,6 +487,13 @@ fn complete_len(buf: &[u8], max: usize) -> Result<(usize, usize), DecodeError> {
         at += n;
     }
     Ok((at, 0))
+}
+
+/// Capacity for the rest of a packet of `partial` bytes in a buffer that
+/// holds `have`: all of it, but no more than twice what came so far, so a
+/// header alone cannot make the connection allocate a large packet.
+fn packet_room(have: usize, partial: usize) -> usize {
+    partial.min(have.saturating_mul(2).max(READ_CHUNK))
 }
 
 /// Next read size: double after a full read, halve after a small one.
@@ -510,14 +539,21 @@ async fn read_loop<R: AsyncRead + Unpin>(
             result
         };
         drop(chunk);
-        crate::broker::ship(lane).await;
+        conn.held.set(true);
+        let mut waited = crate::broker::ship(lane).await;
         // Let other connections on this lane run, such as subscribers whose
         // acks free up their window.
         tokio::task::yield_now().await;
-        let held = lane.borrow_mut().take_held();
+        let held = lane.borrow_mut().take_held(conn.id);
+        waited |= !held.is_empty();
         for h in held {
             h.sync.wait().await;
             lane.borrow_mut().release(&h);
+        }
+        conn.held.set(false);
+        // Keep alive counts from the end of a wait the broker made.
+        if waited {
+            conn.last_rx.set(Instant::now());
         }
         if let Err(close) = result {
             return close;
@@ -558,7 +594,8 @@ async fn read_more<R: AsyncRead + Unpin>(
     } else if !*own {
         // Sized here: growing a slice of the block would allocate as much
         // as the block.
-        let mut b = BytesMut::with_capacity((buf.len() + *chunk).max(partial));
+        let mut b =
+            BytesMut::with_capacity((buf.len() + *chunk).max(packet_room(buf.len(), partial)));
         b.extend_from_slice(buf);
         *buf = b;
         *own = true;
@@ -568,9 +605,10 @@ async fn read_more<R: AsyncRead + Unpin>(
         if buf.capacity() - buf.len() < *chunk / 4 {
             buf.reserve(*chunk);
         }
-        // Room for a large packet in one allocation.
-        if partial > buf.capacity() {
-            buf.reserve(partial - buf.len());
+        // Room for a large packet in few allocations.
+        let room = packet_room(buf.len(), partial);
+        if room > buf.capacity() {
+            buf.reserve(room - buf.len());
         }
     }
     let room = buf.capacity() - buf.len();
@@ -610,7 +648,7 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             let buf = {
                 let mut l = lane.borrow_mut();
                 match l.sessions.get_mut(key) {
-                    Some(s) if s.has_conn(conn.id) && !s.out.is_empty() => {
+                    Some(s) if s.has_conn(conn.id) && !s.out.buf.is_empty() => {
                         conn.connacked.set(true);
                         s.take_out()
                     }
@@ -629,7 +667,7 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             if let Some(s) = l.sessions.get_mut(key)
                 && s.has_conn(conn.id)
             {
-                s.spare = buf;
+                s.out.spare = buf;
             }
         }
         // TLS may only have buffered the last bytes: push them out before
@@ -646,5 +684,18 @@ async fn writer<W: AsyncWrite + Unpin>(lane: LaneRef, key: Key, conn: Rc<ConnSha
             let _ = w.shutdown().await;
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_header_alone_does_not_get_room_for_its_whole_packet() {
+        assert_eq!(packet_room(5, 16 << 20), READ_CHUNK);
+        assert_eq!(packet_room(1 << 20, 16 << 20), 2 << 20);
+        assert_eq!(packet_room(10 << 20, 16 << 20), 16 << 20);
+        assert_eq!(packet_room(5, 100), 100);
     }
 }

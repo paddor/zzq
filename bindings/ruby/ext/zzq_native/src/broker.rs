@@ -50,11 +50,11 @@ pub fn stats_hash(s: &Stats) -> RbResult<VALUE> {
         ("retained", s.retained),
         ("publishes", s.publishes),
         ("deliveries", s.deliveries),
-        ("dropped_buffer_full", s.dropped_buffer_full),
-        ("dropped_offline", s.dropped_offline),
-        ("dropped_queue_full", s.dropped_queue_full),
-        ("dropped_too_large", s.dropped_too_large),
-        ("dropped_expired", s.dropped_expired),
+        ("dropped_buffer_full", s.dropped.buffer_full),
+        ("dropped_offline", s.dropped.offline),
+        ("dropped_queue_full", s.dropped.queue_full),
+        ("dropped_too_large", s.dropped.too_large),
+        ("dropped_expired", s.dropped.expired),
         ("retained_rejected", s.retained_rejected),
         // TODO: add `dropped_session_ended`, `dropped_state_full` and
         // `state_bytes` once Cargo.toml requires the next zzq-broker
