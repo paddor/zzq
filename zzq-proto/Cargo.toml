@@ -20,3 +20,5 @@ alloc = []
 std = ["alloc"]
 
 [dependencies]
+# Not from the workspace, whose `thiserror` has default features.
+thiserror = { version = "2.0", default-features = false }

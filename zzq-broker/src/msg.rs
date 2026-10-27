@@ -283,3 +283,20 @@ pub(crate) fn expiry(props: &[u8]) -> Option<Instant> {
 pub(crate) fn expired(expires_at: Option<Instant>, now: Instant) -> bool {
     expires_at.is_some_and(|t| t <= now)
 }
+
+#[cfg(test)]
+mod tests {
+    use zzq_proto::QoS;
+
+    use super::Msg;
+
+    /// `topic` reads back the topic it was made with, ASCII or not.
+    #[test]
+    fn topics_read_back_as_made() {
+        for topic in ["", "a/\x7f", "caf\u{e9}/\u{1f600}"] {
+            let m = Msg::new(topic, b"x", &[], QoS::AtMostOnce, false);
+            assert_eq!(m.topic(), topic);
+            assert_eq!(m.clone().topic(), topic);
+        }
+    }
+}

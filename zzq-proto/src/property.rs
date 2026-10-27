@@ -140,7 +140,9 @@ pub struct Properties<'a> {
 impl<'a> TryFrom<&'a [u8]> for Properties<'a> {
     type Error = DecodeError;
 
-    /// Validates raw property bytes (without the length prefix).
+    /// Checks that raw property bytes (without the length prefix) encode
+    /// valid properties. Which of them a packet type allows is checked by
+    /// the packet decoder.
     fn try_from(raw: &'a [u8]) -> Result<Self, DecodeError> {
         let mut c = Cursor::new(raw);
         while !c.is_empty() {

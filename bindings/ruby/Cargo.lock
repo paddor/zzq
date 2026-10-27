@@ -911,6 +911,9 @@ dependencies = [
 [[package]]
 name = "zzq-proto"
 version = "0.2.0"
+dependencies = [
+ "thiserror",
+]
 
 [[package]]
 name = "zzq-tokio"

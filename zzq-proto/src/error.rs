@@ -1,24 +1,29 @@
-use core::fmt;
-
 use crate::reason;
 
 /// Why a packet could not be decoded.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum DecodeError {
     /// Bytes do not form a valid packet.
+    #[error("malformed packet")]
     Malformed,
     /// Valid bytes that break a protocol rule.
+    #[error("protocol error")]
     Protocol,
     /// The packet is larger than the allowed maximum.
+    #[error("packet too large")]
     TooLarge,
     /// A string is not valid UTF-8 or contains U+0000.
+    #[error("invalid UTF-8 string")]
     InvalidUtf8,
     /// A topic name is invalid.
+    #[error("invalid topic")]
     InvalidTopic,
     /// A topic filter is invalid.
+    #[error("invalid topic filter")]
     InvalidFilter,
     /// The CONNECT protocol level is not supported.
+    #[error("unsupported protocol level {0}")]
     UnsupportedVersion(u8),
 }
 
@@ -35,22 +40,6 @@ impl DecodeError {
         }
     }
 }
-
-impl fmt::Display for DecodeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DecodeError::Malformed => f.write_str("malformed packet"),
-            DecodeError::Protocol => f.write_str("protocol error"),
-            DecodeError::TooLarge => f.write_str("packet too large"),
-            DecodeError::InvalidUtf8 => f.write_str("invalid UTF-8 string"),
-            DecodeError::InvalidTopic => f.write_str("invalid topic"),
-            DecodeError::InvalidFilter => f.write_str("invalid topic filter"),
-            DecodeError::UnsupportedVersion(v) => write!(f, "unsupported protocol level {v}"),
-        }
-    }
-}
-
-impl core::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
