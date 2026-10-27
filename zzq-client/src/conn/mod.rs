@@ -316,8 +316,9 @@ impl Conn<'_> {
                 return end;
             }
             // A full inbox stops reading past READ_AHEAD, not pings, requests
-            // or acks.
+            // or acks. Output the broker does not take stops it too.
             let blocked = self.s.inbox.blocked();
+            let reading = self.s.scratch.parked_bytes < READ_AHEAD && self.out.has_room();
             make_room(buf);
             if self.s.scratch.chained && !chain_armed {
                 chain.as_mut().reset((Instant::now() + CHAIN_WAIT).into());
@@ -330,7 +331,7 @@ impl Conn<'_> {
                     }
                 }
                 () = self.out.drained.notified(), if !self.out.has_room() => {}
-                n = r.read_buf(buf), if self.s.scratch.parked_bytes < READ_AHEAD => {
+                n = r.read_buf(buf), if reading => {
                     if !matches!(n, Ok(n) if n > 0) {
                         return Err(Error::Closed);
                     }

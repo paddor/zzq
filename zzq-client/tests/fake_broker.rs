@@ -730,3 +730,43 @@ async fn a_full_inbox_still_reads_the_acks_of_the_clients_requests() {
         assert_eq!(timeout(WAIT, c.recv()).await.unwrap().unwrap().payload, "x");
     }
 }
+
+#[tokio::test]
+async fn a_broker_that_does_not_read_its_replies_is_not_read_either() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("deaf"))
+                .await
+                .unwrap()
+        }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let _c = connecting.await.unwrap();
+    // Every PUBREL asks for a PUBCOMP, which the broker never reads.
+    let mut rels = Vec::new();
+    for pkid in 1..=16_384 {
+        encode::ack(
+            &AckFields::new(PacketType::PubRel, pkid),
+            Version::V5,
+            &mut rels,
+        );
+    }
+    let mut sent = 0usize;
+    let end = tokio::time::Instant::now() + Duration::from_secs(3);
+    while sent < 256 << 20 {
+        let left = end.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(
+            left.min(Duration::from_millis(500)),
+            peer.s.write_all(&rels),
+        )
+        .await
+        {
+            Ok(Ok(())) => sent += rels.len(),
+            _ => break,
+        }
+    }
+    assert!(sent < 64 << 20, "the client read {} MiB", sent >> 20);
+}
