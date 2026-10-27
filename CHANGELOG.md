@@ -163,6 +163,9 @@ Notable changes to zzq. The format follows
 - `zzq-client`: after a reconnect that the broker answered without the
   session, QoS 1/2 messages received before were still acked by packet ID
   on the new connection, where the ID may mean another message.
+- `zzq-client`: a QoS 2 publish that got PUBREC before the connection
+  dropped resent its PUBREL to a broker that lost the session, and failed
+  with "packet identifier not found". It now completes.
 
 ## [0.1.1] - 2026-10-26
 

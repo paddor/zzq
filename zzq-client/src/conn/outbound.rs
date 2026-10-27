@@ -30,6 +30,9 @@ impl Conn<'_> {
             self.s.requests.pending.remove(&id);
             self.s.requests.unacked.remove(&id);
         }
+        if !session_present {
+            self.finish_released();
+        }
         let mut resend: Vec<(u64, Vec<u8>)> = self.s.requests.unacked.values().cloned().collect();
         resend.sort_by_key(|(seq, _)| *seq);
         if !session_present {
@@ -63,6 +66,28 @@ impl Conn<'_> {
                 packet[0] |= 0x08;
             }
             self.out.push(|b| b.extend_from_slice(&packet));
+        }
+        // Finished flows may have made room for waiting requests.
+        self.send_waiting();
+    }
+
+    /// Finishes the QoS 2 publishes that got PUBREC, for a broker that lost
+    /// the session and so the flows: PUBREC said it had the message.
+    fn finish_released(&mut self) {
+        let released: Vec<u16> = self
+            .s
+            .requests
+            .unacked
+            .iter()
+            .filter(|(_, (_, p))| p.first().is_some_and(|b| b >> 4 == 6))
+            .map(|(id, _)| *id)
+            .collect();
+        for pkid in released {
+            self.s.requests.unacked.remove(&pkid);
+            if let Some(Pending::Publish(slot)) = self.s.requests.pending.remove(&pkid) {
+                self.s.scratch.finished.push((slot, Ok(())));
+                self.s.requests.inflight = self.s.requests.inflight.saturating_sub(1);
+            }
         }
     }
 

@@ -362,3 +362,41 @@ async fn a_message_from_a_lost_session_is_not_acked_on_the_next() {
     let got = timeout(Duration::from_millis(300), second.s.read(&mut chunk)).await;
     assert!(got.is_err(), "acked on the new connection: {got:?}");
 }
+
+#[tokio::test]
+async fn a_released_qos2_publish_is_done_when_the_broker_lost_the_session() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("rel")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    let h = c.handle();
+    let publish = tokio::spawn(async move { h.publish("t", "x", QoS::ExactlyOnce).await });
+    let (byte1, packet) = first.packet().await;
+    assert_eq!(byte1 >> 4, 3, "PUBLISH");
+    let Ok(Some((Packet::Publish(p), _))) = decode(&packet, Version::V5, usize::MAX) else {
+        panic!("expected PUBLISH");
+    };
+    first.ack(PacketType::PubRec, p.pkid).await;
+    assert_eq!(first.packet().await.0 >> 4, 6, "PUBREL");
+    drop(first);
+    // PUBREC said the broker had it; the new connection has no flow to
+    // finish.
+    let mut second = Peer::accept(&l).await;
+    let done = timeout(WAIT, publish).await.unwrap().unwrap();
+    assert!(done.is_ok(), "{done:?}");
+    let mut chunk = [0u8; 64];
+    let got = timeout(Duration::from_millis(300), second.s.read(&mut chunk)).await;
+    assert!(got.is_err(), "resent on the new connection: {got:?}");
+}
