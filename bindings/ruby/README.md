@@ -63,8 +63,9 @@ Options: the limits `max_packet_size:`, `max_inflight:`, `max_queued:`,
 `max_retained:`, `max_topic_levels:`, `topic_alias_maximum:`,
 `max_session_expiry:`, `max_connections:`, `max_state_bytes:` and
 `max_keep_alive:` of zzq-broker's `BrokerOptions`,
-plus `sys_interval:`, `connect_timeout:`, `persistence:` and `tls:`
-(`cert:`, `key:`, `client_ca:`).
+plus `sys_interval:`, `connect_timeout:`, `persistence:`, `state_file:` and
+`tls:` (`cert:`, `key:`, `client_ca:`). With `state_file:`, `#close` writes
+the sessions there, and the next broker started with it resumes them.
 
 ## Async
 

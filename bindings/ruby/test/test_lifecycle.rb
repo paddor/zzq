@@ -9,6 +9,19 @@ class LifecycleTest < Minitest::Spec
     Dir.children(FD_DIR).size
   end
 
+  it "cancels the op of a killed waiting thread" do
+    cancelled = Queue.new
+    op = Object.new
+    op.define_singleton_method(:poll) { |_wake| ZZQ::Native::PENDING }
+    op.define_singleton_method(:cancel) { cancelled << true }
+    waiter = Thread.new { ZZQ::Waiting.await(op) }
+    deadline = ZZQ::Waiting.now + 2
+    Thread.pass until waiter.status == "sleep" || ZZQ::Waiting.now > deadline
+    waiter.kill
+    waiter.join(2)
+    assert cancelled.pop(timeout: 2), "op not cancelled"
+  end
+
   it "releases the fds of closed clients" do
     skip "needs /proc" unless File.directory?(FD_DIR)
     endpoint = tcp_endpoint
