@@ -340,7 +340,7 @@ pub async fn connect(
     opts: &TransportOptions,
 ) -> Result<Stream> {
     let _ = opts;
-    match endpoint {
+    let res = match endpoint {
         #[cfg(feature = "tls")]
         Endpoint::Tls { host, port } => {
             let default = tls::TlsOptions::default();
@@ -358,7 +358,15 @@ pub async fn connect(
         Endpoint::Ipc(path) => ipc::connect(path).await,
         Endpoint::Inproc(name) => inproc::connect(ctx, name).await,
         other => Err(unsupported(other)),
-    }
+    };
+    // The TCP connect under TLS or WebSocket.
+    res.map_err(|e| match e {
+        Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Error::Refused {
+            endpoint: endpoint.to_string(),
+            source: Some(e.into()),
+        },
+        e => e,
+    })
 }
 
 const fn unsupported(endpoint: &Endpoint) -> Error {

@@ -14,6 +14,8 @@ Notable changes to zzq. The format follows
   as `a#`, made the broker close the client's connection, and its will went
   out. PUBLISH and SUBSCRIBE now get "invalid topic ID", and UNSUBSCRIBE an
   UNSUBACK.
+- `zzq-tokio`: a refused TCP connect under `tls://`, `ws://` or `wss://`
+  failed with `Error::Io` instead of `Error::Refused`, as `tcp://` does.
 
 ## [0.2.0] - 2026-10-27
 

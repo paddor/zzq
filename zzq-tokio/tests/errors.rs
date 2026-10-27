@@ -74,3 +74,35 @@ async fn tls_errors_name_the_failed_step() {
     assert!(e.to_string().starts_with("tls: "), "{e}");
     assert!(e.source().is_some(), "{e:?}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_connect_is_refused_under_tls_and_websocket() {
+    let ctx = Context::new().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut uris = vec![format!("ws://127.0.0.1:{port}/mqtt")];
+    if cfg!(feature = "tls") {
+        uris.push(format!("tls://127.0.0.1:{port}"));
+        uris.push(format!("wss://127.0.0.1:{port}/mqtt"));
+    }
+    for uri in uris {
+        let endpoint: Endpoint = uri.parse().unwrap();
+        let Err(e) = connect(&ctx, &endpoint, &TransportOptions::default()).await else {
+            panic!("{uri}: connect to a closed port succeeded");
+        };
+        assert!(
+            matches!(
+                e,
+                Error::Refused {
+                    source: Some(_),
+                    ..
+                }
+            ),
+            "{uri}: {e:?}"
+        );
+        assert_eq!(e.to_string(), format!("connection refused: {endpoint}"));
+    }
+}
