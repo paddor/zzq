@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- A forked child shared its parent's wake pipes, so one could take the
+  other's wake and leave a call waiting for good. A child now makes its own.
+- Every error the extension raised leaked its message, about 100 bytes.
+
 ## v0.4.0 — 2026-10-27
 
 - `Broker.new` takes `state_file:`: `#close` writes the sessions there, and
