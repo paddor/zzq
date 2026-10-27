@@ -86,9 +86,13 @@ async fn a_client_that_stops_receiving_keeps_its_connection() {
     }
     // Longer than the broker waits for a ping, without taking a message.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    for _ in 0..100 {
-        let m = timeout(WAIT, c.recv()).await.unwrap().unwrap();
-        assert_eq!(m.payload, "x");
+    for i in 0..100 {
+        // The broker's counters tell a message it never sent from one the
+        // client did not hand out.
+        let Ok(m) = timeout(WAIT, c.recv()).await else {
+            panic!("message {i} timed out: {:?}", broker.stats().await);
+        };
+        assert_eq!(m.unwrap().payload, "x");
     }
     // Still the same connection: without reconnect, a lost one ends the
     // client.

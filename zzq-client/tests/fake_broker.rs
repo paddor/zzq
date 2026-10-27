@@ -420,10 +420,15 @@ async fn disconnect_returns_while_the_broker_stops_reading() {
     // Accepts, then reads nothing more.
     let peer = Peer::accept(&l).await;
     let c = connecting.await.unwrap();
-    for _ in 0..4000 {
-        c.publish("t", vec![0u8; 1024], QoS::AtMostOnce)
-            .await
-            .unwrap();
+    // Publishes until one waits for room, however much the socket buffers
+    // took: the output is full and the writer stuck.
+    for sent in 0.. {
+        assert!(sent < 20_000, "no publish waited for room");
+        let publish = c.publish("t", vec![0u8; 1024], QoS::AtMostOnce);
+        let Ok(res) = timeout(Duration::from_millis(300), publish).await else {
+            break;
+        };
+        res.unwrap();
     }
     let done = timeout(WAIT, c.disconnect()).await;
     assert!(
