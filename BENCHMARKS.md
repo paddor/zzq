@@ -11,8 +11,8 @@ loopback.
   Brokers shipped as container images run in podman with host networking.
 - Before each run, the runner waits for 90% idle CPU and no compiler
   processes. A run that overlaps a compiler is repeated.
-- Each cell is one run. The charts show the newest run per cell, all from
-  2026-10-26.
+- Each cell is one run. The charts show the newest run per cell: zzq from
+  2026-10-27, the rest from 2026-10-26.
 - Rivals run tuned configs: in-flight windows of about 1000, queues of about
   100000, no rate limits, and Nagle off where they have the knob. Several
   defaults drop messages or pace subscribers, which would measure the
