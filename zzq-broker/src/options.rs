@@ -215,8 +215,10 @@ impl fmt::Debug for BrokerOptions {
     }
 }
 
-/// MQTT-SN gateway settings.
+/// MQTT-SN gateway settings. Start from [`SnOptions::default`] and set
+/// fields, as later versions may add more.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SnOptions {
     /// Gateway ID, sent in GWINFO.
     pub gateway_id: u8,
@@ -236,6 +238,9 @@ pub struct SnOptions {
     /// More REGISTERs get Rejected: congestion, and messages on further
     /// topics are dropped.
     pub max_topics: usize,
+    /// Clients served at once. Anyone can send a CONNECT over UDP, so more
+    /// get Rejected: congestion.
+    pub max_clients: usize,
 }
 
 impl Default for SnOptions {
@@ -248,6 +253,7 @@ impl Default for SnOptions {
             sleep_buffer: 1000,
             max_keep_alive: 3600,
             max_topics: 4096,
+            max_clients: 10_000,
         }
     }
 }

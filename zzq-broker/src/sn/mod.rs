@@ -97,63 +97,95 @@ impl Drop for Registered {
 
 /// Serves MQTT-SN on `socket` until the broker shuts down.
 pub(crate) async fn gateway(shared: Arc<Shared>, socket: UdpSocket) {
-    let socket = Rc::new(socket);
-    let owned = Owned(Rc::default());
-    let clients = &owned.0;
+    let mut g = Gateway {
+        shared,
+        socket: Rc::new(socket),
+        clients: Owned(Rc::default()),
+        next_id: 0,
+    };
     let mut buf = vec![0u8; MAX_DATAGRAM];
-    let mut next_id = 0u64;
     loop {
-        let Ok((n, addr)) = socket.recv_from(&mut buf).await else {
+        let Ok((n, addr)) = g.socket.recv_from(&mut buf).await else {
             continue;
         };
-        let datagram = &buf[..n];
+        g.datagram(addr, &buf[..n]).await;
+    }
+}
+
+/// The gateway's socket and clients.
+struct Gateway {
+    shared: Arc<Shared>,
+    socket: Rc<UdpSocket>,
+    clients: Owned,
+    /// The last ID a client got.
+    next_id: u64,
+}
+
+impl Gateway {
+    /// Handles a datagram from `addr`.
+    async fn datagram(&mut self, addr: SocketAddr, datagram: &[u8]) {
         let Ok((packet, _)) = sn::decode(datagram) else {
-            continue;
+            return;
         };
         match packet {
-            sn::Packet::Connect { .. } => {
-                // A live client handles its CONNECT: a resend, the end of
-                // its sleep, or a new start.
-                let live = clients.borrow().get(&addr).map(|l| l.tx.clone());
-                if let Some(tx) = live.filter(|tx| !tx.is_closed()) {
-                    let _ = tx.try_send(datagram.to_vec());
-                    continue;
-                }
-                let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
-                next_id += 1;
-                let registered = Registered {
-                    clients: clients.clone(),
-                    addr,
-                    id: next_id,
-                };
-                let client = Client::new(&shared, socket.clone(), addr);
-                let task = tokio::task::spawn_local(client.run(rx, datagram.to_vec(), registered));
-                let live = Live {
-                    id: next_id,
-                    tx,
-                    task: task.abort_handle(),
-                };
-                clients.borrow_mut().insert(addr, live);
-            }
+            sn::Packet::Connect { .. } => self.connect(addr, datagram).await,
             sn::Packet::SearchGw { .. } => {
                 let reply = sn::Packet::GwInfo {
-                    gw_id: shared.opts.sn.gateway_id,
+                    gw_id: self.shared.opts.sn.gateway_id,
                     address: &[],
                 };
-                send(&socket, addr, &reply).await;
+                send(&self.socket, addr, &reply).await;
             }
             sn::Packet::Publish {
                 flags, topic, data, ..
             } if flags.qos == SnQoS::NoConnection => {
-                publish_without_connection(&shared, topic, flags.retain, data);
+                publish_without_connection(&self.shared, topic, flags.retain, data);
             }
             _ => {
-                let tx = clients.borrow().get(&addr).map(|l| l.tx.clone());
+                let tx = self.clients.0.borrow().get(&addr).map(|l| l.tx.clone());
                 if let Some(tx) = tx {
                     let _ = tx.try_send(datagram.to_vec());
                 }
             }
         }
+    }
+
+    /// A live client handles its CONNECT: a resend, the end of its sleep,
+    /// or a new start. Otherwise a client starts, if there is room.
+    async fn connect(&mut self, addr: SocketAddr, datagram: &[u8]) {
+        let clients = &self.clients.0;
+        let live = clients.borrow().get(&addr).map(|l| l.tx.clone());
+        if let Some(tx) = live.filter(|tx| !tx.is_closed()) {
+            let _ = tx.try_send(datagram.to_vec());
+            return;
+        }
+        // A client that starts over from its address takes its own slot.
+        let full = {
+            let c = clients.borrow();
+            !c.contains_key(&addr) && c.len() >= self.shared.opts.sn.max_clients
+        };
+        if full {
+            let refused = sn::Packet::ConnAck {
+                code: sn::REJECTED_CONGESTION,
+            };
+            send(&self.socket, addr, &refused).await;
+            return;
+        }
+        let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
+        self.next_id += 1;
+        let registered = Registered {
+            clients: clients.clone(),
+            addr,
+            id: self.next_id,
+        };
+        let client = Client::new(&self.shared, self.socket.clone(), addr);
+        let task = tokio::task::spawn_local(client.run(rx, datagram.to_vec(), registered));
+        let live = Live {
+            id: self.next_id,
+            tx,
+            task: task.abort_handle(),
+        };
+        clients.borrow_mut().insert(addr, live);
     }
 }
 
