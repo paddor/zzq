@@ -131,8 +131,12 @@ impl Conn<'_> {
                 Ok(Some(m)) => {
                     self.s.inbox.push(m);
                     if self.s.inbox.hand_off() && !self.deliver()? {
+                        // Parked until the handle makes room, which wakes
+                        // the session only while the inbox stays blocked:
+                        // no second flush, which could succeed by now.
                         self.park(chunk.slice(at..), true);
-                        break;
+                        self.finish_acks();
+                        return Ok(());
                     }
                 }
                 Ok(None) => {}

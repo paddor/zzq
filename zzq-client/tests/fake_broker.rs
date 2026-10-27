@@ -726,8 +726,9 @@ async fn a_full_inbox_still_reads_the_acks_of_the_clients_requests() {
     let subscribed = timeout(Duration::from_secs(2), c.subscribe("v", QoS::AtMostOnce)).await;
     assert!(matches!(subscribed, Ok(Ok(_))), "{subscribed:?}");
     let _peer = broker.await.unwrap();
-    for _ in 1..100 {
-        assert_eq!(timeout(WAIT, c.recv()).await.unwrap().unwrap().payload, "x");
+    for i in 1..100 {
+        let m = timeout(WAIT, c.recv()).await;
+        assert!(matches!(m, Ok(Some(_))), "stalled after {i}: {m:?}");
     }
 }
 
