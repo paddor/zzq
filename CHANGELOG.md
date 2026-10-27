@@ -5,6 +5,8 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-27
+
 ### Added
 
 - `zzq-broker`: `Dropped::session_ended` counts the QoS 1/2 messages
