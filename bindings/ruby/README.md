@@ -59,9 +59,10 @@ broker.close
 ```
 
 Options: the limits `max_packet_size:`, `max_inflight:`, `max_queued:`,
-`receive_maximum:`, `max_subscriptions:`, `max_retained:`,
-`max_topic_levels:`, `topic_alias_maximum:`, `max_session_expiry:`,
-`max_connections:` and `max_keep_alive:` of zzq-broker's `BrokerOptions`,
+`max_queued_bytes:`, `receive_maximum:`, `max_subscriptions:`,
+`max_retained:`, `max_topic_levels:`, `topic_alias_maximum:`,
+`max_session_expiry:`, `max_connections:`, `max_state_bytes:` and
+`max_keep_alive:` of zzq-broker's `BrokerOptions`,
 plus `sys_interval:`, `connect_timeout:`, `persistence:` and `tls:`
 (`cert:`, `key:`, `client_ca:`).
 

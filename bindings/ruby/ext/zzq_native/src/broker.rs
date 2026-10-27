@@ -55,10 +55,10 @@ pub fn stats_hash(s: &Stats) -> RbResult<VALUE> {
         ("dropped_queue_full", s.dropped.queue_full),
         ("dropped_too_large", s.dropped.too_large),
         ("dropped_expired", s.dropped.expired),
+        ("dropped_session_ended", s.dropped.session_ended),
+        ("dropped_state_full", s.dropped.state_full),
         ("retained_rejected", s.retained_rejected),
-        // TODO: add `dropped_session_ended`, `dropped_state_full` and
-        // `state_bytes` once Cargo.toml requires the next zzq-broker
-        // release, the first one that has them.
+        ("state_bytes", s.state_bytes),
     ] {
         rb::hash_aset(h, rb::symbol(key)?, rb::u64_value(value))?;
     }
@@ -118,13 +118,11 @@ fn shutdown(this: VALUE) -> RbResult<VALUE> {
     let store = native.store.clone();
     match taken.map(Arc::try_unwrap) {
         Some(Ok(b)) => op::new(async move {
-            // TODO: raise the shutdown error once Cargo.toml requires the next
-            // zzq-broker release, whose shutdown returns one.
-            #[allow(clippy::let_unit_value, reason = "unit before that release")]
-            let _ = b.shutdown().await;
+            let res = b.shutdown().await;
             if let Some(store) = store {
                 store.flush();
             }
+            res?;
             Ok(Out::Nil)
         }),
         _ => Ok(rb::qnil()),

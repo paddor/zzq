@@ -9,9 +9,9 @@ module ZZQ
   #   broker.bind("mqtt://0.0.0.0:1883")
   class Broker
     OPTIONS = %i[
-      max_packet_size max_inflight max_queued receive_maximum max_subscriptions max_retained
-      max_topic_levels topic_alias_maximum max_session_expiry max_connections max_keep_alive
-      connect_timeout sys_interval persistence tls
+      max_packet_size max_inflight max_queued max_queued_bytes receive_maximum max_subscriptions
+      max_retained max_topic_levels topic_alias_maximum max_session_expiry max_connections
+      max_state_bytes max_keep_alive connect_timeout sys_interval persistence tls
     ].freeze
 
     # Starts a broker and binds it. With a block, yields it and closes it
@@ -78,6 +78,8 @@ module ZZQ
     # Stops the broker and waits until its connections are closed.
     #
     # @return [nil]
+    # @raise [ClosedError] if a lane stopped before it could close them; the
+    #   broker stops anyway
     def close
       return if @closed
 

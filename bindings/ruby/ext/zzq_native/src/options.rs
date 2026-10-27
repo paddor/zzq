@@ -136,16 +136,16 @@ pub fn broker(h: VALUE) -> RbResult<(BrokerOptions, Option<Arc<FilePersistence>>
         max_packet_size,
         max_inflight,
         max_queued,
+        max_queued_bytes,
         receive_maximum,
         max_subscriptions,
         max_retained,
         max_topic_levels,
         topic_alias_maximum,
         max_session_expiry,
-        max_connections
+        max_connections,
+        max_state_bytes
     );
-    // TODO: add `max_queued_bytes` and `max_state_bytes` once Cargo.toml
-    // requires the next zzq-broker release, the first one that has them.
     // Present but nil means no limit.
     if rb::hash_get(h, "max_keep_alive")?.is_some() {
         o.max_keep_alive = int(h, "max_keep_alive")?;

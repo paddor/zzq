@@ -18,6 +18,15 @@ module ZZQTestHelpers
     closing(ZZQ::Client.connect(endpoint, **options))
   end
 
+  # Waits until the block is true, failing after +timeout+ seconds.
+  def eventually(timeout = 2)
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + timeout
+    until yield
+      flunk "timed out" if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.01
+    end
+  end
+
   def closing(object)
     (@closing ||= []) << object
     object
