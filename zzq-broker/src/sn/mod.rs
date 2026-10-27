@@ -17,6 +17,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
+use tokio::task::AbortHandle;
 use zzq_proto::encode::{self, ConnectFields, WillFields};
 use zzq_proto::sn::{self, Flags, SnQoS, Topic};
 use zzq_proto::{Packet, QoS, Version, decode};
@@ -52,13 +53,53 @@ const CONNECTIONLESS_QUEUE: usize = 4096;
 /// Time a client has to answer WILLTOPICREQ and WILLMSGREQ.
 const WILL_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Datagram queue of each client, with an ID that tells reconnects apart.
-type Clients = Rc<RefCell<FxHashMap<SocketAddr, (u64, mpsc::Sender<Vec<u8>>)>>>;
+/// The live clients by address.
+type Clients = Rc<RefCell<FxHashMap<SocketAddr, Live>>>;
+
+/// A client's task and datagram queue, with an ID that tells reconnects
+/// apart.
+struct Live {
+    id: u64,
+    tx: mpsc::Sender<Vec<u8>>,
+    task: AbortHandle,
+}
+
+/// The gateway's client tasks, stopped with it.
+struct Owned(Clients);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        for live in self.0.borrow().values() {
+            live.task.abort();
+        }
+    }
+}
+
+/// A client's entry, removed when its task ends or is aborted, unless a
+/// reconnect from the same address replaced it.
+struct Registered {
+    clients: Clients,
+    addr: SocketAddr,
+    id: u64,
+}
+
+impl Drop for Registered {
+    fn drop(&mut self) {
+        // Taken only while the gateway, whose own drop aborts the tasks,
+        // walks the clients.
+        if let Ok(mut map) = self.clients.try_borrow_mut()
+            && map.get(&self.addr).is_some_and(|l| l.id == self.id)
+        {
+            map.remove(&self.addr);
+        }
+    }
+}
 
 /// Serves MQTT-SN on `socket` until the broker shuts down.
 pub(crate) async fn gateway(shared: Arc<Shared>, socket: UdpSocket) {
     let socket = Rc::new(socket);
-    let clients: Clients = Rc::default();
+    let owned = Owned(Rc::default());
+    let clients = &owned.0;
     let mut buf = vec![0u8; MAX_DATAGRAM];
     let mut next_id = 0u64;
     loop {
@@ -73,16 +114,26 @@ pub(crate) async fn gateway(shared: Arc<Shared>, socket: UdpSocket) {
             sn::Packet::Connect { .. } => {
                 // A live client handles its CONNECT: a resend, the end of
                 // its sleep, or a new start.
-                let live = clients.borrow().get(&addr).map(|(_, tx)| tx.clone());
+                let live = clients.borrow().get(&addr).map(|l| l.tx.clone());
                 if let Some(tx) = live.filter(|tx| !tx.is_closed()) {
                     let _ = tx.try_send(datagram.to_vec());
                     continue;
                 }
                 let (tx, rx) = mpsc::channel(CLIENT_QUEUE);
                 next_id += 1;
-                clients.borrow_mut().insert(addr, (next_id, tx));
-                let task = Client::new(&shared, socket.clone(), addr);
-                tokio::task::spawn_local(task.run(next_id, rx, datagram.to_vec(), clients.clone()));
+                let registered = Registered {
+                    clients: clients.clone(),
+                    addr,
+                    id: next_id,
+                };
+                let client = Client::new(&shared, socket.clone(), addr);
+                let task = tokio::task::spawn_local(client.run(rx, datagram.to_vec(), registered));
+                let live = Live {
+                    id: next_id,
+                    tx,
+                    task: task.abort_handle(),
+                };
+                clients.borrow_mut().insert(addr, live);
             }
             sn::Packet::SearchGw { .. } => {
                 let reply = sn::Packet::GwInfo {
@@ -97,7 +148,7 @@ pub(crate) async fn gateway(shared: Arc<Shared>, socket: UdpSocket) {
                 publish_without_connection(&shared, topic, flags.retain, data);
             }
             _ => {
-                let tx = clients.borrow().get(&addr).map(|(_, tx)| tx.clone());
+                let tx = clients.borrow().get(&addr).map(|l| l.tx.clone());
                 if let Some(tx) = tx {
                     let _ = tx.try_send(datagram.to_vec());
                 }
@@ -249,13 +300,14 @@ impl Client {
         }
     }
 
+    /// Serves the client until it is done. Its entry goes with `registered`.
     async fn run(
         mut self,
-        id: u64,
         mut rx: mpsc::Receiver<Vec<u8>>,
         mut connect: Vec<u8>,
-        clients: Clients,
+        registered: Registered,
     ) {
+        let _registered = registered;
         while let Some(mut pipe) = self.connect(&mut rx, &connect).await {
             let Some(again) = self.serve(&mut rx, &mut pipe).await else {
                 break;
@@ -264,10 +316,6 @@ impl Client {
             // connection closes as lost.
             connect = again;
             self = Client::new(&self.shared, self.socket.clone(), self.addr);
-        }
-        let mut map = clients.borrow_mut();
-        if map.get(&self.addr).is_some_and(|(i, _)| *i == id) {
-            map.remove(&self.addr);
         }
     }
 

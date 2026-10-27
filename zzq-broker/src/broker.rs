@@ -388,7 +388,7 @@ impl Broker {
         saved
     }
 
-    fn abort_tasks(&self) {
+    pub(crate) fn abort_tasks(&self) {
         for a in self
             .shared
             .tasks

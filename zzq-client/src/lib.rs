@@ -136,7 +136,7 @@ pub struct ClientOptions {
     /// `recv` takes the queue in batches, so up to twice this many can be
     /// in memory. QoS 1/2 messages are acked once taken: in groups while
     /// `recv` has more at hand, right away once it runs out. v5 brokers are
-    /// asked to keep at most this many unacked.
+    /// asked to keep at most this many unacked, or 65535 for more.
     pub inbox: usize,
     /// Transport settings, such as trust anchors for `tls://`.
     pub transport: TransportOptions,
