@@ -1074,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-bench"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "plotters",
  "serde",
@@ -1086,7 +1086,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-broker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "bytestring",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "bytestring",
@@ -1117,14 +1117,14 @@ dependencies = [
 
 [[package]]
 name = "zzq-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "zzq-tokio"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "quinn",
