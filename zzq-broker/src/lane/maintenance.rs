@@ -59,6 +59,7 @@ impl Lane {
             if let Some(c) = &s.conn {
                 let ka = c.keep_alive.get();
                 if ka > 0
+                    && !c.held.get()
                     && now.duration_since(c.last_rx.get())
                         > Duration::from_millis(u64::from(ka) * 1500)
                 {

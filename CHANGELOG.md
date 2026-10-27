@@ -140,6 +140,9 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: every new subscription scanned all subscriptions to its
   filter on every lane, so k sessions subscribing to one filter took O(k²).
   Only a subscription that replaces one scans now.
+- `zzq-broker`: a client whose packets the broker did not read, waiting for
+  room to forward them or for other lanes, could be disconnected for keep
+  alive. Keep alive now pauses during such waits.
 
 ## [0.1.1] - 2026-10-26
 

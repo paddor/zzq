@@ -96,6 +96,9 @@ pub(crate) struct ConnShared {
     /// Last packet to write before closing.
     farewell: RefCell<Vec<u8>>,
     pub(crate) last_rx: Cell<Instant>,
+    /// The read loop waits for the broker, for room to ship or for other
+    /// lanes, so the client may be sending while nothing is read.
+    pub(crate) held: Cell<bool>,
     /// Keep Alive in seconds.
     pub(crate) keep_alive: Cell<u16>,
     /// The writer took the CONNACK, so the client knows it connected.
@@ -111,6 +114,7 @@ impl ConnShared {
             closed: Cell::new(false),
             farewell: RefCell::new(Vec::new()),
             last_rx: Cell::new(Instant::now()),
+            held: Cell::new(false),
             keep_alive: Cell::new(keep_alive),
             connacked: Cell::new(false),
         }
@@ -535,14 +539,21 @@ async fn read_loop<R: AsyncRead + Unpin>(
             result
         };
         drop(chunk);
-        crate::broker::ship(lane).await;
+        conn.held.set(true);
+        let mut waited = crate::broker::ship(lane).await;
         // Let other connections on this lane run, such as subscribers whose
         // acks free up their window.
         tokio::task::yield_now().await;
         let held = lane.borrow_mut().take_held(conn.id);
+        waited |= !held.is_empty();
         for h in held {
             h.sync.wait().await;
             lane.borrow_mut().release(&h);
+        }
+        conn.held.set(false);
+        // Keep alive counts from the end of a wait the broker made.
+        if waited {
+            conn.last_rx.set(Instant::now());
         }
         if let Err(close) = result {
             return close;

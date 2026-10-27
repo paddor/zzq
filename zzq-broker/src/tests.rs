@@ -722,3 +722,28 @@ async fn an_idle_publisher_lets_go_of_stale_matches() {
     .await;
     assert_eq!(still, Some(false));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_publisher_held_back_by_the_broker_is_not_kicked_for_keep_alive() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let (ctx, _broker, uri) = setup(2, BrokerOptions::default()).await;
+    let mut sub = support::Raw::connect(&uri, &id_on("sub", 1, 2), Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtMostOnce))
+        .await;
+    let mut publisher = support::Raw::connect(&uri, &id_on("pub", 0, 2), Version::V5, 1).await;
+    // Lane 1 stops taking deliveries, so lane 0 fills its mailbox and the
+    // publisher waits for room longer than its keep alive allows.
+    ctx.lane(1)
+        .run(|| std::thread::sleep(Duration::from_secs(3)))
+        .unwrap();
+    for _ in 0..100 {
+        publisher.pub_("t", b"x", QoS::AtMostOnce, 0).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(3500)).await;
+    let mut ping = Vec::new();
+    zzq_proto::encode::pingreq(&mut ping);
+    publisher.send(&ping).await;
+    assert_eq!(publisher.next().await, support::Got::PingResp);
+}

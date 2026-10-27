@@ -37,11 +37,13 @@ thread_local! {
 
 /// Sends batches for other lanes collected on `lane`. Waits while a target
 /// lane is full, which slows the caller down instead of dropping.
-pub(crate) async fn ship(lane: &LaneRef) {
-    if !try_ship(lane) {
-        // Boxed, so the rare wait does not size every connection's future.
-        Box::pin(ship_waiting(lane)).await;
+pub(crate) async fn ship(lane: &LaneRef) -> bool {
+    if try_ship(lane) {
+        return false;
     }
+    // Boxed, so the rare wait does not size every connection's future.
+    Box::pin(ship_waiting(lane)).await;
+    true
 }
 
 /// Ships what goes without waiting. False if a batch is left that must
