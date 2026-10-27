@@ -203,13 +203,13 @@ async fn retain_handling_and_retain_as_published() {
         .await
         .unwrap();
     let never = SubscriptionOptions {
-        retain_handling: 2,
+        retain_handling: zzq_proto::RetainHandling::Never,
         ..SubscriptionOptions::default()
     };
     c.subscribe_with(&[("r", never)], 0).await.unwrap();
     nothing(&mut c).await;
     let if_new = SubscriptionOptions {
-        retain_handling: 1,
+        retain_handling: zzq_proto::RetainHandling::OnNewSubscription,
         retain_as_published: true,
         ..SubscriptionOptions::default()
     };

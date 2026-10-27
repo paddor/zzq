@@ -56,7 +56,7 @@ pub use zzq_tokio::transport::TransportOptions;
 pub use zzq_tokio::transport::tls::TlsOptions;
 pub use zzq_tokio::{Config, Context, Endpoint};
 
-pub use zzq_proto::{QoS, ReasonCode, SubscriptionOptions, Version, reason};
+pub use zzq_proto::{QoS, ReasonCode, RetainHandling, SubscriptionOptions, Version, reason};
 
 /// Client errors.
 #[derive(Debug, thiserror::Error)]

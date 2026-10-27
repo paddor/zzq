@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::task::{Context, Poll, Waker};
 
 use rb_sys::VALUE;
-use zzq_client::{Client, Handle, Message, QoS, ReasonCode, SubscriptionOptions};
+use zzq_client::{Client, Handle, Message, QoS, ReasonCode, RetainHandling, SubscriptionOptions};
 
 use crate::error::{self, Error};
 use crate::op::{self, Out};
@@ -116,7 +116,7 @@ fn subscribe(this: VALUE, filters: VALUE, sub_id: VALUE) -> RbResult<VALUE> {
             retain_as_published: rb::value_to_bool(rap)?,
             retain_handling: u8::try_from(rb::value_to_i64(rh)?)
                 .ok()
-                .filter(|n| *n <= 2)
+                .and_then(|n| RetainHandling::try_from(n).ok())
                 .ok_or_else(|| RubyErr::arg("retain_handling must be 0, 1 or 2"))?,
         };
         parsed.push((rb::value_to_string(filter)?, opts));

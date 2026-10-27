@@ -298,13 +298,27 @@ async fn resubscribe_replaces_the_subscription() {
         retain_handling,
         ..qos.into()
     };
-    raw.subscribe_with(1, &with_id(5), &[("re", opts(QoS::ExactlyOnce, 0))])
-        .await;
+    raw.subscribe_with(
+        1,
+        &with_id(5),
+        &[(
+            "re",
+            opts(QoS::ExactlyOnce, zzq_proto::RetainHandling::OnSubscribe),
+        )],
+    )
+    .await;
     assert_eq!(sub_ids(&raw.publish().await), BTreeSet::from([5]));
     // Resubscribing replaces QoS and identifier [MQTT-3.8.4-3], and with
     // Retain Handling 0 sends the retained message again.
-    raw.subscribe_with(2, &with_id(7), &[("re", opts(QoS::AtLeastOnce, 0))])
-        .await;
+    raw.subscribe_with(
+        2,
+        &with_id(7),
+        &[(
+            "re",
+            opts(QoS::AtLeastOnce, zzq_proto::RetainHandling::OnSubscribe),
+        )],
+    )
+    .await;
     let again = raw.publish().await;
     assert!(again.retain);
     assert_eq!(sub_ids(&again), BTreeSet::from([7]));
@@ -319,8 +333,18 @@ async fn resubscribe_replaces_the_subscription() {
     raw.quiet(200).await;
     // Retain Handling 1 skips it for an existing subscription; no
     // identifier clears it.
-    raw.subscribe_with(3, &[], &[("re", opts(QoS::AtMostOnce, 1))])
-        .await;
+    raw.subscribe_with(
+        3,
+        &[],
+        &[(
+            "re",
+            opts(
+                QoS::AtMostOnce,
+                zzq_proto::RetainHandling::OnNewSubscription,
+            ),
+        )],
+    )
+    .await;
     raw.quiet(200).await;
     publ.publish("re", "live", QoS::AtMostOnce).await.unwrap();
     assert!(sub_ids(&raw.publish().await).is_empty());
@@ -349,7 +373,7 @@ async fn topic_matching_handles_empty_levels() {
     // matching filter.
     let mut live = Raw::connect(&uri, "live", Version::V5, 0).await;
     let rh2 = SubscriptionOptions {
-        retain_handling: 2,
+        retain_handling: zzq_proto::RetainHandling::Never,
         ..QoS::AtMostOnce.into()
     };
     for (i, f) in filters.iter().enumerate() {

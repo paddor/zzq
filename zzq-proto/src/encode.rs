@@ -596,7 +596,7 @@ mod tests {
             qos: QoS::ExactlyOnce,
             no_local: true,
             retain_as_published: true,
-            retain_handling: 2,
+            retain_handling: crate::RetainHandling::Never,
         };
         for version in [Version::V311, Version::V5] {
             let mut out = Vec::new();

@@ -56,6 +56,9 @@ Notable changes to zzq. The format follows
   (name, predefined or short), and WILLTOPIC and WILLTOPICUPD carry
   `will: Option<(Flags, &str)>`. Forms that encoded to bytes decoding as
   another message no longer exist.
+- `zzq-proto`: `SubscriptionOptions::retain_handling` is a `RetainHandling`,
+  re-exported by `zzq-client`, instead of a `u8` whose 3 encoded the reserved
+  value and whose 4 and above silently became 0.
 
 ### Fixed
 

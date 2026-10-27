@@ -6,7 +6,7 @@ use zzq_proto::encode::{self, SubAckFields};
 use zzq_proto::packet::{Subscribe, Unsubscribe};
 use zzq_proto::property;
 use zzq_proto::topic::{SharedFilter, is_shared};
-use zzq_proto::{PacketType, QoS, SubscriptionOptions, reason};
+use zzq_proto::{PacketType, QoS, RetainHandling, SubscriptionOptions, reason};
 
 use crate::index::{Entry, SubIds, SubRef};
 use crate::msg::{Msg, Publication};
@@ -305,7 +305,12 @@ fn may_subscribe(acl: Option<&dyn Authorizer>, s: &Session, filter: &str) -> boo
 /// Whether a subscription gets the retained messages it matches, by
 /// Retain Handling. Shared subscriptions never do.
 fn retained_wanted(filter: &str, opts: SubscriptionOptions, existed: bool) -> bool {
-    !is_shared(filter) && (opts.retain_handling == 0 || (opts.retain_handling == 1 && !existed))
+    !is_shared(filter)
+        && match opts.retain_handling {
+            RetainHandling::OnSubscribe => true,
+            RetainHandling::OnNewSubscription => !existed,
+            RetainHandling::Never => false,
+        }
 }
 
 #[cfg(test)]

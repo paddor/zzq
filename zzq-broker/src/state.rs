@@ -662,7 +662,7 @@ mod tests {
                         qos: QoS::ExactlyOnce,
                         no_local: true,
                         retain_as_published: true,
-                        retain_handling: 2,
+                        retain_handling: zzq_proto::RetainHandling::Never,
                     },
                     9,
                 ),

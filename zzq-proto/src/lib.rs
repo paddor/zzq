@@ -59,4 +59,4 @@ pub use error::DecodeError;
 pub use packet::{Packet, decode, fixed_header};
 pub use property::{Properties, Property};
 pub use reason::ReasonCode;
-pub use types::{PacketType, QoS, SubscriptionOptions, Version};
+pub use types::{PacketType, QoS, RetainHandling, SubscriptionOptions, Version};
