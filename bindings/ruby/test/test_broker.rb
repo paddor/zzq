@@ -69,6 +69,39 @@ class BrokerTest < Minitest::Spec
     end
   end
 
+  it "keeps sessions across a restart with a state file" do
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "state")
+      opts = { client_id: "kept", clean_start: false, session_expiry: 60 }
+      b = broker(state_file: path)
+      endpoint = tcp_endpoint(b)
+      ZZQ::Client.connect(endpoint, **opts).then do |c|
+        c.subscribe("s", qos: 1)
+        c.close
+      end
+      ZZQ::Client.connect(endpoint).then do |c|
+        c.publish("s", "while down", qos: 1)
+        c.close
+      end
+      b.close
+      b = broker(state_file: path)
+      assert_path_exists "#{path}.loaded"
+      c = ZZQ::Client.connect(tcp_endpoint(b), **opts)
+      assert_predicate c, :session_present?
+      assert_equal "while down", c.receive(timeout: WAIT).payload
+      c.close
+      b.close
+    end
+  end
+
+  it "raises when it cannot write the state file" do
+    Dir.mktmpdir do |dir|
+      b = ZZQ::Broker.new(state_file: File.join(dir, "gone", "state"), sys_interval: nil)
+      assert_raises(ZZQ::Error) { b.close }
+      assert_predicate b, :closed?
+    end
+  end
+
   it "refuses calls once closed" do
     b = ZZQ::Broker.new(sys_interval: nil)
     b.close

@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- `Broker.new` takes `state_file:`: `#close` writes the sessions there, and
+  the next broker started with it resumes them.
+
 ## v0.3.0 — 2026-10-27
 
 - Built on the zzq 0.2 crates, with their fixes and faster QoS 1/2

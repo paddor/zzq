@@ -2,6 +2,7 @@
 //! side checked. A nil value keeps the default, except where nil means
 //! "none".
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -165,6 +166,7 @@ pub fn broker(h: VALUE) -> RbResult<(BrokerOptions, Option<Arc<FilePersistence>>
         None => None,
     };
     o.persistence = store.clone().map(|s| s as Arc<dyn zzq_broker::Persistence>);
+    o.state_file = string(h, "state_file")?.map(PathBuf::from);
     o.transport = transport(h)?;
     Ok((o, store))
 }
