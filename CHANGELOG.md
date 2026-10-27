@@ -22,6 +22,10 @@ Notable changes to zzq. The format follows
   publishes, even past a smaller Receive Maximum from the broker, which a
   v5 broker answers with a disconnect, on every reconnect. The rest now go
   as acks make room.
+- `zzq-client`: the reconnect backoff started over after every CONNACK, so
+  two clients with one client ID took the session from each other about 10
+  times a second, forever. A connection lost within `Reconnect::max` of its
+  CONNACK now keeps backing off.
 
 ## [0.2.0] - 2026-10-27
 

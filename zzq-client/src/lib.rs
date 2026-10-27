@@ -147,7 +147,8 @@ pub struct ClientOptions {
 }
 
 /// Reconnect backoff: waits `min` after a loss, doubling up to `max` while
-/// attempts fail.
+/// attempts fail. A connection lost within `max` of its CONNACK counts as a
+/// failed attempt, so clients that take each other's session over back off.
 #[derive(Debug, Clone, Copy)]
 pub struct Reconnect {
     /// First wait after a loss.

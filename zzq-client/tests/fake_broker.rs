@@ -508,3 +508,45 @@ async fn a_resume_resends_no_more_than_the_new_receive_maximum() {
     let (byte1, _) = second.packet().await;
     assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
 }
+
+/// Another client with the same ID takes the session over right after each
+/// CONNACK: the reconnects back off instead of starting over each time.
+#[tokio::test]
+async fn reconnects_after_a_quick_takeover_back_off() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(400),
+        }),
+        ..ClientOptions::new("twin")
+    };
+    let client = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut taken_over = Vec::new();
+    encode::reason_only(
+        PacketType::Disconnect,
+        Version::V5,
+        0x8E,
+        &[],
+        &mut taken_over,
+    );
+    let mut connects = 0;
+    let end = tokio::time::Instant::now() + Duration::from_secs(1);
+    while let Ok(accepted) = tokio::time::timeout_at(end, l.accept()).await {
+        let s = accepted.unwrap().0;
+        let mut peer = Peer { s, buf: Vec::new() };
+        assert_eq!(peer.packet().await.0 >> 4, 1, "CONNECT");
+        let mut out = Vec::new();
+        encode::connack(&ConnAckFields::default(), Version::V5, &mut out);
+        out.extend_from_slice(&taken_over);
+        peer.s.write_all(&out).await.unwrap();
+        connects += 1;
+    }
+    // 10, 20, 40, ... ms apart: about 7 in a second, not one per 10 ms.
+    assert!(connects <= 12, "{connects} connects in 1 s");
+    drop(client);
+}

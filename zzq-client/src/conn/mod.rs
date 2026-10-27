@@ -83,8 +83,10 @@ pub(crate) async fn run_session(
         if s.ended || s.opts.reconnect.is_none() || s.submit.dropped() {
             break;
         }
-        if s.established {
-            s.established = false;
+        // Only a connection that stayed up starts the backoff over. One that
+        // ends soon after CONNACK, such as one another client with the same
+        // ID takes over, keeps backing off.
+        if s.established.take().is_some_and(|at| at.elapsed() >= max) {
             delay = min;
         }
         if !s.wait_offline(delay).await {
@@ -123,8 +125,8 @@ pub(crate) struct Session {
     /// Granted subscriptions: filter, options and Subscription Identifier.
     subs: Vec<(String, SubscriptionOptions, u32)>,
     scratch: Scratch,
-    /// A connection got its CONNACK since the last backoff.
-    established: bool,
+    /// When a connection got its CONNACK, since the last backoff.
+    established: Option<Instant>,
     /// Do not reconnect.
     ended: bool,
 }
@@ -203,7 +205,7 @@ impl Session {
             inbound: Inbound::default(),
             subs: Vec::new(),
             scratch: Scratch::default(),
-            established: false,
+            established: None,
             ended: false,
         }
     }
@@ -242,7 +244,7 @@ where
         .unwrap_or(Err(Error::Closed));
     let session_present = match connected {
         Ok((c, quota)) => {
-            s.established = true;
+            s.established = Some(Instant::now());
             s.requests.quota = usize::from(quota.max(1));
             let present = c.session_present;
             if let Some(tx) = s.connack.take() {
