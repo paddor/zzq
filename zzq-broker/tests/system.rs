@@ -1298,6 +1298,60 @@ mod mqtt_sn {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn publishes_held_for_registers_are_capped_per_client() {
+        let (ctx, broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
+        let s = sn_client(&addr, "held").await;
+        let sub = Packet::Subscribe {
+            flags: qos(SnQoS::AtMostOnce),
+            msg_id: 1,
+            topic: Filter::Name("h/#"),
+        };
+        send(&s, &sub).await;
+        recv(&s).await;
+        // 8 topics with 100 messages each wait for REGACKs.
+        let publ = client(&ctx, &uri, "p", Version::V5).await;
+        for t in 0..8 {
+            for _ in 0..100 {
+                publ.publish(&format!("h/{t}"), "x", QoS::AtMostOnce)
+                    .await
+                    .unwrap();
+            }
+        }
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while broker.stats().await.unwrap().deliveries < 800 {
+            assert!(tokio::time::Instant::now() < deadline, "not delivered");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut registers = Vec::new();
+        while registers.len() < 8 {
+            if let Packet::Register {
+                topic_id, msg_id, ..
+            } = sn::decode(&recv(&s).await).unwrap().0
+                && !registers.iter().any(|&(t, _)| t == topic_id)
+            {
+                registers.push((topic_id, msg_id));
+            }
+        }
+        for (topic_id, msg_id) in registers {
+            let regack = Packet::RegAck {
+                topic_id,
+                msg_id,
+                code: sn::ACCEPTED,
+            };
+            send(&s, &regack).await;
+        }
+        let mut held = 0;
+        let mut buf = vec![0; 2048];
+        while let Ok(Ok(n)) = timeout(Duration::from_millis(500), s.recv(&mut buf)).await {
+            if matches!(sn::decode(&buf[..n]), Ok((Packet::Publish { .. }, _))) {
+                held += 1;
+            }
+        }
+        assert!(held <= 256, "{held} publishes held");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_sleep_lasts_no_longer_than_the_keep_alive_cap() {
         let opts = BrokerOptions {
             sn: SnOptions {

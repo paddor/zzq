@@ -269,6 +269,9 @@ struct Topics {
     registering: FxHashMap<u16, u16>,
     /// Datagrams waiting for a REGACK, by topic ID.
     held: FxHashMap<u16, Vec<Vec<u8>>>,
+    /// Datagrams in `held`, and their bytes.
+    held_count: usize,
+    held_bytes: usize,
 }
 
 /// Datagrams the client must ack.

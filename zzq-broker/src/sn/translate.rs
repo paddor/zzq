@@ -7,9 +7,6 @@ use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version};
 use super::topics::plain;
 use super::{Client, Inbound, MAX_SEND};
 
-/// Publishes held for a topic while its REGISTER waits for the REGACK.
-const HELD_MAX: usize = 256;
-
 impl Client {
     /// Translates a datagram from the client into MQTT bytes in `out`.
     pub(super) async fn inbound(&mut self, packet: &sn::Packet<'_>, out: &mut Vec<u8>) -> Inbound {
@@ -18,7 +15,7 @@ impl Client {
             sn::Packet::Register { msg_id, topic, .. } => self.register(msg_id, topic).await,
             sn::Packet::RegAck { msg_id, code, .. } => {
                 if let Some(topic_id) = self.topics.registering.remove(&msg_id) {
-                    let held = self.topics.held.remove(&topic_id).unwrap_or_default();
+                    let held = self.topics.release(topic_id);
                     if code == sn::ACCEPTED {
                         for d in held {
                             self.deliver(d).await;
@@ -296,10 +293,7 @@ impl Client {
         sn::encode(&publish, &mut d);
         match pending {
             Some(id) => {
-                let held = self.topics.held.entry(id).or_default();
-                if held.len() < HELD_MAX {
-                    held.push(d);
-                } else {
+                if !self.topics.hold(id, d) {
                     self.drop_publish(p);
                 }
             }
