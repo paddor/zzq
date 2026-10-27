@@ -287,8 +287,15 @@ impl Lane {
         })
     }
 
+    /// Delivers to session `key`: false if it is gone.
     #[inline]
-    pub(super) fn deliver(&mut self, key: Key, p: &Publication<'_>, owned: &mut Owned, g: Grant) {
+    pub(super) fn deliver(
+        &mut self,
+        key: Key,
+        p: &Publication<'_>,
+        owned: &mut Owned,
+        g: Grant,
+    ) -> bool {
         let Grant {
             qos,
             retain,
@@ -297,7 +304,7 @@ impl Lane {
         } = g;
         let o = &self.shared.opts;
         let Some(s) = self.sessions.get_mut(key) else {
-            return;
+            return false;
         };
         let outcome = if qos == QoS::AtMostOnce {
             if s.conn.is_none() {
@@ -330,6 +337,7 @@ impl Lane {
             self.congestion.hit.get_or_insert(Hit::Local(key));
         }
         self.count(outcome);
+        true
     }
 
     #[inline]
@@ -362,15 +370,6 @@ impl Lane {
             // After what came before it in the batch.
             Remote::Drained(ticket) => drop(ticket),
             Remote::Deliver { key, item, pins } => {
-                // The member's session ended after another lane picked it.
-                if self.sessions.get(key).is_none() {
-                    if item.qos == QoS::AtMostOnce {
-                        self.stats.dropped.offline += 1;
-                    } else {
-                        self.stats.dropped.session_ended += 1;
-                    }
-                    return;
-                }
                 let p = Publication {
                     pins,
                     ..Publication::of(&item.msg)
@@ -382,7 +381,14 @@ impl Lane {
                     sub_id: item.sub_id,
                     last: true,
                 };
-                self.deliver(key, &p, &mut owned, g);
+                // The member's session ended after another lane picked it.
+                if !self.deliver(key, &p, &mut owned, g) {
+                    if item.qos == QoS::AtMostOnce {
+                        self.stats.dropped.offline += 1;
+                    } else {
+                        self.stats.dropped.session_ended += 1;
+                    }
+                }
             }
         }
     }
