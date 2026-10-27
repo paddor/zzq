@@ -198,8 +198,8 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidOption`] for a zero `sys_interval`, `sn.retry` or
-    /// `receive_maximum`, [`Error::Persistence`] if stored retained messages
+    /// [`Error::InvalidOption`] for a zero `sys_interval`, `sn.retry`,
+    /// `sn.max_keep_alive` or `receive_maximum`, [`Error::Persistence`] if stored retained messages
     /// cannot be loaded, [`Error::State`] if the state file cannot be read,
     /// and [`Error::Transport`] if the lanes have stopped.
     pub async fn new(ctx: &Context, opts: BrokerOptions) -> Result<Broker> {
@@ -433,6 +433,9 @@ fn check(o: &BrokerOptions) -> Result<()> {
     }
     if o.sn.retry.is_zero() {
         return Err(Error::InvalidOption("sn.retry"));
+    }
+    if o.sn.max_keep_alive == 0 {
+        return Err(Error::InvalidOption("sn.max_keep_alive"));
     }
     // A v5 client must not get a Receive Maximum of 0.
     if o.receive_maximum == 0 {

@@ -224,6 +224,9 @@ pub struct SnOptions {
     pub retries: u8,
     /// Datagrams held for a sleeping client; the oldest is dropped.
     pub sleep_buffer: usize,
+    /// Keep alive, in seconds, for a client that asks for none or for more.
+    /// Over UDP nothing else tells the gateway that a client is gone.
+    pub max_keep_alive: u16,
     /// Topic IDs per client, registered by it or assigned by the gateway.
     /// More REGISTERs get Rejected: congestion, and messages on further
     /// topics are dropped.
@@ -238,6 +241,7 @@ impl Default for SnOptions {
             retry: Duration::from_secs(10),
             retries: 5,
             sleep_buffer: 1000,
+            max_keep_alive: 3600,
             max_topics: 4096,
         }
     }

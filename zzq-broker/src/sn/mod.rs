@@ -298,10 +298,15 @@ impl Client {
         } else {
             None
         };
+        let max = self.shared.opts.sn.max_keep_alive;
         let fields = ConnectFields {
             version: Version::V311,
             clean_start: flags.clean_session,
-            keep_alive: duration,
+            keep_alive: if duration == 0 {
+                max
+            } else {
+                duration.min(max)
+            },
             properties: &[],
             client_id,
             will: will.as_ref().map(|(wf, topic, payload)| WillFields {
@@ -376,7 +381,7 @@ impl Client {
         rx: &mut mpsc::Receiver<Vec<u8>>,
         pipe: &mut DuplexStream,
     ) -> Option<Vec<u8>> {
-        let mut buf = BytesMut::with_capacity(64 << 10);
+        let mut buf = BytesMut::with_capacity(4 << 10);
         let mut out = Vec::new();
         let mut tick = tokio::time::interval(TICK.min(self.shared.opts.sn.retry));
         loop {

@@ -747,3 +747,50 @@ async fn a_publisher_held_back_by_the_broker_is_not_kicked_for_keep_alive() {
     publisher.send(&ping).await;
     assert_eq!(publisher.next().await, support::Got::PingResp);
 }
+
+/// An MQTT-SN client on a fresh socket that sent CONNECT and got CONNACK.
+async fn sn_connect(addr: &str, id: &str, duration: u16) -> tokio::net::UdpSocket {
+    use zzq_proto::sn::{self, Flags, Packet};
+
+    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    s.connect(addr).await.unwrap();
+    let connect = Packet::Connect {
+        flags: Flags {
+            clean_session: true,
+            ..Flags::default()
+        },
+        duration,
+        client_id: id,
+    };
+    let mut out = Vec::new();
+    sn::encode(&connect, &mut out);
+    s.send(&out).await.unwrap();
+    let mut buf = [0u8; 64];
+    let n = tokio::time::timeout(WAIT, s.recv(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        sn::decode(&buf[..n]).unwrap().0,
+        Packet::ConnAck { code: sn::ACCEPTED }
+    );
+    s
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_mqtt_sn_client_without_keep_alive_still_times_out() {
+    let opts = BrokerOptions {
+        sn: crate::SnOptions {
+            max_keep_alive: 1,
+            ..crate::SnOptions::default()
+        },
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, _uri) = setup(1, opts).await;
+    let addr = broker.bind("udp://127.0.0.1:0").await.unwrap().to_string();
+    // Anyone can send this over UDP, and a client that never comes back
+    // sends nothing that ends it.
+    let _s = sn_connect(addr.trim_start_matches("udp://"), "silent", 0).await;
+    stats_until(&broker, |s| s.connections == 1).await;
+    stats_until(&broker, |s| s.connections == 0).await;
+}

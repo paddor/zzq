@@ -143,6 +143,9 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a client whose packets the broker did not read, waiting for
   room to forward them or for other lanes, could be disconnected for keep
   alive. Keep alive now pauses during such waits.
+- `zzq-broker`: an MQTT-SN CONNECT with a duration of 0, which anyone can
+  send over UDP, made a client that never ended. Such clients, and those
+  asking for more, now get `SnOptions::max_keep_alive`, 3600 s by default.
 
 ## [0.1.1] - 2026-10-26
 
