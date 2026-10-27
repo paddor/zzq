@@ -127,6 +127,9 @@ pub(super) async fn read_loop<R: AsyncRead + Unpin>(
             Err(e) => return Close::Protocol(e.reason_code()),
         };
         if complete == 0 {
+            if let Some(close) = output_room(lane, key, conn).await {
+                return close;
+            }
             if let Some(close) = read_more(lane, conn, r, &mut input, partial).await {
                 return close;
             }
@@ -161,6 +164,30 @@ pub(super) async fn read_loop<R: AsyncRead + Unpin>(
         }
         if conn.is_closed() {
             return Close::Kicked;
+        }
+    }
+}
+
+/// Waits while the session's replies wait over `max_out_bytes` for the
+/// writer: a client that does not read them is not read either. `Some`
+/// once the connection ends.
+async fn output_room(lane: &LaneRef, key: Key, conn: &ConnShared) -> Option<Close> {
+    loop {
+        let full = {
+            let l = lane.borrow();
+            let max = l.shared.opts.max_out_bytes;
+            l.sessions
+                .get(key)
+                .is_some_and(|s| s.has_conn(conn.id) && s.out.buf.len() >= max)
+        };
+        if !full {
+            return None;
+        }
+        // Cancel-safe as in `read_more`.
+        tokio::select! {
+            biased;
+            () = conn.stop.notified() => return Some(Close::Kicked),
+            () = conn.drained.notified() => {}
         }
     }
 }

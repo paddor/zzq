@@ -28,6 +28,9 @@ pub(crate) struct ConnShared {
     pub(crate) id: u64,
     /// Wakes the writer.
     pub(crate) wake: Notify,
+    /// Wakes the reader once the writer took replies that were over
+    /// `max_out_bytes`.
+    pub(crate) drained: Notify,
     /// Wakes the reader to stop.
     stop: Notify,
     closed: Cell<bool>,
@@ -48,6 +51,7 @@ impl ConnShared {
         ConnShared {
             id,
             wake: Notify::new(),
+            drained: Notify::new(),
             stop: Notify::new(),
             closed: Cell::new(false),
             farewell: RefCell::new(Vec::new()),

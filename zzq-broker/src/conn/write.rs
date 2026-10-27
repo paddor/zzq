@@ -19,10 +19,15 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
         loop {
             let buf = {
                 let mut l = lane.borrow_mut();
+                let max_out = l.shared.opts.max_out_bytes;
                 match l.sessions.get_mut(key) {
                     Some(s) if s.has_conn(conn.id) && !s.out.buf.is_empty() => {
                         conn.connacked.set(true);
-                        s.take_out()
+                        let out = s.take_out();
+                        if out.len() >= max_out {
+                            conn.drained.notify_one();
+                        }
+                        out
                     }
                     _ => break,
                 }

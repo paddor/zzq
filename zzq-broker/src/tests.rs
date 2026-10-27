@@ -940,3 +940,43 @@ async fn mqtt_sn_clients_stop_with_their_gateway() {
     broker.abort_tasks();
     stats_until(&broker, |s| s.connections == 0).await;
 }
+
+/// A client that sends and never reads its replies stops being read once
+/// they reach `max_out_bytes`, instead of growing them without bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_client_that_does_not_read_its_replies_is_not_read_either() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zzq_proto::Version;
+
+    let opts = BrokerOptions {
+        max_out_bytes: 64 << 10,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    let socket = tokio::net::TcpSocket::new_v4().unwrap();
+    socket.set_recv_buffer_size(4096).unwrap();
+    let mut deaf = socket
+        .connect(uri.trim_start_matches("tcp://").parse().unwrap())
+        .await
+        .unwrap();
+    deaf.write_all(&support::connect_bytes(Version::V5, "deaf", &[]))
+        .await
+        .unwrap();
+    let mut connack = [0u8; 64];
+    let _ = deaf.read(&mut connack).await.unwrap();
+    // 32 MiB of PINGREQ asks for 32 MiB of PINGRESP.
+    let pings = [0xc0u8, 0x00].repeat(16 << 20);
+    let _ = tokio::time::timeout(Duration::from_secs(2), deaf.write_all(&pings)).await;
+    let waiting = on_lane(&ctx, &broker, 0, |l| {
+        l.sessions
+            .keys()
+            .filter_map(|k| l.sessions.get(k))
+            .map(|s| s.out.buf.len())
+            .max()
+    })
+    .await;
+    assert!(
+        waiting.is_some_and(|n| n < 1 << 20),
+        "replies waiting: {waiting:?}"
+    );
+}

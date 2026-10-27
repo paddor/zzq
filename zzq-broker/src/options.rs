@@ -93,8 +93,9 @@ pub struct BrokerOptions {
     /// QoS 1/2 messages queued for a connected session before publishers that
     /// feed it get their acks held back. Acks resume at half of this.
     pub qos_queue_high: usize,
-    /// Bytes waiting to be written per connection before QoS 0 messages to it
-    /// are dropped and counted.
+    /// Bytes waiting to be written per connection. Beyond it, QoS 0 messages
+    /// to the connection are dropped and counted, and the connection is not
+    /// read until its writer catches up.
     pub max_out_bytes: usize,
     /// QoS 2 messages from one client awaiting PUBREL, and the Receive
     /// Maximum advertised to v5 clients.
