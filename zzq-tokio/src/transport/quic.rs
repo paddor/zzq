@@ -228,6 +228,9 @@ impl QuicListener {
         for _ in 1..lanes {
             sockets.push(reuse_socket(bound).map_err(in_use)?);
         }
+        // Unbounded: each entry is a connection whose handshake took the
+        // client round trips, and the listener's owner takes them as they
+        // come.
         let (tx, accepted) = mpsc::unbounded_channel();
         let mut endpoints = Vec::with_capacity(lanes);
         let mut tasks = Vec::with_capacity(lanes);

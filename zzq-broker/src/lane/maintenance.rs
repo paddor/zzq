@@ -1,5 +1,6 @@
 //! Periodic sweeps, the state budget, and closing for a dump or shutdown.
 
+use std::collections::hash_map::Entry;
 use std::io;
 use std::ops::Range;
 use std::rc::Rc;
@@ -158,18 +159,17 @@ impl Lane {
         let lanes = self.shared.lanes.len();
         let now = Instant::now();
         for st in states {
-            if self.by_client.contains_key(&st.client_id) {
+            let Entry::Vacant(slot) = self.by_client.entry(st.client_id.clone()) else {
                 continue;
-            }
+            };
             let (session, will) = Session::restore(st, self.budget.total.clone(), lanes);
             let subs: Vec<(Box<str>, SubscriptionOptions, u32)> = session
                 .subs
                 .iter()
                 .map(|(f, (opts, id))| (f.clone(), *opts, *id))
                 .collect();
-            let client_id = session.client_id.clone();
             let key = self.sessions.insert(session);
-            self.by_client.insert(client_id, key);
+            slot.insert(key);
             for (filter, opts, sub_id) in subs {
                 let entry = self.entry_for(key, &filter, opts, sub_id);
                 self.subscribe_entry(&filter, &entry, false, Some(sync));

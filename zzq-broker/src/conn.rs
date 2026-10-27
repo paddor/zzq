@@ -623,6 +623,8 @@ async fn read_more<R: AsyncRead + Unpin>(
         *buf = block.split();
         Poll::Ready(Ok::<_, io::Error>(n))
     });
+    // Cancel-safe: a `notify_one` that a dropped `notified()` got passes on
+    // to the next one, and a dropped read took no bytes.
     tokio::select! {
         biased;
         () = conn.stop.notified() => Some(Close::Kicked),
