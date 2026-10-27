@@ -1296,6 +1296,36 @@ mod mqtt_sn {
         assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
         nothing(&mut watch).await;
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sleep_lasts_no_longer_than_the_keep_alive_cap() {
+        let opts = BrokerOptions {
+            sn: SnOptions {
+                max_keep_alive: 1,
+                ..SnOptions::default()
+            },
+            ..BrokerOptions::default()
+        };
+        let (_ctx, broker, _uri, addr) = bind_sn(opts).await;
+        let s = sn_client(&addr, "sleepy").await;
+        send(
+            &s,
+            &Packet::Disconnect {
+                duration: Some(u16::MAX),
+            },
+        )
+        .await;
+        assert_eq!(
+            sn::decode(&recv(&s).await).unwrap().0,
+            Packet::Disconnect { duration: None }
+        );
+        // Without a ping, the gateway lets go once 1.5 times the cap passed.
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while broker.stats().await.unwrap().connections > 0 {
+            assert!(tokio::time::Instant::now() < deadline, "still asleep");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
 }
 
 #[cfg(feature = "quic")]

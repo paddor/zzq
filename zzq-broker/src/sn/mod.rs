@@ -234,12 +234,28 @@ struct Client {
     /// MQTT packets the gateway itself sends to the broker.
     to_broker: Vec<u8>,
     topics: Topics,
-    /// Sleep deadline and duration while the client sleeps.
-    asleep: Option<(Instant, Duration)>,
-    /// Datagrams held while the client sleeps.
-    buffered: VecDeque<Vec<u8>>,
+    /// Keep alive of the MQTT connection.
+    keep_alive: Duration,
+    sleep: Sleep,
     retry: Retries,
     replies: Replies,
+}
+
+/// A sleeping client and what waits for it to wake.
+#[derive(Default)]
+struct Sleep {
+    /// Deadline and duration while the client sleeps.
+    until: Option<(Instant, Duration)>,
+    /// Datagrams held while the client sleeps.
+    buffered: VecDeque<Vec<u8>>,
+    /// When the gateway last pinged the broker for the sleeping client.
+    pinged: Option<Instant>,
+}
+
+impl Sleep {
+    const fn is_asleep(&self) -> bool {
+        self.until.is_some()
+    }
 }
 
 /// The client's topic IDs.
@@ -293,8 +309,8 @@ impl Client {
             connack: None,
             to_broker: Vec::new(),
             topics: Topics::default(),
-            asleep: None,
-            buffered: VecDeque::new(),
+            keep_alive: Duration::ZERO,
+            sleep: Sleep::default(),
             retry: Retries::default(),
             replies: Replies::default(),
         }
@@ -347,14 +363,16 @@ impl Client {
             None
         };
         let max = self.shared.opts.sn.max_keep_alive;
+        let keep_alive = if duration == 0 {
+            max
+        } else {
+            duration.min(max)
+        };
+        self.keep_alive = Duration::from_secs(u64::from(keep_alive));
         let fields = ConnectFields {
             version: Version::V311,
             clean_start: flags.clean_session,
-            keep_alive: if duration == 0 {
-                max
-            } else {
-                duration.min(max)
-            },
+            keep_alive,
             properties: &[],
             client_id,
             will: will.as_ref().map(|(wf, topic, payload)| WillFields {
@@ -444,14 +462,14 @@ impl Client {
                     }
                     self.fresh = false;
                     self.acked(&packet);
-                    if self.asleep.is_some() && !self.stays_asleep(&packet).await {
+                    if self.sleep.is_asleep() && !self.stays_asleep(&packet).await {
                         self.wake().await;
                     }
                     match self.inbound(&packet, &mut out).await {
                         Inbound::Continue => {}
                         Inbound::Sleep(seconds) => {
                             self.send(&sn::Packet::Disconnect { duration: None }).await;
-                            self.sleep(seconds);
+                            self.fall_asleep(seconds);
                         }
                         Inbound::Disconnect => {
                             let _ = pipe.write_all(&out).await;
@@ -489,7 +507,7 @@ impl Client {
     /// gone.
     async fn relay(&mut self, buf: &mut BytesMut, pipe: &mut DuplexStream) -> bool {
         while let Ok(Some((packet, n))) = decode(buf, Version::V311, usize::MAX) {
-            let datagrams = if self.asleep.is_some() && matches!(packet, Packet::PingResp) {
+            let datagrams = if self.sleep.is_asleep() && matches!(packet, Packet::PingResp) {
                 Vec::new()
             } else {
                 self.outbound(&packet)
@@ -509,7 +527,7 @@ impl Client {
     /// Handles a CONNECT on a live connection. A sleeping client wakes up,
     /// and a resend gets the CONNACK again. Returns true for a new start.
     async fn reconnects(&mut self, flags: Flags, client_id: &str) -> bool {
-        if self.asleep.is_some() && !flags.clean_session {
+        if self.sleep.is_asleep() && !flags.clean_session {
             self.send(&sn::Packet::ConnAck { code: sn::ACCEPTED }).await;
             self.wake().await;
             return false;
