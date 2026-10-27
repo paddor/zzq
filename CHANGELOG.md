@@ -30,6 +30,9 @@ Notable changes to zzq. The format follows
   than `Instant` reaches, as a damaged log or a custom `Persistence` can
   give, made the broker panic on start where `Instant` is narrow, such as
   macOS. It now loads without a deadline.
+- `zzq-broker`: after a spike of sessions, each lane kept a slot the size
+  of a session, about 750 bytes, for every session it ever held at once.
+  Lanes now reuse the lowest free slots and give back the rest.
 
 ## [0.2.0] - 2026-10-27
 

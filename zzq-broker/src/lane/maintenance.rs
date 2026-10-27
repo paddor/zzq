@@ -39,6 +39,10 @@ impl Lane {
                 .unwrap_or_else(PoisonError::into_inner)
                 .sweep(now);
         }
+        // Before the round, so its parts split the same slots.
+        if part == 0 {
+            self.sessions.trim();
+        }
         let generation = self.index.generation();
         for slot in sweep_part(part, self.sessions.slots()) {
             let Some(key) = self.sessions.key_at(slot) else {
