@@ -151,6 +151,10 @@ Notable changes to zzq. The format follows
   under the refused topic ID when the client rejected the REGISTER. At most
   256 now wait per topic, and a rejected REGISTER drops them and forgets the
   ID.
+- `zzq-client`: QoS 1/2 publishes beyond the broker's Receive Maximum
+  waited in the session without a limit, so `Handle::enqueue` callers that
+  did not await the acks were never held back. Publishing now waits once
+  1 MiB of them waits.
 
 ## [0.1.1] - 2026-10-26
 

@@ -135,6 +135,9 @@ struct Requests {
     next_pkid: u16,
     /// QoS 1/2 publishes beyond the broker's Receive Maximum.
     waiting: VecDeque<Cmd>,
+    /// Bytes of the publishes in `waiting`. At `submit::QUEUED`, the session takes
+    /// no more requests, so callers wait as on a full queue.
+    waiting_bytes: usize,
     /// QoS 1/2 publishes sent and not yet acked.
     inflight: usize,
     /// The broker's Receive Maximum.
@@ -183,6 +186,7 @@ impl Session {
                 sent: 0,
                 next_pkid: 0,
                 waiting: VecDeque::new(),
+                waiting_bytes: 0,
                 inflight: 0,
                 quota: usize::from(u16::MAX),
             },
@@ -281,7 +285,7 @@ impl Conn<'_> {
                 chain_armed = true;
             }
             tokio::select! {
-                () = self.s.submit.ready(), if self.out.has_room() => {
+                () = self.s.submit.ready(), if self.takes_requests() => {
                     if !self.requests() {
                         return Ok(());
                     }
@@ -344,6 +348,7 @@ impl Session {
         let queued = self.submit.close();
         let left = std::mem::take(&mut self.scratch.batch);
         let mut cmds: Vec<Cmd> = self.requests.waiting.drain(..).collect();
+        self.requests.waiting_bytes = 0;
         for op in left.ops.into_iter().chain(queued.ops) {
             match op {
                 Op::Publish {

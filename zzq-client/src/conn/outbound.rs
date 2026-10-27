@@ -8,6 +8,7 @@ use zzq_proto::property::{self, Property};
 use zzq_proto::{PacketType, QoS, SubscriptionOptions};
 
 use crate::submit::Op;
+use crate::submit::QUEUED;
 use crate::{Cmd, Error};
 
 use super::{Change, Conn, Pending};
@@ -98,12 +99,21 @@ impl Conn<'_> {
         }
     }
 
+    /// Whether the session takes more requests: the writer has room, and
+    /// not too much waits for the broker's Receive Maximum.
+    pub(super) fn takes_requests(&self) -> bool {
+        self.out.has_room() && self.s.requests.waiting_bytes < QUEUED
+    }
+
     /// Sends waiting commands that may go now, in order.
     pub(super) fn send_waiting(&mut self) {
         while let Some(cmd) = self.s.requests.waiting.front()
             && !self.blocked(cmd)
         {
             if let Some(cmd) = self.s.requests.waiting.pop_front() {
+                if let Cmd::Publish { packet, .. } = &cmd {
+                    self.s.requests.waiting_bytes -= packet.len();
+                }
                 self.command(cmd);
             }
         }
@@ -139,6 +149,9 @@ impl Conn<'_> {
 
     fn command(&mut self, cmd: Cmd) {
         if self.blocked(&cmd) {
+            if let Cmd::Publish { packet, .. } = &cmd {
+                self.s.requests.waiting_bytes += packet.len();
+            }
             self.s.requests.waiting.push_back(cmd);
             return;
         }

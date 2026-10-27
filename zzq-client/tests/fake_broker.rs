@@ -265,3 +265,51 @@ async fn a_dropped_ack_wait_keeps_its_publish() {
     let acked = h.enqueue("t", "z", QoS::AtMostOnce, false).await.unwrap();
     acked.await.unwrap();
 }
+
+#[tokio::test]
+async fn publishes_past_the_receive_maximum_hold_back_the_caller() {
+    use zzq_proto::Property;
+    use zzq_proto::property::{self, RECEIVE_MAXIMUM};
+
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("rm"))
+                .await
+                .unwrap()
+        }
+    });
+    // A broker that allows one QoS 1 publish in flight and never acks.
+    let s = timeout(WAIT, l.accept()).await.unwrap().unwrap().0;
+    let mut peer = Peer { s, buf: Vec::new() };
+    assert_eq!(peer.packet().await.0 >> 4, 1, "CONNECT");
+    let mut props = Vec::new();
+    property::encode_all(&[Property::U16(RECEIVE_MAXIMUM, 1)], &mut props);
+    let ack = ConnAckFields {
+        properties: &props,
+        ..ConnAckFields::default()
+    };
+    let mut out = Vec::new();
+    encode::connack(&ack, Version::V5, &mut out);
+    peer.s.write_all(&out).await.unwrap();
+    let client = connecting.await.unwrap();
+    let handle = client.handle();
+    // The acks are never awaited: only room in the session may stop this.
+    let queued = timeout(Duration::from_secs(1), async {
+        for _ in 0..10_000 {
+            let acked = handle
+                .enqueue("t", vec![0u8; 1024], QoS::AtLeastOnce, false)
+                .await
+                .unwrap();
+            drop(acked);
+        }
+    })
+    .await;
+    assert!(
+        queued.is_err(),
+        "10 MB waited in the session for the broker"
+    );
+    drop(peer);
+}
