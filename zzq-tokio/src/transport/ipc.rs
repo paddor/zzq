@@ -30,7 +30,7 @@ impl IpcListener {
             (bind_abstract(abs).map_err(in_use)?, None)
         } else {
             let path = PathBuf::from(name);
-            if path.exists() && StdStream::connect(&path).is_err() {
+            if stale_socket(&path) {
                 let _ = std::fs::remove_file(&path);
             }
             (StdListener::bind(&path).map_err(in_use)?, Some(path))
@@ -51,6 +51,14 @@ impl IpcListener {
     pub(crate) fn endpoint(&self) -> Endpoint {
         Endpoint::Ipc(self.name.clone())
     }
+}
+
+/// Whether `path` is a socket file nobody listens on, as one left by a
+/// listener that died. Anything else stays, and binding over it fails.
+fn stale_socket(path: &std::path::Path) -> bool {
+    use std::os::unix::fs::FileTypeExt;
+    let socket = std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket());
+    socket && StdStream::connect(path).is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
 }
 
 impl Drop for IpcListener {
@@ -113,4 +121,19 @@ fn connect_abstract(_: &str) -> io::Result<StdStream> {
         io::ErrorKind::Unsupported,
         "abstract sockets need Linux",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_leaves_a_file_that_is_no_socket() {
+        let path = std::env::temp_dir().join(format!("zzq-ipc-file-{}", std::process::id()));
+        std::fs::write(&path, b"data").unwrap();
+        let bound = IpcListener::bind(path.to_str().unwrap());
+        assert!(bound.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"data");
+        std::fs::remove_file(&path).unwrap();
+    }
 }

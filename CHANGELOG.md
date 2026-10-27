@@ -170,6 +170,9 @@ Notable changes to zzq. The format follows
   reading, as could the session after its writer failed to flush. A
   DISCONNECT now goes through a full session and gets 2 s to be written, and
   a failed writer ends the connection.
+- `zzq-tokio`: binding `ipc://` removed whatever was at the path when a
+  connect to it failed, a regular file or a socket that refused for other
+  reasons. Only a socket nobody listens on is replaced now.
 
 ## [0.1.1] - 2026-10-26
 
