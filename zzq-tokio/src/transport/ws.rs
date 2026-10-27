@@ -22,6 +22,8 @@ const GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const MAX_HEADERS: usize = 8 << 10;
 /// Largest frame payload accepted.
 const MAX_FRAME: usize = 16 << 20;
+/// Largest piece of a frame payload read at once.
+const PAYLOAD_CHUNK: usize = 64 << 10;
 /// Buffer of the in-memory stream, each way.
 const PIPE_BYTES: usize = 256 << 10;
 /// How long the writer may finish once the peer closed.
@@ -212,8 +214,8 @@ pub(crate) async fn fuzz_server(mut data: &[u8]) {
     if let Some((key, _)) = check_upgrade(&head, "/mqtt") {
         let _ = accept_key(key);
     }
-    let mut payload = Vec::new();
-    while let Ok(Some(_)) = read_frame(&mut data, true, &mut payload).await {}
+    let (ctl, _writer) = mpsc::channel(1);
+    frames_in(data, tokio::io::sink(), ctl, Role::Server).await;
 }
 
 /// Reads an upgrade response and the server frames after it from `data`,
@@ -224,8 +226,8 @@ pub(crate) async fn fuzz_client(mut data: &[u8]) {
         return;
     };
     let _ = upgrade_accepted(&head, "dGhlIHNhbXBsZSBub25jZQ==");
-    let mut payload = Vec::new();
-    while let Ok(Some(_)) = read_frame(&mut data, false, &mut payload).await {}
+    let (ctl, _writer) = mpsc::channel(1);
+    frames_in(data, tokio::io::sink(), ctl, Role::Client).await;
 }
 
 async fn upgrade_server<S>(mut s: S, path: &str) -> Result<Stream>
@@ -306,23 +308,62 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut payload = Vec::new();
-    while let Ok(Some(opcode)) = read_frame(&mut ws, role == Role::Server, &mut payload).await {
-        match opcode {
-            OP_BINARY | OP_CONTINUATION => {
-                if pipe.write_all(&payload).await.is_err() {
-                    break;
+    let mut buf = Vec::new();
+    while let Ok(Some(h)) = read_header(&mut ws, role == Role::Server).await {
+        let more = match h.opcode {
+            OP_BINARY | OP_CONTINUATION => forward(&mut ws, &h, &mut buf, &mut pipe).await,
+            OP_PING => match read_control(&mut ws, &h).await {
+                Ok(data) => {
+                    let _ = ctl.try_send((OP_PONG, data));
+                    true
                 }
-            }
-            OP_PING => {
-                let _ = ctl.try_send((OP_PONG, std::mem::take(&mut payload)));
-            }
-            OP_PONG => {}
-            _ => break,
+                Err(_) => false,
+            },
+            OP_PONG => read_control(&mut ws, &h).await.is_ok(),
+            _ => false,
+        };
+        if !more {
+            break;
         }
     }
     let _ = ctl.send((OP_CLOSE, Vec::new())).await;
     let _ = pipe.shutdown().await;
+}
+
+/// Copies the payload of data frame `h` to `pipe`, unmasked, as it comes,
+/// so a large frame needs no buffer of its size. False if either side
+/// fails.
+async fn forward<R, W>(ws: &mut R, h: &Header, buf: &mut Vec<u8>, pipe: &mut W) -> bool
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut at = 0;
+    while at < h.len {
+        let want = (h.len - at).min(PAYLOAD_CHUNK);
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        let chunk = &mut buf[..want];
+        let n = match ws.read(chunk).await {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => n,
+        };
+        h.unmask(&mut chunk[..n], at);
+        if pipe.write_all(&chunk[..n]).await.is_err() {
+            return false;
+        }
+        at += n;
+    }
+    true
+}
+
+/// The payload of control frame `h`, unmasked. At most 125 bytes.
+async fn read_control<R: AsyncRead + Unpin>(ws: &mut R, h: &Header) -> io::Result<Vec<u8>> {
+    let mut data = vec![0u8; h.len];
+    ws.read_exact(&mut data).await?;
+    h.unmask(&mut data, 0);
+    Ok(data)
 }
 
 /// Bytes to binary frames, plus control frames from the reader.
@@ -369,12 +410,30 @@ async fn frames_out<W, R>(
     let _ = ws.shutdown().await;
 }
 
-/// Reads one frame into `payload`, unmasked. `Ok(None)` at a clean end.
-async fn read_frame<R: AsyncRead + Unpin>(
+/// A frame header.
+struct Header {
+    opcode: u8,
+    /// Payload length.
+    len: usize,
+    mask: Option<[u8; 4]>,
+}
+
+impl Header {
+    /// Unmasks `data`, which starts `at` bytes into the payload.
+    fn unmask(&self, data: &mut [u8], at: usize) {
+        if let Some(mask) = self.mask {
+            for (i, b) in data.iter_mut().enumerate() {
+                *b ^= mask[(at + i) & 3];
+            }
+        }
+    }
+}
+
+/// Reads a frame header. `Ok(None)` at a clean end.
+async fn read_header<R: AsyncRead + Unpin>(
     r: &mut R,
     want_masked: bool,
-    payload: &mut Vec<u8>,
-) -> io::Result<Option<u8>> {
+) -> io::Result<Option<Header>> {
     let mut h = [0u8; 2];
     match r.read_exact(&mut h).await {
         Ok(_) => {}
@@ -400,18 +459,14 @@ async fn read_frame<R: AsyncRead + Unpin>(
     if len > MAX_FRAME {
         return Err(bad("frame too large"));
     }
-    let mut mask = [0u8; 4];
-    if masked {
+    let mask = if masked {
+        let mut mask = [0u8; 4];
         r.read_exact(&mut mask).await?;
-    }
-    payload.resize(len, 0);
-    r.read_exact(payload).await?;
-    if masked {
-        for (i, b) in payload.iter_mut().enumerate() {
-            *b ^= mask[i & 3];
-        }
-    }
-    Ok(Some(opcode))
+        Some(mask)
+    } else {
+        None
+    };
+    Ok(Some(Header { opcode, len, mask }))
 }
 
 fn write_frame(out: &mut Vec<u8>, opcode: u8, payload: &[u8], masked: bool) {
@@ -545,6 +600,21 @@ mod tests {
         (client, pump(socket, Role::Server))
     }
 
+    /// Reads one frame into `payload`, unmasked. `Ok(None)` at a clean end.
+    async fn read_frame<R: AsyncRead + Unpin>(
+        r: &mut R,
+        want_masked: bool,
+        payload: &mut Vec<u8>,
+    ) -> io::Result<Option<u8>> {
+        let Some(h) = read_header(r, want_masked).await? else {
+            return Ok(None);
+        };
+        payload.resize(h.len, 0);
+        r.read_exact(payload).await?;
+        h.unmask(payload, 0);
+        Ok(Some(h.opcode))
+    }
+
     fn ping(len: usize, fin: bool) -> Vec<u8> {
         let mut f = Vec::new();
         write_frame(&mut f, OP_PING, &vec![1; len], true);
@@ -589,6 +659,28 @@ mod tests {
                 })
                 .await;
                 assert!(gone.is_ok(), "the socket is still read");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn a_large_frame_reaches_the_byte_stream_before_it_is_complete() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, mut mqtt) = server();
+                let mut frame = Vec::new();
+                write_frame(&mut frame, OP_BINARY, &vec![7u8; 1 << 20], true);
+                // Header, mask and the first 1000 bytes of the payload.
+                client.write_all(&frame[..14 + 1000]).await.unwrap();
+                let mut got = vec![0u8; 1000];
+                let read = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    mqtt.read_exact(&mut got),
+                )
+                .await;
+                assert!(read.is_ok(), "nothing before the whole frame came");
+                assert!(got.iter().all(|&b| b == 7), "unmasked");
             })
             .await;
     }
