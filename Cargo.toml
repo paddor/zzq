@@ -5,7 +5,7 @@ default-members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.93"
 license = "ISC OR Apache-2.0"
@@ -35,10 +35,10 @@ panic = "warn"
 missing_const_for_fn = "warn"
 
 [workspace.dependencies]
-zzq-proto = { path = "zzq-proto", version = "0.1.1", default-features = false }
-zzq-tokio = { path = "zzq-tokio", version = "0.1.1", default-features = false }
-zzq-broker = { path = "zzq-broker", version = "0.1.1" }
-zzq-client = { path = "zzq-client", version = "0.1.1" }
+zzq-proto = { path = "zzq-proto", version = "0.2.0", default-features = false }
+zzq-tokio = { path = "zzq-tokio", version = "0.2.0", default-features = false }
+zzq-broker = { path = "zzq-broker", version = "0.2.0" }
+zzq-client = { path = "zzq-client", version = "0.2.0" }
 bytes = { version = "1.12", default-features = false }
 bytestring = "1.4"
 plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series"] }
