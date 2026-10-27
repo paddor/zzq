@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## v0.4.0 — 2026-10-27
+
 - `Broker.new` takes `state_file:`: `#close` writes the sessions there, and
   the next broker started with it resumes them.
 - `Broker#close` during a call on another thread, such as `#stats`,
