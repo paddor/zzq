@@ -2,6 +2,7 @@
 
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -132,8 +133,13 @@ where
         }
     };
     lane.borrow_mut().flush();
-    // A will published on takeover may go to other lanes.
-    crate::broker::ship(lane).await;
+    // A will published on takeover may go to other lanes. Keep alive counts
+    // from the end of a wait the broker made, as in the read loop.
+    conn.held.set(true);
+    if crate::broker::ship(lane).await {
+        conn.last_rx.set(Instant::now());
+    }
+    conn.held.set(false);
     let writer = tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
     Some((key, conn, version, buf, writer))
 }

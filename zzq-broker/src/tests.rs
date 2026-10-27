@@ -1066,3 +1066,34 @@ async fn a_bind_that_lands_after_the_stop_does_not_keep_accepting() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+
+/// A connection that waits with its lane to ship before its read loop
+/// starts is not kicked for keep alive meanwhile.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_held_back_at_connect_is_not_kicked_for_keep_alive() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let (ctx, _broker, uri) = setup(2, BrokerOptions::default()).await;
+    let mut sub = support::Raw::connect(&uri, &id_on("sub", 1, 2), Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtMostOnce))
+        .await;
+    let mut publisher = support::Raw::connect(&uri, &id_on("pub", 0, 2), Version::V5, 0).await;
+    // Lane 1 stops taking deliveries, so lane 0 waits for room to ship.
+    ctx.lane(1)
+        .run(|| std::thread::sleep(Duration::from_secs(3)))
+        .unwrap();
+    for _ in 0..100 {
+        publisher.pub_("t", b"x", QoS::AtMostOnce, 0).await;
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // A second publisher's batch waits behind the first in the lane's
+    // outbox, so a new connection waits for it too.
+    let mut second = support::Raw::connect(&uri, &id_on("pub2", 0, 2), Version::V5, 0).await;
+    second.pub_("t", b"y", QoS::AtMostOnce, 0).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut late = support::Raw::connect(&uri, &id_on("late", 0, 2), Version::V5, 1).await;
+    let mut ping = Vec::new();
+    zzq_proto::encode::pingreq(&mut ping);
+    late.send(&ping).await;
+    assert_eq!(late.next().await, support::Got::PingResp);
+}
