@@ -980,3 +980,40 @@ async fn a_client_that_does_not_read_its_replies_is_not_read_either() {
         "replies waiting: {waiting:?}"
     );
 }
+
+/// Acks held for a congested subscriber do not pile up for publisher
+/// connections that ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn held_acks_of_ended_connections_do_not_pile_up() {
+    use zzq_proto::{SubscriptionOptions, Version};
+
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        qos_queue_high: 2,
+        receive_maximum: 8,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
+    // Never acks, so it stays congested.
+    let mut sub = support::Raw::connect(&uri, "sub", Version::V5, 0).await;
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    for round in 1..=40 {
+        let mut p = support::Raw::connect(&uri, "pub", Version::V311, 0).await;
+        for pkid in 1..=8 {
+            p.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+        }
+        stats_until(&broker, |s| s.publishes >= round * 8).await;
+        drop(p);
+        stats_until(&broker, |s| s.connections == 1).await;
+    }
+    let held = on_lane(&ctx, &broker, 0, |l| {
+        l.sessions
+            .keys()
+            .filter_map(|k| l.sessions.get(k))
+            .find(|s| &*s.client_id == "sub")
+            .map(|s| s.backpressure.waiters.len())
+    })
+    .await;
+    assert!(held.is_some_and(|n| n <= 32), "held acks: {held:?}");
+}
