@@ -9,8 +9,9 @@ use std::task::{self, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
+use crate::signal::DataSignal;
 use crate::transport::inproc::Registry;
 use crate::{Error, Result};
 
@@ -110,7 +111,7 @@ impl LaneHandle {
 
 struct Lane {
     handle: LaneHandle,
-    stop: Arc<Notify>,
+    stop: Arc<DataSignal>,
 }
 
 struct Inner {
@@ -123,7 +124,7 @@ struct Inner {
 impl Drop for Inner {
     fn drop(&mut self) {
         for lane in &self.lanes {
-            lane.stop.notify_one();
+            lane.stop.mark();
         }
         let me = thread::current().id();
         let threads = std::mem::take(
@@ -173,8 +174,10 @@ impl Context {
         let mut lanes = Vec::with_capacity(n);
         let mut threads = Vec::with_capacity(n);
         for index in 0..n {
+            // Unbounded: jobs come from this process, such as an accepted
+            // connection, which holds its socket, so open files bound them.
             let (tx, rx) = mpsc::unbounded_channel();
-            let stop = Arc::new(Notify::new());
+            let stop = Arc::new(DataSignal::new());
             let stop2 = stop.clone();
             let (busy, spin) = (config.busy_poll, config.spin);
             // Built here, so a failure to build reaches the caller.
@@ -212,6 +215,7 @@ impl Context {
     /// The next lane in round-robin order.
     #[doc(hidden)]
     pub fn next_lane(&self) -> &LaneHandle {
+        // Relaxed: only spreads work, no data rides on it.
         self.lane(self.inner.next.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -233,7 +237,7 @@ fn runtime(busy: bool) -> io::Result<tokio::runtime::Runtime> {
 fn lane_main(
     rt: &tokio::runtime::Runtime,
     mut rx: mpsc::UnboundedReceiver<Job>,
-    stop: &Notify,
+    stop: &DataSignal,
     busy: bool,
     spin: Duration,
 ) {
@@ -250,7 +254,7 @@ fn lane_main(
         loop {
             tokio::select! {
                 biased;
-                () = stop.notified() => break,
+                () = stop.ready() => break,
                 job = rx.recv() => match job {
                     Some(job) => job(),
                     None => break,
@@ -292,6 +296,8 @@ impl Wake for Activity {
     }
 
     fn wake_by_ref(self: &Arc<Self>) {
+        // Relaxed: a hint for the spin window; the runtime wake below
+        // orders the work itself.
         self.woken.store(true, Ordering::Relaxed);
         self.runtime.wake_by_ref();
     }
@@ -310,6 +316,7 @@ impl<F: Future> Future for Spin<'_, F> {
             });
             (a.clone(), Waker::from(a))
         });
+        // Relaxed: see `Activity::wake_by_ref`.
         let woken = activity.woken.swap(false, Ordering::Relaxed);
         if let Poll::Ready(out) = this
             .lane

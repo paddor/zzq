@@ -226,6 +226,7 @@ impl Broker {
         )
         .map_err(Error::Persistence)?;
         let shared = Arc::new(Shared {
+            // Relaxed: only unique, no data rides on it.
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             opts,

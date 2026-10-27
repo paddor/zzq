@@ -94,6 +94,8 @@ impl Lane {
         if max == usize::MAX {
             return;
         }
+        // Relaxed: an estimate each lane rereads every sweep; a stale one is
+        // a second late.
         self.shared.lanes[usize::from(self.id)]
             .state
             .store(self.budget.total.get(), Ordering::Relaxed);

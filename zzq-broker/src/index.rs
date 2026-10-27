@@ -79,6 +79,8 @@ pub(crate) struct Entry {
 
 impl Entry {
     fn is_online(&self) -> bool {
+        // Relaxed: a hint for picking a share group member. A stale one
+        // picks an offline member, which queues the message.
         self.online
             .as_ref()
             .is_none_or(|o| o.load(Ordering::Relaxed))

@@ -101,15 +101,20 @@ impl StateSignal {
         }
     }
 
+    // Acquire: pairs with the Release bump, so an attempt made after a newer
+    // generation sees the change before it. A bump this misses is not lost:
+    // `changed_after` makes its `Notified` before the last load, and
+    // `notify_waiters` wakes every `Notified` made before it.
     #[inline]
     fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Bumps the generation and wakes every waiter.
     #[inline]
     pub fn notify_changed(&self) {
-        self.generation.fetch_add(1, Ordering::SeqCst);
+        // Release: see `generation`.
+        self.generation.fetch_add(1, Ordering::Release);
         self.notify.notify_waiters();
     }
 

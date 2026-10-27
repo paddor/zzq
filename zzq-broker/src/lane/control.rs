@@ -33,6 +33,8 @@ impl SyncAck {
 
     /// Waits until every lane applied the change.
     pub(crate) async fn wait(&self) {
+        // Acquire: pairs with each ticket's Release. Read-modify-writes chain
+        // them, so seeing 0 shows the work of every lane.
         self.changed
             .until(|| (self.remaining.load(Ordering::Acquire) == 0).then_some(()))
             .await;
@@ -55,7 +57,7 @@ impl Ticket {
 impl Drop for Ticket {
     fn drop(&mut self) {
         // Release: what the lane did before is visible to the waiter.
-        if self.0.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.0.remaining.fetch_sub(1, Ordering::Release) == 1 {
             self.0.changed.notify_changed();
         }
     }

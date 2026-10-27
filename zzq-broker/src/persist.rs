@@ -212,6 +212,7 @@ impl FilePersistence {
 
     /// Writes that failed. The broker keeps running without them.
     pub fn write_errors(&self) -> u64 {
+        // Relaxed: a counter, no data rides on it.
         self.errors.load(Ordering::Relaxed)
     }
 }
@@ -319,6 +320,7 @@ impl Writer {
 
     fn count(&self, ok: bool) {
         if !ok {
+            // Relaxed: see `write_errors`.
             self.errors.fetch_add(1, Ordering::Relaxed);
         }
     }

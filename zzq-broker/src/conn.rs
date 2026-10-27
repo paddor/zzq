@@ -456,10 +456,11 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
         let takeover = l.is_connected(&c.client_id);
         // `try_update`, the new name, needs Rust 1.99.
         #[allow(deprecated)]
+        // Relaxed: a count for the limit, no data rides on it.
         let reserved = takeover
             || l.shared
                 .connections
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
                     (n < o.max_connections).then_some(n + 1)
                 })
                 .is_ok();

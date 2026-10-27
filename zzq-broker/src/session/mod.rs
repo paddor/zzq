@@ -328,12 +328,14 @@ impl Session {
     /// Attaches a connection.
     pub(crate) fn bind(&mut self, conn: Rc<ConnShared>) {
         self.conn = Some(conn);
+        // Relaxed: see `index::Entry::is_online`.
         self.online.store(true, Ordering::Relaxed);
     }
 
     /// Detaches the connection.
     pub(crate) fn unbind(&mut self) {
         self.conn = None;
+        // Relaxed: see `index::Entry::is_online`.
         self.online.store(false, Ordering::Relaxed);
     }
 
