@@ -181,10 +181,14 @@ impl Context {
             let stop2 = stop.clone();
             let (busy, spin) = (config.busy_poll, config.spin);
             // Built here, so a failure to build reaches the caller.
-            let rt = runtime(busy)?;
+            let rt = LaneRuntime(Some(runtime(busy)?));
             let handle = thread::Builder::new()
                 .name(format!("{}-io-{index}", config.name))
-                .spawn(move || lane_main(&rt, rx, &stop2, busy, spin))?;
+                .spawn(move || {
+                    if let Some(rt) = &rt.0 {
+                        lane_main(rt, rx, &stop2, busy, spin);
+                    }
+                })?;
             threads.push((handle.thread().id(), handle));
             lanes.push(Lane {
                 handle: LaneHandle { index, tx },
@@ -221,6 +225,19 @@ impl Context {
 
     pub(crate) fn inproc(&self) -> &Arc<Registry> {
         &self.inner.inproc
+    }
+}
+
+/// A lane's runtime. Dropping it does not wait for blocking work, such as
+/// the DNS lookup of a connect, and does not panic in an async context, as
+/// on the caller's thread when a lane thread fails to start.
+struct LaneRuntime(Option<tokio::runtime::Runtime>);
+
+impl Drop for LaneRuntime {
+    fn drop(&mut self) {
+        if let Some(rt) = self.0.take() {
+            rt.shutdown_background();
+        }
     }
 }
 
@@ -416,5 +433,30 @@ mod tests {
         let before = cpu(&task);
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(cpu(&task) - before <= 3, "idle lane still spins");
+    }
+
+    #[test]
+    fn dropping_the_context_does_not_wait_for_blocking_work() {
+        let ctx = Context::new().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        ctx.lane(0)
+            .spawn(move || async move {
+                // As a DNS lookup of a connect does.
+                tokio::task::spawn_blocking(move || {
+                    let _ = tx.send(());
+                    thread::sleep(Duration::from_secs(5));
+                });
+            })
+            .unwrap();
+        rx.recv().unwrap();
+        let started = std::time::Instant::now();
+        drop(ctx);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn a_lane_runtime_drops_in_an_async_context() {
+        // As when its thread fails to start, on the caller's runtime.
+        drop(LaneRuntime(Some(runtime(false).unwrap())));
     }
 }
