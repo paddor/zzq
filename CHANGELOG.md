@@ -16,6 +16,8 @@ Notable changes to zzq. The format follows
   UNSUBACK.
 - `zzq-tokio`: a refused TCP connect under `tls://`, `ws://` or `wss://`
   failed with `Error::Io` instead of `Error::Refused`, as `tcp://` does.
+- `zzq-client`: CONNECT was written without a flush, so a transport that
+  buffers writes could hold it back and the connect time out.
 
 ## [0.2.0] - 2026-10-27
 
