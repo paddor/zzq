@@ -162,9 +162,14 @@ impl Conn<'_> {
         let v = self.s.opts.version;
         match packet {
             Packet::Publish(p) => return Ok(self.publish(&p, chunk)),
-            Packet::PubAck(a) | Packet::PubComp(a) => self.done(a.pkid, a.reason),
+            Packet::PubAck(a) | Packet::PubComp(a) => {
+                if self.awaits(a.pkid, true)? {
+                    self.done(a.pkid, a.reason);
+                }
+            }
             Packet::PubRec(a) => {
-                if a.reason >= 0x80 {
+                if !self.awaits(a.pkid, true)? {
+                } else if a.reason >= 0x80 {
                     self.done(a.pkid, a.reason);
                 } else if let Some((_, packet)) = self.s.requests.unacked.get_mut(&a.pkid) {
                     // Resend PUBREL, not the PUBLISH, from now on.
@@ -180,13 +185,14 @@ impl Conn<'_> {
                     .push(|b| encode::ack(&AckFields::new(PacketType::PubComp, a.pkid), v, b));
             }
             Packet::SubAck(ack) | Packet::UnsubAck(ack) => {
-                self.s.requests.unacked.remove(&ack.pkid);
-                match self.s.requests.pending.remove(&ack.pkid) {
-                    Some(Pending::Sub(tx, change)) => {
+                if self.awaits(ack.pkid, false)? {
+                    self.s.requests.unacked.remove(&ack.pkid);
+                    if let Some(Pending::Sub(tx, change)) =
+                        self.s.requests.pending.remove(&ack.pkid)
+                    {
                         self.apply(change, ack.codes);
                         let _ = tx.send(Ok(ack.codes.iter().map(|&c| c.into()).collect()));
                     }
-                    Some(Pending::Restore | Pending::Publish(_)) | None => {}
                 }
                 self.send_waiting();
             }
@@ -195,6 +201,17 @@ impl Conn<'_> {
             _ => return Err(Error::Protocol("unexpected packet")),
         }
         Ok(None)
+    }
+
+    /// Whether request `pkid` waits for an ack: a publish for PUBACK, PUBREC
+    /// and PUBCOMP, a subscribe or unsubscribe for SUBACK and UNSUBACK. An
+    /// ack of the other kind breaks the protocol.
+    fn awaits(&self, pkid: u16, publish: bool) -> Result<bool> {
+        match self.s.requests.pending.get(&pkid) {
+            None => Ok(false),
+            Some(p) if matches!(p, Pending::Publish(_)) == publish => Ok(true),
+            Some(_) => Err(Error::Protocol("ack of the wrong kind")),
+        }
     }
 
     fn publish(&mut self, p: &Publish<'_>, chunk: &Bytes) -> Option<Message> {

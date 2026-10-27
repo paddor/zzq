@@ -770,3 +770,35 @@ async fn a_broker_that_does_not_read_its_replies_is_not_read_either() {
     }
     assert!(sent < 64 << 20, "the client read {} MiB", sent >> 20);
 }
+
+#[tokio::test]
+async fn an_ack_of_the_wrong_kind_fails_the_request_it_names() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move {
+            Client::connect(&ctx, &uri, ClientOptions::new("wrong"))
+                .await
+                .unwrap()
+        }
+    });
+    let mut peer = Peer::accept(&l).await;
+    let c = connecting.await.unwrap();
+    let publish = tokio::spawn(async move { c.publish("t", "x", QoS::AtLeastOnce).await });
+    let (byte1, packet) = peer.packet().await;
+    assert_eq!(byte1 >> 4, 3, "PUBLISH");
+    let pkid = u16::from_be_bytes([packet[5], packet[6]]);
+    // A SUBACK for the publish's packet ID.
+    let mut out = Vec::new();
+    let fields = encode::SubAckFields {
+        kind: PacketType::SubAck,
+        pkid,
+        properties: &[],
+        codes: &[0],
+    };
+    encode::suback(&fields, Version::V5, &mut out);
+    peer.s.write_all(&out).await.unwrap();
+    let done = timeout(Duration::from_secs(2), publish).await;
+    assert!(matches!(done, Ok(Ok(Err(_)))), "{done:?}");
+}
