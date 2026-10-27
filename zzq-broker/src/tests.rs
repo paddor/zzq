@@ -815,7 +815,7 @@ async fn sn_recv(s: &tokio::net::UdpSocket, ms: u64) -> Option<Vec<u8>> {
 
 /// An MQTT-SN client subscribed to `topic` at QoS 0, and the broker.
 async fn sn_subscriber(topic: &str) -> (Context, Broker, tokio::net::UdpSocket) {
-    use zzq_proto::sn::{Flags, Packet, Topic};
+    use zzq_proto::sn::{Filter, Flags, Packet};
 
     let opts = BrokerOptions {
         sys_interval: None,
@@ -827,7 +827,7 @@ async fn sn_subscriber(topic: &str) -> (Context, Broker, tokio::net::UdpSocket) 
     let sub = Packet::Subscribe {
         flags: Flags::default(),
         msg_id: 1,
-        topic: Topic::Name(topic),
+        topic: Filter::Name(topic),
     };
     sn_send(&s, &sub).await;
     assert!(sn_recv(&s, 5000).await.is_some(), "no SUBACK");

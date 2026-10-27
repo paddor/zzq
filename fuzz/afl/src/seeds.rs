@@ -6,7 +6,7 @@ use std::time::{Duration, UNIX_EPOCH};
 use zzq_broker::{FilePersistence, Persistence, Retained};
 use zzq_proto::encode::{self, AckFields, ConnectFields, PublishHeader, WillFields};
 use zzq_proto::property::{self, Property};
-use zzq_proto::sn::{self, Flags, SnQoS, Topic};
+use zzq_proto::sn::{self, Filter, Flags, SnQoS, Topic};
 use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 
 /// Seeds for the target `name`.
@@ -132,11 +132,10 @@ fn mqtt_sn() -> Vec<Vec<u8>> {
         sn::Packet::Subscribe {
             flags,
             msg_id: 4,
-            topic: Topic::Name("a/#"),
+            topic: Filter::Name("a/#"),
         },
         sn::Packet::WillTopic {
-            flags: Some(flags),
-            topic: "w",
+            will: Some((flags, "w")),
         },
         sn::Packet::PingReq {
             client_id: Some("sn"),

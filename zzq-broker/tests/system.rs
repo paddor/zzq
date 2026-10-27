@@ -556,7 +556,7 @@ async fn tls_client_skips_verification_only_when_asked() {
 mod mqtt_sn {
     use super::*;
     use tokio::net::UdpSocket;
-    use zzq_proto::sn::{self, Flags, Packet, SnQoS, Topic};
+    use zzq_proto::sn::{self, Filter, Flags, Packet, SnQoS, Topic};
 
     async fn send(s: &UdpSocket, p: &Packet<'_>) {
         let mut out = Vec::new();
@@ -670,7 +670,7 @@ mod mqtt_sn {
             &Packet::Subscribe {
                 flags: qos(SnQoS::AtLeastOnce),
                 msg_id: 3,
-                topic: Topic::Name("cmd/x"),
+                topic: Filter::Name("cmd/x"),
             },
         )
         .await;
@@ -712,7 +712,7 @@ mod mqtt_sn {
             &Packet::Subscribe {
                 flags: qos(SnQoS::AtMostOnce),
                 msg_id: 4,
-                topic: Topic::Name("w/#"),
+                topic: Filter::Name("w/#"),
             },
         )
         .await;
@@ -794,7 +794,7 @@ mod mqtt_sn {
             &Packet::Subscribe {
                 flags: qos(SnQoS::AtLeastOnce),
                 msg_id: 1,
-                topic: Topic::Name(topic),
+                topic: Filter::Name(topic),
             },
         )
         .await;
@@ -971,7 +971,7 @@ mod mqtt_sn {
             &Packet::Subscribe {
                 flags: qos(SnQoS::ExactlyOnce),
                 msg_id: 4,
-                topic: Topic::Name("a/#"),
+                topic: Filter::Name("a/#"),
             },
         )
         .await;
@@ -1075,7 +1075,7 @@ mod mqtt_sn {
             &Packet::Subscribe {
                 flags: qos(SnQoS::AtLeastOnce),
                 msg_id: 1,
-                topic: Topic::Name("r/#"),
+                topic: Filter::Name("r/#"),
             },
         )
         .await;
@@ -1115,7 +1115,7 @@ mod mqtt_sn {
             &Packet::Subscribe {
                 flags: qos(SnQoS::AtLeastOnce),
                 msg_id: 1,
-                topic: Topic::Name("big/#"),
+                topic: Filter::Name("big/#"),
             },
         )
         .await;
@@ -1158,7 +1158,7 @@ mod mqtt_sn {
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
         let s = sn_client(&addr, "pre").await;
-        for (msg_id, topic) in [(1, Topic::Predefined(9)), (2, Topic::Name("r/#"))] {
+        for (msg_id, topic) in [(1, Filter::Predefined(9)), (2, Filter::Name("r/#"))] {
             let sub = Packet::Subscribe {
                 flags: qos(SnQoS::AtMostOnce),
                 msg_id,
@@ -1227,8 +1227,7 @@ mod mqtt_sn {
         send(&s, &connect).await;
         assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillTopicReq);
         let will_topic = Packet::WillTopic {
-            flags: Some(Flags::default()),
-            topic: "sn/will",
+            will: Some((Flags::default(), "sn/will")),
         };
         send(&s, &will_topic).await;
         assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillMsgReq);

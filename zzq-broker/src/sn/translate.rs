@@ -1,7 +1,7 @@
 //! Translation between MQTT-SN datagrams and MQTT packets.
 
 use zzq_proto::encode::{self, AckFields, PublishHeader};
-use zzq_proto::sn::{self, Flags, SnQoS, Topic};
+use zzq_proto::sn::{self, Filter, Flags, SnQoS, Topic};
 use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version};
 
 use super::topics::plain;
@@ -46,7 +46,7 @@ impl Client {
                 topic,
             } => self.subscribe_in(flags, msg_id, topic, out).await,
             sn::Packet::Unsubscribe { msg_id, topic, .. } => {
-                if let Some(filter) = self.topic_name(topic) {
+                if let Some(filter) = self.filter_name(topic) {
                     encode::unsubscribe(v, msg_id.max(1), &[], &[&filter], out);
                 }
             }
@@ -144,10 +144,10 @@ impl Client {
         &mut self,
         flags: Flags,
         msg_id: u16,
-        topic: Topic<'_>,
+        topic: Filter<'_>,
         out: &mut Vec<u8>,
     ) {
-        let filter = self.topic_name(topic);
+        let filter = self.filter_name(topic);
         // A plain filter gets its topic ID now, so SUBACK has one.
         let code = match &filter {
             None => sn::REJECTED_INVALID_TOPIC_ID,

@@ -51,6 +51,11 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: the `dropped_*` counters of `Stats` moved to
   `Stats::dropped`, a `Dropped` with `total()`, and the `sn_*` fields of
   `BrokerOptions` to `BrokerOptions::sn`, an `SnOptions`.
+- `zzq-proto`: MQTT-SN topics are typed by message: PUBLISH takes a
+  `Topic` (ID, predefined or short), SUBSCRIBE and UNSUBSCRIBE a `Filter`
+  (name, predefined or short), and WILLTOPIC and WILLTOPICUPD carry
+  `will: Option<(Flags, &str)>`. Forms that encoded to bytes decoding as
+  another message no longer exist.
 
 ### Fixed
 

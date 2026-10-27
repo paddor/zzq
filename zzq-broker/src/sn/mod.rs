@@ -124,7 +124,7 @@ fn predefined(shared: &Shared, id: u16) -> Option<&str> {
 
 /// QoS -1: a publish from a client without a connection. The hooks see a
 /// client with an empty ID and no credentials.
-fn publish_without_connection(shared: &Shared, topic: Topic<'_>, retain: bool, data: &[u8]) {
+fn publish_without_connection(shared: &Shared, topic: Topic, retain: bool, data: &[u8]) {
     let name = match topic {
         Topic::Predefined(id) => predefined(shared, id).map(str::to_owned),
         Topic::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
@@ -338,8 +338,7 @@ impl Client {
         let topic = self.ask(rx, &sn::Packet::WillTopicReq).await?;
         let Ok((
             sn::Packet::WillTopic {
-                flags: Some(flags),
-                topic,
+                will: Some((flags, topic)),
             },
             _,
         )) = sn::decode(&topic)

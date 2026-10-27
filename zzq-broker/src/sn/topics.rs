@@ -1,16 +1,26 @@
 //! Topic names, topic IDs and their registration.
 
-use zzq_proto::sn::{self, Topic};
+use zzq_proto::sn::{self, Filter, Topic};
 
 use super::{Client, MAX_SEND, predefined};
 
 impl Client {
-    pub(super) fn topic_name(&self, topic: Topic<'_>) -> Option<String> {
+    /// The topic name a PUBLISH refers to.
+    pub(super) fn topic_name(&self, topic: Topic) -> Option<String> {
         match topic {
             Topic::Id(id) => self.topics.by_id.get(&id).cloned(),
             Topic::Predefined(id) => predefined(&self.shared, id).map(str::to_owned),
             Topic::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
-            Topic::Name(n) => Some(n.to_owned()),
+            _ => None,
+        }
+    }
+
+    /// The topic or filter a SUBSCRIBE or UNSUBSCRIBE refers to.
+    pub(super) fn filter_name(&self, filter: Filter<'_>) -> Option<String> {
+        match filter {
+            Filter::Name(n) => Some(n.to_owned()),
+            Filter::Predefined(id) => predefined(&self.shared, id).map(str::to_owned),
+            Filter::Short(s) => std::str::from_utf8(&s).ok().map(str::to_owned),
             _ => None,
         }
     }
@@ -43,7 +53,7 @@ impl Client {
         &mut self,
         topic: &str,
         out: &mut Vec<Vec<u8>>,
-    ) -> Option<(Topic<'static>, Option<u16>)> {
+    ) -> Option<(Topic, Option<u16>)> {
         let predefined = &self.shared.opts.sn.predefined;
         if let Some((id, _)) = predefined.iter().find(|(_, t)| t == topic) {
             return Some((Topic::Predefined(*id), None));
