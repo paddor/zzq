@@ -7,16 +7,31 @@ use zzq_proto::{Packet, PacketType, QoS, SubscriptionOptions, Version};
 use super::topics::plain;
 use super::{Client, Inbound, MAX_SEND};
 
+/// Publishes held for a topic while its REGISTER waits for the REGACK.
+const HELD_MAX: usize = 256;
+
 impl Client {
     /// Translates a datagram from the client into MQTT bytes in `out`.
     pub(super) async fn inbound(&mut self, packet: &sn::Packet<'_>, out: &mut Vec<u8>) -> Inbound {
         let v = Version::V311;
         match *packet {
             sn::Packet::Register { msg_id, topic, .. } => self.register(msg_id, topic).await,
-            sn::Packet::RegAck { msg_id, .. } => {
+            sn::Packet::RegAck { msg_id, code, .. } => {
                 if let Some(topic_id) = self.topics.registering.remove(&msg_id) {
-                    for d in self.topics.held.remove(&topic_id).unwrap_or_default() {
-                        self.deliver(d).await;
+                    let held = self.topics.held.remove(&topic_id).unwrap_or_default();
+                    if code == sn::ACCEPTED {
+                        for d in held {
+                            self.deliver(d).await;
+                        }
+                    } else {
+                        // Refused: forget the ID, so the next message asks
+                        // again, and drop what waited for it.
+                        if let Some(name) = self.topics.by_id.remove(&topic_id) {
+                            self.topics.ids.remove(&name);
+                        }
+                        for d in held {
+                            self.drop_datagram(&d, out);
+                        }
                     }
                 }
             }
@@ -273,7 +288,14 @@ impl Client {
         let mut d = Vec::with_capacity(sn::encoded_len(&publish));
         sn::encode(&publish, &mut d);
         match pending {
-            Some(id) => self.topics.held.entry(id).or_default().push(d),
+            Some(id) => {
+                let held = self.topics.held.entry(id).or_default();
+                if held.len() < HELD_MAX {
+                    held.push(d);
+                } else {
+                    self.drop_publish(p);
+                }
+            }
             None => out.push(d),
         }
         out
@@ -283,12 +305,27 @@ impl Client {
     /// or because it does not fit a datagram, and acks it so the session's
     /// window moves on.
     fn drop_publish(&mut self, p: &zzq_proto::packet::Publish<'_>) {
-        match p.qos {
+        let mut acks = std::mem::take(&mut self.to_broker);
+        self.drop_qos(p.qos, p.pkid, &mut acks);
+        self.to_broker = acks;
+    }
+
+    /// Drops a translated PUBLISH datagram that waited for a REGACK, acking
+    /// it to the broker in `out`.
+    fn drop_datagram(&mut self, d: &[u8], out: &mut Vec<u8>) {
+        if let Ok((sn::Packet::Publish { flags, msg_id, .. }, _)) = sn::decode(d) {
+            self.drop_qos(flags.qos.mqtt(), msg_id, out);
+        }
+    }
+
+    /// Acks a dropped message of `qos` to the broker in `out`.
+    fn drop_qos(&mut self, qos: QoS, pkid: u16, out: &mut Vec<u8>) {
+        match qos {
             QoS::AtMostOnce => {}
-            QoS::AtLeastOnce => ack(&mut self.to_broker, PacketType::PubAck, p.pkid),
+            QoS::AtLeastOnce => ack(out, PacketType::PubAck, pkid),
             QoS::ExactlyOnce => {
-                self.replies.dropped.insert(p.pkid);
-                ack(&mut self.to_broker, PacketType::PubRec, p.pkid);
+                self.replies.dropped.insert(pkid);
+                ack(out, PacketType::PubRec, pkid);
             }
         }
     }

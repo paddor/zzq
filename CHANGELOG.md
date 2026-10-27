@@ -146,6 +146,11 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: an MQTT-SN CONNECT with a duration of 0, which anyone can
   send over UDP, made a client that never ended. Such clients, and those
   asking for more, now get `SnOptions::max_keep_alive`, 3600 s by default.
+- `zzq-broker`: the MQTT-SN gateway held every broker publish for a topic
+  whose REGISTER the client had not acked, without a limit, and released them
+  under the refused topic ID when the client rejected the REGISTER. At most
+  256 now wait per topic, and a rejected REGISTER drops them and forgets the
+  ID.
 
 ## [0.1.1] - 2026-10-26
 

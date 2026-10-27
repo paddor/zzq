@@ -794,3 +794,106 @@ async fn an_mqtt_sn_client_without_keep_alive_still_times_out() {
     stats_until(&broker, |s| s.connections == 1).await;
     stats_until(&broker, |s| s.connections == 0).await;
 }
+
+/// Sends `p` to the gateway.
+async fn sn_send(s: &tokio::net::UdpSocket, p: &zzq_proto::sn::Packet<'_>) {
+    let mut out = Vec::new();
+    zzq_proto::sn::encode(p, &mut out);
+    s.send(&out).await.unwrap();
+}
+
+/// The next datagram, or `None` within `ms` milliseconds.
+async fn sn_recv(s: &tokio::net::UdpSocket, ms: u64) -> Option<Vec<u8>> {
+    let mut buf = vec![0u8; 2048];
+    let n = tokio::time::timeout(Duration::from_millis(ms), s.recv(&mut buf))
+        .await
+        .ok()?
+        .unwrap();
+    buf.truncate(n);
+    Some(buf)
+}
+
+/// An MQTT-SN client subscribed to `topic` at QoS 0, and the broker.
+async fn sn_subscriber(topic: &str) -> (Context, Broker, tokio::net::UdpSocket) {
+    use zzq_proto::sn::{Flags, Packet, Topic};
+
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, _uri) = setup(1, opts).await;
+    let addr = broker.bind("udp://127.0.0.1:0").await.unwrap().to_string();
+    let s = sn_connect(addr.trim_start_matches("udp://"), "sn", 30).await;
+    let sub = Packet::Subscribe {
+        flags: Flags::default(),
+        msg_id: 1,
+        topic: Topic::Name(topic),
+    };
+    sn_send(&s, &sub).await;
+    assert!(sn_recv(&s, 5000).await.is_some(), "no SUBACK");
+    (ctx, broker, s)
+}
+
+/// The REGISTER that the next datagram must be: topic ID and message ID.
+fn register_of(d: &[u8]) -> (u16, u16) {
+    match zzq_proto::sn::decode(d).unwrap().0 {
+        zzq_proto::sn::Packet::Register {
+            topic_id, msg_id, ..
+        } => (topic_id, msg_id),
+        p => panic!("expected REGISTER, got {p:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_register_drops_what_waited_for_it() {
+    use zzq_proto::sn::{self, Packet};
+
+    let (_ctx, broker, s) = sn_subscriber("plant/#").await;
+    broker
+        .publish("plant/valve/1", "a", QoS::AtMostOnce)
+        .unwrap();
+    let (topic_id, msg_id) = register_of(&sn_recv(&s, 5000).await.unwrap());
+    let refuse = Packet::RegAck {
+        topic_id,
+        msg_id,
+        code: sn::REJECTED_INVALID_TOPIC_ID,
+    };
+    sn_send(&s, &refuse).await;
+    assert!(
+        sn_recv(&s, 300).await.is_none(),
+        "a publish under a refused topic ID"
+    );
+    // The next one asks again.
+    broker
+        .publish("plant/valve/1", "b", QoS::AtMostOnce)
+        .unwrap();
+    register_of(&sn_recv(&s, 5000).await.unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn publishes_waiting_for_a_register_are_bounded() {
+    use zzq_proto::sn::{self, Packet};
+
+    let (_ctx, broker, s) = sn_subscriber("plant/#").await;
+    for i in 0..1000u32 {
+        broker
+            .publish("plant/valve/1", i.to_be_bytes(), QoS::AtMostOnce)
+            .unwrap();
+    }
+    let (topic_id, msg_id) = register_of(&sn_recv(&s, 5000).await.unwrap());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let accept = Packet::RegAck {
+        topic_id,
+        msg_id,
+        code: sn::ACCEPTED,
+    };
+    sn_send(&s, &accept).await;
+    let mut got = 0;
+    while sn_recv(&s, 300).await.is_some() {
+        got += 1;
+    }
+    assert!(
+        got > 0 && got <= 256,
+        "{got} publishes held for one REGISTER"
+    );
+}
