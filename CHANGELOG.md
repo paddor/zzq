@@ -26,6 +26,10 @@ Notable changes to zzq. The format follows
   two clients with one client ID took the session from each other about 10
   times a second, forever. A connection lost within `Reconnect::max` of its
   CONNACK now keeps backing off.
+- `zzq-broker`: a retained message whose stored deadline lay further ahead
+  than `Instant` reaches, as a damaged log or a custom `Persistence` can
+  give, made the broker panic on start where `Instant` is narrow, such as
+  macOS. It now loads without a deadline.
 
 ## [0.2.0] - 2026-10-27
 
