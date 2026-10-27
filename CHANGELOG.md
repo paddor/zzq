@@ -193,6 +193,9 @@ Notable changes to zzq. The format follows
   3.1.1 client sent a password without a user name, both of which brokers
   refuse. DUP now goes with QoS 1 and 2 only, and such a client fails to
   connect with the new `Error::InvalidOption`.
+- `zzq-proto`: variable byte integers longer than their value needs, a
+  CONNACK with bytes after its fields, a SUBACK without a code and a 3.1.1
+  UNSUBACK with a payload decoded; they are malformed or a protocol error now.
 
 ## [0.1.1] - 2026-10-26
 

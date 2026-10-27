@@ -12,7 +12,8 @@ pub const MAX: usize = 268_435_455;
 ///
 /// # Errors
 ///
-/// [`DecodeError::Malformed`] if the integer runs past four bytes.
+/// [`DecodeError::Malformed`] if the integer runs past four bytes, or
+/// takes more bytes than its value needs [MQTT-1.5.5-1].
 #[inline]
 pub fn decode(buf: &[u8]) -> Result<Option<(usize, usize)>, DecodeError> {
     let mut value = 0usize;
@@ -22,6 +23,10 @@ pub fn decode(buf: &[u8]) -> Result<Option<(usize, usize)>, DecodeError> {
         };
         value |= usize::from(b & 0x7f) << (7 * i);
         if b & 0x80 == 0 {
+            // A last byte of 0 after the first adds nothing.
+            if b == 0 && i > 0 {
+                return Err(DecodeError::Malformed);
+            }
             return Ok(Some((value, i + 1)));
         }
     }
@@ -69,6 +74,19 @@ pub const fn encode(mut value: usize, out: &mut [u8; 4]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn longer_than_needed_is_malformed() {
+        assert_eq!(decode(&[0x00]), Ok(Some((0, 1))));
+        assert_eq!(decode(&[0x80, 0x01]), Ok(Some((128, 2))));
+        for b in [
+            &[0x80, 0x00][..],
+            &[0xff, 0x80, 0x00],
+            &[0x80, 0x80, 0x80, 0x00],
+        ] {
+            assert_eq!(decode(b), Err(DecodeError::Malformed), "{b:?}");
+        }
+    }
 
     #[test]
     #[cfg(debug_assertions)]

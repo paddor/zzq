@@ -314,9 +314,9 @@ pub fn decode_body(byte1: u8, body: &[u8], version: Version) -> Result<Packet<'_
         6 => Packet::PubRel(ack(body, v5)?),
         7 => Packet::PubComp(ack(body, v5)?),
         8 => Packet::Subscribe(subscribe(body, version)?),
-        9 => Packet::SubAck(suback(body, v5)?),
+        9 => Packet::SubAck(suback(body, v5, true)?),
         10 => Packet::Unsubscribe(unsubscribe(body, v5)?),
-        11 => Packet::UnsubAck(suback(body, v5)?),
+        11 => Packet::UnsubAck(suback(body, v5, v5)?),
         12 if body.is_empty() => Packet::PingReq,
         13 if body.is_empty() => Packet::PingResp,
         14 => Packet::Disconnect(reason_only(body, v5, Rules::DISCONNECT)?),
@@ -470,6 +470,9 @@ fn connack(body: &[u8], v5: bool) -> Result<ConnAck<'_>, DecodeError> {
     } else {
         Properties::EMPTY
     };
+    if !c.is_empty() {
+        return Err(DecodeError::Malformed);
+    }
     Ok(ConnAck {
         session_present: flags & 0x01 != 0,
         code,
@@ -561,7 +564,8 @@ fn unsubscribe(body: &[u8], v5: bool) -> Result<Unsubscribe<'_>, DecodeError> {
     })
 }
 
-fn suback(body: &[u8], v5: bool) -> Result<SubAck<'_>, DecodeError> {
+/// A SUBACK, or with `codes` false a 3.1.1 UNSUBACK, which has none.
+fn suback(body: &[u8], v5: bool, codes: bool) -> Result<SubAck<'_>, DecodeError> {
     let mut c = Cursor::new(body);
     let pkid = c.u16()?;
     let properties = if v5 {
@@ -569,10 +573,19 @@ fn suback(body: &[u8], v5: bool) -> Result<SubAck<'_>, DecodeError> {
     } else {
         Properties::EMPTY
     };
+    let rest = c.rest();
+    // One code per filter, and a SUBSCRIBE has at least one.
+    if rest.is_empty() == codes {
+        return Err(if codes {
+            DecodeError::Protocol
+        } else {
+            DecodeError::Malformed
+        });
+    }
     Ok(SubAck {
         pkid,
         properties,
-        codes: c.rest(),
+        codes: rest,
     })
 }
 
@@ -597,4 +610,21 @@ fn reason_only(body: &[u8], v5: bool, rules: Rules) -> Result<ReasonOnly<'_>, De
         return Err(DecodeError::Malformed);
     }
     Ok(ReasonOnly { reason, properties })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn acks_with_bytes_they_cannot_have_are_refused() {
+        // CONNACK with a byte after the return code.
+        assert!(decode(&[0x20, 0x03, 0x00, 0x00, 0x00], Version::V311, usize::MAX).is_err());
+        assert!(decode(&[0x20, 0x02, 0x00, 0x00], Version::V311, usize::MAX).is_ok());
+        // SUBACK without a code.
+        assert!(decode(&[0x90, 0x02, 0x00, 0x01], Version::V311, usize::MAX).is_err());
+        // 3.1.1 UNSUBACK with what would be a code.
+        assert!(decode(&[0xb0, 0x03, 0x00, 0x01, 0x00], Version::V311, usize::MAX).is_err());
+        assert!(decode(&[0xb0, 0x02, 0x00, 0x01], Version::V311, usize::MAX).is_ok());
+    }
 }
