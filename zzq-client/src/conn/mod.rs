@@ -271,6 +271,10 @@ where
     }
     let _ = c.serve(&mut r, &mut buf).await;
     c.out.close();
+    // Packets a full inbox left unread belong to this connection: with the
+    // session, the broker sends its messages again; without, their packet
+    // IDs mean other messages on the next.
+    s.scratch.rest = None;
     // A DISCONNECT gets a while to go out. A lost connection's output is
     // not worth waiting for: its unacked requests go again on the next.
     if s.ended {

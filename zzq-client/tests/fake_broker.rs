@@ -609,3 +609,63 @@ async fn a_resumed_pubrel_goes_at_once_and_takes_room() {
     assert_eq!((byte1 >> 4, byte1 & 0x08), (3, 0x08), "PUBLISH with DUP");
     drop((one, two));
 }
+
+#[tokio::test]
+async fn packets_left_unread_by_a_lost_connection_do_not_reach_the_next() {
+    let (l, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        inbox: 2,
+        keep_alive: 1,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("rest")
+    };
+    let connecting = tokio::spawn({
+        let ctx = ctx.clone();
+        async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
+    });
+    let mut first = Peer::accept(&l).await;
+    let mut c = connecting.await.unwrap();
+    let h = c.handle();
+    let sub = tokio::spawn(async move { h.subscribe("t", QoS::ExactlyOnce).await.unwrap() });
+    let (_, packet) = first.packet().await;
+    first.suback(&packet).await;
+    sub.await.unwrap();
+    let publish = |out: &mut Vec<u8>, qos, pkid, payload: &[u8]| {
+        let h = PublishHeader {
+            version: Version::V5,
+            dup: false,
+            qos,
+            retain: false,
+            topic: "t",
+            pkid,
+            properties: &[],
+        };
+        encode::publish(&h, payload, out);
+    };
+    // A full inbox leaves the QoS 2 message unread.
+    let mut out = Vec::new();
+    for _ in 0..10 {
+        publish(&mut out, QoS::AtMostOnce, 0, b"q0");
+    }
+    publish(&mut out, QoS::ExactlyOnce, 9, b"old");
+    first.s.write_all(&out).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    drop(first);
+    // The broker lost the session: packet ID 9 is a new message now.
+    let mut second = Peer::accept(&l).await;
+    let (_, packet) = second.packet().await;
+    second.suback(&packet).await;
+    let mut out = Vec::new();
+    publish(&mut out, QoS::ExactlyOnce, 9, b"new");
+    second.s.write_all(&out).await.unwrap();
+    let mut got = Vec::new();
+    while let Ok(Some(m)) = timeout(Duration::from_millis(1500), c.recv()).await {
+        got.push(m.payload);
+    }
+    assert!(got.contains(&"new".into()), "got {got:?}");
+    assert!(!got.contains(&"old".into()), "got {got:?}");
+}
