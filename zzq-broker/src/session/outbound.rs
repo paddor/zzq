@@ -53,8 +53,11 @@ impl Session {
         }
         self.charge.add(budget::held(&h));
         self.flow.queued_bytes += size;
+        let cap = self.flow.queue.capacity();
         self.flow.queue.push_back(h);
-        self.charge_room();
+        if self.flow.queue.capacity() != cap {
+            self.charge_room();
+        }
         if dropped == 0 {
             Outcome::Queued
         } else {
@@ -93,12 +96,15 @@ impl Session {
             self.charge.sub(budget::held(&h));
             return Outcome::TooLarge;
         }
+        let cap = self.flow.inflight.capacity();
         self.flow.inflight.push_back(Inflight {
             pkid,
             held: h,
             released: false,
         });
-        self.charge_room();
+        if self.flow.inflight.capacity() != cap {
+            self.charge_room();
+        }
         Outcome::Sent
     }
 
@@ -111,7 +117,8 @@ impl Session {
     }
 
     /// Charges the slots the queue and window have room for, which they
-    /// keep as they empty, and the room left in the arena block.
+    /// keep as they empty, and the room left in the arena block. Their room
+    /// changes only when a push grows them or a copy starts a block.
     pub(super) fn charge_room(&mut self) {
         let room = self.flow.queue.capacity() * size_of::<Kept>()
             + self.flow.inflight.capacity() * size_of::<Inflight>()
@@ -189,48 +196,48 @@ impl Session {
         wrote
     }
 
-    fn take_inflight(&mut self, pkid: u16, released: bool) -> Option<Inflight> {
-        let i = self
-            .flow
-            .inflight
-            .iter()
-            .position(|f| f.pkid == pkid && f.released == released)?;
+    /// Where the delivery in flight under `pkid` is in the window. IDs go
+    /// out in order and skip only IDs in use, so it sits at most `pkid -
+    /// front` from the front: look there, then back over acked gaps. A
+    /// window that wrapped all IDs, or came from a state file, may need
+    /// the rest.
+    fn inflight_at(&self, pkid: u16) -> Option<usize> {
+        let w = &self.flow.inflight;
+        let front = w.front()?.pkid;
+        let guess = usize::from(pkid.wrapping_sub(front)).min(w.len() - 1);
+        (0..=guess)
+            .rev()
+            .find(|&i| w[i].pkid == pkid)
+            .or_else(|| (guess + 1..w.len()).find(|&i| w[i].pkid == pkid))
+    }
+
+    fn take_inflight(&mut self, i: usize) {
         if i >= self.flow.inflight.len() - self.flow.unsent {
             self.flow.unsent -= 1;
         }
-        let f = self.flow.inflight.remove(i)?;
-        self.free_pkid(pkid);
-        self.charge.sub(budget::held(&f.held));
-        Some(f)
-    }
-
-    /// QoS of the delivery in flight under `pkid`, and whether PUBREC
-    /// released it.
-    fn inflight_state(&self, pkid: u16) -> Option<(QoS, bool)> {
-        self.flow
-            .inflight
-            .iter()
-            .find(|f| f.pkid == pkid)
-            .map(|f| (f.held.item.qos, f.released))
+        if let Some(f) = self.flow.inflight.remove(i) {
+            self.free_pkid(f.pkid);
+            self.charge.sub(budget::held(&f.held));
+        }
     }
 
     /// PUBACK from the client. `Err` with a reason code if it acks a QoS 2
     /// delivery.
     pub(crate) fn on_puback(&mut self, pkid: u16) -> Result<bool, u8> {
-        match self.inflight_state(pkid) {
-            None => Ok(false),
-            Some((QoS::AtLeastOnce, _)) => {
-                self.take_inflight(pkid, false);
-                Ok(self.pump())
-            }
-            Some(_) => Err(zzq_proto::reason::PROTOCOL_ERROR),
+        let Some(i) = self.inflight_at(pkid) else {
+            return Ok(false);
+        };
+        if self.flow.inflight[i].held.item.qos != QoS::AtLeastOnce {
+            return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
+        self.take_inflight(i);
+        Ok(self.pump())
     }
 
     /// PUBREC from the client. Answers with PUBREL. `Err` with a reason
     /// code if it acks a QoS 1 delivery.
     pub(crate) fn on_pubrec(&mut self, pkid: u16, reason: u8) -> Result<bool, u8> {
-        let Some(f) = self.flow.inflight.iter_mut().find(|f| f.pkid == pkid) else {
+        let Some(i) = self.inflight_at(pkid) else {
             self.ack(
                 PacketType::PubRel,
                 pkid,
@@ -238,11 +245,12 @@ impl Session {
             );
             return Ok(true);
         };
+        let f = &mut self.flow.inflight[i];
         if f.held.item.qos != QoS::ExactlyOnce {
             return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
         if reason >= 0x80 {
-            self.take_inflight(pkid, false);
+            self.take_inflight(i);
             return Ok(self.pump());
         }
         f.released = true;
@@ -253,14 +261,14 @@ impl Session {
     /// PUBCOMP from the client. `Err` with a reason code if it comes before
     /// PUBREC, or for a QoS 1 delivery.
     pub(crate) fn on_pubcomp(&mut self, pkid: u16) -> Result<bool, u8> {
-        match self.inflight_state(pkid) {
-            None => Ok(false),
-            Some((_, true)) => {
-                self.take_inflight(pkid, true);
-                Ok(self.pump())
-            }
-            Some(_) => Err(zzq_proto::reason::PROTOCOL_ERROR),
+        let Some(i) = self.inflight_at(pkid) else {
+            return Ok(false);
+        };
+        if !self.flow.inflight[i].released {
+            return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
+        self.take_inflight(i);
+        Ok(self.pump())
     }
 
     /// Resends the inflight window after a reconnect, as far as the
@@ -298,5 +306,47 @@ impl Session {
         }
         self.flow.inflight = inflight;
         wrote
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use zzq_proto::{QoS, Version};
+
+    use super::super::{Inflight, Kept, Queued, Session};
+    use crate::budget::LaneTotal;
+    use crate::index::SubIds;
+    use crate::msg::Msg;
+
+    fn inflight(pkid: u16) -> Inflight {
+        let item = Queued {
+            msg: Msg::new("t", b"x", &[], QoS::AtLeastOnce, false),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            sub_id: SubIds::default(),
+        };
+        Inflight {
+            pkid,
+            held: Kept::own(item),
+            released: false,
+        }
+    }
+
+    #[test]
+    fn acked_deliveries_are_found_past_gaps_and_the_id_wrap() {
+        let mut s = Session::new("c".into(), Version::V5, LaneTotal::default());
+        assert_eq!(s.inflight_at(1), None);
+        // Acks out of order left gaps, and IDs wrapped past 65535 to 1.
+        let ids = [65533, 65535, 1, 4];
+        for id in ids {
+            s.flow.inflight.push_back(inflight(id));
+        }
+        for (i, id) in ids.into_iter().enumerate() {
+            assert_eq!(s.inflight_at(id), Some(i));
+        }
+        assert_eq!(s.inflight_at(2), None);
+        // Out of order, as a state file may hold it: before where it sits.
+        s.flow.inflight.push_back(inflight(65534));
+        assert_eq!(s.inflight_at(65534), Some(4));
     }
 }
