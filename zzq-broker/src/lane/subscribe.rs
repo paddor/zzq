@@ -34,16 +34,22 @@ pub(crate) struct Held {
 type Wanted = (Box<str>, QoS, u32);
 
 impl Lane {
+    /// Adds a subscription on every lane. With `replace`, the session had
+    /// one to `filter` already.
     pub(super) fn subscribe_entry(
         &mut self,
         filter: &str,
         entry: &Entry,
+        replace: bool,
         sync: Option<&Arc<SyncAck>>,
     ) {
-        self.index.add(filter, entry.clone());
+        self.index.add(filter, entry.clone(), replace);
         let filter: Box<str> = filter.into();
-        self.broadcast(&|| {
-            Control::SubAdd(filter.clone(), entry.clone(), sync.map(SyncAck::ticket))
+        self.broadcast(&|| Control::SubAdd {
+            filter: filter.clone(),
+            entry: entry.clone(),
+            replace,
+            ticket: sync.map(SyncAck::ticket),
         });
     }
 
@@ -96,7 +102,7 @@ impl Lane {
             }
             let existed = s.subscribe(filter, opts, sub_id, lanes);
             let entry = self.entry_for(key, filter, opts, sub_id);
-            self.subscribe_entry(filter, &entry, sync.as_ref());
+            self.subscribe_entry(filter, &entry, existed, sync.as_ref());
             codes.push(opts.qos as u8);
             if retained_wanted(filter, opts, existed) {
                 wanted.push((filter.into(), opts.qos, sub_id));

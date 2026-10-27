@@ -148,11 +148,15 @@ impl Default for SubIndex {
 }
 
 impl SubIndex {
-    /// Adds or replaces the subscription of `entry.sub` to `filter`.
-    pub(crate) fn add(&mut self, filter: &str, entry: Entry) {
+    /// Adds the subscription of `entry.sub` to `filter`. With `replace`, the
+    /// session has one to `filter` already, which this replaces; without,
+    /// adding takes no scan of the filter's subscribers.
+    pub(crate) fn add(&mut self, filter: &str, entry: Entry, replace: bool) {
         let inner = inner_filter(filter);
-        self.trie
-            .remove(inner, |e| e.sub == entry.sub && e.share == entry.share);
+        if replace {
+            self.trie
+                .remove(inner, |e| e.sub == entry.sub && e.share == entry.share);
+        }
         if let Some(share) = &entry.share {
             self.rotations.entry(share.clone()).or_default();
         }
@@ -318,16 +322,18 @@ mod tests {
     #[test]
     fn overlapping_subscriptions_merge_and_groups_rotate() {
         let mut idx = SubIndex::default();
-        idx.add("a/+", entry(1, QoS::AtMostOnce, None));
-        idx.add("a/b", entry(1, QoS::ExactlyOnce, None));
-        idx.add("#", entry(2, QoS::AtLeastOnce, None));
+        idx.add("a/+", entry(1, QoS::AtMostOnce, None), false);
+        idx.add("a/b", entry(1, QoS::ExactlyOnce, None), false);
+        idx.add("#", entry(2, QoS::AtLeastOnce, None), false);
         idx.add(
             "$share/g/a/#",
             entry(3, QoS::AtMostOnce, Some("$share/g/a/#")),
+            false,
         );
         idx.add(
             "$share/g/a/#",
             entry(4, QoS::AtMostOnce, Some("$share/g/a/#")),
+            false,
         );
         let m = idx.lookup("a/b").0;
         assert_eq!(m.direct.len(), 2);
@@ -347,7 +353,7 @@ mod tests {
         let mut idx = SubIndex::default();
         let n = CACHE_ENTRIES / 2 + 1;
         for i in 0..n {
-            idx.add("#", entry(i as u32, QoS::AtMostOnce, None));
+            idx.add("#", entry(i as u32, QoS::AtMostOnce, None), false);
         }
         // A topic is cached on its second lookup.
         for topic in ["a", "a", "b", "b", "c", "c"] {
@@ -358,11 +364,20 @@ mod tests {
     }
 
     #[test]
+    fn a_replaced_subscription_stays_one() {
+        let mut idx = SubIndex::default();
+        idx.add("a", entry(1, QoS::AtMostOnce, None), false);
+        idx.add("a", entry(1, QoS::ExactlyOnce, None), true);
+        assert_eq!(idx.len(), 1);
+        assert_eq!(idx.lookup("a").0.direct[0].opts.qos, QoS::ExactlyOnce);
+    }
+
+    #[test]
     fn shared_rotation_spans_topics() {
         let mut idx = SubIndex::default();
         let share = Some("$share/g/t/#");
-        idx.add("$share/g/t/#", entry(1, QoS::AtMostOnce, share));
-        idx.add("$share/g/t/#", entry(2, QoS::AtMostOnce, share));
+        idx.add("$share/g/t/#", entry(1, QoS::AtMostOnce, share), false);
+        idx.add("$share/g/t/#", entry(2, QoS::AtMostOnce, share), false);
         let picks: Vec<SubRef> = (0..4)
             .map(|i| idx.lookup(&format!("t/{i}")).0.groups[0].pick().sub)
             .collect();

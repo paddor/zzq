@@ -137,6 +137,9 @@ Notable changes to zzq. The format follows
   topics with many matching subscriptions could fill gigabytes outside the
   state budget, and idle publishers kept matches the index had replaced. The
   cache now holds at most 262144 entries, and the sweep drops stale matches.
+- `zzq-broker`: every new subscription scanned all subscriptions to its
+  filter on every lane, so k sessions subscribing to one filter took O(k²).
+  Only a subscription that replaces one scans now.
 
 ## [0.1.1] - 2026-10-26
 

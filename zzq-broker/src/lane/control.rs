@@ -64,8 +64,14 @@ impl Drop for Ticket {
 /// Work sent to a lane by other lanes or the broker handle.
 #[derive(Debug)]
 pub(crate) enum Control {
-    /// Add a subscription, then count down the ack.
-    SubAdd(Box<str>, Entry, Option<Ticket>),
+    /// Add a subscription, in place of the session's one to the same filter
+    /// if it `replace`s one, then count down the ack.
+    SubAdd {
+        filter: Box<str>,
+        entry: Entry,
+        replace: bool,
+        ticket: Option<Ticket>,
+    },
     /// Remove a subscription, then count down the ack.
     SubRemove(Box<str>, SubRef, Option<Ticket>),
     Publish(Msg),
@@ -104,8 +110,13 @@ impl Lane {
     /// Handles a control message.
     pub(crate) fn control(&mut self, c: Control) {
         match c {
-            Control::SubAdd(filter, entry, ticket) => {
-                self.index.add(&filter, entry);
+            Control::SubAdd {
+                filter,
+                entry,
+                replace,
+                ticket,
+            } => {
+                self.index.add(&filter, entry, replace);
                 drop(ticket);
                 self.stats.subscriptions = self.index.len() as u64;
             }

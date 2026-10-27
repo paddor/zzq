@@ -169,7 +169,7 @@ impl Lane {
             self.by_client.insert(client_id, key);
             for (filter, opts, sub_id) in subs {
                 let entry = self.entry_for(key, &filter, opts, sub_id);
-                self.subscribe_entry(&filter, &entry, Some(sync));
+                self.subscribe_entry(&filter, &entry, false, Some(sync));
             }
             if let Some((due, msg)) = will {
                 self.schedule_will(key, msg, due.saturating_duration_since(now));
