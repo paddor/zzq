@@ -1017,3 +1017,36 @@ async fn held_acks_of_ended_connections_do_not_pile_up() {
     .await;
     assert!(held.is_some_and(|n| n <= 32), "held acks: {held:?}");
 }
+
+/// A SUBACK held for a connection that was taken over meanwhile sends
+/// neither the ack nor the retained messages of its subscriptions.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_suback_of_a_replaced_connection_sends_no_retained() {
+    use zzq_proto::Version;
+
+    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    broker
+        .publish_retained("r/t", "kept", QoS::AtMostOnce)
+        .unwrap();
+    stats_until(&broker, |s| s.retained == 1).await;
+    let _s = support::Raw::connect(&uri, "s", Version::V5, 0).await;
+    let sent = on_lane(&ctx, &broker, 0, |l| {
+        let key = l
+            .sessions
+            .keys()
+            .find(|&k| l.sessions.get(k).is_some_and(|s| &*s.client_id == "s"))?;
+        let conn = l.sessions.get(key)?.conn.as_ref()?.id;
+        let held = crate::lane::Held {
+            key,
+            // An earlier connection of the session.
+            conn: conn - 1,
+            sync: std::sync::Arc::default(),
+            packet: Box::new([]),
+            retained: vec![("r/#".into(), QoS::AtMostOnce, 0)].into(),
+        };
+        l.release(&held);
+        Some(l.sessions.get(key)?.out.buf.len())
+    })
+    .await;
+    assert_eq!(sent, Some(0), "retained sent to the new connection");
+}

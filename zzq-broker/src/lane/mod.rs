@@ -28,7 +28,7 @@ mod subscribe;
 use backpressure::Hit;
 pub(crate) use control::{Control, Dump, SyncAck, Ticket};
 pub(crate) use route::Remote;
-use subscribe::Held;
+pub(crate) use subscribe::Held;
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;
 

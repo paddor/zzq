@@ -222,12 +222,15 @@ impl Lane {
 
     /// Queues an ack packet that was held for other lanes.
     pub(crate) fn release(&mut self, h: &Held) {
-        // Not to a connection that took the session over meanwhile.
-        if let Some(s) = self.sessions.get_mut(h.key)
-            && s.has_conn(h.conn)
-        {
-            s.out.buf.extend_from_slice(&h.packet);
+        // Not to a connection that took the session over meanwhile: it sent
+        // no such SUBSCRIBE.
+        let Some(s) = self.sessions.get_mut(h.key) else {
+            return;
+        };
+        if !s.has_conn(h.conn) {
+            return;
         }
+        s.out.buf.extend_from_slice(&h.packet);
         self.mark(h.key);
         self.send_retained(h.key, &h.retained);
         self.flush();
