@@ -189,6 +189,10 @@ Notable changes to zzq. The format follows
 - `zzq-tokio`: a lane whose runtime could not be built stopped silently,
   and `Context::with_config` returned a context whose calls then failed with
   `Error::Closed`. It now fails with `Error::Io`, as documented.
+- `zzq-proto`, `zzq-client`: the encoder set DUP on QoS 0 publishes, and a
+  3.1.1 client sent a password without a user name, both of which brokers
+  refuse. DUP now goes with QoS 1 and 2 only, and such a client fails to
+  connect with the new `Error::InvalidOption`.
 
 ## [0.1.1] - 2026-10-26
 

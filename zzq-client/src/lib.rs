@@ -89,6 +89,9 @@ pub enum Error {
     /// A blocking call ran inside an async runtime.
     #[error("blocking call inside an async runtime")]
     InAsync,
+    /// [`ClientOptions`] that MQTT cannot express.
+    #[error("invalid option: {0}")]
+    InvalidOption(&'static str),
 }
 
 /// Client result.

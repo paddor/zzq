@@ -153,7 +153,8 @@ impl PublishHeader<'_> {
     #[inline]
     pub const fn byte1(&self) -> u8 {
         let mut b = 0x30 | ((self.qos as u8) << 1);
-        if self.dup {
+        // DUP is for QoS 1 and 2 only [MQTT-3.3.1-2].
+        if self.dup && !matches!(self.qos, QoS::AtMostOnce) {
             b |= 0x08;
         }
         if self.retain {
@@ -492,6 +493,25 @@ mod tests {
     use crate::packet::{Packet, decode};
     use crate::property::{RECEIVE_MAXIMUM, USER_PROPERTY};
     use std::vec::Vec;
+
+    #[test]
+    fn qos0_publishes_never_carry_dup() {
+        let h = PublishHeader {
+            version: Version::V5,
+            dup: true,
+            qos: QoS::AtMostOnce,
+            retain: false,
+            topic: "t",
+            pkid: 0,
+            properties: &[],
+        };
+        assert_eq!(h.byte1() & 0x08, 0);
+        let h = PublishHeader {
+            qos: QoS::AtLeastOnce,
+            ..h
+        };
+        assert_eq!(h.byte1() & 0x08, 0x08);
+    }
 
     #[test]
     fn a_sink_needs_only_put() {

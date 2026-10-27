@@ -49,6 +49,10 @@ pub(crate) fn options(o: &ClientOptions) -> Result<()> {
     }
     if let Some(p) = &o.password {
         field("password", p.len())?;
+        // 3.1.1 has no password without a user name [MQTT-3.1.2-22].
+        if o.username.is_none() && !o.version.is_v5() {
+            return Err(Error::InvalidOption("v3.1.1 password without username"));
+        }
     }
     if let Some(w) = &o.will {
         validate_name(&w.topic).map_err(|_| Error::InvalidTopic(w.topic.clone()))?;

@@ -95,3 +95,18 @@ async fn a_client_that_stops_receiving_keeps_its_connection() {
     let published = timeout(WAIT, c.publish("u", "y", QoS::AtLeastOnce)).await;
     assert!(matches!(published, Ok(Ok(()))), "{published:?}");
 }
+
+#[tokio::test]
+async fn a_v311_password_needs_a_user_name() {
+    let (ctx, _broker, uri) = setup("v311-password").await;
+    let opts = ClientOptions {
+        version: zzq_client::Version::V311,
+        password: Some("secret".into()),
+        ..ClientOptions::new("pw")
+    };
+    let res = Client::connect(&ctx, &uri, opts).await;
+    assert!(
+        matches!(res, Err(zzq_client::Error::InvalidOption(_))),
+        "{res:?}"
+    );
+}
