@@ -228,11 +228,14 @@ impl QuicListener {
             },
             _ => Error::Io(e),
         };
-        let first = reuse_socket(addr).map_err(in_use)?;
-        let bound = first.local_addr()?;
+        // A plain socket first: SO_REUSEPORT would share a port that another
+        // listener holds with it too, such as another QUIC listener.
+        let bound = std::net::UdpSocket::bind(addr)
+            .and_then(|probe| probe.local_addr())
+            .map_err(in_use)?;
         let lanes = if cfg!(unix) { ctx.lanes() } else { 1 };
-        let mut sockets = vec![first];
-        for _ in 1..lanes {
+        let mut sockets = Vec::with_capacity(lanes);
+        for _ in 0..lanes {
             sockets.push(reuse_socket(bound).map_err(in_use)?);
         }
         // Unbounded: each entry is a connection whose handshake took the
