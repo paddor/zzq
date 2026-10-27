@@ -39,7 +39,7 @@ impl Session {
         if limit.state_full {
             return Outcome::StateFull;
         }
-        let size = h.item.msg.size();
+        let size = h.msg.size();
         if size > limit.bytes {
             return Outcome::QueueFull(1);
         }
@@ -67,7 +67,7 @@ impl Session {
 
     pub(super) fn pop_queued(&mut self) -> Option<Kept> {
         let h = self.flow.queue.pop_front()?;
-        self.flow.queued_bytes -= h.item.msg.size();
+        self.flow.queued_bytes -= h.msg.size();
         Some(h)
     }
 
@@ -90,7 +90,7 @@ impl Session {
     /// client acks it.
     pub(super) fn send_inflight(&mut self, h: Kept) -> Outcome {
         let pkid = self.alloc_pkid();
-        let ok = self.encode(&Fields::of(&h.item, pkid, false));
+        let ok = self.encode(&Fields::of(&h, pkid, false));
         if !ok {
             self.free_pkid(pkid);
             self.charge.sub(budget::held(&h));
@@ -179,7 +179,7 @@ impl Session {
             let Some(h) = self.pop_queued() else {
                 break;
             };
-            let expires_at = h.item.msg.expires_at;
+            let expires_at = h.msg.expires_at;
             if expires_at.is_some() && expired(expires_at, *now.get_or_insert_with(Instant::now)) {
                 self.flow.expired += 1;
                 self.charge.sub(budget::held(&h));
@@ -227,7 +227,7 @@ impl Session {
         let Some(i) = self.inflight_at(pkid) else {
             return Ok(false);
         };
-        if self.flow.inflight[i].held.item.qos != QoS::AtLeastOnce {
+        if self.flow.inflight[i].held.qos != QoS::AtLeastOnce {
             return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
         self.take_inflight(i);
@@ -246,7 +246,7 @@ impl Session {
             return Ok(true);
         };
         let f = &mut self.flow.inflight[i];
-        if f.held.item.qos != QoS::ExactlyOnce {
+        if f.held.qos != QoS::ExactlyOnce {
             return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
         if reason >= 0x80 {
@@ -292,7 +292,7 @@ impl Session {
             let f = &inflight[at];
             if f.released {
                 self.ack(PacketType::PubRel, f.pkid, 0);
-            } else if !self.encode(&Fields::of(&f.held.item, f.pkid, true)) {
+            } else if !self.encode(&Fields::of(&f.held, f.pkid, true)) {
                 // Larger than the client now takes, so it could never be
                 // acked: it gives up its slot.
                 if let Some(f) = inflight.remove(at) {

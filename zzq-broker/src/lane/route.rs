@@ -8,10 +8,10 @@ use zzq_proto::encode;
 use zzq_proto::packet::decode;
 use zzq_proto::{Packet, QoS, Version};
 
-use crate::budget::{self, Charge, LaneTotal};
+use crate::budget::LaneTotal;
 use crate::index::{Entry, Matches, SubIds, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
-use crate::session::{Kept, Outcome, QueueLimit, Queued, Session};
+use crate::session::{Kept, KeptMsg, Outcome, QueueLimit, Queued, Session, SharedMsg};
 use crate::slab::Key;
 
 use super::{Control, Hit, Lane, Ticket};
@@ -45,16 +45,18 @@ pub(crate) struct Origin {
     pins: bool,
 }
 
-/// The message of one publish once a session holds it, the charge for its
-/// bytes once more than one session of the lane may hold it, and what its
+/// The message of one publish once a session holds it, moved into `share`
+/// once more than one session of the lane may hold it, and what its
 /// sessions may queue beyond the limits.
 #[derive(Debug, Default)]
 pub(super) struct Owned {
     pub(super) msg: Option<Msg>,
-    pub(super) share: Option<Rc<Charge>>,
+    pub(super) share: Option<Rc<SharedMsg>>,
     /// Beyond `max_queued` and `max_queued_bytes`: the batch of retained
     /// messages a SUBSCRIBE sends.
     pub(super) extra: Extra,
+    /// From the retained store, which counts its bytes.
+    pub(super) retained: bool,
 }
 
 impl Owned {
@@ -62,6 +64,14 @@ impl Owned {
         Owned {
             msg: Some(msg),
             ..Owned::default()
+        }
+    }
+
+    /// The message for one more holder, made from `p` the first time.
+    fn cloned(&mut self, p: &Publication<'_>) -> Msg {
+        match &self.share {
+            Some(share) => share.msg.clone(),
+            None => self.msg.get_or_insert_with(|| p.to_msg()).clone(),
         }
     }
 }
@@ -196,7 +206,7 @@ impl Lane {
                     self.deliver(e.sub.key, p, owned, g);
                 }
             } else {
-                let msg = owned.msg.get_or_insert_with(|| p.to_msg()).clone();
+                let msg = owned.cloned(p);
                 let pins = p.pins && p.chunk.is_some_and(|c| msg.pins(c));
                 self.out.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
                     key: e.sub.key,
@@ -406,8 +416,8 @@ fn forward_packet(
 }
 
 /// What session `s` keeps of `p` at QoS 1/2: the message, copied if it would
-/// pin a read buffer long, and a share of its bytes when more sessions of
-/// the lane may get it.
+/// pin a read buffer long, and shared with the other sessions of the lane
+/// that get it.
 fn keep(
     s: &mut Session,
     p: &Publication<'_>,
@@ -415,32 +425,35 @@ fn keep(
     total: &LaneTotal,
     g: Grant,
 ) -> Kept {
-    let msg = owned.msg.get_or_insert_with(|| p.to_msg());
-    // A slow or offline session may hold a message long; do not let it pin
-    // read buffers.
-    if s.holds_long() && p.pins && p.chunk.is_none_or(|c| msg.pins(c)) {
-        *msg = s.copy(msg);
-    }
-    let share = if g.last && owned.share.is_none() {
-        None
-    } else {
-        let share = owned
-            .share
-            .get_or_insert_with(|| Rc::new(Charge::new(total.clone(), budget::shared(msg))));
-        Some(share.clone())
-    };
-    let msg = if g.last {
-        owned.msg.take()
-    } else {
-        owned.msg.clone()
-    };
-    let item = Queued {
-        msg: msg.unwrap_or_else(|| p.to_msg()),
+    let kept = |msg: KeptMsg, charged: bool| Kept {
+        msg,
         qos: g.qos,
         retain: g.retain,
         sub_id: g.sub_id,
+        charged,
     };
-    Kept { item, share }
+    // A slow or offline session may hold a message long; do not let it pin
+    // read buffers.
+    let long = s.holds_long() && p.pins;
+    if let Some(share) = &owned.share
+        && (!long || p.chunk.is_some_and(|c| !share.msg.pins(c)))
+    {
+        return kept(KeptMsg::Shared(share.clone()), false);
+    }
+    let mut msg = match owned.share.take() {
+        // This session and later ones get a copy instead.
+        Some(share) => share.msg.clone(),
+        None => owned.msg.take().unwrap_or_else(|| p.to_msg()),
+    };
+    if long && p.chunk.is_none_or(|c| msg.pins(c)) {
+        msg = s.copy(&msg);
+    }
+    if g.last {
+        return kept(KeptMsg::Own(msg), !owned.retained);
+    }
+    let share = Rc::new(SharedMsg::new(msg, total.clone()));
+    owned.share = Some(share.clone());
+    kept(KeptMsg::Shared(share), false)
 }
 
 /// Appends a forwarded packet, sharing the last batch entry when it uses
@@ -468,4 +481,60 @@ fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: 
         more: Vec::with_capacity(more),
         origin,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use bytes::Bytes;
+    use zzq_proto::{QoS, Version};
+
+    use super::{Grant, Owned, keep};
+    use crate::budget::LaneTotal;
+    use crate::index::SubIds;
+    use crate::msg::Publication;
+    use crate::session::{KeptMsg, Session, SharedMsg};
+
+    /// A session that holds messages long does not share one that pins the
+    /// read buffer, which sessions before it share: it and the sessions
+    /// after it share a copy.
+    #[test]
+    fn a_slow_session_shares_a_copy_instead_of_the_read_buffer() {
+        let chunk = Bytes::from_static(b"topicpayload");
+        let p = Publication {
+            topic: std::str::from_utf8(&chunk[..5]).unwrap(),
+            payload: &chunk[5..],
+            props: &[],
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            raw: None,
+            packet: None,
+            chunk: Some(&chunk),
+            pins: true,
+            expires_at: None,
+        };
+        let total = LaneTotal::default();
+        let g = Grant {
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            sub_id: SubIds::default(),
+            last: false,
+        };
+        let pinned = Rc::new(SharedMsg::new(p.to_msg(), total.clone()));
+        let mut owned = Owned {
+            share: Some(pinned.clone()),
+            ..Owned::default()
+        };
+        // Offline, so they hold messages long.
+        let mut slow = ["a", "b"].map(|id| Session::new(id.into(), Version::V5, total.clone()));
+        let kept = slow.each_mut().map(|s| keep(s, &p, &mut owned, &total, g));
+        let [KeptMsg::Shared(a), KeptMsg::Shared(b)] = kept.each_ref().map(|k| &k.msg) else {
+            panic!("not shared");
+        };
+        assert!(Rc::ptr_eq(a, b) && !Rc::ptr_eq(a, &pinned));
+        assert!(!a.msg.pins(&chunk));
+        assert!(!owned.cloned(&p).pins(&chunk));
+        assert!(kept.iter().all(|k| !k.charged));
+    }
 }

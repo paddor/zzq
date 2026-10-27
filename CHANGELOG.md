@@ -65,6 +65,9 @@ Notable changes to zzq. The format follows
 - `zzq-broker`: a PUBACK, PUBREC or PUBCOMP finds its delivery by packet
   ID instead of scanning the inflight window, which made QoS 2 slow with many
   messages in flight. Fan-in at QoS 2 is about 40% faster.
+- `zzq-broker`: sessions of a lane that get the same QoS 1/2 message share
+  one handle to it, so a delivery takes no atomic refcount update. Fan-out
+  at QoS 1 is about 5% faster, at QoS 2 about 15%.
 
 ### Fixed
 

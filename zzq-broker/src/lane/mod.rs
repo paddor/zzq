@@ -10,7 +10,7 @@ use std::time::Instant;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::broker::{Dropped, Shared};
-use crate::budget::{Charge, LaneTotal};
+use crate::budget::LaneTotal;
 use crate::conn::ReadBlocks;
 use crate::index::{SubIndex, SubRef};
 use crate::msg::Arena;
@@ -139,9 +139,6 @@ struct Congestion {
 pub(crate) struct StateBudget {
     /// Bytes the sessions charge.
     total: LaneTotal,
-    /// The share of retained messages sent on subscribe, which the store
-    /// counts.
-    retained_share: Rc<Charge>,
     /// The budget was reached at the last check.
     pub(crate) full: bool,
 }
@@ -173,11 +170,7 @@ impl Lane {
             held: Vec::new(),
             congestion: Congestion::default(),
             stats: LaneStats::default(),
-            budget: StateBudget {
-                retained_share: Rc::new(Charge::new(total.clone(), 0)),
-                total,
-                full: false,
-            },
+            budget: StateBudget { total, full: false },
             read_blocks: ReadBlocks::default(),
             sweeps: 0,
             ids: Ids::default(),

@@ -170,8 +170,9 @@ impl Lane {
             retained.retain = true;
             let mut owned = Owned {
                 msg: Some(retained),
-                share: Some(self.budget.retained_share.clone()),
                 extra,
+                retained: true,
+                ..Owned::default()
             };
             self.deliver(key, &p, &mut owned, g);
         }

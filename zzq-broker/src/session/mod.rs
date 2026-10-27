@@ -1,6 +1,7 @@
 //! Per-client session state.
 
 use std::collections::VecDeque;
+use std::ops::Deref;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +41,8 @@ pub(crate) struct DelayedWill {
     pub(crate) msg: Msg,
 }
 
-/// A message waiting for the inflight window.
+/// A QoS 1/2 message for a session, as another lane or a state file hands
+/// it over.
 #[derive(Debug, Clone)]
 pub(crate) struct Queued {
     pub(crate) msg: Msg,
@@ -49,18 +51,66 @@ pub(crate) struct Queued {
     pub(crate) sub_id: SubIds,
 }
 
-/// A QoS 1/2 message a session keeps. With `share`, other sessions of the
-/// lane hold the same message, and the share counts its bytes once for all.
+/// A QoS 1/2 message a session keeps.
 #[derive(Debug)]
 pub(crate) struct Kept {
-    pub(crate) item: Queued,
-    pub(crate) share: Option<Rc<Charge>>,
+    pub(crate) msg: KeptMsg,
+    pub(crate) qos: QoS,
+    pub(crate) retain: bool,
+    pub(crate) sub_id: SubIds,
+    /// Whether the session pays for the message's bytes: not when the lane
+    /// shares them, or the retained store counts them.
+    pub(crate) charged: bool,
 }
 
 impl Kept {
     /// A message no other session shares.
-    pub(crate) const fn own(item: Queued) -> Kept {
-        Kept { item, share: None }
+    pub(crate) fn own(item: Queued) -> Kept {
+        Kept {
+            msg: KeptMsg::Own(item.msg),
+            qos: item.qos,
+            retain: item.retain,
+            sub_id: item.sub_id,
+            charged: true,
+        }
+    }
+}
+
+/// The message of a [`Kept`]: the session's own, or one that sessions of
+/// the lane share, so a delivery to each takes no atomic refcount update.
+#[derive(Debug)]
+pub(crate) enum KeptMsg {
+    Own(Msg),
+    Shared(Rc<SharedMsg>),
+}
+
+impl Deref for KeptMsg {
+    type Target = Msg;
+
+    #[inline]
+    fn deref(&self) -> &Msg {
+        match self {
+            KeptMsg::Own(msg) => msg,
+            KeptMsg::Shared(s) => &s.msg,
+        }
+    }
+}
+
+/// A message that sessions of one lane share, and the charge for its bytes,
+/// counted once for all of them.
+#[derive(Debug)]
+pub(crate) struct SharedMsg {
+    pub(crate) msg: Msg,
+    _charge: Charge,
+}
+
+impl SharedMsg {
+    pub(crate) fn new(msg: Msg, total: LaneTotal) -> SharedMsg {
+        let charge = Charge::new(total, budget::shared(&msg));
+        SharedMsg {
+            msg,
+            _charge: charge,
+        }
     }
 }
 
@@ -329,16 +379,16 @@ impl Session {
 impl Session {
     /// Messages sent and not acked: packet ID, message, and whether PUBREC
     /// released it.
-    pub(crate) fn inflight(&self) -> impl ExactSizeIterator<Item = (u16, &Queued, bool)> {
+    pub(crate) fn inflight(&self) -> impl ExactSizeIterator<Item = (u16, &Kept, bool)> {
         self.flow
             .inflight
             .iter()
-            .map(|f| (f.pkid, &f.held.item, f.released))
+            .map(|f| (f.pkid, &f.held, f.released))
     }
 
     /// Messages waiting for the inflight window, oldest first.
-    pub(crate) fn queue(&self) -> impl ExactSizeIterator<Item = &Queued> {
-        self.flow.queue.iter().map(|h| &h.item)
+    pub(crate) fn queue(&self) -> impl ExactSizeIterator<Item = &Kept> {
+        self.flow.queue.iter()
     }
 
     /// The last packet ID sent.
@@ -384,7 +434,7 @@ impl Session {
         for item in st.queue {
             let h = Kept::own(item);
             s.charge.add(budget::held(&h));
-            s.flow.queued_bytes += h.item.msg.size();
+            s.flow.queued_bytes += h.msg.size();
             s.flow.queue.push_back(h);
         }
         s.charge_room();
@@ -465,10 +515,11 @@ mod tests {
         // Both sessions alike.
         let base = total.get();
         let bytes = budget::shared(&item().msg);
-        let share = Rc::new(Charge::new(total.clone(), bytes));
+        let share = Rc::new(SharedMsg::new(item().msg, total.clone()));
         let shared = || Kept {
-            item: item(),
-            share: Some(share.clone()),
+            msg: KeptMsg::Shared(share.clone()),
+            charged: false,
+            ..held()
         };
         assert_eq!(budget::held(&shared()), 0);
         for s in &mut sessions {

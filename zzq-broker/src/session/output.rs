@@ -9,7 +9,7 @@ use zzq_proto::{PacketType, QoS};
 use crate::index::SubIds;
 use crate::msg::{Publication, same_family};
 
-use super::{Outcome, Queued, Session};
+use super::{Kept, Outcome, Session};
 
 /// One PUBLISH to encode for the client.
 pub(super) struct Fields<'a> {
@@ -25,7 +25,7 @@ pub(super) struct Fields<'a> {
 }
 
 impl<'a> Fields<'a> {
-    pub(super) fn of(item: &'a Queued, pkid: u16, dup: bool) -> Fields<'a> {
+    pub(super) fn of(item: &'a Kept, pkid: u16, dup: bool) -> Fields<'a> {
         Fields {
             topic: item.msg.topic(),
             payload: item.msg.payload(),
