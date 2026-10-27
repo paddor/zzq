@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## v0.5.0 — 2026-10-27
+
+- Built on the zzq 0.3 crates, with their fixes. The broker stops reading
+  a client that does not read its replies, and a client reads the acks of
+  its own requests while its inbox is full.
 - A forked child shared its parent's wake pipes, so one could take the
   other's wake and leave a call waiting for good. A child now makes its own.
 - Every error the extension raised leaked its message, about 100 bytes.
