@@ -17,6 +17,9 @@ use super::{MAX_PACKET, READ_BUF, READ_MIN};
 /// catches up.
 const OUT_ROOM: usize = 1 << 20;
 
+/// Spare output buffers larger than this are not kept.
+const KEEP: usize = 4 << 20;
+
 /// Output shared with the writer task.
 #[derive(Debug, Default)]
 pub(super) struct Out {
@@ -83,6 +86,16 @@ pub(super) fn make_room(buf: &mut BytesMut) {
     }
 }
 
+/// A written buffer, emptied for the next swap, unless one large write grew
+/// it past [`KEEP`].
+fn reuse(mut buf: Vec<u8>) -> Vec<u8> {
+    if buf.capacity() > KEEP {
+        return Vec::new();
+    }
+    buf.clear();
+    buf
+}
+
 pub(super) async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
     let mut spare = Vec::new();
     loop {
@@ -98,7 +111,7 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
                 }
                 return;
             }
-            spare = buf;
+            spare = reuse(buf);
             // TLS may only have buffered the last bytes.
             if w.flush().await.is_err() {
                 out.broken.set(true);
@@ -113,14 +126,20 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(out: Rc<Out>, mut w: W) {
             out.drained.notify_one();
             return;
         }
-        spare = buf;
-        spare.clear();
+        spare = reuse(buf);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_written_buffer_is_kept_unless_it_grew_large() {
+        let small = reuse(Vec::with_capacity(1024));
+        assert!(small.is_empty() && small.capacity() >= 1024);
+        assert_eq!(reuse(vec![0; KEEP + 1]).capacity(), 0);
+    }
 
     #[test]
     fn a_header_alone_does_not_reserve_its_whole_packet() {
