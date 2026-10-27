@@ -173,6 +173,11 @@ Notable changes to zzq. The format follows
 - `zzq-tokio`: binding `ipc://` removed whatever was at the path when a
   connect to it failed, a regular file or a socket that refused for other
   reasons. Only a socket nobody listens on is replaced now.
+- `zzq-tokio`: WebSocket control frames could be up to 16 MiB and
+  fragmented, and pongs queued without a limit, so a peer that pinged and did
+  not read grew memory without bound. Control frames over 125 bytes or
+  without FIN now close the connection, and one pong waits at most. Once
+  either side closes, the pump stops within 2 s instead of reading on.
 
 ## [0.1.1] - 2026-10-26
 

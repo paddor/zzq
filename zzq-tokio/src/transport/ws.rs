@@ -6,8 +6,9 @@
 
 use std::hash::{BuildHasher, RandomState};
 use std::io;
+use std::pin::pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
 use tokio::sync::mpsc;
@@ -23,6 +24,8 @@ const MAX_HEADERS: usize = 8 << 10;
 const MAX_FRAME: usize = 16 << 20;
 /// Buffer of the in-memory stream, each way.
 const PIPE_BYTES: usize = 256 << 10;
+/// How long the writer may finish once the peer closed.
+const CLOSE_LINGER: Duration = Duration::from_secs(2);
 /// Subprotocols accepted, in preference order.
 const SUBPROTOCOLS: [&str; 2] = ["mqtt", "mqttv3.1"];
 
@@ -255,6 +258,8 @@ where
 }
 
 /// Starts the frame pump on the current lane and returns the byte stream.
+/// Once the byte stream closes, the pump stops reading the socket; once the
+/// peer closes, what is left to write gets [`CLOSE_LINGER`].
 fn pump<S>(ws: S, role: Role) -> DuplexStream
 where
     S: AsyncRead + AsyncWrite + Unpin + 'static,
@@ -262,19 +267,25 @@ where
     let (local, remote) = tokio::io::duplex(PIPE_BYTES);
     let (ws_r, ws_w) = tokio::io::split(ws);
     let (pipe_r, pipe_w) = tokio::io::split(local);
-    let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
-    tokio::task::spawn_local(frames_in(ws_r, pipe_w, ctl_tx, role));
-    tokio::task::spawn_local(frames_out(ws_w, pipe_r, ctl_rx, role));
+    // One control frame waits to be written. While a pong waits, newer
+    // pings get none [RFC 6455 5.5.3].
+    let (ctl_tx, ctl_rx) = mpsc::channel(1);
+    tokio::task::spawn_local(async move {
+        let mut inbound = pin!(frames_in(ws_r, pipe_w, ctl_tx, role));
+        let mut outbound = pin!(frames_out(ws_w, pipe_r, ctl_rx, role));
+        tokio::select! {
+            () = &mut inbound => {
+                let _ = tokio::time::timeout(CLOSE_LINGER, outbound).await;
+            }
+            () = &mut outbound => {}
+        }
+    });
     remote
 }
 
 /// WebSocket frames to bytes. Control frames go to the writer.
-async fn frames_in<R, W>(
-    mut ws: R,
-    mut pipe: W,
-    ctl: mpsc::UnboundedSender<(u8, Vec<u8>)>,
-    role: Role,
-) where
+async fn frames_in<R, W>(mut ws: R, mut pipe: W, ctl: mpsc::Sender<(u8, Vec<u8>)>, role: Role)
+where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
@@ -287,13 +298,13 @@ async fn frames_in<R, W>(
                 }
             }
             OP_PING => {
-                let _ = ctl.send((OP_PONG, std::mem::take(&mut payload)));
+                let _ = ctl.try_send((OP_PONG, std::mem::take(&mut payload)));
             }
             OP_PONG => {}
             _ => break,
         }
     }
-    let _ = ctl.send((OP_CLOSE, Vec::new()));
+    let _ = ctl.send((OP_CLOSE, Vec::new())).await;
     let _ = pipe.shutdown().await;
 }
 
@@ -301,7 +312,7 @@ async fn frames_in<R, W>(
 async fn frames_out<W, R>(
     mut ws: W,
     mut pipe: R,
-    mut ctl: mpsc::UnboundedReceiver<(u8, Vec<u8>)>,
+    mut ctl: mpsc::Receiver<(u8, Vec<u8>)>,
     role: Role,
 ) where
     W: AsyncWrite + Unpin,
@@ -358,6 +369,11 @@ async fn read_frame<R: AsyncRead + Unpin>(
     let masked = h[1] & 0x80 != 0;
     if h[0] & 0x70 != 0 || masked != want_masked || opcode == OP_TEXT {
         return Err(bad("unsupported frame"));
+    }
+    // Control frames are short and whole [RFC 6455 5.5].
+    let control = opcode & 0x08 != 0;
+    if control && (h[1] & 0x7f > 125 || h[0] & 0x80 == 0) {
+        return Err(bad("bad control frame"));
     }
     let len = match h[1] & 0x7f {
         126 => usize::from(r.read_u16().await?),
@@ -504,6 +520,61 @@ fn base64(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server pump over an in-memory socket: the client's end, and the byte
+    /// stream for MQTT.
+    fn server() -> (DuplexStream, DuplexStream) {
+        let (client, socket) = tokio::io::duplex(1 << 20);
+        (client, pump(socket, Role::Server))
+    }
+
+    fn ping(len: usize, fin: bool) -> Vec<u8> {
+        let mut f = Vec::new();
+        write_frame(&mut f, OP_PING, &vec![1; len], true);
+        if !fin {
+            f[0] &= 0x7f;
+        }
+        f
+    }
+
+    #[tokio::test]
+    async fn an_oversized_or_fragmented_ping_closes_the_connection() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                for (len, fin) in [(126, true), (4, false)] {
+                    let (mut client, _mqtt) = server();
+                    client.write_all(&ping(len, fin)).await.unwrap();
+                    let mut payload = Vec::new();
+                    let read = read_frame(&mut client, false, &mut payload);
+                    let op = tokio::time::timeout(std::time::Duration::from_secs(1), read).await;
+                    assert!(matches!(op, Ok(Ok(Some(OP_CLOSE)))), "{len} {fin}: {op:?}");
+                }
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn closing_the_byte_stream_lets_go_of_the_socket() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, mqtt) = server();
+                drop(mqtt);
+                let mut payload = Vec::new();
+                let op = read_frame(&mut client, false, &mut payload).await.unwrap();
+                assert_eq!(op, Some(OP_CLOSE));
+                // A peer that never closes: the pump must not keep reading.
+                let gone = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                    while client.write_all(&ping(4, true)).await.is_ok() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                assert!(gone.is_ok(), "the socket is still read");
+            })
+            .await;
+    }
 
     #[test]
     fn accept_key_matches_rfc_example() {
