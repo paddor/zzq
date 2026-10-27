@@ -5,6 +5,10 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 /// Maps topic filters to values and finds the values matching a topic.
+///
+/// Matching, removal and drop recurse once per topic level, so callers
+/// bound the levels of the filters and topics they pass, as the broker
+/// does with `max_topic_levels`.
 #[derive(Debug)]
 pub struct TopicTrie<T> {
     root: Node<T>,
