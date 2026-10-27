@@ -9,7 +9,7 @@ use zzq_proto::{PacketType, QoS, ReasonCode, SubscriptionOptions};
 
 use crate::submit::Op;
 use crate::submit::QUEUED;
-use crate::{Cmd, Error};
+use crate::{Cmd, Error, Result};
 
 use super::{Change, Conn, Pending};
 
@@ -358,11 +358,19 @@ impl Conn<'_> {
         }
     }
 
-    pub(super) fn done(&mut self, pkid: u16, code: u8) {
-        self.s.requests.unacked.remove(&pkid);
-        let Some(Pending::Publish(slot)) = self.s.requests.pending.remove(&pkid) else {
-            return;
+    /// Finishes the publish that `pkid` acks with `code`. An ack for a
+    /// subscribe or unsubscribe breaks the protocol.
+    pub(super) fn done(&mut self, pkid: u16, code: u8) -> Result<()> {
+        let slot = match self.s.requests.pending.remove(&pkid) {
+            Some(Pending::Publish(slot)) => slot,
+            Some(other) => {
+                // Kept for the next connection to send again.
+                self.s.requests.pending.insert(pkid, other);
+                return Err(Error::Protocol("ack of the wrong kind"));
+            }
+            None => return Ok(()),
         };
+        self.s.requests.unacked.remove(&pkid);
         let res = if code >= 0x80 {
             Err(Error::Rejected(code.into()))
         } else {
@@ -371,6 +379,7 @@ impl Conn<'_> {
         self.s.scratch.finished.push((slot, res));
         self.s.requests.inflight = self.s.requests.inflight.saturating_sub(1);
         self.send_waiting();
+        Ok(())
     }
 }
 

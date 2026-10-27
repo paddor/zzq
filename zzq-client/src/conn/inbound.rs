@@ -88,7 +88,7 @@ impl Conn<'_> {
             };
             if is_reply(&packet) {
                 self.park(chunk.slice(run..at), false);
-                if let Err(e) = self.packet(packet, chunk) {
+                if let Err(e) = self.control(packet) {
                     res = Err(e);
                     break;
                 }
@@ -127,22 +127,24 @@ impl Conn<'_> {
                 break;
             };
             at += n;
-            match self.packet(packet, chunk) {
-                Ok(Some(m)) => {
-                    self.s.inbox.push(m);
-                    if self.s.inbox.hand_off() && !self.deliver()? {
-                        // Parked until the handle makes room, which wakes
-                        // the session only while the inbox stays blocked:
-                        // no second flush, which could succeed by now.
-                        self.park(chunk.slice(at..), true);
-                        self.finish_acks();
-                        return Ok(());
-                    }
-                }
-                Ok(None) => {}
-                Err(e) => {
+            // Messages take the inline path; the rest goes out of line, so
+            // it cannot keep this loop from being optimized as one.
+            let Packet::Publish(p) = packet else {
+                if let Err(e) = self.control(packet) {
                     res = Err(e);
                     break;
+                }
+                continue;
+            };
+            if let Some(m) = self.publish(&p, chunk) {
+                self.s.inbox.push(m);
+                if self.s.inbox.hand_off() && !self.deliver()? {
+                    // Parked until the handle makes room, which wakes the
+                    // session only while the inbox stays blocked: no second
+                    // flush, which could succeed by now.
+                    self.park(chunk.slice(at..), true);
+                    self.finish_acks();
+                    return Ok(());
                 }
             }
         }
@@ -161,20 +163,15 @@ impl Conn<'_> {
         })
     }
 
-    /// Handles one packet of `chunk`. A PUBLISH becomes a message.
-    fn packet(&mut self, packet: Packet<'_>, chunk: &Bytes) -> Result<Option<Message>> {
+    /// Handles a packet other than PUBLISH: acks, PINGRESP and DISCONNECT.
+    fn control(&mut self, packet: Packet<'_>) -> Result<()> {
         let v = self.s.opts.version;
         match packet {
-            Packet::Publish(p) => return Ok(self.publish(&p, chunk)),
-            Packet::PubAck(a) | Packet::PubComp(a) => {
-                if self.awaits(a.pkid, true)? {
-                    self.done(a.pkid, a.reason);
-                }
-            }
+            Packet::PubAck(a) | Packet::PubComp(a) => self.done(a.pkid, a.reason)?,
             Packet::PubRec(a) => {
-                if !self.awaits(a.pkid, true)? {
-                } else if a.reason >= 0x80 {
-                    self.done(a.pkid, a.reason);
+                if a.reason >= 0x80 {
+                    self.done(a.pkid, a.reason)?;
+                } else if !self.awaits(a.pkid, true)? {
                 } else if let Some((_, packet)) = self.s.requests.unacked.get_mut(&a.pkid) {
                     // Resend PUBREL, not the PUBLISH, from now on.
                     packet.clear();
@@ -204,7 +201,7 @@ impl Conn<'_> {
             Packet::Disconnect(_) => return Err(Error::Closed),
             _ => return Err(Error::Protocol("unexpected packet")),
         }
-        Ok(None)
+        Ok(())
     }
 
     /// Whether request `pkid` waits for an ack: a publish for PUBACK, PUBREC
