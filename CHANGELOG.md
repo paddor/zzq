@@ -5,6 +5,8 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-27
+
 ### Added
 
 - `zzq-broker`: `SnOptions::max_clients` caps the clients the MQTT-SN
