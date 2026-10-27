@@ -1971,6 +1971,6 @@ emqtt publishes QoS 1 and 2 from 100 processes.
 </text>
 
 <text x="720" y="17" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#F9FAFB">MQTT clients, one connection, TCP loopback</text>
-<text x="720" y="31" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#9CA3AF">Intel Core i7-8700B @ 3.20 GHz (KVM), performance governor, turbo off</text>
+<text x="720" y="31" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#9CA3AF">Intel Core i7-8700B @ 3.20 GHz (QEMU/KVM), performance governor, turbo off</text>
 <text x="720" y="50" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#F9FAFB">publish: client → fake broker</text>
 <text x="720" y="414" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#F9FAFB">subscribe: fake broker → client</text></svg>

@@ -18,6 +18,8 @@ Notable changes to zzq. The format follows
   `zzq_client_bench`, the rival broker configs in `zzq-bench/harness`, and
   rumqttc and ntex-mqtt benches in a workspace of their own.
   `RUNNING_BENCHMARKS.md` shows how to run them.
+- `COMPARISONS.md` lists how the other brokers in the benchmarks behave
+  under load, what survives a crash, and what their clustering offers.
 
 ### Fixed
 

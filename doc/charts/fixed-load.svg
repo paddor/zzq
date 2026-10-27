@@ -1,5 +1,5 @@
-<svg viewBox="0 0 1440 1257" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, sans-serif">
-<rect x="0" y="0" width="1440" height="1257" opacity="1" fill="#000000" stroke="none"/>
+<svg viewBox="0 0 1440 1231" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, sans-serif">
+<rect x="0" y="0" width="1440" height="1231" opacity="1" fill="#000000" stroke="none"/>
 <text x="174" y="63" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#E5E7EB">
 latency: p99, whiskers p50 to p99.9
 </text>
@@ -1640,17 +1640,11 @@ A step fails under 95% delivered, on a closed connection, or at a median over 10
 A broker that drops clients while they connect fails its first step with 0% delivered. Fan-out latency includes the generator reading each burst of 1000 deliveries.
 </text>
 <text x="78" y="1208" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
-Tuned configs, except NanoMQ keeps its default queue (2048): the tuned 100000 preallocates about 800 KB per connection, and NanoMQ runs out of memory near 18K connections.
-</text>
-<text x="78" y="1221" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
-FluxMQ&apos;s send queue holds 1000, as it allocates it in full per connection. VerneMQ gets 128 KiB socket buffers: by default it copies the kernel&apos;s, 2.5 MiB on loopback, and runs out of memory near 6000 connections.
-</text>
-<text x="78" y="1234" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
-FluxMQ resets connections that send about once a second: its 1 s read deadline can expire mid-packet, and the next read starts inside the packet.
+Tuned configs, except where they run out of memory at 20K connections: NanoMQ&apos;s queue (2048), FluxMQ&apos;s send queue (1000), VerneMQ&apos;s socket buffers (128 KiB). See COMPARISONS.md.
 </text>
 
 <text x="720" y="17" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#F9FAFB">MQTT brokers at fixed load, TCP loopback</text>
-<text x="720" y="31" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#9CA3AF">Intel Core i7-8700B @ 3.20 GHz (KVM), performance governor, turbo off</text>
+<text x="720" y="31" text-anchor="middle" font-family="sans-serif" font-size="10" fill="#9CA3AF">Intel Core i7-8700B @ 3.20 GHz (QEMU/KVM), performance governor, turbo off</text>
 <text x="720" y="50" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#F9FAFB">point to point: 10K publishers → 10K subscribers, a topic each (20K connections)</text>
 <text x="720" y="360" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#F9FAFB">fan-in: 10K publishers → a shared subscription of 100</text>
 <text x="720" y="670" text-anchor="middle" font-family="sans-serif" font-size="13" font-weight="bold" fill="#F9FAFB">fan-out: 5 publishers → 1000 subscribers (deliveries/s)</text></svg>

@@ -6,8 +6,8 @@ them.
 
 ## Setup
 
-- Intel Core i7-8700B @ 3.20 GHz, KVM guest with 6 vCPUs and 28 GiB, Debian
-  13, Linux 6.12, performance governor, turbo off.
+- Intel Core i7-8700B @ 3.20 GHz, QEMU/KVM guest with 6 vCPUs and 28 GiB,
+  Debian 13, Linux 6.12, performance governor, turbo off.
 - The broker runs on CPUs 0-3 (`taskset`), the load generator on CPUs 4-5.
   Brokers shipped as container images run in podman with host networking.
 - Before each run, the runner waits for 90% idle CPU and no compiler
@@ -15,7 +15,7 @@ them.
 - Each cell is one run. The charts show the newest run per cell: zzq from
   2026-10-27, the rest from 2026-10-26.
 - Rivals run tuned configs: in-flight windows of about 1000, queues of about
-  100000, no rate limits, and Nagle off where they have the knob. Several
+  100K, no rate limits, and Nagle off where they have the knob. Several
   defaults drop messages or pace subscribers, which would measure the
   config, not the broker.
 - zzq runs its defaults with 1 or 2 IO lanes. With 2 lanes, the single
@@ -37,6 +37,9 @@ them.
 
 [^vernemq]: VerneMQ's binary packages and images come under an EULA that
     forbids competitive analysis. The source is Apache-2.0.
+
+[COMPARISONS.md](COMPARISONS.md) lists how the other brokers behave under
+this load, and why some configs differ from the tuned ones.
 
 ## Broker throughput and latency
 
