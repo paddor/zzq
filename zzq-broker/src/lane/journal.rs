@@ -154,6 +154,12 @@ impl LaneLog {
             log.fail_next_write();
         }
     }
+
+    /// Number of the last record appended, and groups written.
+    #[cfg(test)]
+    pub(crate) fn counts(&self) -> (u64, u64) {
+        self.lock().log.as_ref().map_or((0, 0), Log::counts)
+    }
 }
 
 impl LogState {
@@ -328,6 +334,8 @@ impl Lane {
 
     /// Journals what became of the journaled deliveries of session `key`
     /// since the last call. A released one holds its PUBREL until then.
+    /// No ack waits for a DONE: it goes out with the next write, or with
+    /// the next sweep.
     pub(super) fn journal_progress(&mut self, key: Key) {
         let id = usize::from(self.id);
         let Some(s) = self.sessions.get_mut(key) else {
@@ -339,7 +347,7 @@ impl Lane {
         let mut progress = std::mem::take(&mut s.flow.progress);
         let log = &self.shared.lane_logs[id];
         let mut released = Vec::new();
-        let mut last = 0;
+        let mut last = None;
         if let Some(s) = self.sessions.get(key) {
             let cid = &s.client_id;
             for p in &progress {
@@ -352,16 +360,17 @@ impl Lane {
                     Progress::Sent(_, pkid) => rec::sent(b, cid, seq, pkid),
                     _ => rec::delivery(b, cid, seq),
                 });
-                if let Some(Journaled::At { wait, .. }) = j {
-                    last = wait.n;
+                if kind != rec::DONE {
+                    last = Some(j);
                 }
                 if kind == rec::RELEASED {
                     released.extend(j);
                 }
             }
         }
-        self.journal_unflushed = true;
-        self.pairs.appended = self.pairs.appended.max(last);
+        if let Some(j) = last {
+            self.appended(j);
+        }
         progress.clear();
         if let Some(s) = self.sessions.get_mut(key) {
             s.flow.progress = progress;
@@ -407,6 +416,11 @@ impl Lane {
         if std::mem::take(&mut self.journal_unflushed) {
             self.log().flush();
         }
+    }
+
+    /// Sends the records appended that no ack waited for, such as DONE.
+    pub(super) fn sweep_journal(&self) {
+        self.log().flush();
     }
 
     /// Writes a snapshot of the lane's sessions if the journal grew enough

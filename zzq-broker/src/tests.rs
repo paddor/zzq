@@ -1108,6 +1108,53 @@ async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn acked_deliveries_go_out_with_later_writes() {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("done-along");
+    let (ctx, broker, uri) = setup(1, opts()).await;
+    let (mut sub, _) = Raw::connect_with(&uri, &durable("along-sub")).await;
+    sub.subscribe("a/t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    let mut p = Raw::connect(&uri, "along-pub", Version::V5, 0).await;
+    let log = &broker.shared().lane_logs[0];
+    let (_, before) = log.counts();
+    for pkid in 1..=20 {
+        p.pub_("a/t", b"x", QoS::AtLeastOnce, pkid).await;
+        let ack = Got::Ack {
+            kind: PacketType::PubAck,
+            pkid,
+            reason: 0,
+        };
+        assert_eq!(p.next().await, ack);
+        let m = sub.publish().await;
+        sub.ack(PacketType::PubAck, m.pkid).await;
+    }
+    // Each DONE went with the next publish's records, not alone.
+    let writes = log.counts().1 - before;
+    assert!(writes < 30, "{writes} writes for 20 publishes");
+    // The last one goes out with a sweep, once the lane has it.
+    lane_until(&ctx, &broker, 0, |l| {
+        let keys: Vec<_> = l.sessions.keys().collect();
+        keys.into_iter()
+            .all(|k| l.sessions.get(k).is_none_or(|s| s.inflight().len() == 0))
+            .then_some(())
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while log.cursor.check(log.counts().0) != Some(true) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the last DONE stays"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stored_topics_deeper_than_allowed_are_not_loaded() {
     let dir = std::env::temp_dir().join(format!("zzq-deep-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

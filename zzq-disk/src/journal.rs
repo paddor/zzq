@@ -29,8 +29,10 @@ pub struct Record<'a> {
 ///
 /// Each record gets the next number, from 1. [`Journal::flush`] sends the
 /// records appended so far as one write, unless a write is in flight: then
-/// they wait behind it, and its completion sends them. A completed write is
-/// on disk, and [`Journal::durable`] moves to its last record.
+/// they wait behind it, and its completion sends them. Records appended
+/// after the last flush go along with such a write, or wait for the next
+/// flush. A completed write is on disk, and [`Journal::durable`] moves to
+/// its last record.
 pub struct Journal {
     id: u64,
     dir: Arc<Path>,
@@ -40,6 +42,8 @@ pub struct Journal {
     pending: Pending,
     in_flight: Option<InFlight>,
     appended: u64,
+    /// The last record a flush asked for.
+    flushed: u64,
     durable: u64,
     /// Framed bytes of all records appended.
     appended_bytes: u64,
@@ -156,7 +160,8 @@ impl Journal {
         Ok(self.appended)
     }
 
-    /// Sends the oldest group waiting, unless a write is in flight.
+    /// Sends the records appended so far, unless a write is in flight:
+    /// then its completion sends them.
     ///
     /// # Errors
     ///
@@ -165,7 +170,14 @@ impl Journal {
         if self.stopped {
             return Err(Error::Closed);
         }
-        if self.in_flight.is_some() {
+        self.flushed = self.appended;
+        self.send()
+    }
+
+    /// Sends the oldest group waiting, unless a write is in flight or no
+    /// flush asked for its records.
+    fn send(&mut self) -> Result<(), Error> {
+        if self.in_flight.is_some() || self.durable >= self.flushed {
             return Ok(());
         }
         let Some(mut group) = self.pending.take() else {
@@ -337,6 +349,13 @@ impl Journal {
         self.tail.fail = true;
     }
 
+    /// Groups written to the directory so far.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub const fn groups(&self) -> u64 {
+        self.tail.group - 1
+    }
+
     /// Framed bytes of the records appended since the journal opened.
     pub const fn appended_bytes(&self) -> u64 {
         self.appended_bytes
@@ -375,13 +394,13 @@ impl Journal {
                     Ok(()) => {
                         self.tail.offset += w.length;
                         self.tail.group += 1;
-                        self.flush()?;
+                        self.send()?;
                         Ok(true)
                     }
                     // The next group goes to the same place, with the same
-                    // number. A flush error shows again on the next call.
+                    // number. A send error shows again on the next call.
                     Err(source) => {
-                        let _ = self.flush();
+                        let _ = self.send();
                         Err(Error::Write {
                             first: w.first,
                             last: w.last,
@@ -393,7 +412,7 @@ impl Journal {
             Done::Created(result) => {
                 self.tail.creating = false;
                 self.tail.next = Some(result?);
-                self.flush()?;
+                self.send()?;
                 Ok(false)
             }
             Done::Stopped => {
@@ -528,6 +547,7 @@ impl Disk {
             pending: Pending::default(),
             in_flight: None,
             appended: 0,
+            flushed: 0,
             durable: 0,
             appended_bytes: 0,
             stopped: false,

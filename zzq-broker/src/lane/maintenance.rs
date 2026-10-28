@@ -36,8 +36,11 @@ impl Lane {
             self.shared.retained.sweep(now);
             let _ = self.shared.retained.snapshot(false);
         }
-        if part == 0 && self.pairs_on() {
-            let _ = self.snapshot_journal(false);
+        if self.pairs_on() {
+            if part == 0 {
+                let _ = self.snapshot_journal(false);
+            }
+            self.sweep_journal();
         }
         // Before the round, so its parts split the same slots.
         if part == 0 {

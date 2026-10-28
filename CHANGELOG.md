@@ -10,7 +10,8 @@ Notable changes to zzq. The format follows
 - `zzq-disk`: append-only journals in segment files, for one owner each.
   Records go out in groups with Linux AIO and `O_DIRECT | O_DSYNC`, one
   write in flight per journal and no fill delay, so a completed write is
-  on disk. Opening a journal replays its records and ends the log at a
+  on disk. Records appended after the last flush go along with a write
+  that one asked for, or wait for the next flush. Opening a journal replays its records and ends the log at a
   torn last write, unless its `DURABLE` mark says that write was on disk.
   A journal makes its first segment on its first write; `Journal::roll`
   starts a new one, and `Journal::trim` removes those before it.
@@ -21,7 +22,9 @@ Notable changes to zzq. The format follows
   packet IDs, in one per lane. A message goes in once per lane. An ack
   waits until what it stands for is on disk: the PUBACK or PUBREC of a
   retained publish or of one such sessions get, also on other lanes,
-  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. If a write
+  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. A subscriber's
+  ack of a delivery goes out with the next write, or within 50 ms, so a
+  crash may send a QoS 1 message it had acked again. If a write
   fails, a v5 publisher gets Unspecified error, other clients are
   disconnected, and `Stats::write_errors` counts it. Once a journal grew
   well past what it holds, it writes a snapshot and drops the segments

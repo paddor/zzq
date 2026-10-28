@@ -93,6 +93,12 @@ impl Log {
         self.0.fail_next_write();
     }
 
+    /// Number of the last record appended, and groups written.
+    #[cfg(test)]
+    pub(crate) const fn counts(&self) -> (u64, u64) {
+        (self.0.appended(), self.0.groups())
+    }
+
     /// Removes the segments before `before`.
     pub(crate) fn trim(&mut self, before: u64) -> io::Result<()> {
         self.0.trim(before).map_err(to_io)

@@ -127,6 +127,28 @@ fn records_wait_behind_the_write_in_flight() {
 }
 
 #[test]
+fn records_no_flush_asked_for_wait_for_one() {
+    let dir = TempDir::new("unflushed");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    j.append(1, &[b"first"]).unwrap();
+    j.flush().unwrap();
+    j.append(1, &[b"lazy"]).unwrap();
+    // That completion sent nothing more.
+    assert_eq!(j.wait().unwrap(), 1);
+    assert_eq!(j.wait().unwrap(), 1);
+    assert!(j.backlog() > 0);
+    j.flush().unwrap();
+    j.append(1, &[b"wanted"]).unwrap();
+    j.flush().unwrap();
+    j.append(1, &[b"along"]).unwrap();
+    assert_eq!(j.wait().unwrap(), 2);
+    // The flushed record took the later one along in its write.
+    assert_eq!(j.wait().unwrap(), 4);
+    assert_eq!(j.wait().unwrap(), 4);
+}
+
+#[test]
 fn completions_wake_an_async_owner() {
     let dir = TempDir::new("async");
     let disk = Disk::new(small()).unwrap();
