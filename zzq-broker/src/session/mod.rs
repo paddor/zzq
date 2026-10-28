@@ -18,8 +18,11 @@ use crate::msg::{Arena, Msg};
 use crate::slab::Key;
 use crate::state::SessionState;
 
+mod hold;
 mod outbound;
 mod output;
+
+pub(crate) use hold::AckHold;
 
 /// Write buffers above this size are freed once their session goes idle.
 const IDLE_BUFFER: usize = 64 << 10;
@@ -61,6 +64,9 @@ pub(crate) struct Kept {
     /// Whether the session pays for the message's bytes: not when the lane
     /// shares them, or the retained store counts them.
     pub(crate) charged: bool,
+    /// The session's number for it in the lane's journal, 0 if it is not
+    /// there.
+    pub(crate) seq: u64,
 }
 
 impl Kept {
@@ -72,8 +78,20 @@ impl Kept {
             retain: item.retain,
             sub_id: item.sub_id,
             charged: true,
+            seq: 0,
         }
     }
+}
+
+/// Progress of a journaled delivery that the lane's journal records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Progress {
+    /// Delivery `seq` is done: acked, or dropped.
+    Done(u64),
+    /// QoS 2 delivery `seq` went out under this packet ID.
+    Sent(u64, u16),
+    /// The client has QoS 2 delivery `seq`: PUBREC came, PUBREL waits.
+    Released(u64),
 }
 
 /// The message of a [`Kept`]: the session's own, or one that sessions of
@@ -179,6 +197,8 @@ pub(crate) struct Session {
     pub(crate) expires_at: Option<Instant>,
     pub(crate) will: Option<Will>,
     pub(crate) delayed_will: Option<DelayedWill>,
+    /// The lane's journal holds the session.
+    pub(crate) journaled: bool,
     /// Client's Maximum Packet Size.
     pub(crate) max_packet: usize,
     pub(crate) out: Output,
@@ -217,6 +237,8 @@ pub(crate) struct Inbound {
     /// Acks of the current connection's publishes held for congested
     /// subscribers.
     pub(crate) held_acks: u32,
+    /// Acks held until journal writes finish.
+    pub(crate) hold: Option<Box<AckHold>>,
 }
 
 /// QoS 1/2 messages towards the client.
@@ -242,6 +264,10 @@ pub(crate) struct Outbound {
     /// Bytes charged for the slots `queue` and `inflight` have room for, and
     /// the room left in the arena block.
     room: usize,
+    /// The last journal number given to a delivery.
+    pub(crate) last_seq: u64,
+    /// Progress of journaled deliveries for the lane to record.
+    pub(crate) progress: Vec<Progress>,
 }
 
 impl Default for Outbound {
@@ -257,6 +283,8 @@ impl Default for Outbound {
             counts: Counts::default(),
             arena: Arena::default(),
             room: 0,
+            last_seq: 0,
+            progress: Vec::new(),
         }
     }
 }
@@ -296,6 +324,7 @@ impl Session {
             expires_at: None,
             will: None,
             delayed_will: None,
+            journaled: false,
             max_packet: usize::MAX,
             out: Output::default(),
             inbound: Inbound::default(),
@@ -419,8 +448,11 @@ impl Session {
             s.subscribe(filter, *opts, *sub_id, lanes);
         }
         s.inbound.awaiting_rel.extend(st.awaiting_rel);
+        s.flow.last_seq = st.last_seq;
+        let mut seqs = st.seqs.into_iter();
         for (pkid, item, released) in st.inflight {
-            let held = Kept::own(item);
+            let mut held = Kept::own(item);
+            held.seq = seqs.next().unwrap_or(0);
             s.charge.add(budget::held(&held));
             s.flow.inflight.push_back(Inflight {
                 pkid,
@@ -438,7 +470,8 @@ impl Session {
             s.flow.in_use = Some(bits);
         }
         for item in st.queue {
-            let h = Kept::own(item);
+            let mut h = Kept::own(item);
+            h.seq = seqs.next().unwrap_or(0);
             s.charge.add(budget::held(&h));
             s.flow.queued_bytes += h.msg.size();
             s.flow.queue.push_back(h);
@@ -595,6 +628,8 @@ mod tests {
                 (7, item(), false),
             ],
             queue: vec![item()],
+            seqs: Vec::new(),
+            last_seq: 0,
         };
         let (mut s, _) = Session::restore(st, total.clone(), 1);
         assert_eq!((s.queued(), s.flow.inflight.len()), (1, 3));

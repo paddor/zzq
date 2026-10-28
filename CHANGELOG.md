@@ -14,6 +14,20 @@ Notable changes to zzq. The format follows
   torn last write, unless its `DURABLE` mark says that write was on disk.
   A journal makes its first segment on its first write; `Journal::roll`
   starts a new one, and `Journal::trim` removes those before it.
+- `zzq-broker`: `BrokerOptions::data_dir` and `zzq_broker --data-dir` keep
+  state in journals: retained messages in one per stripe of topics, each
+  behind a lock of its own, and the sessions that outlive their
+  connection, with their subscriptions, wills, QoS 1/2 messages and QoS 2
+  packet IDs, in one per lane. A message goes in once per lane. An ack
+  waits until what it stands for is on disk: the PUBACK or PUBREC of a
+  retained publish or of one such sessions get, also on other lanes,
+  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. If a write
+  fails, a v5 publisher gets Unspecified error, other clients are
+  disconnected, and `Stats::write_errors` counts it. Once a journal grew
+  well past what it holds, it writes a snapshot and drops the segments
+  before it. A connection a crash ended counts as lost at the next start,
+  so its will goes out. A changed lane count moves the sessions to their
+  new lanes. Linux only; not with `state_file`.
 - `zzq-bench`: `zzq_loadbench` runs the fixed-load test against any broker:
   up to tens of thousands of connections, each publishing on a schedule,
   in steps of offered load, with latency from each send to its delivery.
@@ -27,6 +41,13 @@ Notable changes to zzq. The format follows
   `RUNNING_BENCHMARKS.md` shows how to run them.
 - `COMPARISONS.md` lists how the other brokers in the benchmarks behave
   under load, what survives a crash, and what their clustering offers.
+
+### Removed
+
+- `zzq-broker`: the `Persistence` trait, `FilePersistence`, `Retained`,
+  `BrokerOptions::persistence`, `Error::Persistence` and
+  `zzq_broker --retained-file`, whose log was written after the ack. Use
+  `data_dir` and `Error::DataDir`.
 
 ### Fixed
 

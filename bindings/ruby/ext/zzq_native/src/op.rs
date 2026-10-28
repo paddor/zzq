@@ -4,11 +4,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::task::Poll;
 
 use rb_sys::VALUE;
-use zzq_broker::FilePersistence;
 use zzq_client::{Acked, ReasonCode};
 
 use crate::error::Error;
@@ -24,7 +23,7 @@ pub enum Out {
     Nil,
     Codes(Vec<ReasonCode>),
     Client(zzq_client::Client),
-    Broker(zzq_broker::Broker, Option<Arc<FilePersistence>>),
+    Broker(zzq_broker::Broker),
     Endpoint(String),
     Stats(zzq_broker::Stats),
 }
@@ -104,7 +103,7 @@ fn to_ruby(out: Out) -> RbResult<VALUE> {
             Ok(array)
         }
         Out::Client(c) => client::wrap(c),
-        Out::Broker(b, store) => broker::wrap(b, store),
+        Out::Broker(b) => broker::wrap(b),
         Out::Endpoint(e) => rb::new_utf8_string(&e),
         Out::Stats(s) => broker::stats_hash(&s),
     }

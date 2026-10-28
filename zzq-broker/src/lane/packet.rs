@@ -1,7 +1,5 @@
 //! Packets from a client connection.
 
-use std::sync::PoisonError;
-
 use bytes::Bytes;
 use bytestring::ByteString;
 use zzq_proto::encode;
@@ -100,10 +98,14 @@ impl Lane {
     ) -> Result<(), Close> {
         let mut result = Ok(());
         if let Some(s) = self.sessions.get_mut(key) {
+            let journaled = s.journaled;
             match f(s) {
                 Ok(true) => self.mark(key),
                 Ok(false) => {}
                 Err(code) => result = Err(Close::Protocol(code)),
+            }
+            if journaled {
+                self.journal_progress(key);
             }
         }
         self.release_waiters(key);
@@ -114,7 +116,17 @@ impl Lane {
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
-        let code = if s.inbound.awaiting_rel.remove(&a.pkid) {
+        let removed = s.inbound.awaiting_rel.remove(&a.pkid);
+        // Not before the journal has it: a restart would take a new
+        // PUBLISH with this ID as a repeat.
+        if removed && let Some(j) = self.journal_inbound(key, a.pkid, true) {
+            self.hold_ack(key, PacketType::PubComp, a.pkid, j);
+            return;
+        }
+        let Some(s) = self.sessions.get_mut(key) else {
+            return;
+        };
+        let code = if removed {
             0
         } else {
             reason::PACKET_IDENTIFIER_NOT_FOUND
@@ -133,6 +145,7 @@ impl Lane {
     ) -> Result<(), Close> {
         let opts_alias_max = self.shared.opts.topic_alias_maximum;
         let receive_max = usize::from(self.shared.opts.receive_maximum);
+        self.needs.clear();
         let s = self.sessions.get_mut(key).ok_or(Close::Kicked)?;
         let (aliased, filtered_props) = if s.version.is_v5() && !p.properties.is_empty() {
             // Subscription Identifiers are the broker's to set [MQTT-3.3.4-6].
@@ -167,7 +180,13 @@ impl Lane {
             Self::mark_in(&mut self.dirty, s, key);
             return Ok(());
         }
-        let packet = filtered_props.is_none().then_some((raw, s.version));
+        let version = s.version;
+        // A repeat of a QoS 2 ID after a restart is no new message.
+        if p.qos == QoS::ExactlyOnce && s.journaled {
+            let j = self.journal_inbound(key, p.pkid, false);
+            self.needs.note(j);
+        }
+        let packet = filtered_props.is_none().then_some((raw, version));
         let publication = Publication {
             topic,
             payload: p.payload,
@@ -180,20 +199,23 @@ impl Lane {
             pins: true,
             expires_at: None,
         };
+        self.route_publish(key, &publication);
+        self.ack_or_hold(key, p)
+    }
+
+    /// Stores a retained publication and routes it, noting the journal
+    /// writes its ack needs.
+    fn route_publish(&mut self, key: Key, publication: &Publication<'_>) {
         let mut owned = Owned::default();
-        if p.retain {
+        if publication.retain {
             let msg = publication.to_msg();
-            self.shared
-                .retained
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .set(&msg, self.budget.full);
+            let j = self.shared.retained.set(&msg, self.budget.full);
+            self.needs.note(j);
             owned.msg = Some(msg);
         }
-        let m = self.publisher_matches(key, topic);
+        let m = self.publisher_matches(key, publication.topic);
         self.congestion.hit = None;
-        self.route_matches(Some(key), &m, &publication, &mut owned);
-        self.ack_or_hold(key, p)
+        self.route_matches(Some(key), &m, publication, &mut owned);
     }
 }
 

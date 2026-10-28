@@ -15,11 +15,14 @@ use zzq_tokio::transport::Listener;
 use zzq_tokio::{Context, Endpoint};
 
 use crate::conn::ConnDriver;
-use crate::lane::{Control, Lane, LaneRef, LaneStats, Phase, Remote};
+use crate::disk::{self, DataDir};
+use crate::durable::{Cursor, JournalId};
+use crate::lane::{Control, Lane, LaneLog, LaneRef, LaneStats, Phase, Remote};
 use crate::mailbox::{self, Mailbox};
 use crate::msg::Msg;
 use crate::options::BrokerOptions;
-use crate::retain::RetainedStore;
+use crate::retain::{Retained, STRIPES};
+use crate::state::SessionState;
 use crate::{Error, Result};
 
 /// Batches in flight to one lane before senders wait.
@@ -108,7 +111,14 @@ pub(crate) struct Shared {
     pub(crate) id: u64,
     pub(crate) ctx: Context,
     pub(crate) opts: BrokerOptions,
-    pub(crate) retained: Mutex<RetainedStore>,
+    pub(crate) retained: Retained,
+    /// The session journal of each lane.
+    pub(crate) lane_logs: Box<[LaneLog]>,
+    /// For lane `to`, how far its journal holds the deliveries lane `from`
+    /// sent it, at `to * lanes + from`.
+    pairs: Box<[Cursor]>,
+    /// The disk threads of `opts.data_dir`, after the journals they serve.
+    data: Option<DataDir>,
     pub(crate) lanes: Box<[LaneTx]>,
     /// Connected clients on all lanes, for `max_connections`.
     pub(crate) connections: AtomicUsize,
@@ -118,6 +128,42 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// The cursor of journal `j`.
+    pub(crate) fn cursor(&self, j: JournalId) -> &Cursor {
+        match j {
+            JournalId::Retained(i) => self.retained.cursor(i),
+            JournalId::Lane(i) => &self.lane_logs[i].cursor,
+            JournalId::Pair { from, to } => &self.pairs[to * self.lane_logs.len() + from],
+        }
+    }
+
+    /// Whether the broker has a data directory.
+    pub(crate) const fn journals(&self) -> bool {
+        self.data.is_some()
+    }
+
+    /// Closes the cursors of the lane journals and their pairs: what they
+    /// did not write by now they never will.
+    fn close_cursors(&self) {
+        for log in &self.lane_logs {
+            log.cursor.close();
+        }
+        for pair in &self.pairs {
+            pair.close();
+        }
+    }
+
+    /// Makes the next write of journal `j` fail.
+    #[cfg(test)]
+    pub(crate) fn fail_next_write(&self, j: JournalId) {
+        match j {
+            JournalId::Retained(i) => self.retained.fail_next_write(i),
+            JournalId::Lane(i) | JournalId::Pair { to: i, .. } => {
+                self.lane_logs[i].fail_next_write();
+            }
+        }
+    }
+
     /// Stops `task` with the broker, or now if the broker stopped already,
     /// as a bind cancelled before its listener was up may find it.
     fn own_task(&self, task: AbortHandle) {
@@ -151,6 +197,9 @@ pub struct Stats {
     pub retained_rejected: u64,
     /// Approximate bytes of state counted against `max_state_bytes`.
     pub state_bytes: u64,
+    /// Writes to the data directory that failed. Their v5 publishers got
+    /// Unspecified error, and v3.1.1 ones were disconnected.
+    pub write_errors: u64,
 }
 
 /// Messages the broker dropped, by reason.
@@ -214,9 +263,10 @@ impl Broker {
     /// # Errors
     ///
     /// [`Error::InvalidOption`] for a zero `sys_interval`, `sn.retry`,
-    /// `sn.max_keep_alive` or `receive_maximum`, [`Error::Persistence`] if stored retained messages
-    /// cannot be loaded, [`Error::State`] if the state file cannot be read,
-    /// and [`Error::Transport`] if the lanes have stopped.
+    /// `sn.max_keep_alive` or `receive_maximum`, [`Error::DataDir`] if the
+    /// data directory cannot be opened or read, or the system is not
+    /// Linux, [`Error::State`] if the state file cannot be read, and
+    /// [`Error::Transport`] if the lanes have stopped.
     pub async fn new(ctx: &Context, opts: BrokerOptions) -> Result<Broker> {
         check(&opts)?;
         let n = ctx.lanes();
@@ -232,18 +282,21 @@ impl Broker {
             });
             receivers.push((ctl_rx, data_rx));
         }
-        let retained = RetainedStore::new(
-            opts.persistence.clone(),
-            opts.max_retained,
-            opts.max_topic_levels,
-        )
-        .map_err(Error::Persistence)?;
+        let Opened {
+            retained,
+            data,
+            lane_logs,
+            sessions,
+        } = open_data(&opts, n).await?;
         let shared = Arc::new(Shared {
             // Relaxed: only unique, no data rides on it.
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ctx: ctx.clone(),
             opts,
-            retained: Mutex::new(retained),
+            retained,
+            lane_logs,
+            pairs: (0..n * n).map(|_| Cursor::default()).collect(),
+            data,
             lanes: lanes.into_boxed_slice(),
             connections: AtomicUsize::new(0),
             tasks: Mutex::new(Some(Vec::new())),
@@ -257,6 +310,10 @@ impl Broker {
             ctx.lane(i)
                 .call(move || install(i as u16, s, ctl_rx, data_rx))
                 .await?;
+        }
+        if shared.data.is_some() {
+            complete_writes(&shared).await?;
+            crate::dump::restore(&shared, sessions).await?;
         }
         if let Some(path) = &shared.opts.state_file {
             crate::dump::load(&shared, path).await?;
@@ -277,6 +334,11 @@ impl Broker {
     #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
         self.shared.id
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Shared {
+        &self.shared
     }
 
     /// Binds an endpoint such as `tcp://0.0.0.0:1883` and returns the bound
@@ -379,6 +441,9 @@ impl Broker {
         self.abort_tasks();
         let saved = match &self.shared.opts.state_file {
             Some(path) => crate::dump::save(&self.shared, path).await,
+            // Connections end as lost: journals get their ends, and wills go
+            // out once.
+            None if self.shared.data.is_some() => crate::dump::quiesce(&self.shared).await,
             None => Ok(()),
         };
         let mut done = Vec::with_capacity(self.shared.lanes.len());
@@ -390,6 +455,19 @@ impl Broker {
         }
         for rx in done {
             let _ = rx.await;
+        }
+        // Changes up to here, such as wills, reach the disk, and the data
+        // directory is free for the next broker.
+        if self.shared.data.is_some() {
+            let shared = self.shared.clone();
+            let _ = blocking(move || {
+                for log in &shared.lane_logs {
+                    log.close();
+                }
+                shared.close_cursors();
+                shared.retained.close();
+            })
+            .await;
         }
         saved
     }
@@ -424,16 +502,95 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
         total.dropped += s.dropped;
         total.state_bytes += s.state_bytes;
     }
-    {
-        let r = shared
-            .retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        total.retained = r.len() as u64;
-        total.retained_rejected = r.rejected;
-        total.state_bytes += r.bytes() as u64;
-    }
+    let r = &shared.retained;
+    total.retained = r.len() as u64;
+    total.retained_rejected = r.rejected();
+    total.write_errors = r.write_errors()
+        + shared
+            .lane_logs
+            .iter()
+            .map(|l| l.write_errors.load(Ordering::Relaxed))
+            .sum::<u64>();
+    total.state_bytes += r.bytes() as u64;
     Ok(total)
+}
+
+/// What the data directory holds, or empty stores without one.
+struct Opened {
+    retained: Retained,
+    data: Option<DataDir>,
+    lane_logs: Box<[LaneLog]>,
+    /// The sessions of each lane.
+    sessions: Vec<Vec<SessionState>>,
+}
+
+/// Opens the journals in `opts.data_dir`, if it is set, for `n` lanes,
+/// with what they hold.
+async fn open_data(opts: &BrokerOptions, n: usize) -> Result<Opened> {
+    let Some(path) = opts.data_dir.clone() else {
+        return Ok(Opened {
+            retained: Retained::new(opts.max_retained),
+            data: None,
+            lane_logs: (0..n).map(|i| LaneLog::new(i, None)).collect(),
+            sessions: Vec::new(),
+        });
+    };
+    let (max_packet, max, levels) = (
+        opts.max_packet_size,
+        opts.max_retained,
+        opts.max_topic_levels,
+    );
+    // Replaying the journals reads files.
+    blocking(move || {
+        let data = DataDir::open(&path, max_packet)?;
+        let retained = Retained::open(&data, max, levels)?;
+        let (logs, sessions) = disk::open_lanes(&data, n)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, (log, sessions))| (LaneLog::new(i, Some(log)), sessions))
+            .unzip::<_, _, Vec<_>, _>();
+        Ok(Opened {
+            retained,
+            data: Some(data),
+            lane_logs: logs.into(),
+            sessions,
+        })
+    })
+    .await?
+    .map_err(Error::DataDir)
+}
+
+/// Starts the task per retained stripe that takes its finished writes,
+/// spread over the lanes.
+async fn complete_writes(shared: &Arc<Shared>) -> Result<()> {
+    for i in 0..STRIPES {
+        let s = shared.clone();
+        shared
+            .ctx
+            .lane(i % shared.lanes.len())
+            .call(move || {
+                let task = tokio::task::spawn_local({
+                    let s = s.clone();
+                    async move { s.retained.complete(i).await }
+                });
+                s.own_task(task.abort_handle());
+            })
+            .await?;
+    }
+    Ok(())
+}
+
+/// Runs `f` on a thread of its own, for file work too long for a lane,
+/// with or without a Tokio runtime around the caller.
+async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    let (tx, rx) = oneshot::channel();
+    std::thread::Builder::new()
+        .name("zzq-files".to_owned())
+        .spawn(move || {
+            let _ = tx.send(f());
+        })
+        .map_err(Error::DataDir)?;
+    rx.await.map_err(|_| Error::Closed)
 }
 
 /// Refuses options the broker cannot work with.
@@ -446,6 +603,10 @@ fn check(o: &BrokerOptions) -> Result<()> {
     }
     if o.sn.max_keep_alive == 0 {
         return Err(Error::InvalidOption("sn.max_keep_alive"));
+    }
+    // A data directory keeps the sessions.
+    if o.data_dir.is_some() && o.state_file.is_some() {
+        return Err(Error::InvalidOption("state_file"));
     }
     // A v5 client must not get a Receive Maximum of 0.
     if o.receive_maximum == 0 {
@@ -470,6 +631,12 @@ impl Drop for Broker {
         for lane in &self.shared.lanes {
             let _ = lane.control.push(Control::Shutdown(None));
         }
+        // The data directory is free for another broker at once.
+        for log in &self.shared.lane_logs {
+            log.release();
+        }
+        self.shared.close_cursors();
+        self.shared.retained.release();
     }
 }
 
@@ -482,6 +649,10 @@ fn install(
     let broker = shared.id;
     let lane: LaneRef = Rc::new(RefCell::new(Lane::new(id, shared.clone())));
     LANES.with(|l| l.borrow_mut().insert(broker, lane.clone()));
+    if shared.data.is_some() {
+        let task = tokio::task::spawn_local(crate::lane::complete(lane.clone()));
+        shared.own_task(task.abort_handle());
+    }
 
     let l = lane.clone();
     tokio::task::spawn_local(async move {

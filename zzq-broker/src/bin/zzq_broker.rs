@@ -1,23 +1,24 @@
 //! Standalone broker.
 //!
 //! Usage: `zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM]
-//! [--client-ca PEM] [--retained-file PATH] [--state-file PATH]
+//! [--client-ca PEM] [--data-dir PATH] [--state-file PATH]
 //! [--max-state-mib N] [--busy-poll] [--spin-us N]`
 //!
 //! Without `--bind`, it binds `tcp://0.0.0.0:1883`. `--cert` and `--key`,
 //! which go together, enable `tls://`, `wss://` and `quic://` binds.
-//! `--client-ca` makes them require client certificates. `--retained-file`
-//! keeps retained messages across restarts. `--state-file` keeps sessions
+//! `--client-ca` makes them require client certificates. `--data-dir`
+//! keeps retained messages, sessions and their QoS 1/2 messages on disk,
+//! and acks what goes there once it is (Linux only).
+//! `--state-file` keeps sessions
 //! across a restart: SIGTERM or SIGINT write it, and the next start loads
 //! it. `--max-state-mib` sets `max_state_bytes`. `--spin-us` sets how long
 //! a lane polls on after work before it sleeps. Prints each bound endpoint
 //! on its own line, then runs until SIGTERM or SIGINT.
 
 use std::process::ExitCode;
-use std::sync::Arc;
 use std::time::Duration;
 
-use zzq_broker::{Broker, BrokerOptions, Config, Context, FilePersistence};
+use zzq_broker::{Broker, BrokerOptions, Config, Context};
 
 struct Args {
     lanes: usize,
@@ -25,7 +26,7 @@ struct Args {
     cert: Option<String>,
     key: Option<String>,
     client_ca: Option<String>,
-    retained_file: Option<String>,
+    data_dir: Option<String>,
     state_file: Option<String>,
     max_state_mib: Option<usize>,
     busy_poll: bool,
@@ -39,7 +40,7 @@ fn parse() -> Option<Args> {
         cert: None,
         key: None,
         client_ca: None,
-        retained_file: None,
+        data_dir: None,
         state_file: None,
         max_state_mib: None,
         busy_poll: false,
@@ -58,7 +59,7 @@ fn parse() -> Option<Args> {
             "--cert" => a.cert = Some(value),
             "--key" => a.key = Some(value),
             "--client-ca" => a.client_ca = Some(value),
-            "--retained-file" => a.retained_file = Some(value),
+            "--data-dir" => a.data_dir = Some(value),
             "--state-file" => a.state_file = Some(value),
             "--max-state-mib" => a.max_state_mib = Some(value.parse().ok()?),
             "--spin-us" => a.spin = Duration::from_micros(value.parse().ok()?),
@@ -71,23 +72,17 @@ fn parse() -> Option<Args> {
     Some(a)
 }
 
-/// The broker's options, and the retained log to flush before exiting.
-fn options(a: &Args) -> Result<(BrokerOptions, Option<Arc<FilePersistence>>), String> {
-    let mut opts = BrokerOptions::default();
-    let store = match &a.retained_file {
-        Some(path) => {
-            let store = FilePersistence::open(path).map_err(|e| format!("{path}: {e}"))?;
-            Some(Arc::new(store))
-        }
-        None => None,
+fn options(a: &Args) -> Result<BrokerOptions, String> {
+    let mut opts = BrokerOptions {
+        data_dir: a.data_dir.as_ref().map(Into::into),
+        state_file: a.state_file.as_ref().map(Into::into),
+        ..BrokerOptions::default()
     };
-    opts.persistence = store.clone().map(|s| s as Arc<dyn zzq_broker::Persistence>);
-    opts.state_file = a.state_file.as_ref().map(Into::into);
     if let Some(mib) = a.max_state_mib {
         opts.max_state_bytes = mib.saturating_mul(1 << 20);
     }
     tls(a, &mut opts)?;
-    Ok((opts, store))
+    Ok(opts)
 }
 
 #[cfg(feature = "tls")]
@@ -179,23 +174,17 @@ fn main() -> ExitCode {
     let Some(args) = parse() else {
         eprintln!(
             "usage: zzq_broker [--lanes N] [--bind URI]... [--cert PEM --key PEM] \
-             [--client-ca PEM] [--retained-file PATH] [--state-file PATH] \
+             [--client-ca PEM] [--data-dir PATH] [--state-file PATH] \
              [--max-state-mib N] [--busy-poll] [--spin-us N]"
         );
         return ExitCode::FAILURE;
     };
-    let result = options(&args).and_then(|(opts, store)| {
+    let result = options(&args).and_then(|opts| {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|e| format!("runtime: {e}"))?;
-        let served = rt.block_on(serve(args, opts));
-        // Retained changes up to the shutdown, such as wills it published,
-        // reach the log before the process exits.
-        if let Some(store) = store {
-            store.flush();
-        }
-        served
+        rt.block_on(serve(args, opts))
     });
     match result {
         Ok(()) => ExitCode::SUCCESS,

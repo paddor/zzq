@@ -11,7 +11,7 @@ module ZZQ
     OPTIONS = %i[
       max_packet_size max_inflight max_queued max_queued_bytes receive_maximum max_subscriptions
       max_retained max_topic_levels topic_alias_maximum max_session_expiry max_connections
-      max_state_bytes max_keep_alive connect_timeout sys_interval persistence state_file tls
+      max_state_bytes max_keep_alive connect_timeout sys_interval data_dir state_file tls
     ].freeze
 
     # Starts a broker and binds it. With a block, yields it and closes it
@@ -40,7 +40,9 @@ module ZZQ
     # @param options [Hash] limits as in zzq-broker's +BrokerOptions+, such
     #   as +max_connections:+ or +max_queued:+; +max_keep_alive:+ and
     #   +sys_interval:+ (seconds, nil for none); +connect_timeout:+
-    #   (seconds); +persistence:+ (path of a file for retained messages);
+    #   (seconds); +data_dir:+ (directory that keeps retained messages,
+    #   sessions and their QoS 1/2 messages on disk; acks wait until what
+    #   they stand for is there; Linux only);
     #   +state_file:+ (path of a file that keeps sessions over a restart:
     #   {#close} writes it, and a broker started with it loads it and renames
     #   it to +<path>.loaded+); +tls:+ (+cert:+, +key:+, +client_ca:+ as PEM

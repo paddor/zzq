@@ -4,8 +4,8 @@ use std::collections::hash_map::Entry;
 use std::io;
 use std::ops::Range;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use zzq_proto::{SubscriptionOptions, reason};
@@ -33,11 +33,11 @@ impl Lane {
         self.sweeps = self.sweeps.wrapping_add(1);
         // The retained store is shared; one lane, once a round, is enough.
         if self.id == 0 && part == 0 {
-            self.shared
-                .retained
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .sweep(now);
+            self.shared.retained.sweep(now);
+            let _ = self.shared.retained.snapshot(false);
+        }
+        if part == 0 && self.pairs_on() {
+            let _ = self.snapshot_journal(false);
         }
         // Before the round, so its parts split the same slots.
         if part == 0 {
@@ -88,6 +88,9 @@ impl Lane {
                 .and_then(|s| s.delayed_will.take_if(|w| w.timer == timer));
             if let Some(w) = will {
                 self.publish_will(w.msg);
+                if self.sessions.get(key).is_some_and(|s| s.journaled) {
+                    self.journal_session(key, crate::state::journal::WILL_SENT);
+                }
             }
         }
     }
@@ -104,12 +107,7 @@ impl Lane {
         self.shared.lanes[usize::from(self.id)]
             .state
             .store(self.budget.total.get(), Ordering::Relaxed);
-        let retained = self
-            .shared
-            .retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .bytes();
+        let retained = self.shared.retained.bytes();
         let lanes: usize = self
             .shared
             .lanes
@@ -162,11 +160,14 @@ impl Lane {
     pub(super) fn restore(&mut self, states: Vec<SessionState>, sync: &Arc<SyncAck>) {
         let lanes = self.shared.lanes.len();
         let now = Instant::now();
+        // Sessions come from the journal, or from a state file without one.
+        let journaled = self.journals();
         for st in states {
             let Entry::Vacant(slot) = self.by_client.entry(st.client_id.clone()) else {
                 continue;
             };
-            let (session, will) = Session::restore(st, self.budget.total.clone(), lanes);
+            let (mut session, will) = Session::restore(st, self.budget.total.clone(), lanes);
+            session.journaled = journaled;
             let subs: Vec<(Box<str>, SubscriptionOptions, u32)> = session
                 .subs
                 .iter()

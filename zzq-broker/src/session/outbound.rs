@@ -10,7 +10,7 @@ use crate::budget;
 use crate::msg::{Msg, expired};
 
 use super::output::Fields;
-use super::{Inflight, Kept, Outcome, QueueLimit, Session};
+use super::{AckHold, Inflight, Kept, Outcome, Progress, QueueLimit, Session};
 
 /// Unacked messages beyond which a session counts as slow: new messages
 /// for it get their own copy instead of pinning read buffers.
@@ -37,10 +37,12 @@ impl Session {
             return self.send_inflight(h);
         }
         if limit.state_full {
+            self.progress(h.seq, Progress::Done(h.seq));
             return Outcome::StateFull;
         }
         let size = h.msg.size();
         if size > limit.bytes {
+            self.progress(h.seq, Progress::Done(h.seq));
             return Outcome::QueueFull(1);
         }
         let mut dropped = 0;
@@ -48,6 +50,7 @@ impl Session {
             let Some(old) = self.pop_queued() else {
                 break;
             };
+            self.progress(old.seq, Progress::Done(old.seq));
             self.charge.sub(budget::held(&old));
             dropped += 1;
         }
@@ -94,7 +97,11 @@ impl Session {
         if !ok {
             self.free_pkid(pkid);
             self.charge.sub(budget::held(&h));
+            self.progress(h.seq, Progress::Done(h.seq));
             return Outcome::TooLarge;
+        }
+        if h.qos == QoS::ExactlyOnce {
+            self.progress(h.seq, Progress::Sent(h.seq, pkid));
         }
         let cap = self.flow.inflight.capacity();
         self.flow.inflight.push_back(Inflight {
@@ -183,6 +190,7 @@ impl Session {
             if expires_at.is_some() && expired(expires_at, *now.get_or_insert_with(Instant::now)) {
                 self.flow.counts.expired += 1;
                 self.charge.sub(budget::held(&h));
+                self.progress(h.seq, Progress::Done(h.seq));
                 continue;
             }
             match self.send_inflight(h) {
@@ -218,6 +226,15 @@ impl Session {
         if let Some(f) = self.flow.inflight.remove(i) {
             self.free_pkid(f.pkid);
             self.charge.sub(budget::held(&f.held));
+            self.progress(f.held.seq, Progress::Done(f.held.seq));
+        }
+    }
+
+    /// Notes progress of delivery `seq` for the lane's journal, if it is
+    /// there.
+    fn progress(&mut self, seq: u64, p: Progress) {
+        if seq != 0 {
+            self.flow.progress.push(p);
         }
     }
 
@@ -254,7 +271,15 @@ impl Session {
             return Ok(self.pump());
         }
         f.released = true;
-        self.ack(PacketType::PubRel, pkid, 0);
+        let seq = f.held.seq;
+        if seq == 0 {
+            self.ack(PacketType::PubRel, pkid, 0);
+            return Ok(true);
+        }
+        // Not before the journal has it: a restart would send the PUBLISH
+        // again, which a client that sent PUBCOMP takes as new.
+        self.progress(seq, Progress::Released(seq));
+        self.hold_durable(PacketType::PubRel, pkid);
         Ok(true)
     }
 
@@ -269,6 +294,18 @@ impl Session {
         }
         self.take_inflight(i);
         Ok(self.pump())
+    }
+
+    /// Holds ack `kind` for `pkid` of the current connection until the
+    /// writes the lane notes in the hold are done.
+    pub(crate) fn hold_durable(&mut self, kind: PacketType, pkid: u16) {
+        let Some(conn) = self.conn.as_ref().map(|c| c.id) else {
+            return;
+        };
+        self.inbound
+            .hold
+            .get_or_insert_with(|| Box::new(AckHold::new(conn)))
+            .push_durable(kind, pkid);
     }
 
     /// Resends the inflight window after a reconnect, as far as the
@@ -299,6 +336,7 @@ impl Session {
                     self.free_pkid(f.pkid);
                     self.charge.sub(budget::held(&f.held));
                     self.flow.counts.too_large += 1;
+                    self.progress(f.held.seq, Progress::Done(f.held.seq));
                 }
                 continue;
             }

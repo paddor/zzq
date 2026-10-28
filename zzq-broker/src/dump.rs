@@ -116,7 +116,7 @@ pub(crate) async fn save(shared: &Shared, path: &Path) -> Result<()> {
 }
 
 /// Closes every connection, then waits for deliveries between lanes.
-async fn quiesce(shared: &Shared) -> Result<()> {
+pub(crate) async fn quiesce(shared: &Shared) -> Result<()> {
     let mut closed = Vec::with_capacity(shared.lanes.len());
     for lane in &shared.lanes {
         let (tx, rx) = oneshot::channel();
@@ -150,12 +150,7 @@ async fn write(shared: &Shared, tmp: &Path) -> Result<()> {
         push(lane, Control::Dump(Box::new(Dump { part, reply })))?;
         lanes.push(rx);
     }
-    // A persistence backend keeps retained messages itself.
-    let mut written = if shared.opts.persistence.is_none() {
-        retained(shared, &mut head).map_err(Error::State)
-    } else {
-        Ok(())
-    };
+    let mut written = retained(shared, &mut head).map_err(Error::State);
     for rx in lanes {
         let lane = rx.await.map_err(|_| Error::Closed);
         written = written.and(lane.and_then(|r| r.map_err(Error::State)));
@@ -170,11 +165,7 @@ async fn write(shared: &Shared, tmp: &Path) -> Result<()> {
 /// Writes the retained messages in topic order, so related ones share a
 /// frame.
 fn retained(shared: &Shared, head: &mut Part) -> io::Result<()> {
-    let mut retained = shared
-        .retained
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .messages();
+    let mut retained = shared.retained.messages();
     retained.sort_unstable_by(|a, b| a.topic().cmp(b.topic()));
     for m in &retained {
         head.retained(m)?;
@@ -193,29 +184,35 @@ pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
     let records = decode(file)?;
     let n = shared.lanes.len();
     let mut sessions: Vec<Vec<SessionState>> = (0..n).map(|_| Vec::new()).collect();
-    {
-        let mut store = shared
-            .retained
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        // Topics deeper than clients may use now are left out: the store and
-        // the index walk them a level at a time.
-        let max = shared.opts.max_topic_levels;
-        for r in records {
-            match r {
-                Record::Session(mut st) => {
-                    st.subs.retain(|(filter, _, _)| !too_deep(filter, max));
-                    sessions[lane_for(&st.client_id, n)].push(*st);
-                }
-                Record::Retained(m) if !too_deep(m.topic(), max) => store.set(&m, false),
-                Record::Retained(_) => {}
+    let max = shared.opts.max_topic_levels;
+    for r in records {
+        match r {
+            Record::Session(st) => sessions[lane_for(&st.client_id, n)].push(*st),
+            // Deeper than clients may use now: the store walks topics a
+            // level at a time.
+            Record::Retained(m) if !too_deep(m.topic(), max) => {
+                let _ = shared.retained.set(&m, false);
             }
+            Record::Retained(_) => {}
         }
     }
-    // Subscriptions are on every lane before the broker serves.
+    restore(shared, sessions).await?;
+    fs::rename(path, with_suffix(path, ".loaded")).map_err(Error::State)?;
+    sync_dir(path).map_err(Error::State)
+}
+
+/// Hands each lane its sessions, and waits until every lane has their
+/// subscriptions.
+pub(crate) async fn restore(shared: &Shared, sessions: Vec<Vec<SessionState>>) -> Result<()> {
+    // Filters deeper than clients may use now are left out: the index walks
+    // them a level at a time.
+    let max = shared.opts.max_topic_levels;
     let subscribed = Arc::new(SyncAck::default());
-    let mut restored = Vec::with_capacity(n);
-    for (lane, states) in shared.lanes.iter().zip(sessions) {
+    let mut restored = Vec::with_capacity(sessions.len());
+    for (lane, mut states) in shared.lanes.iter().zip(sessions) {
+        for st in &mut states {
+            st.subs.retain(|(filter, _, _)| !too_deep(filter, max));
+        }
         let (tx, rx) = oneshot::channel();
         push(lane, Control::Restore(states, subscribed.clone(), tx))?;
         restored.push(rx);
@@ -224,8 +221,7 @@ pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
         rx.await.map_err(|_| Error::Closed)?;
     }
     subscribed.wait().await;
-    fs::rename(path, with_suffix(path, ".loaded")).map_err(Error::State)?;
-    sync_dir(path).map_err(Error::State)
+    Ok(())
 }
 
 /// Decompresses and decodes the image a piece at a time, with no buffer

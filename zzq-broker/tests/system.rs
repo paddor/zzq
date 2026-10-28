@@ -1610,12 +1610,12 @@ async fn mutual_tls_identifies_clients() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retained_messages_survive_restart() {
-    let path = std::env::temp_dir().join(format!("zzq-retained-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&path);
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zzq-retained-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     for run in 0..2 {
-        let store = Arc::new(zzq_broker::FilePersistence::open(&path).unwrap());
         let opts = BrokerOptions {
-            persistence: Some(store.clone()),
+            data_dir: Some(dir.clone()),
             ..BrokerOptions::default()
         };
         let (ctx, broker, uri) = setup_with(2, opts).await;
@@ -1626,7 +1626,6 @@ async fn retained_messages_survive_restart() {
                     .await
                     .unwrap();
             }
-            store.flush();
         } else {
             let mut s = client(&ctx, &uri, "s", Version::V5).await;
             s.subscribe("keep/#", QoS::AtLeastOnce).await.unwrap();
@@ -1635,11 +1634,65 @@ async fn retained_messages_survive_restart() {
             assert_eq!(m.payload, "A");
             nothing(&mut s).await;
         }
-        assert_eq!(store.write_errors(), 0);
+        assert_eq!(broker.stats().await.unwrap().write_errors, 0);
         drop(broker);
         drop(ctx);
     }
-    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sessions_move_lanes_when_the_lane_count_changes() {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zzq-relane-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let durable = |id: String| ClientOptions {
+        clean_start: false,
+        session_expiry: 600,
+        ..ClientOptions::new(id)
+    };
+    let ids: Vec<String> = (0..12).map(|i| format!("moving-{i}")).collect();
+    for lanes in [2, 3, 1] {
+        let opts = BrokerOptions {
+            data_dir: Some(dir.clone()),
+            ..BrokerOptions::default()
+        };
+        let (ctx, broker, uri) = setup_with(lanes, opts).await;
+        let mut clients = Vec::new();
+        for id in &ids {
+            let c = Client::connect(&ctx, &uri, durable(id.clone()))
+                .await
+                .unwrap();
+            if lanes == 2 {
+                c.subscribe(&format!("m/{id}"), QoS::AtLeastOnce)
+                    .await
+                    .unwrap();
+            } else {
+                assert!(c.connected().session_present, "{id} on {lanes} lanes");
+            }
+            clients.push(c);
+        }
+        let p = client(&ctx, &uri, "pub", Version::V5).await;
+        for id in &ids {
+            p.publish(&format!("m/{id}"), lanes.to_string(), QoS::AtLeastOnce)
+                .await
+                .unwrap();
+        }
+        for c in &mut clients {
+            // An earlier message whose PUBACK the shutdown cut off comes
+            // again first.
+            while next(c).await.payload != lanes.to_string() {}
+        }
+        broker.shutdown().await.unwrap();
+        drop(ctx);
+    }
+    let dirs: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with("lanes-"))
+        .collect();
+    assert_eq!(dirs, ["lanes-1"]);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]

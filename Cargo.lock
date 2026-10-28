@@ -1330,6 +1330,7 @@ dependencies = [
  "xxhash-rust",
  "zrip",
  "zzq-client",
+ "zzq-disk",
  "zzq-proto",
  "zzq-tokio",
 ]

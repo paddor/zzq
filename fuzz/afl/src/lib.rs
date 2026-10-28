@@ -11,12 +11,13 @@ use zzq_proto::{Packet, Version, decode, sn, topic};
 pub type Target = fn(&[u8]);
 
 /// Every target, by name.
-pub const TARGETS: [(&str, Target); 8] = [
+pub const TARGETS: [(&str, Target); 9] = [
     ("mqtt", mqtt),
     ("mqtt_sn", mqtt_sn),
     ("websocket", websocket),
-    ("retained_log", retained_log),
+    ("retained_record", retained_record),
     ("state_image", state_image),
+    ("lane_records", lane_records),
     ("journal_segment", journal_segment),
     ("endpoint", endpoint),
     ("topics", topics),
@@ -78,9 +79,15 @@ pub fn websocket(data: &[u8]) {
     zzq_tokio::fuzzing::websocket_client(data);
 }
 
-/// A retained message log, as the broker replays it on start.
-pub fn retained_log(data: &[u8]) {
-    zzq_broker::fuzzing::retained_log(data);
+/// A record of a retained message journal, as the broker replays it on
+/// start.
+pub fn retained_record(data: &[u8]) {
+    zzq_broker::fuzzing::retained_record(data);
+}
+
+/// Records of a lane journal, as the broker replays them on start.
+pub fn lane_records(data: &[u8]) {
+    zzq_broker::fuzzing::lane_records(data);
 }
 
 /// A state image, as the broker loads a dump. Restored sessions encode

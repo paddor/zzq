@@ -40,6 +40,15 @@ let message = client.recv().await;
 and `udp://` for MQTT-SN. TLS and QUIC are behind the default `tls` and
 `quic` features.
 
+## Durability
+
+The broker keeps its state in memory. With `BrokerOptions::data_dir`
+(`zzq_broker --data-dir`, Linux only), it keeps retained messages, the
+sessions that outlive their connection, their subscriptions and their
+QoS 1/2 messages in journals written with `O_DIRECT | O_DSYNC`, and an ack
+waits until what it stands for is on disk. See
+[COMPARISONS.md](COMPARISONS.md#durability).
+
 ## Benchmarks
 
 See [BENCHMARKS.md](BENCHMARKS.md).

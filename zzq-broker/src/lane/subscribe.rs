@@ -1,6 +1,6 @@
 //! Subscription changes, their acks, and retained messages on subscribe.
 
-use std::sync::{Arc, PoisonError};
+use std::sync::Arc;
 
 use zzq_proto::encode::{self, SubAckFields};
 use zzq_proto::packet::{Subscribe, Unsubscribe};
@@ -8,6 +8,7 @@ use zzq_proto::property;
 use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{PacketType, QoS, RetainHandling, SubscriptionOptions, reason};
 
+use crate::durable::Due;
 use crate::index::{Entry, SubIds, SubRef};
 use crate::msg::{Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
@@ -17,13 +18,16 @@ use crate::slab::Key;
 use super::route::{Extra, Grant, Owned};
 use super::{Control, Lane, SyncAck};
 
-/// An ack packet held until other lanes applied a subscription change.
+/// An ack packet held until other lanes applied a subscription change and
+/// the journal holds it.
 #[derive(Debug)]
 pub(crate) struct Held {
     pub(crate) key: Key,
     /// The connection the ack is for.
     pub(crate) conn: u64,
-    pub(crate) sync: Arc<SyncAck>,
+    pub(crate) sync: Option<Arc<SyncAck>>,
+    /// The journal write the change needs.
+    pub(crate) due: Due,
     pub(crate) packet: Box<[u8]>,
     /// New subscriptions that get retained messages after the ack.
     pub(crate) retained: Box<[Wanted]>,
@@ -92,6 +96,7 @@ impl Lane {
         let mut codes = Vec::new();
         let mut wanted = Vec::new();
         let sync = self.sync();
+        let mut due = Due::Now;
         for (filter, opts) in sub.filters() {
             let Some(s) = self.sessions.get_mut(key) else {
                 return;
@@ -103,6 +108,7 @@ impl Lane {
             let existed = s.subscribe(filter, opts, sub_id, lanes);
             let entry = self.entry_for(key, filter, opts, sub_id);
             self.subscribe_entry(filter, &entry, existed, sync.as_ref());
+            due = due.then(self.journal_sub(key, filter, Some((opts, sub_id))));
             codes.push(opts.qos as u8);
             if retained_wanted(filter, opts, existed) {
                 wanted.push((filter.into(), opts.qos, sub_id));
@@ -119,7 +125,12 @@ impl Lane {
             codes: &codes,
         };
         let version = s.version;
-        self.ack_after_sync(key, sync, |out| encode::suback(&a, version, out), wanted);
+        self.ack_after_sync(
+            key,
+            (sync, due),
+            |out| encode::suback(&a, version, out),
+            wanted,
+        );
     }
 
     /// Sends the retained messages `wanted` subscriptions match. Read only
@@ -130,20 +141,14 @@ impl Lane {
             return;
         }
         let mut retained = Vec::new();
-        {
-            let store = self
-                .shared
-                .retained
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            for (filter, qos, sub_id) in wanted {
-                retained.extend(
-                    store
-                        .matching(filter)
-                        .into_iter()
-                        .map(|m| (m, *qos, *sub_id)),
-                );
-            }
+        for (filter, qos, sub_id) in wanted {
+            retained.extend(
+                self.shared
+                    .retained
+                    .matching(filter)
+                    .into_iter()
+                    .map(|m| (m, *qos, *sub_id)),
+            );
         }
         self.deliver_retained(key, retained);
     }
@@ -183,15 +188,16 @@ impl Lane {
         (self.shared.lanes.len() > 1).then(Arc::default)
     }
 
-    /// Queues an ack packet now, or holds it until `sync` completes.
+    /// Queues an ack packet now, or holds it until `sync` completes and
+    /// the journal write `due` finished.
     fn ack_after_sync(
         &mut self,
         key: Key,
-        sync: Option<Arc<SyncAck>>,
+        (sync, due): (Option<Arc<SyncAck>>, Due),
         encode: impl FnOnce(&mut Vec<u8>),
         retained: Vec<Wanted>,
     ) {
-        if let Some(sync) = sync {
+        if sync.is_some() || due != Due::Now {
             let mut packet = Vec::new();
             encode(&mut packet);
             let conn = self
@@ -203,6 +209,7 @@ impl Lane {
                 key,
                 conn,
                 sync,
+                due,
                 packet: packet.into(),
                 retained: retained.into(),
             });
@@ -241,6 +248,7 @@ impl Lane {
         let sub = self.sub_ref(key);
         let sync = self.sync();
         let lanes = self.shared.lanes.len();
+        let mut due = Due::Now;
         for filter in u.filters() {
             let existed = self
                 .sessions
@@ -248,6 +256,7 @@ impl Lane {
                 .is_some_and(|s| s.unsubscribe(filter, lanes));
             if existed {
                 self.unsubscribe_entry(filter, sub, sync.as_ref());
+                due = due.then(self.journal_sub(key, filter, None));
             }
             codes.push(if existed {
                 0
@@ -268,7 +277,7 @@ impl Lane {
         let version = s.version;
         self.ack_after_sync(
             key,
-            sync,
+            (sync, due),
             |out| encode::suback(&a, version, out),
             Vec::new(),
         );
@@ -375,7 +384,8 @@ mod tests {
             l.held.push(Held {
                 key,
                 conn,
-                sync,
+                sync: Some(sync),
+                due: crate::durable::Due::Now,
                 packet: packet.into(),
                 retained: Box::default(),
             });

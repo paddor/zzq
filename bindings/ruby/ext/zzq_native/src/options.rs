@@ -3,14 +3,12 @@
 //! "none".
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use rb_sys::VALUE;
-use zzq_broker::{BrokerOptions, FilePersistence};
+use zzq_broker::BrokerOptions;
 use zzq_client::{ClientOptions, LastWill, QoS, Reconnect, TlsOptions, TransportOptions, Version};
 
-use crate::error;
 use crate::rb::{self, RbResult, RubyErr};
 
 /// The value under `key`, unless missing or nil.
@@ -123,8 +121,8 @@ pub fn client(h: VALUE) -> RbResult<ClientOptions> {
     Ok(o)
 }
 
-/// Broker options, and the retained-message store they use.
-pub fn broker(h: VALUE) -> RbResult<(BrokerOptions, Option<Arc<FilePersistence>>)> {
+/// Broker options.
+pub fn broker(h: VALUE) -> RbResult<BrokerOptions> {
     let mut o = BrokerOptions::default();
     macro_rules! ints {
         ($($field:ident),*) => {$(
@@ -157,16 +155,8 @@ pub fn broker(h: VALUE) -> RbResult<(BrokerOptions, Option<Arc<FilePersistence>>
     if let Some(v) = duration(h, "connect_timeout")? {
         o.connect_timeout = v;
     }
-    let store = match string(h, "persistence")? {
-        Some(path) => {
-            Some(Arc::new(FilePersistence::open(&path).map_err(|e| {
-                error::zzq(format!("opening {path} failed: {e}"))
-            })?))
-        }
-        None => None,
-    };
-    o.persistence = store.clone().map(|s| s as Arc<dyn zzq_broker::Persistence>);
+    o.data_dir = string(h, "data_dir")?.map(PathBuf::from);
     o.state_file = string(h, "state_file")?.map(PathBuf::from);
     o.transport = transport(h)?;
-    Ok((o, store))
+    Ok(o)
 }

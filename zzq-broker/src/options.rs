@@ -134,14 +134,23 @@ pub struct BrokerOptions {
     pub authenticator: Option<Arc<dyn Authenticator>>,
     /// Optional publish and subscribe authorization. `None` allows all.
     pub authorizer: Option<Arc<dyn Authorizer>>,
-    /// Durable storage for retained messages. `None` keeps them in memory
-    /// only.
-    pub persistence: Option<Arc<dyn crate::Persistence>>,
+    /// Directory for state that survives a crash: retained messages, and
+    /// the sessions that outlive their connection with their
+    /// subscriptions and QoS 1/2 messages. An ack waits until what it
+    /// stands for is on disk: PUBACK or PUBREC for the message, retained or
+    /// queued for such sessions, PUBCOMP for the end of a QoS 2 flow,
+    /// SUBACK and UNSUBACK for the change. A connection the crash ended
+    /// counts as lost at the next start, so its will goes out.
+    /// `None` keeps it all in memory. Linux only, and the file system must
+    /// take `O_DIRECT`, which tmpfs before Linux 6.6 does not. Not with
+    /// `state_file`.
+    pub data_dir: Option<PathBuf>,
     /// File that keeps sessions over a restart: [`Broker::shutdown`]
     /// closes every connection and writes it, and [`Broker::new`] loads it
     /// and renames it to `<name>.loaded`. It holds the retained messages
-    /// too, unless `persistence` keeps them. Sessions that end with their
-    /// connection are left out. The file is compressed with Zstandard.
+    /// too. Sessions that end with their connection are left out. The file
+    /// is compressed with Zstandard. Not with `data_dir`, which keeps all
+    /// of it.
     ///
     /// [`Broker::shutdown`]: crate::Broker::shutdown
     /// [`Broker::new`]: crate::Broker::new
@@ -176,7 +185,7 @@ impl Default for BrokerOptions {
             connect_timeout: Duration::from_secs(10),
             authenticator: None,
             authorizer: None,
-            persistence: None,
+            data_dir: None,
             state_file: None,
             sys_interval: Some(Duration::from_secs(10)),
             transport: TransportOptions::default(),
@@ -206,7 +215,7 @@ impl fmt::Debug for BrokerOptions {
             .field("connect_timeout", &self.connect_timeout)
             .field("authenticator", &self.authenticator.is_some())
             .field("authorizer", &self.authorizer.is_some())
-            .field("persistence", &self.persistence.is_some())
+            .field("data_dir", &self.data_dir)
             .field("state_file", &self.state_file)
             .field("sys_interval", &self.sys_interval)
             .field("transport", &self.transport)
