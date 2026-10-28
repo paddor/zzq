@@ -452,6 +452,7 @@ fn on_a_full_device(root: &Path) {
     }
     settle(&mut j);
     assert_eq!(files(&dir, "tmp"), Vec::<PathBuf>::new());
+    assert!(zzq_disk::free_bytes(root).unwrap() < kill_config().segment_bytes);
     // A roll starts in the spare kept back, and the trim behind it makes
     // room for the segments after.
     let roll = loop {
@@ -543,6 +544,17 @@ fn a_reopen_waits_for_the_work_of_the_journal_dropped_before() {
         "{} records read back",
         got.len()
     );
+}
+
+#[test]
+fn free_bytes_tell_the_room_on_the_device() {
+    let dir = TempDir::new("free");
+    std::fs::create_dir_all(&dir.0).unwrap();
+    assert!(zzq_disk::free_bytes(&dir.0).unwrap() > 0);
+    assert!(matches!(
+        zzq_disk::free_bytes(dir.0.join("missing")),
+        Err(Error::Io(_))
+    ));
 }
 
 #[test]

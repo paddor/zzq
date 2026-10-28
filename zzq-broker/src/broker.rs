@@ -142,6 +142,24 @@ impl Shared {
         self.data.is_some()
     }
 
+    /// Bytes the state may take: `max_state_bytes`, and no more than the
+    /// room on the device of the data directory.
+    pub(crate) fn state_limit(&self) -> usize {
+        let room = self.data.as_ref().map_or(u64::MAX, DataDir::room);
+        self.opts
+            .max_state_bytes
+            .min(usize::try_from(room).unwrap_or(usize::MAX))
+    }
+
+    /// Makes the data directory's device seem to have `free` bytes, or
+    /// what it has with `None`.
+    #[cfg(test)]
+    pub(crate) fn set_free_bytes(&self, free: Option<u64>) {
+        if let Some(data) = &self.data {
+            data.set_free(free);
+        }
+    }
+
     /// Closes the cursors of the lane journals and their pairs: what they
     /// did not write by now they never will.
     fn close_cursors(&self) {

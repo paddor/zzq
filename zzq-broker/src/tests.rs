@@ -1064,6 +1064,61 @@ async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
+    use zzq_proto::ReasonCode;
+
+    let (dir, opts) = on_disk("room");
+    let (ctx, broker, uri) = setup(1, opts()).await;
+    let durable = |id: &str| ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        ..ClientOptions::new(id)
+    };
+    let d = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
+    d.subscribe("q", QoS::AtLeastOnce).await.unwrap();
+    d.disconnect().await;
+    // No room for another copy of the state: it stops growing.
+    broker.shared().set_free_bytes(Some(0));
+    lane_until(&ctx, &broker, 0, |l| l.budget.full.then_some(())).await;
+    let refused = Client::connect(&ctx, &uri, durable("e")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(zzq_client::Error::Refused(ReasonCode::QUOTA_EXCEEDED))
+        ),
+        "{refused:?}"
+    );
+    let mut live = Client::connect(&ctx, &uri, ClientOptions::new("live"))
+        .await
+        .unwrap();
+    live.subscribe("live", QoS::AtLeastOnce).await.unwrap();
+    live.publish("live", "x", QoS::AtLeastOnce).await.unwrap();
+    assert_eq!(support::next(&mut live).await.payload, "x");
+    // A message dropped for the full state costs the journal nothing.
+    let journaled = broker.shared().lane_logs[0].counts().0;
+    live.publish("q", "dropped", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    assert_eq!(broker.shared().lane_logs[0].counts().0, journaled);
+    live.publish_retained("live", "kept?", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    assert_eq!(support::next(&mut live).await.payload, "kept?");
+    stats_until(&broker, |s| {
+        s.dropped.state_full == 1 && (s.retained, s.retained_rejected) == (0, 1)
+    })
+    .await;
+    // Room again: the state grows again.
+    broker.shared().set_free_bytes(None);
+    lane_until(&ctx, &broker, 0, |l| (!l.budget.full).then_some(())).await;
+    live.publish("q", "kept", QoS::AtLeastOnce).await.unwrap();
+    let mut d = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
+    assert!(d.connected().session_present);
+    assert_eq!(support::next(&mut d).await.payload, "kept");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
     use zzq_proto::{PacketType, SubscriptionOptions, Version, reason};
 

@@ -39,10 +39,21 @@ mod segment;
 mod testing;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use backend::{Config, Disk};
 pub use journal::{Journal, Record};
+
+/// Bytes an unprivileged writer may still take on the device that holds
+/// `path`, such as a journal's directory.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the device cannot tell, as for a missing path.
+pub fn free_bytes(path: impl AsRef<Path>) -> Result<u64, Error> {
+    let st = rustix::fs::statvfs(path.as_ref()).map_err(io::Error::from)?;
+    Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
 
 /// Why replaying a record failed, from the callback of [`Disk::open`].
 pub type ReplayError = Box<dyn std::error::Error + Send + Sync>;

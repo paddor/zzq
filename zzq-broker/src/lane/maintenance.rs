@@ -98,10 +98,11 @@ impl Lane {
         }
     }
 
-    /// Publishes this lane's state bytes, and checks `max_state_bytes`
-    /// against those of all lanes and the retained store.
+    /// Publishes this lane's state bytes, and checks those of all lanes
+    /// and the retained store against `max_state_bytes` and the room in the
+    /// data directory.
     fn check_state(&mut self) {
-        let max = self.shared.opts.max_state_bytes;
+        let max = self.shared.state_limit();
         if max == usize::MAX {
             return;
         }

@@ -113,7 +113,9 @@ pub struct BrokerOptions {
     /// While it is reached, new sessions that would outlive their connection
     /// get CONNACK Quota Exceeded, messages that would wait in a session
     /// queue are dropped and counted, and retained messages for new topics
-    /// are not stored.
+    /// are not stored. With `data_dir`, the same holds while its device has
+    /// less room than the state takes and two segments, so every journal
+    /// can still write a snapshot and drop the segments before it.
     pub max_state_bytes: usize,
     /// Levels a topic name or filter may have. Deeper ones are rejected,
     /// which bounds the work and stack depth of matching.

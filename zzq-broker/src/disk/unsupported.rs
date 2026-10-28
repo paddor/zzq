@@ -29,6 +29,10 @@ impl DataDir {
         match *self {}
     }
 
+    pub(crate) const fn room(&self) -> u64 {
+        match *self {}
+    }
+
     pub(crate) fn journal(
         &self,
         _name: &str,

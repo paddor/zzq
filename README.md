@@ -46,8 +46,9 @@ The broker keeps its state in memory. With `BrokerOptions::data_dir`
 (`zzq_broker --data-dir`, Linux only), it keeps retained messages, the
 sessions that outlive their connection, their subscriptions and their
 QoS 1/2 messages in journals written with `O_DIRECT | O_DSYNC`, and an ack
-waits until what it stands for is on disk. See
-[COMPARISONS.md](COMPARISONS.md#durability).
+waits until what it stands for is on disk. The state stops growing while
+the disk has less room than another copy of it would take, as it does at
+`max_state_bytes`. See [COMPARISONS.md](COMPARISONS.md#durability).
 
 ## Benchmarks
 
