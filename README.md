@@ -2,7 +2,8 @@
 
 MQTT 3.1.1 and 5.0 broker and client in Rust, with an MQTT-SN 1.2 gateway.
 Connections run on IO lanes: threads with their own Tokio runtime, so a
-connection never moves between threads.
+connection never moves between threads. [doc/architecture.md](doc/architecture.md)
+shows the threads, the queues between them and the path of a message.
 
 ## Crates
 

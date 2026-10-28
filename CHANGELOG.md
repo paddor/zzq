@@ -71,6 +71,8 @@ Notable changes to zzq. The format follows
   `RUNNING_BENCHMARKS.md` shows how to run them.
 - `COMPARISONS.md` lists how the other brokers in the benchmarks behave
   under load, what survives a crash, and what their clustering offers.
+- `doc/architecture.md`: threads, channels, the path of a message, and
+  what makes zzq fast.
 
 ### Removed
 
