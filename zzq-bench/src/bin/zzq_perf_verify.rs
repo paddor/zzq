@@ -12,7 +12,7 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use zzq_bench::child;
-use zzq_bench::load::{self, Load, Scenario};
+use zzq_bench::load::{self, Load, Scenario, Until};
 use zzq_bench::ram::{self, Probe};
 use zzq_bench::wire;
 
@@ -512,7 +512,7 @@ fn load_child(args: &[String]) -> ExitCode {
     let cross = scenario == "cross";
     let scenario = match scenario.as_str() {
         "rtt" => {
-            return match load::latency(&cfg, 20_000) {
+            return match load::latency(&cfg, 20_000, Until::Delivered) {
                 Ok(l) => {
                     println!(
                         "p50={:.1} p99={:.1} p999={:.1} lost={}",

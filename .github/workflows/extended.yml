@@ -51,7 +51,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [mqtt, mqtt_sn, websocket, retained_log, endpoint, topics]
+        target: [mqtt, mqtt_sn, websocket, retained_record, endpoint, topics]
     defaults:
       run:
         working-directory: fuzz/afl

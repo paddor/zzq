@@ -2,9 +2,34 @@
 
 use crate::budget::LaneTotal;
 
-/// Replays `data` as a retained message log.
-pub fn retained_log(data: &[u8]) {
-    let _ = crate::persist::parse_log(data);
+/// Replays `data` as a record of a retained message journal: a kind
+/// byte, then the body.
+pub fn retained_record(data: &[u8]) {
+    let _ = crate::retain::replay_one(data);
+}
+
+/// Seeds for [`retained_record`]: a message set, a topic cleared, and a
+/// stripe cleared.
+#[must_use]
+pub fn retained_record_seeds() -> Vec<Vec<u8>> {
+    crate::retain::record_seeds()
+}
+
+/// Replays `data` as records of a lane journal: each a kind byte, a big
+/// endian `u16` length and the body.
+pub fn lane_records(data: &[u8]) {
+    let _ = crate::state::journal::replay_records(data);
+}
+
+/// Seeds for [`lane_records`]: a session's life in records, and each
+/// record alone.
+#[must_use]
+pub fn lane_records_seeds() -> Vec<Vec<u8>> {
+    use crate::state::journal::{framed, record_seeds};
+    let records = record_seeds();
+    let mut seeds = vec![framed(&records)];
+    seeds.extend(records.chunks(1).map(framed));
+    seeds
 }
 
 /// Decodes `data` as a state image, whole and in pieces, and as the body

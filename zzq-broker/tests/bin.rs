@@ -14,6 +14,37 @@ impl Drop for Running {
     }
 }
 
+/// Starts the broker on a free port with `args`, and returns it with the
+/// endpoint it bound.
+#[cfg(unix)]
+#[expect(clippy::unwrap_used, reason = "tests fail loudly")]
+fn spawn(args: &[&str]) -> (Running, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut child = Command::new(EXE)
+        .args(["--bind", "tcp://127.0.0.1:0"])
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut uri = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut uri)
+        .unwrap();
+    (Running(child), uri.trim().to_owned())
+}
+
+/// A fresh data directory for the test `name`, on the target directory's
+/// file system, which takes `O_DIRECT`.
+#[cfg(unix)]
+fn data_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zzq-bin-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
 #[test]
 fn bad_flags_print_usage() {
     let out = Command::new(EXE).args(["--nope", "x"]).output().unwrap();
@@ -34,28 +65,13 @@ fn bind_errors_name_the_cause() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_keeps_sessions_in_the_state_file() {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
     let dir = std::env::temp_dir().join(format!("zzq-bin-state-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("state");
-    let start = || {
-        let mut child = Command::new(EXE)
-            .args(["--lanes", "2", "--bind", "tcp://127.0.0.1:0"])
-            .args(["--state-file", file.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut uri = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut uri)
-            .unwrap();
-        (Running(child), uri.trim().to_owned())
-    };
+    let start = || spawn(&["--lanes", "2", "--state-file", file.to_str().unwrap()]);
     // SIGTERM, then a clean exit.
     let stop = |mut b: Running| {
         let pid = b.0.id().to_string();
@@ -90,31 +106,14 @@ async fn sigterm_keeps_sessions_in_the_state_file() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_writes_every_retained_change_first() {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
     use std::time::Duration;
 
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
     const N: usize = 50_000;
-    let dir = std::env::temp_dir().join(format!("zzq-bin-retained-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("retained.log");
-    let start = || {
-        let mut child = Command::new(EXE)
-            .args(["--lanes", "1", "--bind", "tcp://127.0.0.1:0"])
-            .args(["--retained-file", file.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut uri = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut uri)
-            .unwrap();
-        (Running(child), uri.trim().to_owned())
-    };
+    let dir = data_dir("retained");
+    let start = || spawn(&["--lanes", "1", "--data-dir", dir.to_str().unwrap()]);
     let ctx = Context::new().unwrap();
     let (mut broker, uri) = start();
     let c = Client::connect(&ctx, &uri, ClientOptions::new("pub"))
@@ -155,6 +154,165 @@ async fn sigterm_writes_every_retained_change_first() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigkill_keeps_acked_retained_messages() {
+    use std::time::Duration;
+
+    use zzq_broker::Context;
+    use zzq_client::{Client, ClientOptions, QoS};
+
+    let dir = data_dir("sigkill");
+    let args = ["--data-dir", dir.to_str().unwrap()];
+    // Big, so a write behind an early ack would still run when the kill
+    // lands.
+    let payload: Vec<u8> = (0..=u8::MAX).cycle().take(15 << 20).collect();
+    let ctx = Context::new().unwrap();
+    let (mut broker, uri) = spawn(&args);
+    let c = Client::connect(&ctx, &uri, ClientOptions::new("pub"))
+        .await
+        .unwrap();
+    c.publish_retained("k/big", &payload, QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    // No shutdown: the PUBACK alone has to mean the message is stored.
+    broker.0.kill().unwrap();
+    broker.0.wait().unwrap();
+    drop(c);
+    let (_broker, uri) = spawn(&args);
+    let mut c = Client::connect(&ctx, &uri, ClientOptions::new("sub"))
+        .await
+        .unwrap();
+    c.subscribe("k/#", QoS::AtMostOnce).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), c.recv())
+        .await
+        .ok()
+        .flatten()
+        .expect("the acked retained message after the restart");
+    assert!(got.payload == payload, "payload changed");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigkill_keeps_sessions_and_their_subscriptions() {
+    use std::time::Duration;
+
+    use zzq_broker::Context;
+    use zzq_client::{Client, ClientOptions, LastWill, QoS};
+
+    let dir = data_dir("sessions");
+    let args = ["--lanes", "2", "--data-dir", dir.to_str().unwrap()];
+    let durable = |id: &str| ClientOptions {
+        clean_start: false,
+        session_expiry: 600,
+        ..ClientOptions::new(id)
+    };
+    let ctx = Context::new().unwrap();
+    let (mut broker, uri) = spawn(&args);
+    let c = Client::connect(&ctx, &uri, durable("sub")).await.unwrap();
+    // No shutdown: the SUBACK alone has to mean the subscription is stored.
+    c.subscribe("s/#", QoS::AtLeastOnce).await.unwrap();
+    c.disconnect().await;
+    let dying = ClientOptions {
+        will: Some(LastWill {
+            topic: "s/will".into(),
+            payload: "gone".into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            delay: 0,
+        }),
+        ..durable("dying")
+    };
+    let dying = Client::connect(&ctx, &uri, dying).await.unwrap();
+    // CONNACK does not wait for the disk; a SUBACK after it does.
+    dying.subscribe("x", QoS::AtMostOnce).await.unwrap();
+    broker.0.kill().unwrap();
+    broker.0.wait().unwrap();
+    let (_broker, uri) = spawn(&args);
+    let mut c = Client::connect(&ctx, &uri, durable("sub")).await.unwrap();
+    assert!(c.connected().session_present);
+    let next = async |c: &mut Client| {
+        let got = tokio::time::timeout(Duration::from_secs(5), c.recv()).await;
+        got.ok().flatten().expect("a message")
+    };
+    // A connection the crash ended sends its will after the restart.
+    assert_eq!(next(&mut c).await.payload, "gone");
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("pub"))
+        .await
+        .unwrap();
+    p.publish("s/1", "after", QoS::AtLeastOnce).await.unwrap();
+    assert_eq!(next(&mut c).await.payload, "after");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Runs the broker with `lanes`, queues acked QoS 1 and 2 messages for an
+/// offline persistent session, kills it, and finds them all after a
+/// restart.
+#[cfg(unix)]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests fail loudly")]
+async fn acked_messages_survive_sigkill(lanes: &str) {
+    use std::time::Duration;
+
+    use zzq_broker::Context;
+    use zzq_client::{Client, ClientOptions, QoS};
+
+    let dir = data_dir(&format!("queue-{lanes}"));
+    let args = ["--lanes", lanes, "--data-dir", dir.to_str().unwrap()];
+    let durable = |id: &str| ClientOptions {
+        clean_start: false,
+        session_expiry: 600,
+        ..ClientOptions::new(id)
+    };
+    let ctx = Context::new().unwrap();
+    let (mut broker, uri) = spawn(&args);
+    let mut subs = Vec::new();
+    for id in ["q-sub-1", "q-sub-2", "q-sub-3"] {
+        let c = Client::connect(&ctx, &uri, durable(id)).await.unwrap();
+        c.subscribe("q/#", QoS::ExactlyOnce).await.unwrap();
+        c.disconnect().await;
+        subs.push(id);
+    }
+    let p = Client::connect(&ctx, &uri, ClientOptions::new("q-pub"))
+        .await
+        .unwrap();
+    for i in 0..50 {
+        let qos = if i % 2 == 0 {
+            QoS::AtLeastOnce
+        } else {
+            QoS::ExactlyOnce
+        };
+        p.publish("q/1", i.to_string(), qos).await.unwrap();
+    }
+    // No shutdown: the acks alone have to mean the messages are stored.
+    broker.0.kill().unwrap();
+    broker.0.wait().unwrap();
+    drop(p);
+    let (_broker, uri) = spawn(&args);
+    for id in subs {
+        let mut c = Client::connect(&ctx, &uri, durable(id)).await.unwrap();
+        assert!(c.connected().session_present);
+        for i in 0..50 {
+            let got = tokio::time::timeout(Duration::from_secs(5), c.recv()).await;
+            let m = got.ok().flatten().expect("a queued message");
+            assert_eq!(m.payload, i.to_string(), "{id}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigkill_keeps_acked_messages_on_one_lane() {
+    acked_messages_survive_sigkill("1").await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigkill_keeps_acked_messages_across_lanes() {
+    acked_messages_survive_sigkill("4").await;
+}
+
 #[cfg(feature = "tls")]
 mod tls {
     use std::io::{BufRead, BufReader};
@@ -168,7 +326,8 @@ mod tls {
     #[tokio::test(flavor = "multi_thread")]
 
     async fn serves_tcp_and_tls_with_retained_messages_on_disk() {
-        let dir = std::env::temp_dir().join(format!("zzq-bin-{}", std::process::id()));
+        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join(format!("zzq-bin-tls-{}", std::process::id()));
 
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -187,7 +346,7 @@ mod tls {
             .args(["--bind", "tcp://127.0.0.1:0", "--bind", "tls://127.0.0.1:0"])
             .args(["--cert", &path(&cert), "--key", &path(&pem_key)])
             .args(["--client-ca", &path(&cert)])
-            .args(["--retained-file", &path(&dir.join("retained.log"))])
+            .args(["--data-dir", &path(&dir.join("data"))])
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();

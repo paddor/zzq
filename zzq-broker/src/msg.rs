@@ -78,16 +78,6 @@ impl Msg {
         self.props.get(&self.buf)
     }
 
-    /// The payload as its own handle on the buffer.
-    pub(crate) fn payload_bytes(&self) -> Bytes {
-        self.buf.slice_ref(self.payload())
-    }
-
-    /// The properties as their own handle on the buffer.
-    pub(crate) fn props_bytes(&self) -> Bytes {
-        self.buf.slice_ref(self.props())
-    }
-
     /// A copy in one new allocation, so long-lived storage does not pin the
     /// read buffer the fields were sliced from.
     pub(crate) fn compact(&self) -> Msg {

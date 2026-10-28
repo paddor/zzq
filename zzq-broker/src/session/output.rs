@@ -80,8 +80,15 @@ impl Session {
         }
     }
 
-    /// Writes an ack.
+    /// Writes an ack. A PUBACK or PUBREC goes behind those held for the
+    /// disk, if there are any.
     pub(crate) fn ack(&mut self, kind: PacketType, pkid: u16, reason: u8) {
+        if let Some(h) = &mut self.inbound.hold
+            && matches!(kind, PacketType::PubAck | PacketType::PubRec)
+        {
+            h.push_now(kind, pkid, reason);
+            return;
+        }
         let a = AckFields {
             reason,
             ..AckFields::new(kind, pkid)

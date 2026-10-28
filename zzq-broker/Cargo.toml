@@ -32,6 +32,12 @@ tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time", 
 xxhash-rust.workspace = true
 zrip.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zzq-disk.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+zzq-disk = { workspace = true, features = ["testing"] }
+
 [dev-dependencies]
 rcgen = "0.14"
 # Path only, so publishing drops it and the two crates publish in any order.

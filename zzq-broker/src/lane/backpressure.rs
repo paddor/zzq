@@ -20,8 +20,13 @@ impl Lane {
     /// Acks a routed QoS 1/2 publish, or holds the ack while a subscriber it
     /// went to is congested. A publisher gets at most Receive Maximum acks
     /// held: a v5 one breaks the protocol past it, a v3.1.1 one, which has no
-    /// such limit, gets the rest at once.
+    /// such limit, gets the rest at once. A publish that needs journal
+    /// writes gets its ack once they are done instead.
     pub(super) fn ack_or_hold(&mut self, key: Key, p: &Publish<'_>) -> Result<(), Close> {
+        if !self.needs.is_empty() {
+            self.hold_publish(key, p);
+            return Ok(());
+        }
         let kind = match p.qos {
             QoS::AtMostOnce => return Ok(()),
             QoS::AtLeastOnce => PacketType::PubAck,

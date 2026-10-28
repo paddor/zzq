@@ -8,8 +8,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zzq_bench::fixed::{self, Fixed, Report};
-use zzq_bench::load::{self, Load, Scenario};
-use zzq_broker::{Authorizer, Broker, BrokerOptions, ClientInfo, Context};
+use zzq_bench::load::{self, Keep, Load, Scenario, Until};
+use zzq_broker::{Authorizer, Broker, BrokerOptions, ClientInfo, Context, Stats};
 
 async fn broker() -> (Context, Broker, String) {
     broker_with(BrokerOptions::default()).await
@@ -64,11 +64,83 @@ async fn every_scenario_moves_messages() {
         qos: 1,
         ..short(&addr)
     };
-    let l = tokio::task::spawn_blocking(move || load::latency(&rtt, 50))
+    let l = tokio::task::spawn_blocking(move || load::latency(&rtt, 50, Until::Delivered))
         .await
         .unwrap()
         .unwrap();
     assert!(l.p50 > 0.0 && l.lost == 0, "{l:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_publishes_and_sessions_stay_in_the_broker() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, addr) = broker_with(opts).await;
+    let load = Load {
+        qos: 1,
+        pubs: 2,
+        keep: Keep {
+            retain: true,
+            sessions: true,
+        },
+        ..short(&addr)
+    };
+    let t = tokio::task::spawn_blocking(move || load::throughput(Scenario::Pairs, &load))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(t.delivered > 0.0 && t.closed == 0, "{t:?}");
+    let stats = stats_when_idle(&broker).await;
+    assert_eq!((stats.retained, stats.sessions), (2, 2), "{stats:?}");
+}
+
+/// The broker's stats once its last connection is gone.
+async fn stats_when_idle(broker: &Broker) -> Stats {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let stats = broker.stats().await.unwrap();
+            if stats.connections == 0 {
+                return stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn rtt_times_the_acks_of_messages_kept_on_disk() {
+    let dir = std::env::temp_dir().join(format!("zzq-smoke-ack-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = BrokerOptions {
+        data_dir: Some(dir.clone()),
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, addr) = broker_with(opts).await;
+    let qos0 = short(&addr);
+    let e = load::latency(&qos0, 1, Until::Acked).unwrap_err();
+    assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "{e}");
+    let rtt = Load {
+        qos: 1,
+        keep: Keep {
+            retain: true,
+            sessions: true,
+        },
+        ..qos0
+    };
+    let l = tokio::task::spawn_blocking(move || load::latency(&rtt, 20, Until::Acked))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(l.p50 > 0.0 && l.lost == 0, "{l:?}");
+    let stats = stats_when_idle(&broker).await;
+    assert_eq!((stats.retained, stats.sessions), (1, 1), "{stats:?}");
+    drop(broker);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Lets no one publish.
@@ -120,6 +192,16 @@ async fn the_load_generator_runs_from_the_command_line() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         out.status.success() && stdout.contains("rtt v5") && stdout.contains("lost 0  cpu "),
+        "{stdout}"
+    );
+    let out = Command::new(exe)
+        .args(["rtt", &format!("addr={addr}"), "iters=50", "qos=1"])
+        .args(["retain=1", "persist=1", "ack=1"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("iters=50 retain persist ack  p50 "),
         "{stdout}"
     );
     let out = Command::new(exe)

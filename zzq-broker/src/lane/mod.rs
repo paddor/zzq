@@ -20,13 +20,17 @@ use crate::slab::{Key, Slab};
 mod backpressure;
 mod connect;
 mod control;
+mod hold;
+mod journal;
 mod maintenance;
 mod packet;
+mod pairs;
 mod route;
 mod subscribe;
 
 use backpressure::Hit;
 pub(crate) use control::{Control, Dump, SyncAck, Ticket};
+pub(crate) use journal::{LaneLog, complete};
 pub(crate) use route::Remote;
 pub(crate) use subscribe::Held;
 
@@ -99,6 +103,11 @@ pub(crate) struct Lane {
     /// Sessions with a delayed will, by its due time and timer ID.
     wills: BTreeMap<(Instant, u64), Key>,
     pub(crate) phase: Phase,
+    /// Records were appended to the lane's journal since its last flush.
+    journal_unflushed: bool,
+    /// The journal writes the publish being handled needs.
+    needs: hold::Needs,
+    pairs: pairs::Pairs,
 }
 
 /// Whether a lane serves connections.
@@ -155,6 +164,7 @@ struct Ids {
 impl Lane {
     pub(crate) fn new(id: u16, shared: Arc<Shared>) -> Lane {
         let lanes = shared.lanes.len();
+        let shared_journals = shared.journals();
         let total = LaneTotal::default();
         Lane {
             id,
@@ -177,6 +187,9 @@ impl Lane {
             ids: Ids::default(),
             wills: BTreeMap::new(),
             phase: Phase::Open,
+            journal_unflushed: false,
+            needs: hold::Needs::default(),
+            pairs: pairs::Pairs::new(lanes, shared_journals),
         }
     }
 
@@ -207,9 +220,11 @@ impl Lane {
         }
     }
 
-    /// Wakes the writers of sessions with new output.
+    /// Sends the journal records of the work so far, and wakes the
+    /// writers of sessions with new output.
     #[inline]
     pub(crate) fn flush(&mut self) {
+        self.flush_journal();
         for key in self.dirty.drain(..) {
             if let Some(s) = self.sessions.get_mut(key) {
                 s.out.dirty = false;

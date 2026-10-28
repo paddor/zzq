@@ -10,6 +10,7 @@ connection never moves between threads.
 | --- | --- |
 | `zzq-proto` | `no_std` codec for MQTT 3.1.1, 5.0 and MQTT-SN, topic rules and a topic trie |
 | `zzq-tokio` | `Context`, IO lanes and transports |
+| `zzq-disk` | Durable append-only journals, written with Linux AIO |
 | `zzq-broker` | `Broker`: sessions, retained messages, wills, shared subscriptions, MQTT-SN gateway, auth hooks |
 | `zzq-client` | `Client`, async and blocking, with reconnect and session resume |
 | `zzq-bench` | Load generators and local performance gates |
@@ -38,6 +39,15 @@ let message = client.recv().await;
 `tcp://`, `tls://`, `ws://`, `wss://`, `quic://`, `ipc://`, `inproc://`,
 and `udp://` for MQTT-SN. TLS and QUIC are behind the default `tls` and
 `quic` features.
+
+## Durability
+
+The broker keeps its state in memory. With `BrokerOptions::data_dir`
+(`zzq_broker --data-dir`, Linux only), it keeps retained messages, the
+sessions that outlive their connection, their subscriptions and their
+QoS 1/2 messages in journals written with `O_DIRECT | O_DSYNC`, and an ack
+waits until what it stands for is on disk. See
+[COMPARISONS.md](COMPARISONS.md#durability).
 
 ## Benchmarks
 

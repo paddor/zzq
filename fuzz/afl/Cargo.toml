@@ -12,6 +12,7 @@ afl = "0.18"
 zzq-proto = { path = "../../zzq-proto" }
 zzq-tokio = { path = "../../zzq-tokio", default-features = false, features = ["fuzzing"] }
 zzq-broker = { path = "../../zzq-broker", default-features = false, features = ["fuzzing"] }
+zzq-disk = { path = "../../zzq-disk", features = ["fuzzing"] }
 
 [lints.rust]
 missing_debug_implementations = "deny"

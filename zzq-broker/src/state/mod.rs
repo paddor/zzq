@@ -31,12 +31,16 @@ use std::io::{self, Write};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use xxhash_rust::xxh3::xxh3_64;
-use zzq_proto::topic::{validate_filter, validate_name};
-use zzq_proto::{Properties, QoS, SubscriptionOptions, Version};
+use zzq_proto::{SubscriptionOptions, Version};
 
-use crate::index::SubIds;
 use crate::msg::Msg;
-use crate::session::{Kept, Queued, Session, Will};
+use crate::session::{Queued, Session, Will};
+
+mod codec;
+pub(crate) mod journal;
+
+use codec::{Decoder, put_msg, put_session};
+pub(crate) use codec::{decode_msg, msg_head};
 
 const MAGIC: &[u8; 8] = b"ZZQSTATE";
 /// Format version. A reader refuses any other.
@@ -44,10 +48,6 @@ pub(crate) const VERSION: u16 = 1;
 const END: u8 = 0;
 const SESSION: u8 = 1;
 const RETAINED: u8 = 2;
-/// Smallest encodings, which bound counts by the bytes left.
-const MIN_MSG: usize = 4 + 1 + 1 + 8 + 4 + 4;
-const MIN_ITEM: usize = 1 + 1 + 16 + MIN_MSG;
-const MIN_SUB: usize = 4 + 1 + 4;
 
 /// Maps deadlines between `Instant` and Unix time from one reading of both
 /// clocks, so a deadline survives a round trip to the millisecond.
@@ -121,6 +121,11 @@ pub(crate) struct SessionState {
     pub(crate) awaiting_rel: Vec<u16>,
     pub(crate) inflight: Vec<Sent>,
     pub(crate) queue: Vec<Queued>,
+    /// The journal numbers of the deliveries in `inflight`, then in
+    /// `queue`; empty if a journal does not hold them.
+    pub(crate) seqs: Vec<u64>,
+    /// The last journal number the session gave a delivery.
+    pub(crate) last_seq: u64,
 }
 
 /// One decoded record.
@@ -305,319 +310,15 @@ pub(crate) fn framed(body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn put_u16(b: &mut Vec<u8>, v: u16) {
-    b.extend_from_slice(&v.to_be_bytes());
-}
-
-fn put_u32(b: &mut Vec<u8>, v: u32) {
-    b.extend_from_slice(&v.to_be_bytes());
-}
-
-fn put_u64(b: &mut Vec<u8>, v: u64) {
-    b.extend_from_slice(&v.to_be_bytes());
-}
-
-fn put_count(b: &mut Vec<u8>, n: usize) {
-    put_u32(b, u32::try_from(n).unwrap_or(u32::MAX));
-}
-
-fn put_bytes(b: &mut Vec<u8>, data: &[u8]) {
-    put_count(b, data.len());
-    b.extend_from_slice(data);
-}
-
-fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
-    put_bytes(b, s.client_id.as_bytes());
-    match &s.username {
-        Some(u) => {
-            b.push(1);
-            put_bytes(b, u.as_bytes());
-        }
-        None => b.push(0),
-    }
-    b.push(s.version.level());
-    put_u32(b, s.expiry);
-    put_u64(b, clock.unix_ms(s.expires_at));
-    match &s.will {
-        Some(w) => {
-            b.push(1);
-            put_u32(b, w.delay);
-            put_msg(b, &w.msg, clock);
-        }
-        None => b.push(0),
-    }
-    match &s.delayed_will {
-        Some(w) => {
-            b.push(1);
-            put_u64(b, clock.unix_ms(Some(w.due)));
-            put_msg(b, &w.msg, clock);
-        }
-        None => b.push(0),
-    }
-    put_u16(b, s.next_pkid());
-    let mut subs: Vec<_> = s.subs.iter().collect();
-    subs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-    put_count(b, subs.len());
-    for (filter, (opts, sub_id)) in subs {
-        put_bytes(b, filter.as_bytes());
-        b.push(opts.to_byte(Version::V5));
-        put_u32(b, *sub_id);
-    }
-    let mut rel: Vec<u16> = s.inbound.awaiting_rel.iter().copied().collect();
-    rel.sort_unstable();
-    put_count(b, rel.len());
-    for pkid in rel {
-        put_u16(b, pkid);
-    }
-    put_count(b, s.inflight().len());
-    for (pkid, item, released) in s.inflight() {
-        put_u16(b, pkid);
-        b.push(u8::from(released));
-        put_item(b, item, clock);
-    }
-    put_count(b, s.queue().len());
-    for item in s.queue() {
-        put_item(b, item, clock);
-    }
-}
-
-fn put_item(b: &mut Vec<u8>, q: &Kept, clock: Clock) {
-    b.push(q.qos as u8);
-    b.push(u8::from(q.retain));
-    for slot in q.sub_id.slots() {
-        put_u32(b, slot);
-    }
-    put_msg(b, &q.msg, clock);
-}
-
-fn put_msg(b: &mut Vec<u8>, m: &Msg, clock: Clock) {
-    put_bytes(b, m.topic().as_bytes());
-    b.push(m.qos as u8);
-    b.push(u8::from(m.retain));
-    put_u64(b, clock.unix_ms(m.expires_at));
-    put_bytes(b, m.props());
-    put_bytes(b, m.payload());
-}
-
-/// Reads one record body.
-struct Decoder<'a>(&'a [u8]);
-
-impl<'a> Decoder<'a> {
-    fn take(&mut self, n: usize) -> Result<&'a [u8], &'static str> {
-        let (head, rest) = self.0.split_at_checked(n).ok_or("record too short")?;
-        self.0 = rest;
-        Ok(head)
-    }
-
-    fn u8(&mut self) -> Result<u8, &'static str> {
-        Ok(self.take(1)?[0])
-    }
-
-    fn u16(&mut self) -> Result<u16, &'static str> {
-        let b = self.take(2)?;
-        Ok(u16::from_be_bytes([b[0], b[1]]))
-    }
-
-    fn u32(&mut self) -> Result<u32, &'static str> {
-        let b = self.take(4)?;
-        Ok(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    }
-
-    fn u64(&mut self) -> Result<u64, &'static str> {
-        let mut v = [0; 8];
-        v.copy_from_slice(self.take(8)?);
-        Ok(u64::from_be_bytes(v))
-    }
-
-    fn flag(&mut self) -> Result<bool, &'static str> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err("invalid flag"),
-        }
-    }
-
-    /// A count of elements at least `min` bytes each.
-    fn count(&mut self, min: usize) -> Result<usize, &'static str> {
-        let n = self.u32()? as usize;
-        if n > self.0.len() / min {
-            return Err("count beyond the record");
-        }
-        Ok(n)
-    }
-
-    fn bytes(&mut self) -> Result<&'a [u8], &'static str> {
-        let n = self.u32()? as usize;
-        self.take(n)
-    }
-
-    fn str(&mut self) -> Result<&'a str, &'static str> {
-        std::str::from_utf8(self.bytes()?).map_err(|_| "invalid UTF-8")
-    }
-
-    fn qos(&mut self) -> Result<QoS, &'static str> {
-        QoS::try_from(self.u8()?).map_err(|_| "invalid QoS")
-    }
-
-    const fn end(&self) -> Result<(), &'static str> {
-        if self.0.is_empty() {
-            Ok(())
-        } else {
-            Err("bytes after the record")
-        }
-    }
-
-    fn msg(&mut self, clock: Clock) -> Result<Msg, &'static str> {
-        let topic = self.str()?;
-        validate_name(topic).map_err(|_| "invalid topic")?;
-        let qos = self.qos()?;
-        let retain = self.flag()?;
-        let expires_at = clock.instant(self.u64()?);
-        let props = self.bytes()?;
-        Properties::try_from(props).map_err(|_| "invalid properties")?;
-        let payload = self.bytes()?;
-        let mut m = Msg::new(topic, payload, props, qos, retain);
-        m.expires_at = expires_at;
-        Ok(m)
-    }
-
-    /// A QoS 1/2 message a session holds.
-    fn item(&mut self, clock: Clock) -> Result<Queued, &'static str> {
-        let qos = self.qos()?;
-        if qos == QoS::AtMostOnce {
-            return Err("QoS 0 message held");
-        }
-        let retain = self.flag()?;
-        let mut sub_id = SubIds::default();
-        for _ in 0..4 {
-            sub_id.add(self.u32()?);
-        }
-        Ok(Queued {
-            msg: self.msg(clock)?,
-            qos,
-            retain,
-            sub_id,
-        })
-    }
-
-    fn session(&mut self, clock: Clock) -> Result<SessionState, &'static str> {
-        let client_id = self.str()?;
-        if client_id.is_empty() {
-            return Err("empty client ID");
-        }
-        let username = if self.flag()? {
-            Some(self.str()?.into())
-        } else {
-            None
-        };
-        let version = match self.u8()? {
-            3 => Version::V31,
-            4 => Version::V311,
-            5 => Version::V5,
-            _ => return Err("invalid protocol level"),
-        };
-        let expiry = self.u32()?;
-        let expires_at = clock.instant(self.u64()?);
-        let will = if self.flag()? {
-            let delay = self.u32()?;
-            Some(Will {
-                msg: self.msg(clock)?,
-                delay,
-            })
-        } else {
-            None
-        };
-        let delayed_will = if self.flag()? {
-            let due = clock
-                .instant(self.u64()?)
-                .ok_or("delayed will without a time")?;
-            Some((due, self.msg(clock)?))
-        } else {
-            None
-        };
-        let next_pkid = self.u16()?;
-        let subs = self.subs()?;
-        let awaiting_rel = self.awaiting_rel()?;
-        let inflight = self.inflight(clock)?;
-        let n = self.count(MIN_ITEM)?;
-        let mut queue = Vec::with_capacity(n);
-        for _ in 0..n {
-            queue.push(self.item(clock)?);
-        }
-        Ok(SessionState {
-            client_id: client_id.into(),
-            username,
-            version,
-            expiry,
-            expires_at,
-            will,
-            delayed_will,
-            next_pkid,
-            subs,
-            awaiting_rel,
-            inflight,
-            queue,
-        })
-    }
-
-    fn subs(&mut self) -> Result<Vec<Sub>, &'static str> {
-        let n = self.count(MIN_SUB)?;
-        let mut subs = Vec::with_capacity(n);
-        for _ in 0..n {
-            let filter = self.str()?;
-            validate_filter(filter).map_err(|_| "invalid filter")?;
-            let opts = SubscriptionOptions::from_byte(self.u8()?, Version::V5)
-                .map_err(|_| "invalid subscription options")?;
-            subs.push((filter.into(), opts, self.u32()?));
-        }
-        if subs.windows(2).any(|w| w[0].0 >= w[1].0) {
-            return Err("subscriptions not sorted or repeated");
-        }
-        Ok(subs)
-    }
-
-    /// Inbound QoS 2 packet IDs, sorted and nonzero.
-    fn awaiting_rel(&mut self) -> Result<Vec<u16>, &'static str> {
-        let n = self.count(2)?;
-        let mut ids = Vec::with_capacity(n);
-        for _ in 0..n {
-            ids.push(self.u16()?);
-        }
-        if ids.first() == Some(&0) || ids.windows(2).any(|w| w[0] >= w[1]) {
-            return Err("invalid inbound packet IDs");
-        }
-        Ok(ids)
-    }
-
-    /// The inflight window, each packet ID nonzero and used once.
-    fn inflight(&mut self, clock: Clock) -> Result<Vec<Sent>, &'static str> {
-        let n = self.count(2 + 1 + MIN_ITEM)?;
-        let mut inflight = Vec::with_capacity(n);
-        let mut seen = vec![0u64; 1024];
-        for _ in 0..n {
-            let pkid = self.u16()?;
-            let (word, bit) = (usize::from(pkid >> 6), 1u64 << (pkid & 63));
-            if pkid == 0 || seen[word] & bit != 0 {
-                return Err("invalid inflight packet ID");
-            }
-            seen[word] |= bit;
-            let released = self.flag()?;
-            let item = self.item(clock)?;
-            if released && item.qos != QoS::ExactlyOnce {
-                return Err("released QoS 1 message");
-            }
-            inflight.push((pkid, item, released));
-        }
-        Ok(inflight)
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use zzq_proto::QoS;
     use zzq_proto::property::{self, Property};
 
+    use super::codec::{put_bytes, put_count, put_u16, put_u32, put_u64};
     use super::*;
     use crate::budget::LaneTotal;
+    use crate::index::SubIds;
     use crate::session::DelayedWill;
 
     fn msg(topic: &str, payload: &[u8], qos: QoS, expires_at: Option<Instant>) -> Msg {
@@ -676,6 +377,8 @@ mod tests {
                 (7, item(3, QoS::ExactlyOnce), false),
             ],
             queue: vec![item(4, QoS::AtLeastOnce), expiring],
+            seqs: Vec::new(),
+            last_seq: 0,
         }
     }
 

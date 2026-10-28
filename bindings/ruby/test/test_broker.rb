@@ -58,12 +58,12 @@ class BrokerTest < Minitest::Spec
 
   it "keeps retained messages across a restart" do
     Dir.mktmpdir do |dir|
-      path = File.join(dir, "retained.log")
-      ZZQ::Broker.new(persistence: path, sys_interval: nil).then do |b|
+      path = File.join(dir, "data")
+      ZZQ::Broker.new(data_dir: path, sys_interval: nil).then do |b|
         b.publish("keep", "me", retain: true)
         b.close
       end
-      c = client(tcp_endpoint(broker(persistence: path)))
+      c = client(tcp_endpoint(broker(data_dir: path)))
       c.subscribe("keep")
       assert_equal "me", c.receive(timeout: WAIT).payload
     end

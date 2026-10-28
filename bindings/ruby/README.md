@@ -50,7 +50,7 @@ and `tls:` (`ca:`, `cert:`, `key:` as PEM strings, `server_name:`,
 ## Broker
 
 ```ruby
-broker = ZZQ::Broker.new(persistence: "retained.log")
+broker = ZZQ::Broker.new(data_dir: "/var/lib/zzq")
 broker.bind("mqtt://0.0.0.0:1883")
 broker.bind("ws://0.0.0.0:8080")
 broker.publish("status/broker", "up", retain: true)
@@ -63,9 +63,11 @@ Options: the limits `max_packet_size:`, `max_inflight:`, `max_queued:`,
 `max_retained:`, `max_topic_levels:`, `topic_alias_maximum:`,
 `max_session_expiry:`, `max_connections:`, `max_state_bytes:` and
 `max_keep_alive:` of zzq-broker's `BrokerOptions`,
-plus `sys_interval:`, `connect_timeout:`, `persistence:`, `state_file:` and
-`tls:` (`cert:`, `key:`, `client_ca:`). With `state_file:`, `#close` writes
-the sessions there, and the next broker started with it resumes them.
+plus `sys_interval:`, `connect_timeout:`, `data_dir:`, `state_file:` and
+`tls:` (`cert:`, `key:`, `client_ca:`). With `data_dir:` (Linux only),
+retained messages, sessions and their QoS 1/2 messages stay on disk, and
+acks wait until what they stand for is there. With `state_file:`, `#close` writes the sessions there,
+and the next broker started with it resumes them.
 
 ## Async
 

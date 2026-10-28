@@ -258,7 +258,7 @@ What a crash loses that a publisher already has its PUBACK for.
 
 | Broker | Default | Storage option | PUBACK waits for the disk | A crash loses, with storage on |
 | --- | --- | --- | --- | --- |
-| zzq | RAM | state file at SIGTERM, retained log | no | every session and queue, recent retained changes |
+| zzq | RAM | state file at SIGTERM, or a data directory | yes | nothing it acked |
 | rmqtt | RAM | plugins: sessions in sled, messages in Redis | no | queues of connected sessions |
 | EMQX | RAM | durable sessions in RocksDB | no | writes in flight, 15 s of session state |
 | Mosquitto | RAM | snapshot every 30 min, or a SQLite plugin | no | 30 min, or 5 s with SQLite |
@@ -271,14 +271,15 @@ What a crash loses that a publisher already has its PUBACK for.
 | Sagüin | none until configured | memory or SQLite | for the commit, not the fsync | 150 ms on power loss with SQLite |
 
 - **Ack, then write.** Of the brokers with storage, only XMQ in
-  Super-Durable mode with `max_queued_writes: 0`, Sagüin and FluxMQ
-  queues in `fsync` mode write before the PUBACK. XMQ's source says that
+  Super-Durable mode with `max_queued_writes: 0`, Sagüin, FluxMQ queues in
+  `fsync` mode and zzq write before the PUBACK. XMQ's source says that
   mode caps the broker at about 25K msg/s
   ([MessageDelivery.cpp](https://github.com/alexparshin1/xmq_public/blob/version-1.0.0/server/MessageDelivery.cpp#L85-L107)).
 - **zzq.** Sessions and queues live in RAM. `--state-file` writes them at
   SIGTERM or SIGINT and loads them at the next start, so a crash loses
-  all of them. `--retained-file` keeps retained messages in a log that a
-  background thread writes after the ack, without fsync.
+  all of them. `--data-dir` keeps retained messages, sessions, their
+  subscriptions and QoS 1/2 messages in journals written with `O_DSYNC`,
+  and acks a publish or a subscription once its write is done.
 - **rmqtt.** Both storage plugins are off in the shipped config
   ([rmqtt.toml](https://github.com/rmqtt/rmqtt/blob/0.24.0/rmqtt.toml#L78-L105)).
   Only disconnected sessions are stored

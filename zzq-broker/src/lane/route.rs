@@ -1,7 +1,6 @@
 //! Routing a publish to the lane's sessions and to other lanes.
 
 use std::rc::Rc;
-use std::sync::PoisonError;
 
 use bytes::Bytes;
 use zzq_proto::encode;
@@ -29,7 +28,13 @@ pub(crate) enum Remote {
     },
     /// A delivery to one session, chosen for a shared subscription. With
     /// `pins`, the message slices the publisher's read buffer.
-    Deliver { key: Key, item: Queued, pins: bool },
+    Deliver {
+        key: Key,
+        item: Queued,
+        pins: bool,
+        /// The lane that sent it.
+        sender: u16,
+    },
     /// The last batch the sending lane ships before a state dump.
     Drained(Ticket),
 }
@@ -37,6 +42,8 @@ pub(crate) enum Remote {
 /// How forwarded packets were sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Origin {
+    /// The lane that sent them.
+    sender: u16,
     version: Version,
     /// The publisher, for No Local.
     from: Option<SubRef>,
@@ -57,6 +64,8 @@ pub(super) struct Owned {
     pub(super) extra: Extra,
     /// From the retained store, which counts its bytes.
     pub(super) retained: bool,
+    /// The lane's journal has the message.
+    pub(super) journaled: bool,
 }
 
 impl Owned {
@@ -122,11 +131,8 @@ impl Lane {
     /// Routes a message that is not from a client connection.
     pub(crate) fn publish_owned(&mut self, msg: &Msg) {
         if msg.retain {
-            self.shared
-                .retained
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .set(msg, self.budget.full);
+            // Nothing waits for the disk.
+            let _ = self.shared.retained.set(msg, self.budget.full);
         }
         let p = Publication::of(msg);
         let mut owned = Owned::of(msg.clone());
@@ -179,7 +185,9 @@ impl Lane {
         owned: &mut Owned,
     ) {
         self.stats.publishes += 1;
+        // Lanes to forward to, and those whose journal the ack waits for.
         let mut remote_lanes = 0u64;
+        let mut wait_lanes = 0u64;
         let mut remote_hot = false;
         let n = m.direct.len();
         for (i, e) in m.direct.iter().enumerate() {
@@ -189,7 +197,11 @@ impl Lane {
                     self.deliver(e.sub.key, p, owned, g);
                 }
             } else {
-                remote_lanes |= 1 << (e.sub.lane & 63);
+                let bit = 1 << (e.sub.lane & 63);
+                remote_lanes |= bit;
+                if e.journaled && e.opts.qos != QoS::AtMostOnce {
+                    wait_lanes |= bit;
+                }
                 if p.qos != QoS::AtMostOnce
                     && !self.congestion.remote.is_empty()
                     && self.congestion.remote.contains(&e.sub)
@@ -208,30 +220,67 @@ impl Lane {
             } else {
                 let msg = owned.cloned(p);
                 let pins = p.pins && p.chunk.is_some_and(|c| msg.pins(c));
-                self.out.remote[usize::from(e.sub.lane)].push(Remote::Deliver {
+                let lane = usize::from(e.sub.lane);
+                let qos = p.qos.min(e.opts.qos);
+                self.out.remote[lane].push(Remote::Deliver {
                     key: e.sub.key,
                     pins,
                     item: Queued {
                         msg,
-                        qos: p.qos.min(e.opts.qos),
+                        qos,
                         retain: e.opts.retain_as_published && p.retain,
                         sub_id: e.sub_id,
                     },
+                    sender: self.id,
                 });
+                self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
             }
         }
         if remote_lanes != 0 {
-            let (chunk, at, version, pins) = forward_packet(p, remote_hot, &mut self.out.fwd);
-            let origin = Origin {
-                version,
-                from: from.map(|k| self.sub_ref(k)),
-                pins,
-            };
-            for (lane, batch) in self.out.remote.iter_mut().enumerate() {
-                if remote_lanes & (1 << (lane & 63)) != 0 && lane != usize::from(self.id) {
-                    push_forward(batch, &chunk, at, origin);
-                }
+            self.forward(from, p, (remote_lanes, wait_lanes), remote_hot);
+        }
+    }
+
+    /// Forwards `p` to the lanes in the mask `remote_lanes`, a copy of it
+    /// if a congested subscriber there is `hot`. Its ack waits for those
+    /// in `wait_lanes`.
+    fn forward(
+        &mut self,
+        from: Option<Key>,
+        p: &Publication<'_>,
+        (remote_lanes, wait_lanes): (u64, u64),
+        hot: bool,
+    ) {
+        let (chunk, at, version, pins) = forward_packet(p, hot, &mut self.out.fwd);
+        let origin = Origin {
+            sender: self.id,
+            version,
+            from: from.map(|k| self.sub_ref(k)),
+            pins,
+        };
+        let to = |lane: usize| remote_lanes & (1 << (lane & 63)) != 0;
+        for (lane, batch) in self.out.remote.iter_mut().enumerate() {
+            if to(lane) && lane != usize::from(self.id) {
+                push_forward(batch, &chunk, at, origin);
             }
+        }
+        for lane in 0..self.out.remote.len() {
+            if to(lane) && lane != usize::from(self.id) {
+                let wait = wait_lanes & (1 << (lane & 63)) != 0;
+                self.count_sent(lane, wait && p.qos != QoS::AtMostOnce);
+            }
+        }
+    }
+
+    /// Counts a delivery sent to lane `lane`. With `wait`, a journaled
+    /// session there gets it at QoS 1/2: the publisher's ack waits for
+    /// that lane to journal it.
+    #[inline]
+    fn count_sent(&mut self, lane: usize, wait: bool) {
+        if let Some(w) = self.pairs.sent(self.id, lane)
+            && wait
+        {
+            self.needs.wait(w);
         }
     }
 
@@ -241,6 +290,7 @@ impl Lane {
             version,
             from,
             pins,
+            ..
         } = origin;
         let Some(packet) = chunk.get(at.0 as usize..(at.0 + at.1) as usize) else {
             return;
@@ -306,20 +356,27 @@ impl Lane {
         let Some(s) = self.sessions.get_mut(key) else {
             return false;
         };
-        let outcome = if qos == QoS::AtMostOnce {
-            if s.conn.is_none() {
+        let limit = QueueLimit {
+            count: o.max_queued.saturating_add(owned.extra.count),
+            bytes: o.max_queued_bytes.saturating_add(owned.extra.bytes),
+            state_full: self.budget.full,
+        };
+        let (outcome, s) = if qos == QoS::AtMostOnce {
+            let outcome = if s.conn.is_none() {
                 Outcome::Offline
             } else {
                 s.deliver_qos0(p, retain, sub_id, o.max_out_bytes)
-            }
-        } else {
-            let limit = QueueLimit {
-                count: o.max_queued.saturating_add(owned.extra.count),
-                bytes: o.max_queued_bytes.saturating_add(owned.extra.bytes),
-                state_full: self.budget.full,
             };
+            (outcome, s)
+        } else if !s.journaled {
             let kept = keep(s, p, owned, &self.budget.total, g);
-            s.deliver_qos12(kept, limit)
+            (s.deliver_qos12(kept, limit), s)
+        } else {
+            let outcome = self.deliver_journaled(key, p, owned, g);
+            let Some(s) = self.sessions.get_mut(key) else {
+                return true;
+            };
+            (outcome, s)
         };
         if outcome == Outcome::Sent {
             // The session is at hand: no second lookup.
@@ -338,6 +395,32 @@ impl Lane {
         }
         self.count(outcome);
         true
+    }
+
+    /// [`Lane::deliver`] at QoS 1/2 to a journaled session: the delivery
+    /// goes to the journal first, and what becomes of it after.
+    fn deliver_journaled(
+        &mut self,
+        key: Key,
+        p: &Publication<'_>,
+        owned: &mut Owned,
+        g: Grant,
+    ) -> Outcome {
+        let o = &self.shared.opts;
+        let limit = QueueLimit {
+            count: o.max_queued.saturating_add(owned.extra.count),
+            bytes: o.max_queued_bytes.saturating_add(owned.extra.bytes),
+            state_full: self.budget.full,
+        };
+        let seq = self.journal_delivery(key, p, owned, (g.qos, g.retain, g.sub_id));
+        let Some(s) = self.sessions.get_mut(key) else {
+            return Outcome::Offline;
+        };
+        let mut kept = keep(s, p, owned, &self.budget.total, g);
+        kept.seq = seq;
+        let outcome = s.deliver_qos12(kept, limit);
+        self.journal_progress(key);
+        outcome
     }
 
     #[inline]
@@ -363,13 +446,19 @@ impl Lane {
                 origin,
             } => {
                 self.route_forwarded(&chunk, first, origin);
-                for at in more {
+                for &at in &more {
                     self.route_forwarded(&chunk, at, origin);
                 }
+                self.got_from(origin.sender, 1 + more.len() as u64);
             }
             // After what came before it in the batch.
             Remote::Drained(ticket) => drop(ticket),
-            Remote::Deliver { key, item, pins } => {
+            Remote::Deliver {
+                key,
+                item,
+                pins,
+                sender,
+            } => {
                 let p = Publication {
                     pins,
                     ..Publication::of(&item.msg)
@@ -389,6 +478,7 @@ impl Lane {
                         self.stats.dropped.session_ended += 1;
                     }
                 }
+                self.got_from(sender, 1);
             }
         }
     }
@@ -446,6 +536,7 @@ fn keep(
         retain: g.retain,
         sub_id: g.sub_id,
         charged,
+        seq: 0,
     };
     // A slow or offline session may hold a message long; do not let it pin
     // read buffers.
@@ -537,6 +628,7 @@ mod tests {
                         retain: false,
                         sub_id: SubIds::default(),
                     },
+                    sender: 0,
                 });
             }
             (l.stats.dropped.offline, l.stats.dropped.session_ended)

@@ -1342,20 +1342,6 @@ async fn client_and_broker_refuse_what_mqtt_cannot_encode() {
     c.publish("a", "fine", QoS::AtLeastOnce).await.unwrap();
 }
 
-/// A store whose disk is gone.
-#[derive(Debug)]
-struct Unreadable;
-
-impl zzq_broker::Persistence for Unreadable {
-    fn load_retained(&self) -> std::io::Result<Vec<zzq_broker::Retained>> {
-        Err(std::io::Error::other("disk gone"))
-    }
-
-    fn set_retained(&self, _: &zzq_broker::Retained) {}
-
-    fn remove_retained(&self, _: &str) {}
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn errors_say_what_failed_and_keep_the_cause() {
     use std::error::Error as _;
@@ -1366,14 +1352,20 @@ async fn errors_say_what_failed_and_keep_the_cause() {
     assert!(matches!(e, zzq_client::Error::Transport(_)), "{e:?}");
     assert_eq!(e.to_string(), "transport failed");
     assert!(e.source().unwrap().to_string().contains("unknown scheme"));
+    // A file where the data directory should be.
+    let file = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("zzq-not-a-dir-{}", std::process::id()));
+    std::fs::write(&file, "x").unwrap();
     let opts = BrokerOptions {
-        persistence: Some(std::sync::Arc::new(Unreadable)),
+        data_dir: Some(file.clone()),
         ..BrokerOptions::default()
     };
     let e = Broker::new(&ctx, opts).await.unwrap_err();
-    assert!(matches!(e, zzq_broker::Error::Persistence(_)), "{e:?}");
-    assert_eq!(e.to_string(), "loading retained messages failed");
-    assert_eq!(e.source().unwrap().to_string(), "disk gone");
+    assert!(matches!(e, zzq_broker::Error::DataDir(_)), "{e:?}");
+    assert_eq!(e.to_string(), "data directory failed");
+    let cause = e.source().unwrap().downcast_ref::<std::io::Error>();
+    assert!(cause.is_some(), "{:?}", e.source());
+    let _ = std::fs::remove_file(&file);
 }
 
 /// A v5 PUBLISH with `props`.

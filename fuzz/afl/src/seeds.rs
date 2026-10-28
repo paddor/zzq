@@ -1,9 +1,6 @@
 //! Seed inputs for each target, built with the real encoders, so no binary
 //! files are checked in.
 
-use std::time::{Duration, UNIX_EPOCH};
-
-use zzq_broker::{FilePersistence, Persistence, Retained};
 use zzq_proto::encode::{self, AckFields, ConnectFields, PublishHeader, WillFields};
 use zzq_proto::property::{self, Property};
 use zzq_proto::sn::{self, Filter, Flags, SnQoS, Topic};
@@ -16,8 +13,10 @@ pub fn for_target(name: &str) -> Vec<Vec<u8>> {
         "mqtt" => mqtt(),
         "mqtt_sn" => mqtt_sn(),
         "websocket" => websocket(),
-        "retained_log" => retained_log(),
+        "retained_record" => zzq_broker::fuzzing::retained_record_seeds(),
         "state_image" => zzq_broker::fuzzing::state_image_seeds(),
+        "lane_records" => zzq_broker::fuzzing::lane_records_seeds(),
+        "journal_segment" => zzq_disk::fuzzing::journal_segment_seeds(),
         "endpoint" => text(&[
             "tcp://localhost",
             "tls://[::1]:8883",
@@ -177,28 +176,4 @@ fn websocket() -> Vec<Vec<u8>> {
         .map(|f| [upgrade.as_bytes(), &f].concat())
         .chain([server])
         .collect()
-}
-
-fn retained_log() -> Vec<Vec<u8>> {
-    let path = std::env::temp_dir().join(format!("zzq-fuzz-seed-{}.log", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    {
-        let Ok(p) = FilePersistence::open(&path) else {
-            return Vec::new();
-        };
-        for topic in ["a/b", "c"] {
-            p.set_retained(&Retained {
-                topic: topic.to_owned(),
-                payload: "v".into(),
-                qos: QoS::AtLeastOnce,
-                properties: vec![1, 1].into(),
-                expires_at: Some(UNIX_EPOCH + Duration::from_secs(4_000_000_000)),
-            });
-        }
-        p.remove_retained("c");
-        p.flush();
-    }
-    let log = std::fs::read(&path).unwrap_or_default();
-    let _ = std::fs::remove_file(&path);
-    vec![log]
 }

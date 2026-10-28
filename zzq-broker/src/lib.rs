@@ -35,7 +35,9 @@
 mod broker;
 mod budget;
 mod conn;
+mod disk;
 mod dump;
+mod durable;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzzing;
@@ -44,7 +46,6 @@ mod lane;
 mod mailbox;
 mod msg;
 mod options;
-mod persist;
 mod retain;
 mod session;
 mod slab;
@@ -62,7 +63,6 @@ pub use broker::{Broker, Dropped, Stats, lane_for};
 pub use options::{
     AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo, SnOptions,
 };
-pub use persist::{FilePersistence, Persistence, Retained};
 pub use zzq_proto::{QoS, ReasonCode};
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]
@@ -85,9 +85,9 @@ pub enum Error {
     /// The broker is shut down.
     #[error("broker is shut down")]
     Closed,
-    /// The persistence backend failed to load retained messages.
-    #[error("loading retained messages failed")]
-    Persistence(#[source] std::io::Error),
+    /// [`BrokerOptions::data_dir`] could not be opened or read.
+    #[error("data directory failed")]
+    DataDir(#[source] std::io::Error),
     /// [`BrokerOptions::state_file`] could not be read or written.
     #[error("state file failed")]
     State(#[source] std::io::Error),

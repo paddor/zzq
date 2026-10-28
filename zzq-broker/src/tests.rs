@@ -616,6 +616,11 @@ async fn options_that_cannot_work_are_refused() {
             receive_maximum: 0,
             ..BrokerOptions::default()
         },
+        BrokerOptions {
+            data_dir: Some("d".into()),
+            state_file: Some("s".into()),
+            ..BrokerOptions::default()
+        },
     ];
     for opts in cases {
         let res = Broker::new(&ctx, opts).await;
@@ -661,34 +666,512 @@ async fn a_denial_with_a_success_code_still_refuses() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn stored_topics_deeper_than_allowed_are_not_loaded() {
-    use std::sync::Arc;
+async fn a_failed_retained_write_nacks_v5_publishers_and_drops_v3_ones() {
+    use zzq_proto::encode::{self, PublishHeader};
+    use zzq_proto::{PacketType, Version, reason};
 
-    use crate::{FilePersistence, Persistence, Retained};
+    use support::{Got, Raw};
 
-    let dir = std::env::temp_dir().join(format!("zzq-deep-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("retained.log");
-    let _ = std::fs::remove_file(&path);
-    {
-        let p = FilePersistence::open(&path).unwrap();
-        for topic in ["ok/1".to_owned(), "a/".repeat(1000) + "a"] {
-            p.set_retained(&Retained {
-                topic,
-                payload: "x".into(),
-                qos: QoS::AtMostOnce,
-                properties: bytes::Bytes::new(),
-                expires_at: None,
-            });
-        }
-        p.flush();
-    }
+    let dir = std::env::temp_dir().join(format!("zzq-failed-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     let opts = BrokerOptions {
-        persistence: Some(Arc::new(FilePersistence::open(&path).unwrap())),
+        data_dir: Some(dir.clone()),
         sys_interval: None,
         ..BrokerOptions::default()
     };
-    let (_ctx, broker, _uri) = setup(1, opts).await;
+    let (_ctx, broker, uri) = setup(1, opts).await;
+    // The first three records of the topic's journal fail.
+    broker.shared().retained.cursor_of("f/1").fail(1, 3);
+    let publish = |version, qos, pkid, retain| {
+        let h = PublishHeader {
+            version,
+            dup: false,
+            qos,
+            retain,
+            topic: "f/1",
+            pkid,
+            properties: &[],
+        };
+        let mut out = Vec::new();
+        encode::publish(&h, b"v", &mut out);
+        out
+    };
+    let ack = |kind, pkid, reason| Got::Ack { kind, pkid, reason };
+    let mut v5 = Raw::connect(&uri, "v5", Version::V5, 0).await;
+    // The ack of the publish after it waits too, to keep their order.
+    let both = [
+        publish(Version::V5, QoS::AtLeastOnce, 1, true),
+        publish(Version::V5, QoS::AtLeastOnce, 2, false),
+    ];
+    v5.send(&both.concat()).await;
+    let failed = reason::UNSPECIFIED_ERROR;
+    assert_eq!(v5.next().await, ack(PacketType::PubAck, 1, failed));
+    assert_eq!(v5.next().await, ack(PacketType::PubAck, 2, 0));
+    v5.send(&publish(Version::V5, QoS::ExactlyOnce, 3, true))
+        .await;
+    assert_eq!(v5.next().await, ack(PacketType::PubRec, 3, failed));
+    // The failed PUBREC ended the flow.
+    v5.ack(PacketType::PubRel, 3).await;
+    let unknown = reason::PACKET_IDENTIFIER_NOT_FOUND;
+    assert_eq!(v5.next().await, ack(PacketType::PubComp, 3, unknown));
+    let mut v3 = Raw::connect(&uri, "v3", Version::V311, 0).await;
+    v3.send(&publish(Version::V311, QoS::AtLeastOnce, 1, true))
+        .await;
+    v3.closed().await;
+    // Later records are written.
+    let mut ok = Raw::connect(&uri, "ok", Version::V5, 0).await;
+    ok.send(&publish(Version::V5, QoS::AtLeastOnce, 1, true))
+        .await;
+    assert_eq!(ok.next().await, ack(PacketType::PubAck, 1, 0));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_subscription_write_disconnects() {
+    use zzq_proto::encode::ConnectFields;
+    use zzq_proto::{SubscriptionOptions, Version, reason};
+
+    use support::{Got, Raw};
+
+    let dir = std::env::temp_dir().join(format!("zzq-failed-sub-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = BrokerOptions {
+        data_dir: Some(dir.clone()),
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, uri) = setup(1, opts).await;
+    // The lane journal fails its first records: the session, then the
+    // subscription.
+    broker.shared().lane_logs[0].cursor.fail(1, 2);
+    let expiry = [zzq_proto::Property::U32(
+        zzq_proto::property::SESSION_EXPIRY_INTERVAL,
+        60,
+    )];
+    let connect = ConnectFields {
+        version: Version::V5,
+        clean_start: false,
+        keep_alive: 0,
+        properties: &expiry,
+        client_id: "failing",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (mut c, code) = Raw::connect_with(&uri, &connect).await;
+    assert_eq!(code, 0);
+    c.send(&{
+        let mut out = Vec::new();
+        let opts = SubscriptionOptions::from(QoS::AtLeastOnce);
+        zzq_proto::encode::subscribe(Version::V5, 1, &[], &[("t", opts)], &mut out);
+        out
+    })
+    .await;
+    assert_eq!(
+        c.next().await,
+        Got::Disconnect {
+            reason: reason::UNSPECIFIED_ERROR
+        }
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Options of a broker on data directory `name`, and CONNECT fields for
+/// a session that outlives its connection.
+fn on_disk(name: &str) -> (std::path::PathBuf, impl Fn() -> BrokerOptions) {
+    let dir = std::env::temp_dir().join(format!("zzq-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = {
+        let dir = dir.clone();
+        move || BrokerOptions {
+            data_dir: Some(dir.clone()),
+            sys_interval: None,
+            ..BrokerOptions::default()
+        }
+    };
+    (dir, opts)
+}
+
+const EXPIRY: [zzq_proto::Property<'static>; 1] = [zzq_proto::Property::U32(
+    zzq_proto::property::SESSION_EXPIRY_INTERVAL,
+    600,
+)];
+
+fn durable(client_id: &str) -> zzq_proto::encode::ConnectFields<'_> {
+    zzq_proto::encode::ConnectFields {
+        version: zzq_proto::Version::V5,
+        clean_start: false,
+        keep_alive: 0,
+        properties: &EXPIRY,
+        client_id,
+        will: None,
+        username: None,
+        password: None,
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_qos2_publish_repeated_after_a_restart_is_delivered_once() {
+    use zzq_proto::encode::{self, PublishHeader};
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("qos2-in");
+    let publish = |dup| {
+        let h = PublishHeader {
+            version: Version::V5,
+            dup,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            topic: "q2/t",
+            pkid: 5,
+            properties: &[],
+        };
+        let mut out = Vec::new();
+        encode::publish(&h, b"once", &mut out);
+        out
+    };
+    let ack = |kind, pkid| Got::Ack {
+        kind,
+        pkid,
+        reason: 0,
+    };
+    {
+        let (_ctx, _broker, uri) = setup(1, opts()).await;
+        let (mut sub, _) = Raw::connect_with(&uri, &durable("q2-sub")).await;
+        sub.subscribe("q2/t", SubscriptionOptions::from(QoS::ExactlyOnce))
+            .await;
+        drop(sub);
+        let (mut p, _) = Raw::connect_with(&uri, &durable("q2-pub")).await;
+        p.send(&publish(false)).await;
+        // The PUBREC means the ID is on disk: a repeat is no new message.
+        assert_eq!(p.next().await, ack(PacketType::PubRec, 5));
+    }
+    let (_ctx, _broker, uri) = setup(1, opts()).await;
+    let (mut p, _) = Raw::connect_with(&uri, &durable("q2-pub")).await;
+    p.send(&publish(true)).await;
+    assert_eq!(p.next().await, ack(PacketType::PubRec, 5));
+    p.ack(PacketType::PubRel, 5).await;
+    assert_eq!(p.next().await, ack(PacketType::PubComp, 5));
+    let (mut sub, _) = Raw::connect_with(&uri, &durable("q2-sub")).await;
+    let m = sub.publish().await;
+    assert_eq!(m.payload, b"once");
+    sub.complete(&m).await;
+    sub.quiet(300).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_released_delivery_gets_its_pubrel_after_a_restart() {
+    use zzq_proto::{PacketType, SubscriptionOptions};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("qos2-out");
+    let pkid = {
+        let (_ctx, broker, uri) = setup(1, opts()).await;
+        let (mut sub, _) = Raw::connect_with(&uri, &durable("rel-sub")).await;
+        sub.subscribe("r/t", SubscriptionOptions::from(QoS::ExactlyOnce))
+            .await;
+        broker.publish("r/t", "x", QoS::ExactlyOnce).unwrap();
+        let m = sub.publish().await;
+        sub.ack(PacketType::PubRec, m.pkid).await;
+        // PUBREL only once the journal has the PUBREC.
+        let rel = Got::Ack {
+            kind: PacketType::PubRel,
+            pkid: m.pkid,
+            reason: 0,
+        };
+        assert_eq!(sub.next().await, rel);
+        m.pkid
+    };
+    let (_ctx, _broker, uri) = setup(1, opts()).await;
+    let (mut sub, _) = Raw::connect_with(&uri, &durable("rel-sub")).await;
+    // The client has the message: PUBREL again, not the PUBLISH.
+    let rel = Got::Ack {
+        kind: PacketType::PubRel,
+        pkid,
+        reason: 0,
+    };
+    assert_eq!(sub.next().await, rel);
+    sub.ack(PacketType::PubComp, pkid).await;
+    sub.quiet(300).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_snapshot_replaces_the_segments_before_it() {
+    use zzq_proto::SubscriptionOptions;
+
+    use support::Raw;
+
+    let (dir, opts) = on_disk("lane-snapshot");
+    {
+        let (ctx, broker, uri) = setup(1, opts()).await;
+        let (mut c, _) = Raw::connect_with(&uri, &durable("snap")).await;
+        c.subscribe("a", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        // The first try asks for a new segment; a later one rolls into it.
+        lane_until(&ctx, &broker, 0, |l| l.snapshot_journal(true).then_some(())).await;
+        c.subscribe("b", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        let first = dir.join("lanes-1/lane-0/0000000000000001.seg");
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while first.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "segment 1 stays");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(c);
+        broker.shutdown().await.unwrap();
+    }
+    let (ctx, broker, _uri) = setup(1, opts()).await;
+    let subs = on_lane(&ctx, &broker, 0, |l| {
+        let key = l.sessions.keys().next()?;
+        let mut f: Vec<String> = l
+            .sessions
+            .get(key)?
+            .subs
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        f.sort();
+        Some(f)
+    })
+    .await;
+    assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version, reason};
+
+    use crate::durable::JournalId;
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("lane-fail");
+    let sub_id = id_on("fail-sub", 1, 2);
+    let ack = |pkid, reason| Got::Ack {
+        kind: PacketType::PubAck,
+        pkid,
+        reason,
+    };
+    {
+        let (_ctx, broker, uri) = setup(2, opts()).await;
+        let (mut sub, _) = Raw::connect_with(&uri, &durable(&sub_id)).await;
+        // Once acked, the lane has nothing more to write.
+        sub.subscribe("f/t", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        let mut p = Raw::connect(&uri, &id_on("fail-pub", 0, 2), Version::V5, 0).await;
+        broker.shared().fail_next_write(JournalId::Lane(1));
+        p.pub_("f/t", b"lost", QoS::AtLeastOnce, 1).await;
+        assert_eq!(p.next().await, ack(1, reason::UNSPECIFIED_ERROR));
+        p.pub_("f/t", b"kept", QoS::AtLeastOnce, 2).await;
+        assert_eq!(p.next().await, ack(2, 0));
+        assert!(broker.stats().await.unwrap().write_errors >= 1);
+    }
+    // The lane wrote its sessions again after the failure.
+    let (_ctx, _broker, uri) = setup(2, opts()).await;
+    let (mut sub, got) = Raw::connack_with(&uri, &durable(&sub_id)).await;
+    assert!(
+        matches!(
+            got,
+            Got::ConnAck {
+                session_present: true,
+                ..
+            }
+        ),
+        "{got:?}"
+    );
+    while sub.publish().await.payload != b"kept" {}
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_retained_write_rewrites_the_stripe() {
+    use zzq_proto::{PacketType, Version, reason};
+
+    use crate::durable::JournalId;
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("stripe-fail");
+    let publish = |pkid, payload: &[u8]| {
+        let h = zzq_proto::encode::PublishHeader {
+            version: Version::V5,
+            dup: false,
+            qos: QoS::AtLeastOnce,
+            retain: true,
+            topic: "r/fail",
+            pkid,
+            properties: &[],
+        };
+        let mut out = Vec::new();
+        zzq_proto::encode::publish(&h, payload, &mut out);
+        out
+    };
+    let ack = |pkid, reason| Got::Ack {
+        kind: PacketType::PubAck,
+        pkid,
+        reason,
+    };
+    {
+        let (_ctx, broker, uri) = setup(1, opts()).await;
+        let stripe = crate::retain::Retained::stripe_of("r/fail");
+        broker.shared().fail_next_write(JournalId::Retained(stripe));
+        let mut p = Raw::connect(&uri, "stripe-pub", Version::V5, 0).await;
+        p.send(&publish(1, b"first")).await;
+        assert_eq!(p.next().await, ack(1, reason::UNSPECIFIED_ERROR));
+        p.send(&publish(2, b"second")).await;
+        assert_eq!(p.next().await, ack(2, 0));
+    }
+    let (_ctx, broker, _uri) = setup(1, opts()).await;
+    let got = broker.shared().retained.matching("r/fail");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].payload(), b"second");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_burst_to_another_lane_is_acked_once_journaled() {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("burst");
+    let (_ctx, _broker, uri) = setup(2, opts()).await;
+    let (mut sub, _) = Raw::connect_with(&uri, &durable(&id_on("burst-sub", 1, 2))).await;
+    sub.subscribe("b/t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    drop(sub);
+    let mut p = Raw::connect(&uri, &id_on("burst-pub", 0, 2), Version::V5, 0).await;
+    let burst: Vec<u8> = (1..=200)
+        .flat_map(|i| support::publish_bytes(Version::V5, "b/t", b"x", QoS::AtLeastOnce, i, &[]))
+        .collect();
+    p.send(&burst).await;
+    for i in 1..=200 {
+        let got = p.next().await;
+        assert_eq!(
+            got,
+            Got::Ack {
+                kind: PacketType::PubAck,
+                pkid: i,
+                reason: 0
+            }
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("cross-hold");
+    let (ctx, _broker, uri) = setup(2, opts()).await;
+    let qos1 = SubscriptionOptions::from(QoS::AtLeastOnce);
+    let mut plain = Raw::connect(&uri, &id_on("plain-sub", 1, 2), Version::V5, 0).await;
+    plain.subscribe("plain/t", qos1).await;
+    let (mut kept, _) = Raw::connect_with(&uri, &durable(&id_on("kept-sub", 1, 2))).await;
+    kept.subscribe("kept/t", qos1).await;
+    let mut p = Raw::connect(&uri, &id_on("cross-pub", 0, 2), Version::V5, 0).await;
+    // Lane 1 stops until `go`.
+    let (stopped, on_stop) = tokio::sync::oneshot::channel();
+    let (go, on_go) = std::sync::mpsc::channel::<()>();
+    let lanes = ctx.clone();
+    let stall = tokio::spawn(async move {
+        let lane = lanes.lane(1);
+        lane.call(move || {
+            let _ = stopped.send(());
+            let _ = on_go.recv_timeout(WAIT);
+        })
+        .await
+    });
+    on_stop.await.unwrap();
+    let ack = |pkid| Got::Ack {
+        kind: PacketType::PubAck,
+        pkid,
+        reason: 0,
+    };
+    p.pub_("plain/t", b"x", QoS::AtLeastOnce, 1).await;
+    assert_eq!(p.next().await, ack(1));
+    p.pub_("kept/t", b"x", QoS::AtLeastOnce, 2).await;
+    p.quiet(300).await;
+    go.send(()).unwrap();
+    stall.await.unwrap().unwrap();
+    assert_eq!(p.next().await, ack(2));
+    assert_eq!(plain.publish().await.payload, b"x");
+    assert_eq!(kept.publish().await.payload, b"x");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn acked_deliveries_go_out_with_later_writes() {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("done-along");
+    let (ctx, broker, uri) = setup(1, opts()).await;
+    let (mut sub, _) = Raw::connect_with(&uri, &durable("along-sub")).await;
+    sub.subscribe("a/t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    let mut p = Raw::connect(&uri, "along-pub", Version::V5, 0).await;
+    let log = &broker.shared().lane_logs[0];
+    let (_, before) = log.counts();
+    for pkid in 1..=20 {
+        p.pub_("a/t", b"x", QoS::AtLeastOnce, pkid).await;
+        let ack = Got::Ack {
+            kind: PacketType::PubAck,
+            pkid,
+            reason: 0,
+        };
+        assert_eq!(p.next().await, ack);
+        let m = sub.publish().await;
+        sub.ack(PacketType::PubAck, m.pkid).await;
+    }
+    // Each DONE went with the next publish's records, not alone.
+    let writes = log.counts().1 - before;
+    assert!(writes < 30, "{writes} writes for 20 publishes");
+    // The last one goes out with a sweep, once the lane has it.
+    lane_until(&ctx, &broker, 0, |l| {
+        let keys: Vec<_> = l.sessions.keys().collect();
+        keys.into_iter()
+            .all(|k| l.sessions.get(k).is_none_or(|s| s.inflight().len() == 0))
+            .then_some(())
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while log.cursor.check(log.counts().0) != Some(true) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the last DONE stays"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stored_topics_deeper_than_allowed_are_not_loaded() {
+    let dir = std::env::temp_dir().join(format!("zzq-deep-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let opts = |max_topic_levels| BrokerOptions {
+        data_dir: Some(dir.clone()),
+        max_topic_levels,
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, _uri) = setup(1, opts(2000)).await;
+    for topic in ["ok/1".to_owned(), "a/".repeat(1000) + "a"] {
+        broker
+            .publish_retained(&topic, "x", QoS::AtMostOnce)
+            .unwrap();
+    }
+    broker.shutdown().await.unwrap();
+    let (_ctx, broker, _uri) = setup(1, opts(128)).await;
     assert_eq!(broker.stats().await.unwrap().retained, 1);
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1024,7 +1507,12 @@ async fn held_acks_of_ended_connections_do_not_pile_up() {
 async fn a_held_suback_of_a_replaced_connection_sends_no_retained() {
     use zzq_proto::Version;
 
-    let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+    // Without the retained `$SYS/` topics, which the count would race with.
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (ctx, broker, uri) = setup(1, opts).await;
     broker
         .publish_retained("r/t", "kept", QoS::AtMostOnce)
         .unwrap();
@@ -1040,7 +1528,8 @@ async fn a_held_suback_of_a_replaced_connection_sends_no_retained() {
             key,
             // An earlier connection of the session.
             conn: conn - 1,
-            sync: std::sync::Arc::default(),
+            sync: Some(std::sync::Arc::default()),
+            due: crate::durable::Due::Now,
             packet: Box::new([]),
             retained: vec![("r/#".into(), QoS::AtMostOnce, 0)].into(),
         };

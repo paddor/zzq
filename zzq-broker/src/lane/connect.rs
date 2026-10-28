@@ -13,6 +13,7 @@ use crate::conn::{ConnShared, OwnedConnect};
 use crate::msg::Msg;
 use crate::session::{DelayedWill, Session};
 use crate::slab::Key;
+use crate::state::journal as rec;
 
 use super::{Attached, Close, Lane};
 
@@ -40,6 +41,9 @@ impl Lane {
         let Some(mut s) = self.sessions.remove(key) else {
             return;
         };
+        if s.journaled {
+            self.journal_end(&s);
+        }
         self.stats.add_session(&s);
         self.stats.dropped.session_ended += s.held();
         let sub = self.sub_ref(key);
@@ -101,6 +105,7 @@ impl Lane {
         s.username = c.username.as_deref().map(Box::from);
         s.inbound.last_allowed = None;
         s.inbound.held_acks = 0;
+        s.inbound.hold = None;
         s.bind(conn);
         s.expiry = c.session_expiry.min(max_expiry);
         s.expires_at = None;
@@ -109,8 +114,15 @@ impl Lane {
         s.max_packet = c.max_packet_size;
         s.inbound.aliases.clear();
         connack_ok(c.version, present, &props, &mut s.out.buf);
+        self.journal_attach(key);
+        let Some(s) = self.sessions.get_mut(key) else {
+            return Attached { key };
+        };
         if present {
             s.resend();
+            if s.journaled {
+                self.journal_progress(key);
+            }
         }
         self.mark(key);
         Attached { key }
@@ -205,6 +217,7 @@ impl Lane {
         s.unbind();
         s.out.buf.clear();
         s.inbound.aliases.clear();
+        s.inbound.hold = None;
         self.stats.connections -= 1;
         // Relaxed: see `conn::handshake::establish`.
         self.shared.connections.fetch_sub(1, Ordering::Relaxed);
@@ -224,6 +237,28 @@ impl Lane {
             } else {
                 let delay = Duration::from_secs(u64::from(w.delay.min(expiry)));
                 self.schedule_will(key, w.msg, delay);
+            }
+        }
+        if self.sessions.get(key).is_some_and(|s| s.journaled) {
+            self.journal_session(key, rec::DOWN);
+        }
+    }
+
+    /// Journals a new connection of a session that outlives it, or the end
+    /// of a journaled one that no longer does.
+    fn journal_attach(&mut self, key: Key) {
+        let Some(s) = self.sessions.get(key) else {
+            return;
+        };
+        if s.expiry != 0 {
+            let journaled = self.journal_session(key, rec::SESSION).is_some();
+            if let Some(s) = self.sessions.get_mut(key) {
+                s.journaled = journaled;
+            }
+        } else if s.journaled {
+            self.journal_session(key, rec::END);
+            if let Some(s) = self.sessions.get_mut(key) {
+                s.journaled = false;
             }
         }
     }

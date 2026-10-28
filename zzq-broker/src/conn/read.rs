@@ -9,10 +9,11 @@ use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use zzq_proto::DecodeError;
 use zzq_proto::packet::fixed_header;
+use zzq_proto::{DecodeError, reason};
 
 use super::ConnShared;
+use crate::durable::Due;
 use crate::lane::{Close, LaneRef};
 use crate::slab::Key;
 
@@ -151,8 +152,17 @@ pub(super) async fn read_loop<R: AsyncRead + Unpin>(
         let held = lane.borrow_mut().take_held(conn.id);
         waited |= !held.is_empty();
         for h in held {
-            h.sync.wait().await;
+            if let Some(sync) = &h.sync {
+                sync.wait().await;
+            }
+            if let Err(close) = written(lane, conn, h.due).await {
+                return close;
+            }
             lane.borrow_mut().release(&h);
+        }
+        match disk_acks(lane, key, conn).await {
+            Ok(w) => waited |= w,
+            Err(close) => return close,
         }
         conn.held.set(false);
         // Keep alive counts from the end of a wait the broker made.
@@ -166,6 +176,50 @@ pub(super) async fn read_loop<R: AsyncRead + Unpin>(
             return Close::Kicked;
         }
     }
+}
+
+/// Waits for the journal write `due`. A failed one closes the connection:
+/// the client learns of it, and a new connection finds the journal
+/// written again.
+async fn written(lane: &LaneRef, conn: &ConnShared, due: Due) -> Result<(), Close> {
+    let w = match due {
+        Due::Now => return Ok(()),
+        Due::After(w) => w,
+        Due::Failed => return Err(Close::Protocol(reason::UNSPECIFIED_ERROR)),
+    };
+    let shared = lane.borrow().shared.clone();
+    // Cancel-safe as in `read_more`.
+    tokio::select! {
+        biased;
+        () = conn.stop.notified() => Err(Close::Kicked),
+        ok = shared.cursor(w.journal).wait(w.n) => {
+            if ok { Ok(()) } else { Err(Close::Protocol(reason::UNSPECIFIED_ERROR)) }
+        }
+    }
+}
+
+/// Waits for the journal writes the connection's held acks need, then
+/// sends them. True if it held any.
+async fn disk_acks(lane: &LaneRef, key: Key, conn: &ConnShared) -> Result<bool, Close> {
+    let (shared, waits) = {
+        let mut l = lane.borrow_mut();
+        let Some(waits) = l.hold_waits(key, conn.id) else {
+            return Ok(false);
+        };
+        (l.shared.clone(), waits)
+    };
+    let mut written = true;
+    for w in waits {
+        // Cancel-safe as in `read_more`; a lost wait leaves the record to
+        // its cursor.
+        tokio::select! {
+            biased;
+            () = conn.stop.notified() => return Err(Close::Kicked),
+            ok = shared.cursor(w.journal).wait(w.n) => written &= ok,
+        }
+    }
+    lane.borrow_mut().release_acks(key, conn.id, written)?;
+    Ok(true)
 }
 
 /// Waits while the session's replies wait over `max_out_bytes` for the
