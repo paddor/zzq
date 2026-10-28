@@ -18,6 +18,7 @@ pub fn for_target(name: &str) -> Vec<Vec<u8>> {
         "websocket" => websocket(),
         "retained_log" => retained_log(),
         "state_image" => zzq_broker::fuzzing::state_image_seeds(),
+        "journal_segment" => zzq_disk::fuzzing::journal_segment_seeds(),
         "endpoint" => text(&[
             "tcp://localhost",
             "tls://[::1]:8883",

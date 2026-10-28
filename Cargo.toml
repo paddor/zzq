@@ -1,7 +1,7 @@
 [workspace]
-members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client", "zzq-bench"]
+members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-broker", "zzq-client", "zzq-bench"]
 exclude = ["fuzz", "bindings", "zzq-bench/harness"]
-default-members = ["zzq-proto", "zzq-tokio", "zzq-broker", "zzq-client"]
+default-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-broker", "zzq-client"]
 resolver = "2"
 
 [workspace.package]
@@ -37,6 +37,7 @@ missing_const_for_fn = "warn"
 [workspace.dependencies]
 zzq-proto = { path = "zzq-proto", version = "0.3.0", default-features = false }
 zzq-tokio = { path = "zzq-tokio", version = "0.3.0", default-features = false }
+zzq-disk = { path = "zzq-disk", version = "0.3.0" }
 zzq-broker = { path = "zzq-broker", version = "0.3.0" }
 zzq-client = { path = "zzq-client", version = "0.3.0" }
 bytes = { version = "1.12", default-features = false }

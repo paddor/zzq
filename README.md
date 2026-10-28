@@ -10,6 +10,7 @@ connection never moves between threads.
 | --- | --- |
 | `zzq-proto` | `no_std` codec for MQTT 3.1.1, 5.0 and MQTT-SN, topic rules and a topic trie |
 | `zzq-tokio` | `Context`, IO lanes and transports |
+| `zzq-disk` | Durable append-only journals, written with Linux AIO |
 | `zzq-broker` | `Broker`: sessions, retained messages, wills, shared subscriptions, MQTT-SN gateway, auth hooks |
 | `zzq-client` | `Client`, async and blocking, with reconnect and session resume |
 | `zzq-bench` | Load generators and local performance gates |

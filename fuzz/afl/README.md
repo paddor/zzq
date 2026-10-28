@@ -10,6 +10,7 @@ the workspace, so AFL's instrumentation stays out of normal builds.
 | `websocket` | Upgrade request or response, and the frames after it | no panic |
 | `retained_log` | A retained message log | no panic |
 | `state_image` | A state image | no panic, restored sessions encode and decode again |
+| `journal_segment` | A journal segment file | no panic, written records read back, damage keeps a prefix or fails |
 | `endpoint` | An endpoint URI | no panic, print and parse round trip |
 | `topics` | A filter and a topic, one per line | trie and `topic::matches` agree |
 

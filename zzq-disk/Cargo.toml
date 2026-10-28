@@ -1,0 +1,26 @@
+[package]
+name = "zzq-disk"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme.workspace = true
+description = "Durable append-only journals for zzq, written with Linux AIO."
+keywords = ["mqtt", "journal", "aio", "durability"]
+categories = ["filesystem"]
+
+[lints]
+workspace = true
+
+[features]
+# Entry points for the fuzz targets in `fuzz/afl`.
+fuzzing = []
+
+[dependencies]
+fanring = { version = "0.3.9", features = ["async"] }
+libc = "0.2"
+rustix = { version = "1.1.4", features = ["fs", "event"] }
+thiserror.workspace = true
+xxhash-rust.workspace = true

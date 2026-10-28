@@ -11,12 +11,13 @@ use zzq_proto::{Packet, Version, decode, sn, topic};
 pub type Target = fn(&[u8]);
 
 /// Every target, by name.
-pub const TARGETS: [(&str, Target); 7] = [
+pub const TARGETS: [(&str, Target); 8] = [
     ("mqtt", mqtt),
     ("mqtt_sn", mqtt_sn),
     ("websocket", websocket),
     ("retained_log", retained_log),
     ("state_image", state_image),
+    ("journal_segment", journal_segment),
     ("endpoint", endpoint),
     ("topics", topics),
 ];
@@ -90,6 +91,17 @@ pub fn retained_log(data: &[u8]) {
 /// When it finds a bug.
 pub fn state_image(data: &[u8]) {
     zzq_broker::fuzzing::state_image(data);
+}
+
+/// A journal segment file, as a journal reads it when it opens. Records
+/// written to a segment read back the same, and after one flipped bit,
+/// the first groups of them or an error.
+///
+/// # Panics
+///
+/// When it finds a bug.
+pub fn journal_segment(data: &[u8]) {
+    zzq_disk::fuzzing::journal_segment(data);
 }
 
 /// An endpoint URI that parses prints back to one that parses the same.
