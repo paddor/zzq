@@ -1080,6 +1080,7 @@ async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
     // No room for another copy of the state: it stops growing.
     broker.shared().set_free_bytes(Some(0));
     lane_until(&ctx, &broker, 0, |l| l.budget.full.then_some(())).await;
+    assert_eq!(broker.stats().await.unwrap().state_limit, 0);
     let refused = Client::connect(&ctx, &uri, durable("e")).await;
     assert!(
         matches!(
@@ -1111,6 +1112,7 @@ async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
     // Room again: the state grows again.
     broker.shared().set_free_bytes(None);
     lane_until(&ctx, &broker, 0, |l| (!l.budget.full).then_some(())).await;
+    assert!(broker.stats().await.unwrap().state_limit > 0);
     live.publish("q", "kept", QoS::AtLeastOnce).await.unwrap();
     let mut d = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
     assert!(d.connected().session_present);

@@ -46,7 +46,9 @@ Notable changes to zzq. The format follows
   `zzq_broker` says on stderr when the data directory fills and when it
   has room again. The state stops growing, as at `max_state_bytes`, while
   the data directory's device has less room than the state takes and
-  two segments, so every journal can still write a snapshot. A message
+  two segments, so every journal can still write a snapshot;
+  `Stats::state_limit` shows the limit, and `zzq_broker` says when the
+  state reaches it and when it is down to half. A message
   dropped for a full state costs no journal write. A connection a crash
   ended counts as lost at the next start, so its will goes out. A changed
   lane count moves the sessions to their new lanes. Linux only; not with

@@ -15,7 +15,8 @@
 //! a lane polls on after work before it sleeps. Prints each bound endpoint
 //! on its own line, then runs until SIGTERM or SIGINT. With `--data-dir`,
 //! it says on stderr when journals there could not make a new segment, as
-//! on a full device, and when they can again.
+//! on a full device, and when they can again, and when the state stops
+//! growing for lack of room there, and when it has room again.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -134,6 +135,7 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
         spin: a.spin,
     };
     let ctx = Context::with_config(&config).map_err(|e| format!("context: {}", chain(&e)))?;
+    let max_state = opts.max_state_bytes;
     let broker = Broker::new(&ctx, opts)
         .await
         .map_err(|e| format!("broker: {}", chain(&e)))?;
@@ -146,7 +148,7 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
     }
     tokio::select! {
         () = stopped => {}
-        () = watch(&broker, a.data_dir.as_deref()) => {}
+        () = watch(&broker, a.data_dir.as_deref(), max_state) => {}
     }
     broker
         .shutdown()
@@ -155,23 +157,31 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
 }
 
 /// Says on stderr, checked each second, when journals in the data directory
-/// `dir` could not make a new segment, and when they can again. Ends never.
-async fn watch(broker: &Broker, dir: Option<&str>) {
+/// `dir` could not make a new segment, and when they can again, and when the
+/// state stops growing for lack of room there, below `max_state`, and when
+/// it has room again. Ends never.
+async fn watch(broker: &Broker, dir: Option<&str>, max_state: usize) {
     let Some(dir) = dir else {
         return std::future::pending().await;
     };
+    let max = u64::try_from(max_state).unwrap_or(u64::MAX);
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let mut was = 0;
+    let (mut full, mut short) = (0, false);
     loop {
         tick.tick().await;
         // A broker that stopped has nothing more to say.
         let Ok(stats) = broker.stats().await else {
             return std::future::pending().await;
         };
-        if let Some(line) = full_change(dir, was, stats.full_journals) {
+        if let Some(line) = full_change(dir, full, stats.full_journals) {
             eprintln!("{line}");
         }
-        was = stats.full_journals;
+        full = stats.full_journals;
+        let line;
+        (short, line) = room_change(dir, short, stats.state_bytes, stats.state_limit, max);
+        if let Some(line) = line {
+            eprintln!("{line}");
+        }
     }
 }
 
@@ -185,6 +195,29 @@ fn full_change(dir: &str, was: u64, now: u64) -> Option<String> {
         (1.., 0) => Some(format!("data directory {dir} has room again")),
         _ => None,
     }
+}
+
+/// Whether the state in `dir` is short of room, given whether it `was`, and
+/// what to say if that changed: short once the `state` bytes reach a
+/// `limit` the device set below `max`, and no longer once they are back
+/// under half of it, or the device no longer sets it.
+fn room_change(dir: &str, was: bool, state: u64, limit: u64, max: u64) -> (bool, Option<String>) {
+    let by_device = limit < max;
+    let short = by_device
+        && if was {
+            state > limit / 2
+        } else {
+            state >= limit
+        };
+    let line = match (was, short) {
+        (false, true) => Some(format!(
+            "data directory {dir} is short of room: the state stops growing at {} MiB",
+            limit >> 20
+        )),
+        (true, false) => Some(format!("data directory {dir} has room for the state again")),
+        _ => None,
+    };
+    (short, line)
 }
 
 /// Handles SIGTERM and SIGINT from now on, and returns the wait for either.
@@ -235,7 +268,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::full_change;
+    use super::{full_change, room_change};
 
     #[test]
     fn a_full_data_dir_is_said_once_when_it_fills_and_once_when_it_empties() {
@@ -250,5 +283,32 @@ mod tests {
             Some("data directory d has room again")
         );
         assert_eq!(said(0, 0), None);
+    }
+
+    #[test]
+    fn a_data_dir_short_of_room_is_said_once_until_the_state_is_half_of_it() {
+        let mib = 1 << 20;
+        let said = |was, state, limit| room_change("d", was, state, limit, u64::MAX);
+        assert_eq!(
+            said(false, 20 * mib, 15 * mib),
+            (
+                true,
+                Some("data directory d is short of room: the state stops growing at 15 MiB".into())
+            )
+        );
+        assert_eq!(said(true, 10 * mib, 15 * mib), (true, None));
+        assert_eq!(
+            said(true, 7 * mib, 15 * mib),
+            (
+                false,
+                Some("data directory d has room for the state again".into())
+            )
+        );
+        assert_eq!(said(false, 10 * mib, 15 * mib), (false, None));
+        // A limit `max_state_bytes` sets is no lack of room.
+        assert_eq!(
+            room_change("d", false, 20 * mib, 15 * mib, 15 * mib),
+            (false, None)
+        );
     }
 }

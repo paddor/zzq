@@ -235,6 +235,10 @@ pub struct Stats {
     /// as on a full device. Their writes go on in the spare segment each
     /// keeps back, and wait once that is full too, until space comes back.
     pub full_journals: u64,
+    /// Bytes the state may take before it stops growing:
+    /// `max_state_bytes`, or less while the device of the data directory
+    /// has less room.
+    pub state_limit: u64,
 }
 
 /// Messages the broker dropped, by reason.
@@ -549,6 +553,7 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
     total.full_journals =
         r.full_journals() + shared.lane_logs.iter().filter(|l| l.full()).count() as u64;
     total.state_bytes += r.bytes() as u64;
+    total.state_limit = u64::try_from(shared.state_limit()).unwrap_or(u64::MAX);
     Ok(total)
 }
 

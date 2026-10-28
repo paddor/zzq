@@ -460,3 +460,8 @@ What the open release offers, and what happens when a node fails.
 - An offline session queues up to `max_queued` messages and
   `max_queued_bytes`; past that the oldest are dropped and counted.
   `max_state_bytes` bounds all sessions, queues and retained messages.
+- With `--data-dir`, the state stops growing the same way while the disk
+  has less room than another copy of it, so every journal can still
+  compact. A journal that finds the disk full writes on in the segment it
+  keeps spare, and waits once that is full too, until there is room.
+  `$SYS/broker/store/full` and a line on stderr say so.
