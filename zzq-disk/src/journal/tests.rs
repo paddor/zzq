@@ -42,20 +42,42 @@ fn one_empty_segment_stays_as_the_next_and_others_go() {
         j.append(1, &[&[0; 4000]]).unwrap();
     }
     j.sync().unwrap();
-    assert!(j.tail.active.id >= 2, "rolled into the kept segment");
+    assert!(
+        j.tail.active.as_ref().unwrap().id >= 2,
+        "rolled into the kept segment"
+    );
+}
+
+#[test]
+fn a_journal_never_written_holds_no_segment() {
+    let dir = TempDir::new("fresh");
+    let disk = Disk::new(small()).unwrap();
+    let Some(mut j) = open(&disk, dir.path()) else {
+        return;
+    };
+    assert_eq!(j.sync().unwrap(), 0);
+    drop(j);
+    assert_eq!(segment::list(dir.path()).unwrap(), [0; 0]);
+    let mut j = open(&disk, dir.path()).unwrap();
+    j.append(1, &[b"x"]).unwrap();
+    assert_eq!(j.sync().unwrap(), 1);
+    assert_eq!(segment::list(dir.path()).unwrap(), [1]);
 }
 
 #[test]
 fn an_empty_journal_starts_in_its_first_empty_segment() {
-    let dir = TempDir::new("fresh");
+    let dir = TempDir::new("empty-first");
     let disk = Disk::new(small()).unwrap();
     let Some(j) = open(&disk, dir.path()) else {
         return;
     };
     drop(j);
-    segment::create(dir.path(), 2, small().segment_bytes).unwrap();
+    for id in 1..=2 {
+        segment::create(dir.path(), id, small().segment_bytes).unwrap();
+    }
     let j = open(&disk, dir.path()).unwrap();
-    assert_eq!((j.tail.active.id, j.tail.offset), (1, PAGE as u64));
+    let active = j.tail.active.as_ref().map(|a| a.id);
+    assert_eq!((active, j.tail.offset), (Some(1), PAGE as u64));
     assert_eq!(j.tail.next.as_ref().map(|s| s.id), Some(2));
     assert_eq!(j.tail.group, 1);
 }
@@ -98,15 +120,18 @@ fn a_failed_write_reports_its_records_and_writes_go_on() {
 fn a_written_segment_after_an_empty_one_fails_the_open() {
     let dir = TempDir::new("gap");
     let disk = Disk::new(small()).unwrap();
-    let Some(mut j) = open(&disk, dir.path()) else {
+    let Some(j) = open(&disk, dir.path()) else {
         return;
     };
+    drop(j);
+    segment::create(dir.path(), 1, small().segment_bytes).unwrap();
+    let mut j = open(&disk, dir.path()).unwrap();
     // Writes skip segment 1, which a journal never does.
     j.tail.next = Some(segment::create(dir.path(), 2, small().segment_bytes).unwrap());
-    j.tail.offset = j.tail.active.capacity;
+    j.tail.offset = j.tail.active.as_ref().unwrap().capacity;
     j.append(1, &[b"x"]).unwrap();
     j.sync().unwrap();
-    assert_eq!(j.tail.active.id, 2);
+    assert_eq!(j.tail.active.as_ref().unwrap().id, 2);
     drop(j);
     match disk.open(dir.path(), |_| Ok(())) {
         Err(Error::Corrupt { reason, .. }) => {

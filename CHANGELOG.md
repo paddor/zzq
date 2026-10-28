@@ -11,7 +11,9 @@ Notable changes to zzq. The format follows
   Records go out in groups with Linux AIO and `O_DIRECT | O_DSYNC`, one
   write in flight per journal and no fill delay, so a completed write is
   on disk. Opening a journal replays its records and ends the log at a
-  torn last write.
+  torn last write, unless its `DURABLE` mark says that write was on disk.
+  A journal makes its first segment on its first write; `Journal::roll`
+  starts a new one, and `Journal::trim` removes those before it.
 - `zzq-bench`: `zzq_loadbench` runs the fixed-load test against any broker:
   up to tens of thousands of connections, each publishing on a schedule,
   in steps of offered load, with latency from each send to its delivery.

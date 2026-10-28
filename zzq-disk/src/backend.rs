@@ -87,6 +87,16 @@ pub(crate) enum FileJob {
         capacity: u64,
         reply: Sender<Done>,
     },
+    /// Remove the segments before `before`, oldest first.
+    Trim {
+        dir: Arc<Path>,
+        before: u64,
+    },
+    /// Note that groups up to `group` are on disk.
+    Mark {
+        dir: Arc<Path>,
+        group: u64,
+    },
     Stop,
 }
 
@@ -337,6 +347,15 @@ fn run_files(mut jobs: Receiver<FileJob>) {
                 mut reply,
             } => {
                 let _ = reply.try_send(Done::Created(segment::create(&dir, id, capacity)));
+            }
+            // A failure leaves segments the next trim or open finds; they
+            // replay before what replaced them.
+            FileJob::Trim { dir, before } => {
+                let _ = segment::trim(&dir, before);
+            }
+            // A failure leaves an older mark, which asks less.
+            FileJob::Mark { dir, group } => {
+                let _ = segment::write_mark(&dir, group);
             }
             FileJob::Stop => return,
         }

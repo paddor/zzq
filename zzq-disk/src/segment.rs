@@ -123,6 +123,56 @@ pub(crate) fn remove(dir: &Path, id: u64) -> io::Result<()> {
     sync_dir(dir)
 }
 
+/// Removes the segments before `before`, oldest first, so the rest stay
+/// in a row.
+pub(crate) fn trim(dir: &Path, before: u64) -> io::Result<()> {
+    for id in list(dir)?.into_iter().filter(|&id| id < before) {
+        fs::remove_file(path(dir, id))?;
+    }
+    sync_dir(dir)
+}
+
+/// The file that names the last group known to be on disk: the group
+/// number and its XXH3, big endian.
+const MARK: &str = "DURABLE";
+
+/// Notes that the groups up to `group` are on disk.
+pub(crate) fn write_mark(dir: &Path, group: u64) -> io::Result<()> {
+    let done = dir.join(MARK);
+    let partial = done.with_extension(PARTIAL);
+    {
+        let mut file = File::create(&partial)?;
+        let bytes = group.to_be_bytes();
+        file.write_all(&bytes)?;
+        file.write_all(&xxhash_rust::xxh3::xxh3_64(&bytes).to_be_bytes())?;
+        file.sync_all()?;
+    }
+    fs::rename(&partial, &done)?;
+    sync_dir(dir)
+}
+
+/// The group the mark names, 0 without one.
+pub(crate) fn read_mark(dir: &Path) -> io::Result<u64> {
+    let bytes = match fs::read(dir.join(MARK)) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let Some((group, sum)) = bytes.split_first_chunk::<8>() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable mark too short",
+        ));
+    };
+    if sum != xxhash_rust::xxh3::xxh3_64(group).to_be_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "durable mark damaged",
+        ));
+    }
+    Ok(u64::from_be_bytes(*group))
+}
+
 /// Makes the names in `dir` durable.
 pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()

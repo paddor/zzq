@@ -217,18 +217,15 @@ fn a_torn_last_write_ends_the_log() {
     let (mut j, _) = open(&disk, &dir.0);
     append(&mut j, 1, 3);
     j.sync().unwrap();
+    let mark = dir.0.join("DURABLE");
+    let before = std::fs::read(&mark).unwrap();
     // One write of its own, at the end.
     j.append(9, &[&[7; 5000]]).unwrap();
     j.sync().unwrap();
     drop(j);
-    let first = dir.0.join(format!("{:016x}.seg", 1));
-    let mut bytes = std::fs::read(&first).unwrap();
-    let last = (4096..bytes.len())
-        .step_by(4096)
-        .rfind(|&at| bytes[at..].starts_with(b"ZZQGROUP"))
-        .unwrap();
-    bytes[last + 64 + 4000] ^= 1;
-    std::fs::write(&first, &bytes).unwrap();
+    // A crash during that write: the mark names the group before it.
+    std::fs::write(&mark, &before).unwrap();
+    tear_last_group(&dir.0);
     let (mut j, got) = open(&disk, &dir.0);
     assert_eq!(got, expected(3));
     // Writes go on where the torn one was.
@@ -238,6 +235,78 @@ fn a_torn_last_write_ends_the_log() {
     let (_, got) = open(&disk, &dir.0);
     assert_eq!(got.last().unwrap(), &(1, b"after".to_vec()));
     assert_eq!(got.len(), 4);
+}
+
+/// Flips a bit in the body of the last group of segment 1.
+fn tear_last_group(dir: &Path) {
+    let first = dir.join(format!("{:016x}.seg", 1));
+    let mut bytes = std::fs::read(&first).unwrap();
+    let last = (4096..bytes.len())
+        .step_by(4096)
+        .rfind(|&at| bytes[at..].starts_with(b"ZZQGROUP"))
+        .unwrap();
+    bytes[last + 64 + 4000] ^= 1;
+    std::fs::write(&first, &bytes).unwrap();
+}
+
+#[test]
+fn damage_to_a_group_the_mark_names_fails_the_open() {
+    let dir = TempDir::new("marked");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    j.append(9, &[&[7; 5000]]).unwrap();
+    j.sync().unwrap();
+    drop(j);
+    tear_last_group(&dir.0);
+    match disk.open(&dir.0, |_| Ok(())) {
+        Err(Error::Corrupt { reason, .. }) => {
+            assert_eq!(reason, "the journal ends before groups it had on disk");
+        }
+        other => panic!("{other:?}"),
+    }
+    std::fs::write(dir.0.join("DURABLE"), b"garbage").unwrap();
+    match disk.open(&dir.0, |_| Ok(())) {
+        Err(Error::Corrupt { reason, .. }) => assert_eq!(reason, "the durable mark is damaged"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn a_rolled_journal_trims_the_segments_before() {
+    let dir = TempDir::new("trim");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    assert_eq!(
+        j.roll().unwrap(),
+        Some(1),
+        "nothing written: the first segment"
+    );
+    append(&mut j, 1, 3);
+    j.sync().unwrap();
+    // The next segment is asked for, and there once a wait got it.
+    assert_eq!(j.roll().unwrap(), None);
+    j.wait().unwrap();
+    let next = j.roll().unwrap().unwrap();
+    assert_eq!(next, 2);
+    assert_eq!(
+        j.roll().unwrap(),
+        Some(2),
+        "the roll waits for the next group"
+    );
+    append(&mut j, 4, 6);
+    j.sync().unwrap();
+    assert_eq!(j.roll().unwrap(), None, "in segment 2, which holds groups");
+    j.trim(next).unwrap();
+    assert!(j.appended_bytes() > 0);
+    // The file thread trims in turn; a sync that comes after waits for it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while dir.0.join(format!("{:016x}.seg", 1)).exists() {
+        assert!(std::time::Instant::now() < deadline, "segment 1 stays");
+        std::thread::yield_now();
+    }
+    drop(j);
+    let (_, got) = open(&disk, &dir.0);
+    assert_eq!(got, expected(6)[3..]);
 }
 
 #[test]
