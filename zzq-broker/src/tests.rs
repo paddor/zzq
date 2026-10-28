@@ -271,6 +271,74 @@ async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
     again.quiet(300).await;
 }
 
+/// With a data directory, an ack waits for a congested subscriber too, not
+/// only for the disk, on the publisher's lane or another. Without that, a
+/// subscriber's queue fills to `max_queued` and drops acked messages.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_disk_an_ack_waits_for_a_congested_subscriber() {
+    for lanes in [1, 2] {
+        acks_wait_for_a_congested_subscriber_on_disk(lanes).await;
+    }
+}
+
+async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize) {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let name = format!("congested-{lanes}");
+    let (dir, opts) = on_disk(&name);
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        qos_queue_high: 2,
+        ..opts()
+    };
+    let (_ctx, _broker, uri) = setup(lanes, opts).await;
+    let (mut sub, code) = Raw::connect_with(&uri, &durable("sub")).await;
+    assert_eq!(code, 0);
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    // With two lanes, the publisher is on the other one.
+    let id = (0..64)
+        .map(|i| format!("pub-{i}"))
+        .find(|id| lanes == 1 || crate::lane_for(id, lanes) != crate::lane_for("sub", lanes))
+        .unwrap();
+    let mut publisher = Raw::connect(&uri, &id, Version::V5, 0).await;
+    // The acks of `want`, in any order: an ack released while later ones
+    // wait for the disk goes behind them.
+    let acks = async |p: &mut Raw, want: &[u16]| {
+        let mut pkids = Vec::new();
+        while pkids.len() < want.len() {
+            match p.next().await {
+                Got::Ack { pkid, .. } => pkids.push(pkid),
+                other => panic!("{lanes} lanes: {other:?}"),
+            }
+        }
+        pkids.sort_unstable();
+        assert_eq!(pkids, want, "{lanes} lanes");
+    };
+    for pkid in 1..=3 {
+        publisher.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+    }
+    // The third makes the subscriber congested. Its own lane holds that
+    // ack; another lane learns of it after routing the third.
+    acks(
+        &mut publisher,
+        if lanes == 1 { &[1, 2] } else { &[1, 2, 3] },
+    )
+    .await;
+    publisher.quiet(300).await;
+    publisher.pub_("t", b"x", QoS::AtLeastOnce, 4).await;
+    publisher.quiet(300).await;
+    for _ in 0..4 {
+        let p = sub.publish().await;
+        sub.ack(PacketType::PubAck, p.pkid).await;
+    }
+    acks(&mut publisher, if lanes == 1 { &[3, 4] } else { &[4] }).await;
+    publisher.quiet(100).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A subscriber that never acks and is congested from its third message,
 /// and the options that make it so, with a Receive Maximum of 10.
 async fn congested_subscriber() -> (Context, Broker, String, support::Raw) {

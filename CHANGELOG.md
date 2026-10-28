@@ -33,7 +33,9 @@ Notable changes to zzq. The format follows
   packet IDs, in one per lane. A message goes in once per lane. An ack
   waits until what it stands for is on disk: the PUBACK or PUBREC of a
   retained publish or of one such sessions get, also on other lanes,
-  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. A subscriber's
+  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. A publisher's
+  ack then still waits while a subscriber it fed is congested, as without
+  a data directory. A subscriber's
   ack of a delivery goes out with the next write, or within 50 ms, so a
   crash may send a QoS 1 message it had acked again. If a write
   fails, a v5 publisher gets Unspecified error, other clients are

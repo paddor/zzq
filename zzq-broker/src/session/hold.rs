@@ -3,6 +3,7 @@
 use zzq_proto::PacketType;
 
 use crate::durable::{Journaled, Wait};
+use crate::index::SubRef;
 
 /// Acks of one connection held for journal writes, in the order they were
 /// due, so they leave in the order of the packets they answer.
@@ -25,6 +26,9 @@ pub(crate) struct HeldAck {
     /// It answers for a change that must be on disk first, not only for
     /// its place in line.
     pub(crate) durable: bool,
+    /// A congested subscriber the publish went to: once on disk, the ack
+    /// waits for it to drain too.
+    pub(crate) congested: Option<SubRef>,
 }
 
 impl AckHold {
@@ -40,11 +44,18 @@ impl AckHold {
     /// Holds an ack until the writes of its change, which the hold waits
     /// for, are done.
     pub(crate) fn push_durable(&mut self, kind: PacketType, pkid: u16) {
+        self.push_publish(kind, pkid, None);
+    }
+
+    /// Holds the ack of a publish until the writes of its change are done,
+    /// then while `congested`, a subscriber it went to, is congested.
+    pub(crate) fn push_publish(&mut self, kind: PacketType, pkid: u16, congested: Option<SubRef>) {
         self.acks.push(HeldAck {
             kind,
             pkid,
             reason: 0,
             durable: true,
+            congested,
         });
     }
 
@@ -55,6 +66,7 @@ impl AckHold {
             pkid,
             reason,
             durable: false,
+            congested: None,
         });
     }
 
