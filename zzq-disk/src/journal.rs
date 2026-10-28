@@ -70,8 +70,8 @@ struct Tail {
     /// The segment after `active`, made ahead of need.
     next: Option<Segment>,
     creating: bool,
-    /// The next group starts a new segment.
-    roll: bool,
+    /// Groups of the records after this one start a new segment.
+    roll_after: Option<u64>,
     /// The next write goes to a place the kernel refuses.
     #[cfg(feature = "testing")]
     fail: bool,
@@ -139,12 +139,8 @@ impl Journal {
             return Err(Error::TooLarge { len });
         }
         let p = &mut self.pending;
-        if p.open.records > 0 && p.open.buf.len() + framed > self.config.group_bytes {
-            let fresh = Group {
-                buf: p.free.pop().unwrap_or_default(),
-                ..Group::default()
-            };
-            p.queued.push_back(std::mem::replace(&mut p.open, fresh));
+        if p.open.buf.len() + framed > self.config.group_bytes {
+            p.seal();
         }
         let open = &mut p.open;
         if open.buf.is_empty() {
@@ -184,7 +180,9 @@ impl Journal {
         };
         let length = format::group_len(group.buf.len()) as u64;
         let t = &mut self.tail;
-        let fits = |a: &&Segment| !t.roll && t.offset + length <= a.capacity;
+        let first = group.last + 1 - u64::from(group.records);
+        let rolls = t.roll_after.is_some_and(|n| first > n);
+        let fits = |a: &&Segment| !rolls && t.offset + length <= a.capacity;
         let active = if let Some(a) = t.active.as_ref().filter(fits) {
             a
         } else {
@@ -193,7 +191,7 @@ impl Journal {
                 return self.create_next();
             };
             t.offset = PAGE as u64;
-            t.roll = false;
+            t.roll_after = None;
             t.active.insert(next)
         };
         format::seal(&mut group.buf, active.id, t.group, group.records)?;
@@ -288,29 +286,50 @@ impl Journal {
         Ok(self.durable)
     }
 
-    /// Starts the next group in a new segment, unless the current one
-    /// holds none yet, and returns that segment's id. Once what the
+    /// Starts a new segment for the records appended from here on, unless
+    /// the current one holds none yet, and returns that segment's id. The
+    /// records before stay in the segments before it. Once what the
     /// records from here on replace is durable, [`Journal::trim`] retires
-    /// the segments before it. `None` while the next segment is still
-    /// being made, so writes need not wait for it: ask again later.
+    /// those. `None` while the next segment is still being made, or while
+    /// the records before do not fit the current one, so writes need not
+    /// wait: ask again later.
     ///
     /// # Errors
     ///
     /// [`Error::Closed`] once the disk threads stopped.
     pub fn roll(&mut self) -> Result<Option<u64>, Error> {
+        let ahead = self.ahead();
         let t = &mut self.tail;
         match (&t.active, &t.next) {
             (None, _) => Ok(Some(1)),
-            (Some(a), _) if t.offset == PAGE as u64 => Ok(Some(a.id)),
-            (Some(_), Some(next)) => {
-                t.roll = true;
-                Ok(Some(next.id))
+            // Records from an earlier roll go there already.
+            (Some(_), Some(next)) if t.roll_after.is_some() => Ok(Some(next.id)),
+            (Some(a), _) if t.offset == PAGE as u64 && ahead == 0 => Ok(Some(a.id)),
+            (Some(a), Some(next)) if t.offset + ahead <= a.capacity => {
+                t.roll_after = Some(self.appended);
+                let id = next.id;
+                self.pending.seal();
+                Ok(Some(id))
             }
+            (Some(_), Some(_)) => Ok(None),
             (Some(_), None) => {
                 self.create_next()?;
                 Ok(None)
             }
         }
+    }
+
+    /// Bytes the groups in flight and waiting take in a segment.
+    fn ahead(&self) -> u64 {
+        let p = &self.pending;
+        let open = (p.open.records > 0).then_some(&p.open);
+        let waiting = p
+            .queued
+            .iter()
+            .chain(open)
+            .map(|g| format::group_len(g.buf.len()) as u64)
+            .sum::<u64>();
+        self.in_flight.map_or(0, |w| w.length) + waiting
     }
 
     /// Retires the segments before `before`, oldest first, on the file
@@ -461,6 +480,19 @@ impl Journal {
 }
 
 impl Pending {
+    /// Queues the open group, if it has records, so later ones start
+    /// another.
+    fn seal(&mut self) {
+        if self.open.records > 0 {
+            let fresh = Group {
+                buf: self.free.pop().unwrap_or_default(),
+                ..Group::default()
+            };
+            self.queued
+                .push_back(std::mem::replace(&mut self.open, fresh));
+        }
+    }
+
     /// The oldest group with records, taken out.
     fn take(&mut self) -> Option<Group> {
         if let Some(g) = self.queued.pop_front() {
@@ -582,7 +614,7 @@ impl Disk {
             offset,
             next,
             creating: false,
-            roll: false,
+            roll_after: None,
             #[cfg(feature = "testing")]
             fail: false,
             group: found.last.map_or(1, |g| g + 1),

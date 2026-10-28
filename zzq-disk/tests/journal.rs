@@ -75,16 +75,18 @@ fn expected(to: u64) -> Vec<(u8, Vec<u8>)> {
 }
 
 fn segments(dir: &Path) -> usize {
-    std::fs::read_dir(dir)
+    files(dir, "seg").len()
+}
+
+/// Names in `dir` that end in `.<ext>`, sorted.
+fn files(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut found: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap()
-        .filter(|e| {
-            e.as_ref()
-                .unwrap()
-                .path()
-                .extension()
-                .is_some_and(|x| x == "seg")
-        })
-        .count()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == ext))
+        .collect();
+    found.sort();
+    found
 }
 
 #[test]
@@ -363,6 +365,148 @@ fn trimmed_segments_become_the_next_ones() {
     drop(j);
     let (_, got) = open(&disk, &dir.0);
     assert_eq!(got, expected(200)[3..]);
+}
+
+#[test]
+fn records_appended_before_a_roll_stay_before_its_segment() {
+    let dir = TempDir::new("roll-after");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    append(&mut j, 1, 3);
+    j.sync().unwrap();
+    assert_eq!(j.roll().unwrap(), None);
+    j.wait().unwrap();
+    // Not yet sent when the roll comes.
+    append(&mut j, 4, 5);
+    let next = j.roll().unwrap().unwrap();
+    append(&mut j, 6, 7);
+    // These go to the new segment already.
+    assert_eq!(j.roll().unwrap(), Some(next));
+    append(&mut j, 8, 8);
+    j.sync().unwrap();
+    j.trim(next).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while dir.0.join(format!("{:016x}.seg", 1)).exists() {
+        assert!(Instant::now() < deadline, "segment 1 stays");
+        std::thread::yield_now();
+    }
+    drop(j);
+    let (_, got) = open(&disk, &dir.0);
+    assert!(got == expected(8)[5..], "{} records read back", got.len());
+}
+
+/// Bytes of the device [`a_full_device_holds_writes_until_space_returns`]
+/// mounts: four segments of [`kill_config`], and room for marks.
+const DEVICE: u64 = (1 << 20) + (64 << 10);
+
+fn full(e: &Error) -> bool {
+    matches!(e, Error::Io(e) if e.kind() == std::io::ErrorKind::StorageFull)
+}
+
+/// Waits until no write is in flight, through failures of a full device,
+/// and returns what is durable then.
+fn settle(j: &mut Journal) -> u64 {
+    let mut last = j.durable();
+    loop {
+        match j.wait() {
+            Ok(d) if d == last => return d,
+            Ok(d) => last = d,
+            Err(e) => assert!(full(&e), "{e}"),
+        }
+    }
+}
+
+/// The child of [`a_full_device_holds_writes_until_space_returns`], on a
+/// tmpfs of [`DEVICE`] bytes at `root`.
+fn on_a_full_device(root: &Path) {
+    let filler = root.join("filler");
+    std::fs::write(&filler, vec![1; (DEVICE - (128 << 10)) as usize]).unwrap();
+    let dir = root.join("journal");
+    let disk = Disk::new(kill_config()).unwrap();
+    let (mut j, _) = open(&disk, &dir);
+    // No room for a first segment: the write waits, and nothing half made
+    // keeps the space.
+    append(&mut j, 1, 1);
+    j.flush().unwrap();
+    assert!(j.wait().is_err_and(|e| full(&e)));
+    assert_eq!(files(&dir, "tmp"), Vec::<PathBuf>::new());
+    std::fs::remove_file(&filler).unwrap();
+    j.flush().unwrap();
+    match j.wait() {
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+        r => assert_eq!(r.unwrap(), 1),
+    }
+    // Segments fill the device. Once the last has no room, the records
+    // after it wait.
+    let mut n = 1;
+    loop {
+        n += 1;
+        assert!(n < 10_000, "writes never waited");
+        append(&mut j, n, n);
+        if let Err(e) = j.sync() {
+            assert!(full(&e), "{e}");
+            let durable = settle(&mut j);
+            assert_eq!(files(&dir, "tmp"), Vec::<PathBuf>::new());
+            if durable < j.appended() {
+                break;
+            }
+        }
+    }
+    // A trim of the segments before the last makes spares, and the records
+    // waiting go on in them.
+    let last = files(&dir, "seg").pop().unwrap();
+    let stem = last.file_stem().unwrap().to_str().unwrap();
+    j.trim(u64::from_str_radix(stem, 16).unwrap()).unwrap();
+    for _ in 0..3 {
+        match j.sync() {
+            Ok(_) => break,
+            // A try made before the trim.
+            Err(e) => assert!(full(&e), "{e}"),
+        }
+    }
+    assert_eq!(j.durable(), n);
+    drop(j);
+    let (_, got) = open(&disk, &dir);
+    let all = expected(n);
+    assert!(got.len() > 1 && got == all[all.len() - got.len()..]);
+}
+
+#[test]
+fn a_full_device_holds_writes_until_space_returns() {
+    const CHILD: &str = "ZZQ_DISK_FULL_CHILD";
+    const NAME: &str = "a_full_device_holds_writes_until_space_returns";
+    if let Some(root) = std::env::var_os(CHILD) {
+        on_a_full_device(Path::new(&root));
+        return;
+    }
+    let root = TempDir::new("full");
+    std::fs::create_dir_all(&root.0).unwrap();
+    // A small tmpfs, in a user and mount namespace of its own.
+    let script =
+        format!(r#"mount -t tmpfs -o size={DEVICE} none "$0" && exec "$1" --exact {NAME}"#);
+    let out = Command::new("unshare")
+        .args(["-Urm", "sh", "-c", &script])
+        .arg(&root.0)
+        .arg(std::env::current_exe().unwrap())
+        .env(CHILD, &root.0)
+        .output();
+    let out = match out {
+        Ok(out) => out,
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+    };
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if !stdout.contains("running 1 test") {
+        eprintln!("skipped: {stderr}");
+        return;
+    }
+    assert!(out.status.success(), "{stdout}{stderr}");
 }
 
 #[test]

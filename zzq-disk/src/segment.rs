@@ -86,17 +86,28 @@ fn ids(dir: &Path, suffix: &str) -> io::Result<Vec<u64>> {
 pub(crate) fn create(dir: &Path, id: u64, capacity: u64, zero: bool) -> io::Result<Segment> {
     let done = path(dir, id);
     let partial = done.with_extension(PARTIAL);
-    {
-        let file = match reuse(dir, id, capacity, &partial)? {
-            Some(file) => file,
-            None => fresh(&partial, capacity, zero)?,
-        };
-        file.write_all_at(&format::segment_header(id, capacity), 0)?;
-        file.sync_all()?;
-    }
+    made(&partial, || prepare(dir, id, capacity, zero, &partial))?;
     fs::rename(&partial, &done)?;
     sync_dir(dir)?;
     open(dir, id, capacity)
+}
+
+/// Runs `make`, which fills `partial`. A failure removes it, which gives
+/// back the space it took on a full device.
+fn made(partial: &Path, make: impl FnOnce() -> io::Result<()>) -> io::Result<()> {
+    make().inspect_err(|_| {
+        let _ = fs::remove_file(partial);
+    })
+}
+
+/// Segment `id` at `to`, with its header, synced.
+fn prepare(dir: &Path, id: u64, capacity: u64, zero: bool, to: &Path) -> io::Result<()> {
+    let file = match reuse(dir, id, capacity, to)? {
+        Some(file) => file,
+        None => fresh(to, capacity, zero)?,
+    };
+    file.write_all_at(&format::segment_header(id, capacity), 0)?;
+    file.sync_all()
 }
 
 /// The newest spare older than segment `id`, renamed to `to`. Removes the
@@ -116,15 +127,16 @@ fn reuse(dir: &Path, id: u64, capacity: u64, to: &Path) -> io::Result<Option<Fil
 }
 
 /// A new file at `to` of `capacity` bytes, of zeros or allocated blocks.
+/// The blocks come first, so a full device fails before any zeros.
 fn fresh(to: &Path, capacity: u64, zero: bool) -> io::Result<File> {
     let mut file = File::create(to)?;
+    let zero = match rustix::fs::fallocate(&file, FallocateFlags::empty(), 0, capacity) {
+        Ok(()) => zero,
+        Err(Errno::OPNOTSUPP) => true,
+        Err(e) => return Err(e.into()),
+    };
     if !zero {
-        match rustix::fs::fallocate(&file, FallocateFlags::empty(), 0, capacity) {
-            Ok(()) => return Ok(file),
-            // Zeros instead.
-            Err(Errno::OPNOTSUPP) => {}
-            Err(e) => return Err(e.into()),
-        }
+        return Ok(file);
     }
     let zeros = vec![0; ZEROS];
     let mut left = capacity;
@@ -204,13 +216,13 @@ const MARK: &str = "DURABLE";
 pub(crate) fn write_mark(dir: &Path, group: u64) -> io::Result<()> {
     let done = dir.join(MARK);
     let partial = done.with_extension(PARTIAL);
-    {
+    made(&partial, || {
         let mut file = File::create(&partial)?;
         let bytes = group.to_be_bytes();
         file.write_all(&bytes)?;
         file.write_all(&xxhash_rust::xxh3::xxh3_64(&bytes).to_be_bytes())?;
-        file.sync_all()?;
-    }
+        file.sync_all()
+    })?;
     fs::rename(&partial, &done)?;
     sync_dir(dir)
 }

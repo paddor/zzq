@@ -15,10 +15,12 @@ Notable changes to zzq. The format follows
   replays its records and ends the log at a torn last write, unless its
   `DURABLE` mark says that write was on disk. A journal makes its first
   segment, of zeros, on its first write; `Journal::roll` starts a new
-  one, and `Journal::trim` keeps those before it as spares for the next.
-  Writes into a spare cost no metadata write, and a new segment without
-  one gets its blocks allocated, not zeroed, so no zeros hold up the
-  writes beside it.
+  one for the records appended after it, and `Journal::trim` keeps those
+  before it as spares for the next. Writes into a spare cost no metadata
+  write, and a new segment without one gets its blocks allocated, not
+  zeroed, so no zeros hold up the writes beside it. On a full device,
+  writes that need a new segment wait until a trim or freed space makes
+  room, and a segment or mark it could not make takes no space.
 - `zzq-broker`: `BrokerOptions::data_dir` and `zzq_broker --data-dir` keep
   state in journals: retained messages in one per stripe of topics, each
   behind a lock of its own, and the sessions that outlive their

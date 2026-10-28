@@ -85,6 +85,54 @@ fn an_empty_journal_starts_in_its_first_empty_segment() {
 }
 
 #[test]
+fn a_roll_skips_the_empty_segment_a_write_goes_to() {
+    let dir = TempDir::new("roll-in-flight");
+    let disk = Disk::new(small()).unwrap();
+    let Some(j) = open(&disk, dir.path()) else {
+        return;
+    };
+    drop(j);
+    for id in 1..=2 {
+        segment::create(dir.path(), id, small().segment_bytes, false).unwrap();
+    }
+    let mut j = open(&disk, dir.path()).unwrap();
+    j.append(1, &[b"before"]).unwrap();
+    j.flush().unwrap();
+    // Segment 1 is empty until that write finishes, and holds it then.
+    assert_eq!(j.roll().unwrap(), Some(2));
+    j.append(1, &[b"after"]).unwrap();
+    j.sync().unwrap();
+    drop(j);
+    segment::trim(dir.path(), 2).unwrap();
+    let mut got = Vec::new();
+    disk.open(dir.path(), |r| {
+        got.push(r.body.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(got, [b"after".to_vec()]);
+}
+
+#[test]
+fn a_roll_waits_while_the_records_before_it_do_not_fit() {
+    let dir = TempDir::new("roll-full");
+    let disk = Disk::new(small()).unwrap();
+    let Some(mut j) = open(&disk, dir.path()) else {
+        return;
+    };
+    j.append(1, &[b"x"]).unwrap();
+    j.sync().unwrap();
+    assert_eq!(j.roll().unwrap(), None);
+    j.wait().unwrap();
+    // One page left in segment 1; the record waiting takes two.
+    j.tail.offset = small().segment_bytes - PAGE as u64;
+    j.append(1, &[&[0; 5000]]).unwrap();
+    assert_eq!(j.roll().unwrap(), None);
+    j.sync().unwrap();
+    assert_eq!(j.tail.active.as_ref().map(|a| a.id), Some(2));
+}
+
+#[test]
 fn a_failed_write_reports_its_records_and_writes_go_on() {
     let dir = TempDir::new("failed");
     let disk = Disk::new(small()).unwrap();
