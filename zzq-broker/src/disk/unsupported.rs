@@ -55,7 +55,7 @@ impl Log {
         match *self {}
     }
 
-    pub(crate) const fn appended_bytes(&self) -> u64 {
+    pub(crate) const fn written_bytes(&self) -> u64 {
         match *self {}
     }
 

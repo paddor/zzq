@@ -11,10 +11,14 @@ Notable changes to zzq. The format follows
   Records go out in groups with Linux AIO and `O_DIRECT | O_DSYNC`, one
   write in flight per journal and no fill delay, so a completed write is
   on disk. Records appended after the last flush go along with a write
-  that one asked for, or wait for the next flush. Opening a journal replays its records and ends the log at a
-  torn last write, unless its `DURABLE` mark says that write was on disk.
-  A journal makes its first segment on its first write; `Journal::roll`
-  starts a new one, and `Journal::trim` removes those before it.
+  that one asked for, or wait for the next flush. Opening a journal
+  replays its records and ends the log at a torn last write, unless its
+  `DURABLE` mark says that write was on disk. A journal makes its first
+  segment, of zeros, on its first write; `Journal::roll` starts a new
+  one, and `Journal::trim` keeps those before it as spares for the next.
+  Writes into a spare cost no metadata write, and a new segment without
+  one gets its blocks allocated, not zeroed, so no zeros hold up the
+  writes beside it.
 - `zzq-broker`: `BrokerOptions::data_dir` and `zzq_broker --data-dir` keep
   state in journals: retained messages in one per stripe of topics, each
   behind a lock of its own, and the sessions that outlive their

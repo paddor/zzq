@@ -7,7 +7,8 @@
 //! [`Journal::flush`] sends them at once, even one, and records appended
 //! meanwhile wait behind it. Writes use `O_DIRECT | O_DSYNC`, so a
 //! completed write is on disk and [`Journal::durable`] moves to its last
-//! record.
+//! record. Trimmed segments stay as spares for later ones, so writes
+//! land in blocks written before.
 //!
 //! The directory must take `O_DIRECT`. Linux only.
 //!

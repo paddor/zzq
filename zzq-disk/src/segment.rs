@@ -1,18 +1,21 @@
-//! Segment files in a journal directory: `<id as 16 hex digits>.seg`.
+//! Segment files in a journal directory: `<id as 16 hex digits>.seg`, and
+//! spares, segments trimmed and kept for later ones: `<id>.spare`.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rustix::fs::FlockOperation;
+use rustix::fs::{FallocateFlags, FlockOperation};
+use rustix::io::Errno;
 
-use crate::format::{self, PAGE};
+use crate::format;
 
 /// The largest segment a journal writes or reads.
 pub(crate) const MAX_BYTES: u64 = 1 << 30;
 const SUFFIX: &str = "seg";
+const SPARE: &str = "spare";
 /// A segment being made; a crash leaves it behind, and [`list`] removes it.
 const PARTIAL: &str = "tmp";
 /// Zeros written per call while a segment is made.
@@ -30,9 +33,24 @@ pub(crate) fn path(dir: &Path, id: u64) -> PathBuf {
     dir.join(format!("{id:016x}.{SUFFIX}"))
 }
 
+fn spare_path(dir: &Path, id: u64) -> PathBuf {
+    dir.join(format!("{id:016x}.{SPARE}"))
+}
+
 /// Segment ids in `dir`, oldest first. Removes segments a crash left half
 /// made.
 pub(crate) fn list(dir: &Path) -> io::Result<Vec<u64>> {
+    ids(dir, SUFFIX)
+}
+
+/// Spare ids in `dir`, oldest first.
+pub(crate) fn spares(dir: &Path) -> io::Result<Vec<u64>> {
+    ids(dir, SPARE)
+}
+
+/// Ids of the files in `dir` named `<id>.<suffix>`, oldest first. Removes
+/// segments a crash left half made.
+fn ids(dir: &Path, suffix: &str) -> io::Result<Vec<u64>> {
     let mut ids = Vec::new();
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -49,8 +67,8 @@ pub(crate) fn list(dir: &Path) -> io::Result<Vec<u64>> {
             continue;
         };
         match ext {
-            SUFFIX => ids.push(id),
             PARTIAL => fs::remove_file(&path)?,
+            _ if ext == suffix => ids.push(id),
             _ => {}
         }
     }
@@ -58,26 +76,64 @@ pub(crate) fn list(dir: &Path) -> io::Result<Vec<u64>> {
     Ok(ids)
 }
 
-/// Makes segment `id` of `capacity` bytes: its header, then zeros, so
-/// direct writes land in allocated blocks. Synced, then renamed into place.
-pub(crate) fn create(dir: &Path, id: u64, capacity: u64) -> io::Result<Segment> {
+/// Makes segment `id` of `capacity` bytes, synced, then renamed into place.
+///
+/// It takes a spare when there is one, so direct writes land in blocks
+/// written before. They cost no metadata write; blocks only allocated
+/// do. Otherwise `zero` writes zeros through it, for a first segment
+/// that nothing writes beside, and without `zero` the blocks are only
+/// allocated: zeros would hold up the writes to the active segment.
+pub(crate) fn create(dir: &Path, id: u64, capacity: u64, zero: bool) -> io::Result<Segment> {
     let done = path(dir, id);
     let partial = done.with_extension(PARTIAL);
     {
-        let mut file = File::create(&partial)?;
-        file.write_all(&format::segment_header(id, capacity))?;
-        let zeros = vec![0; ZEROS];
-        let mut left = capacity.saturating_sub(PAGE as u64);
-        while left > 0 {
-            let n = left.min(ZEROS as u64) as usize;
-            file.write_all(&zeros[..n])?;
-            left -= n as u64;
-        }
+        let file = match reuse(dir, id, capacity, &partial)? {
+            Some(file) => file,
+            None => fresh(&partial, capacity, zero)?,
+        };
+        file.write_all_at(&format::segment_header(id, capacity), 0)?;
         file.sync_all()?;
     }
     fs::rename(&partial, &done)?;
     sync_dir(dir)?;
     open(dir, id, capacity)
+}
+
+/// The newest spare older than segment `id`, renamed to `to`. Removes the
+/// spares it passes over: one not older could hold groups that name `id`,
+/// and one of another capacity does not fit.
+fn reuse(dir: &Path, id: u64, capacity: u64, to: &Path) -> io::Result<Option<File>> {
+    let mut spares = spares(dir)?;
+    while let Some(old) = spares.pop() {
+        let from = spare_path(dir, old);
+        if old < id && fs::metadata(&from)?.len() == capacity {
+            fs::rename(&from, to)?;
+            return OpenOptions::new().write(true).open(to).map(Some);
+        }
+        fs::remove_file(&from)?;
+    }
+    Ok(None)
+}
+
+/// A new file at `to` of `capacity` bytes, of zeros or allocated blocks.
+fn fresh(to: &Path, capacity: u64, zero: bool) -> io::Result<File> {
+    let mut file = File::create(to)?;
+    if !zero {
+        match rustix::fs::fallocate(&file, FallocateFlags::empty(), 0, capacity) {
+            Ok(()) => return Ok(file),
+            // Zeros instead.
+            Err(Errno::OPNOTSUPP) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let zeros = vec![0; ZEROS];
+    let mut left = capacity;
+    while left > 0 {
+        let n = left.min(ZEROS as u64) as usize;
+        file.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    Ok(file)
 }
 
 /// Opens segment `id` for direct writes that are durable once they finish.
@@ -123,11 +179,19 @@ pub(crate) fn remove(dir: &Path, id: u64) -> io::Result<()> {
     sync_dir(dir)
 }
 
-/// Removes the segments before `before`, oldest first, so the rest stay
-/// in a row.
+/// Turns the segments before `before` into spares, oldest first, so the
+/// rest stay in a row. They replace the spares left: about as many new
+/// segments come before the next trim.
 pub(crate) fn trim(dir: &Path, before: u64) -> io::Result<()> {
-    for id in list(dir)?.into_iter().filter(|&id| id < before) {
-        fs::remove_file(path(dir, id))?;
+    let trimmed: Vec<u64> = list(dir)?.into_iter().filter(|&id| id < before).collect();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    for id in spares(dir)? {
+        fs::remove_file(spare_path(dir, id))?;
+    }
+    for id in trimmed {
+        fs::rename(path(dir, id), spare_path(dir, id))?;
     }
     sync_dir(dir)
 }

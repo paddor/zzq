@@ -76,9 +76,9 @@ impl Log {
         self.0.backlog()
     }
 
-    /// Bytes appended since the journal opened.
-    pub(crate) const fn appended_bytes(&self) -> u64 {
-        self.0.appended_bytes()
+    /// Bytes written since the journal opened, padding included.
+    pub(crate) const fn written_bytes(&self) -> u64 {
+        self.0.written_bytes()
     }
 
     /// Starts the next write in a new segment, and returns its id; `None`
@@ -99,7 +99,7 @@ impl Log {
         (self.0.appended(), self.0.groups())
     }
 
-    /// Removes the segments before `before`.
+    /// Retires the segments before `before`.
     pub(crate) fn trim(&mut self, before: u64) -> io::Result<()> {
         self.0.trim(before).map_err(to_io)
     }

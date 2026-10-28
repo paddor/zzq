@@ -208,7 +208,7 @@ impl LogState {
         let Some(log) = self.log.as_mut() else {
             return Ok(true);
         };
-        let since = log.appended_bytes() - self.snapshot_at;
+        let since = log.written_bytes() - self.snapshot_at;
         if !force && !disk::snapshot_due(since, live) {
             return Ok(true);
         }
@@ -217,7 +217,7 @@ impl LogState {
         };
         let last = self.write_all(sessions)?;
         if let Some(log) = self.log.as_mut() {
-            self.snapshot_at = log.appended_bytes();
+            self.snapshot_at = log.written_bytes();
             log.flush()?;
         }
         self.trim = Some((segment, last));

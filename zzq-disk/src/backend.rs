@@ -85,6 +85,8 @@ pub(crate) enum FileJob {
         dir: Arc<Path>,
         id: u64,
         capacity: u64,
+        /// Zeros for a first segment, if no spare is left.
+        zero: bool,
         reply: Sender<Done>,
     },
     /// Remove the segments before `before`, oldest first.
@@ -344,9 +346,11 @@ fn run_files(mut jobs: Receiver<FileJob>) {
                 dir,
                 id,
                 capacity,
+                zero,
                 mut reply,
             } => {
-                let _ = reply.try_send(Done::Created(segment::create(&dir, id, capacity)));
+                let made = segment::create(&dir, id, capacity, zero);
+                let _ = reply.try_send(Done::Created(made));
             }
             // A failure leaves segments the next trim or open finds; they
             // replay before what replaced them.

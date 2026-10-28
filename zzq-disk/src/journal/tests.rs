@@ -1,3 +1,5 @@
+use std::os::unix::fs::MetadataExt;
+
 use super::*;
 use crate::testing::TempDir;
 
@@ -33,7 +35,7 @@ fn one_empty_segment_stays_as_the_next_and_others_go() {
     drop(j);
     // A crash after the next segments were made, before writes reached them.
     for id in 2..=4 {
-        segment::create(dir.path(), id, small().segment_bytes).unwrap();
+        segment::create(dir.path(), id, small().segment_bytes, false).unwrap();
     }
     let mut j = open(&disk, dir.path()).unwrap();
     assert_eq!(segment::list(dir.path()).unwrap(), [1, 2]);
@@ -73,7 +75,7 @@ fn an_empty_journal_starts_in_its_first_empty_segment() {
     };
     drop(j);
     for id in 1..=2 {
-        segment::create(dir.path(), id, small().segment_bytes).unwrap();
+        segment::create(dir.path(), id, small().segment_bytes, false).unwrap();
     }
     let j = open(&disk, dir.path()).unwrap();
     let active = j.tail.active.as_ref().map(|a| a.id);
@@ -124,10 +126,10 @@ fn a_written_segment_after_an_empty_one_fails_the_open() {
         return;
     };
     drop(j);
-    segment::create(dir.path(), 1, small().segment_bytes).unwrap();
+    segment::create(dir.path(), 1, small().segment_bytes, true).unwrap();
     let mut j = open(&disk, dir.path()).unwrap();
     // Writes skip segment 1, which a journal never does.
-    j.tail.next = Some(segment::create(dir.path(), 2, small().segment_bytes).unwrap());
+    j.tail.next = Some(segment::create(dir.path(), 2, small().segment_bytes, false).unwrap());
     j.tail.offset = j.tail.active.as_ref().unwrap().capacity;
     j.append(1, &[b"x"]).unwrap();
     j.sync().unwrap();
@@ -139,4 +141,41 @@ fn a_written_segment_after_an_empty_one_fails_the_open() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn a_new_segment_takes_the_newest_spare_that_fits() {
+    let dir = TempDir::new("spares");
+    let disk = Disk::new(small()).unwrap();
+    let Some(j) = open(&disk, dir.path()) else {
+        return;
+    };
+    drop(j);
+    let d = dir.path();
+    let cap = small().segment_bytes;
+    let ino = |id: u64| fs::metadata(segment::path(d, id)).unwrap().ino();
+    segment::create(d, 1, cap, true).unwrap();
+    segment::create(d, 2, cap, false).unwrap();
+    segment::create(d, 3, 2 * cap, false).unwrap();
+    let two = ino(2);
+    segment::trim(d, 4).unwrap();
+    assert_eq!(segment::list(d).unwrap(), [0; 0]);
+    assert_eq!(segment::spares(d).unwrap(), [1, 2, 3]);
+    // Spare 3 is too large; 2 is the newest that fits.
+    segment::create(d, 4, cap, false).unwrap();
+    assert_eq!(ino(4), two);
+    assert_eq!(segment::spares(d).unwrap(), [1]);
+    // What a trim takes replaces the spares left.
+    segment::trim(d, 5).unwrap();
+    assert_eq!(segment::spares(d).unwrap(), [4]);
+    // A trim that takes none keeps them.
+    segment::trim(d, 5).unwrap();
+    assert_eq!(segment::spares(d).unwrap(), [4]);
+    // A spare not older than the new segment could hold groups that name
+    // it.
+    let spare = |id: u64| d.join(format!("{id:016x}.spare"));
+    fs::rename(spare(4), spare(9)).unwrap();
+    segment::create(d, 5, cap, false).unwrap();
+    assert_eq!(segment::spares(d).unwrap(), [0; 0]);
+    assert_eq!(segment::list(d).unwrap(), [5]);
 }

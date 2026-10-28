@@ -45,8 +45,8 @@ pub struct Journal {
     /// The last record a flush asked for.
     flushed: u64,
     durable: u64,
-    /// Framed bytes of all records appended.
-    appended_bytes: u64,
+    /// Bytes of the groups written, padding included.
+    written_bytes: u64,
     stopped: bool,
     /// Held while open: one journal per directory.
     _lock: File,
@@ -156,7 +156,6 @@ impl Journal {
         open.last = self.appended;
         open.bytes += framed;
         p.bytes += framed;
-        self.appended_bytes += framed as u64;
         Ok(self.appended)
     }
 
@@ -291,7 +290,7 @@ impl Journal {
 
     /// Starts the next group in a new segment, unless the current one
     /// holds none yet, and returns that segment's id. Once what the
-    /// records from here on replace is durable, [`Journal::trim`] removes
+    /// records from here on replace is durable, [`Journal::trim`] retires
     /// the segments before it. `None` while the next segment is still
     /// being made, so writes need not wait for it: ask again later.
     ///
@@ -314,8 +313,10 @@ impl Journal {
         }
     }
 
-    /// Removes the segments before `before`, oldest first, on the file
-    /// thread, and notes the groups on disk so far.
+    /// Retires the segments before `before`, oldest first, on the file
+    /// thread, and notes the groups on disk so far. They stay as spares
+    /// for the next segments, whose writes then land in blocks written
+    /// before: those cost no metadata write.
     ///
     /// # Errors
     ///
@@ -356,9 +357,10 @@ impl Journal {
         self.tail.group - 1
     }
 
-    /// Framed bytes of the records appended since the journal opened.
-    pub const fn appended_bytes(&self) -> u64 {
-        self.appended_bytes
+    /// Bytes of the groups written since the journal opened, padding
+    /// included: what it added to its segments.
+    pub const fn written_bytes(&self) -> u64 {
+        self.written_bytes
     }
 
     /// Number of the last record appended, 0 for none.
@@ -392,6 +394,7 @@ impl Journal {
                 self.durable = w.last;
                 match result {
                     Ok(()) => {
+                        self.written_bytes += w.length;
                         self.tail.offset += w.length;
                         self.tail.group += 1;
                         self.send()?;
@@ -448,6 +451,7 @@ impl Journal {
             dir: self.dir.clone(),
             id: t.active.as_ref().map_or(1, |a| a.id + 1),
             capacity: self.config.segment_bytes,
+            zero: t.active.is_none(),
             reply,
         };
         send(&mut self.links.files, job)?;
@@ -549,13 +553,13 @@ impl Disk {
             appended: 0,
             flushed: 0,
             durable: 0,
-            appended_bytes: 0,
+            written_bytes: 0,
             stopped: false,
             _lock: lock,
         })
     }
 
-    /// Opens the segments writes continue in and removes spare empty
+    /// Opens the segments writes continue in and removes further empty
     /// ones. A journal with none makes its first on the first write.
     fn tail(dir: &Path, found: Found) -> Result<Tail, Error> {
         let mut empty = found.empty.into_iter();

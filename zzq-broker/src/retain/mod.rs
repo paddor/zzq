@@ -399,7 +399,7 @@ impl State {
         let Some(log) = self.log.as_mut() else {
             return Ok(true);
         };
-        let since = log.appended_bytes() - self.snapshot_at;
+        let since = log.written_bytes() - self.snapshot_at;
         if !force && !disk::snapshot_due(since, self.tree.bytes() as u64) {
             return Ok(true);
         }
@@ -408,7 +408,7 @@ impl State {
         };
         let (last, _) = self.write_all()?;
         if let Some(log) = self.log.as_ref() {
-            self.snapshot_at = log.appended_bytes();
+            self.snapshot_at = log.written_bytes();
         }
         self.trim = Some((segment, last));
         Ok(true)

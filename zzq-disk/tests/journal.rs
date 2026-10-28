@@ -4,6 +4,7 @@
 #![expect(clippy::unwrap_used, reason = "tests fail loudly")]
 
 use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -319,7 +320,7 @@ fn a_rolled_journal_trims_the_segments_before() {
     j.sync().unwrap();
     assert_eq!(j.roll().unwrap(), None, "in segment 2, which holds groups");
     j.trim(next).unwrap();
-    assert!(j.appended_bytes() > 0);
+    assert!(j.written_bytes() > 0);
     // The file thread trims in turn; a sync that comes after waits for it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while dir.0.join(format!("{:016x}.seg", 1)).exists() {
@@ -329,6 +330,53 @@ fn a_rolled_journal_trims_the_segments_before() {
     drop(j);
     let (_, got) = open(&disk, &dir.0);
     assert_eq!(got, expected(6)[3..]);
+}
+
+#[test]
+fn trimmed_segments_become_the_next_ones() {
+    let dir = TempDir::new("spare");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    let file = |name: String| dir.0.join(name);
+    let ino = |name: String| std::fs::metadata(file(name)).unwrap().ino();
+    append(&mut j, 1, 3);
+    j.sync().unwrap();
+    let first = ino(format!("{:016x}.seg", 1));
+    assert_eq!(j.roll().unwrap(), None);
+    j.wait().unwrap();
+    let next = j.roll().unwrap().unwrap();
+    append(&mut j, 4, 6);
+    j.sync().unwrap();
+    j.trim(next).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !file(format!("{:016x}.spare", 1)).exists() {
+        assert!(Instant::now() < deadline, "segment 1 is no spare");
+        std::thread::yield_now();
+    }
+    assert!(!file(format!("{:016x}.seg", 1)).exists());
+    // Segment 3 is the old segment 1. Its groups name segment 1, so they
+    // do not read back as segment 3's.
+    append(&mut j, 7, 200);
+    j.sync().unwrap();
+    assert_eq!(ino(format!("{:016x}.seg", 3)), first);
+    assert!(!file(format!("{:016x}.spare", 1)).exists());
+    drop(j);
+    let (_, got) = open(&disk, &dir.0);
+    assert_eq!(got, expected(200)[3..]);
+}
+
+#[test]
+fn written_bytes_count_whole_pages() {
+    let dir = TempDir::new("written");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    j.append(1, &[b"x"]).unwrap();
+    j.append(1, &[b"y"]).unwrap();
+    j.sync().unwrap();
+    assert_eq!(j.written_bytes(), 4096);
+    j.append(1, &[&[0; 5000]]).unwrap();
+    j.sync().unwrap();
+    assert_eq!(j.written_bytes(), 3 * 4096);
 }
 
 #[test]
