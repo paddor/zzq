@@ -60,6 +60,8 @@ pub struct Load {
     /// Topics per publisher, cycled message by message. Above 1,
     /// subscribers use `/#` filters.
     pub topics: usize,
+    /// What the broker has to keep.
+    pub keep: Keep,
     /// The broker's PID. Its CPU and memory, with its descendants', go into
     /// the results.
     pub broker_pid: Option<u32>,
@@ -80,9 +82,19 @@ impl Default for Load {
             lanes: 1,
             cross: false,
             topics: 1,
+            keep: Keep::default(),
             broker_pid: None,
         }
     }
+}
+
+/// What the broker has to keep: the state a data directory puts on disk.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Keep {
+    /// Publish with the retain flag.
+    pub retain: bool,
+    /// Subscribers have sessions that outlive their connection.
+    pub sessions: bool,
 }
 
 /// Throughput result.
@@ -219,8 +231,12 @@ struct Conn {
 }
 
 impl Conn {
-    fn open(addr: &str, id: String, v5: bool) -> io::Result<Conn> {
-        let (s, rd, rmax) = wire::connect(addr, &id, v5)?;
+    fn open(addr: &str, id: String, v5: bool, persistent: bool) -> io::Result<Conn> {
+        let (s, rd, rmax) = if persistent {
+            wire::connect_persistent(addr, &id, v5)?
+        } else {
+            wire::connect(addr, &id, v5)?
+        };
         Ok(Conn { id, s, rd, rmax })
     }
 }
@@ -234,7 +250,7 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<Conns> {
     let mut subs = Vec::new();
     for i in 0..shape.subs {
         let id = client_id(&format!("zb-{pid}-s{i}"), i, load.lanes);
-        let mut c = Conn::open(&load.addr, id, load.v5)?;
+        let mut c = Conn::open(&load.addr, id, load.v5, load.keep.sessions)?;
         wire::subscribe(&mut c.s, &mut c.rd, &shape.filter(i), load.qos, load.v5)?;
         c.s.set_read_timeout(Some(Duration::from_millis(100)))?;
         run.register(&c.s)?;
@@ -247,7 +263,7 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<Conns> {
             i + usize::from(load.cross),
             load.lanes,
         );
-        let c = Conn::open(&load.addr, id, load.v5)?;
+        let c = Conn::open(&load.addr, id, load.v5, false)?;
         run.register(&c.s)?;
         pubs.push((shape.topic(i), c));
     }
@@ -459,7 +475,7 @@ fn publisher(load: &Load, topic: &str, mut c: Conn, run: &Run) {
         vec![topic.to_owned()]
     };
     let result = if load.qos == 0 {
-        publish_qos0(&mut c.s, &topics, &payload, load.v5, run)
+        publish_qos0(&mut c.s, &topics, &payload, load, run)
     } else {
         let window = load.window.min(usize::from(c.rmax.unwrap_or(u16::MAX)));
         publish_acked(&mut c, (&topics, &payload), load, window, run)
@@ -475,7 +491,7 @@ fn publish_qos0(
     s: &mut TcpStream,
     topics: &[String],
     payload: &[u8],
-    v5: bool,
+    load: &Load,
     run: &Run,
 ) -> io::Result<()> {
     // One packet per topic, repeated to about 64 KiB.
@@ -485,8 +501,8 @@ fn publish_qos0(
             topic,
             qos: 0,
             pkid: 0,
-            v5,
-            retain: false,
+            v5: load.v5,
+            retain: load.keep.retain,
         };
         wire::publish(&mut ring, head, payload);
     }
@@ -524,7 +540,7 @@ fn publish_acked(
                     qos: load.qos,
                     pkid,
                     v5: load.v5,
-                    retain: false,
+                    retain: load.keep.retain,
                 };
                 wire::publish(&mut out, head, payload);
                 outstanding += 1;

@@ -4,12 +4,15 @@
 //!
 //! Keys (defaults): addr=127.0.0.1:1883 v=5 qos=0 size=16 pubs=1 subs=1
 //! warmup=1 secs=5 window=100 iters=20000 lanes=1 cross=0 topics=1
-//! `cpu_pid`=0
+//! retain=0 persist=0 `cpu_pid`=0
 //!
 //! - pairs: `pubs` publishers, each to its own topic with its own subscriber.
 //! - fanout: one publisher, `subs` subscribers on the same topic.
 //! - fanin: `pubs` publishers on distinct topics, one wildcard subscriber.
 //! - rtt: one message in flight between two connections, QoS 0 or 1.
+//!
+//! `retain` sets the retain flag on publishes. `persist` gives subscribers
+//! sessions that outlive their connection.
 //!
 //! `lanes` and `cross` place clients on the lanes of a zzq broker. `cpu_pid`
 //! names the broker process: its CPU over the measured window and its
@@ -20,7 +23,7 @@ use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use zzq_bench::load::{self, Latency, Load, Scenario, Throughput};
+use zzq_bench::load::{self, Keep, Latency, Load, Scenario, Throughput};
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -74,6 +77,10 @@ fn parse(args: &[String]) -> Option<(String, Load, usize)> {
         lanes: num("lanes", "1")? as usize,
         cross: get("cross", "0") == "1",
         topics: num("topics", "1")? as usize,
+        keep: Keep {
+            retain: get("retain", "0") == "1",
+            sessions: get("persist", "0") == "1",
+        },
         broker_pid: Some(get("cpu_pid", "0").parse::<u32>().ok()?).filter(|&p| p > 0),
     };
     Some((scenario.clone(), cfg, num("iters", "20000")? as usize))
@@ -113,12 +120,14 @@ fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
         .map(|r| format!("{:.2}M", r / 1e6))
         .collect();
     println!(
-        "{name:>6} v{} qos={} size={:>5} pubs={} subs={}  pub {:>9.0}/s  delivered {:>9.0}/s {:>7.1} MB/s  loss {:>5.1}%  closed {} nacks {}  {}  per-sec [{}]",
+        "{name:>6} v{} qos={} size={:>5} pubs={} subs={}{}{}  pub {:>9.0}/s  delivered {:>9.0}/s {:>7.1} MB/s  loss {:>5.1}%  closed {} nacks {}  {}  per-sec [{}]",
         if cfg.v5 { 5 } else { 4 },
         cfg.qos,
         cfg.size,
         pubs,
         subs,
+        if cfg.keep.retain { " retain" } else { "" },
+        if cfg.keep.sessions { " persist" } else { "" },
         t.published,
         t.delivered,
         t.delivered * cfg.size as f64 / 1e6,

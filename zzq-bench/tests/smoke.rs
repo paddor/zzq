@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use zzq_bench::fixed::{self, Fixed, Report};
-use zzq_bench::load::{self, Load, Scenario};
+use zzq_bench::load::{self, Keep, Load, Scenario};
 use zzq_broker::{Authorizer, Broker, BrokerOptions, ClientInfo, Context};
 
 async fn broker() -> (Context, Broker, String) {
@@ -69,6 +69,41 @@ async fn every_scenario_moves_messages() {
         .unwrap()
         .unwrap();
     assert!(l.p50 > 0.0 && l.lost == 0, "{l:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn kept_publishes_and_sessions_stay_in_the_broker() {
+    let opts = BrokerOptions {
+        sys_interval: None,
+        ..BrokerOptions::default()
+    };
+    let (_ctx, broker, addr) = broker_with(opts).await;
+    let load = Load {
+        qos: 1,
+        pubs: 2,
+        keep: Keep {
+            retain: true,
+            sessions: true,
+        },
+        ..short(&addr)
+    };
+    let t = tokio::task::spawn_blocking(move || load::throughput(Scenario::Pairs, &load))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(t.delivered > 0.0 && t.closed == 0, "{t:?}");
+    let stats = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let stats = broker.stats().await.unwrap();
+            if stats.connections == 0 {
+                return stats;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!((stats.retained, stats.sessions), (2, 2), "{stats:?}");
 }
 
 /// Lets no one publish.

@@ -34,6 +34,8 @@ Notable changes to zzq. The format follows
 - `zzq-bench`: `zzq_brokerbench` reports the broker's CPU and memory
   (`cpu_pid`), v5 nacks, why connections closed, and publishers still
   blocked 10 s after a run, and places `rtt` clients on zzq lanes.
+  `retain=1` publishes retained messages, and `persist=1` gives
+  subscribers sessions that outlive their connection.
 - `zzq-bench`: `zzq_suite` runs the suites behind `BENCHMARKS.md` and
   records them into the result cache, with `zzq_fakebroker`,
   `zzq_client_bench`, the rival broker configs in `zzq-bench/harness`, and
