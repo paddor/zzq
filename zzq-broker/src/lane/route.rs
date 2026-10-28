@@ -185,7 +185,9 @@ impl Lane {
         owned: &mut Owned,
     ) {
         self.stats.publishes += 1;
+        // Lanes to forward to, and those whose journal the ack waits for.
         let mut remote_lanes = 0u64;
+        let mut wait_lanes = 0u64;
         let mut remote_hot = false;
         let n = m.direct.len();
         for (i, e) in m.direct.iter().enumerate() {
@@ -195,7 +197,11 @@ impl Lane {
                     self.deliver(e.sub.key, p, owned, g);
                 }
             } else {
-                remote_lanes |= 1 << (e.sub.lane & 63);
+                let bit = 1 << (e.sub.lane & 63);
+                remote_lanes |= bit;
+                if e.journaled && e.opts.qos != QoS::AtMostOnce {
+                    wait_lanes |= bit;
+                }
                 if p.qos != QoS::AtMostOnce
                     && !self.congestion.remote.is_empty()
                     && self.congestion.remote.contains(&e.sub)
@@ -227,17 +233,24 @@ impl Lane {
                     },
                     sender: self.id,
                 });
-                self.count_sent(lane, qos);
+                self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
             }
         }
         if remote_lanes != 0 {
-            self.forward(from, p, remote_lanes, remote_hot);
+            self.forward(from, p, (remote_lanes, wait_lanes), remote_hot);
         }
     }
 
     /// Forwards `p` to the lanes in the mask `remote_lanes`, a copy of it
-    /// if a congested subscriber there is `hot`.
-    fn forward(&mut self, from: Option<Key>, p: &Publication<'_>, remote_lanes: u64, hot: bool) {
+    /// if a congested subscriber there is `hot`. Its ack waits for those
+    /// in `wait_lanes`.
+    fn forward(
+        &mut self,
+        from: Option<Key>,
+        p: &Publication<'_>,
+        (remote_lanes, wait_lanes): (u64, u64),
+        hot: bool,
+    ) {
         let (chunk, at, version, pins) = forward_packet(p, hot, &mut self.out.fwd);
         let origin = Origin {
             sender: self.id,
@@ -253,17 +266,19 @@ impl Lane {
         }
         for lane in 0..self.out.remote.len() {
             if to(lane) && lane != usize::from(self.id) {
-                self.count_sent(lane, p.qos);
+                let wait = wait_lanes & (1 << (lane & 63)) != 0;
+                self.count_sent(lane, wait && p.qos != QoS::AtMostOnce);
             }
         }
     }
 
-    /// Counts a delivery sent to lane `lane`. Its publisher, if it gets an
-    /// ack, waits for that lane to journal it.
+    /// Counts a delivery sent to lane `lane`. With `wait`, a journaled
+    /// session there gets it at QoS 1/2: the publisher's ack waits for
+    /// that lane to journal it.
     #[inline]
-    fn count_sent(&mut self, lane: usize, qos: QoS) {
+    fn count_sent(&mut self, lane: usize, wait: bool) {
         if let Some(w) = self.pairs.sent(self.id, lane)
-            && qos != QoS::AtMostOnce
+            && wait
         {
             self.needs.wait(w);
         }

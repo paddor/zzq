@@ -9,7 +9,7 @@ use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{PacketType, QoS, RetainHandling, SubscriptionOptions, reason};
 
 use crate::durable::Due;
-use crate::index::{Entry, SubIds, SubRef};
+use crate::index::{Entry, Share, SubIds, SubRef};
 use crate::msg::{Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
 use crate::session::Session;
@@ -76,14 +76,18 @@ impl Lane {
         opts: SubscriptionOptions,
         sub_id: u32,
     ) -> Entry {
+        let s = self.sessions.get(key);
         Entry {
             sub: self.sub_ref(key),
             opts,
             sub_id: SubIds::one(sub_id),
-            share: is_shared(filter).then(|| Arc::from(filter)),
-            online: is_shared(filter)
-                .then(|| self.sessions.get(key).map(|s| s.online.clone()))
-                .flatten(),
+            share: is_shared(filter).then(|| {
+                Arc::new(Share {
+                    filter: Arc::from(filter),
+                    online: s.map(|s| s.online.clone()).unwrap_or_default(),
+                })
+            }),
+            journaled: s.is_some_and(|s| s.journaled),
         }
     }
 

@@ -70,20 +70,34 @@ pub(crate) struct Entry {
     pub(crate) opts: SubscriptionOptions,
     /// v5 Subscription Identifiers.
     pub(crate) sub_id: SubIds,
-    /// The whole `$share/...` filter for shared subscriptions.
-    pub(crate) share: Option<Arc<str>>,
-    /// Whether a shared subscriber's session has a connection. `None` for
-    /// unshared subscriptions.
-    pub(crate) online: Option<Arc<AtomicBool>>,
+    /// Set for shared subscriptions.
+    pub(crate) share: Option<Arc<Share>>,
+    /// The session journals its QoS 1/2 deliveries, so a publisher on
+    /// another lane waits for that lane's journal before its ack.
+    pub(crate) journaled: bool,
+}
+
+/// What a shared subscription adds to its entry.
+#[derive(Debug)]
+pub(crate) struct Share {
+    /// The whole `$share/...` filter.
+    pub(crate) filter: Arc<str>,
+    /// Whether the subscriber's session has a connection.
+    pub(crate) online: Arc<AtomicBool>,
 }
 
 impl Entry {
     fn is_online(&self) -> bool {
         // Relaxed: a hint for picking a share group member. A stale one
         // picks an offline member, which queues the message.
-        self.online
+        self.share
             .as_ref()
-            .is_none_or(|o| o.load(Ordering::Relaxed))
+            .is_none_or(|s| s.online.load(Ordering::Relaxed))
+    }
+
+    /// The whole `$share/...` filter of a shared subscription.
+    fn share_filter(&self) -> Option<&str> {
+        self.share.as_ref().map(|s| &*s.filter)
     }
 }
 
@@ -156,11 +170,12 @@ impl SubIndex {
     pub(crate) fn add(&mut self, filter: &str, entry: Entry, replace: bool) {
         let inner = inner_filter(filter);
         if replace {
-            self.trie
-                .remove(inner, |e| e.sub == entry.sub && e.share == entry.share);
+            self.trie.remove(inner, |e| {
+                e.sub == entry.sub && e.share_filter() == entry.share_filter()
+            });
         }
         if let Some(share) = &entry.share {
-            self.rotations.entry(share.clone()).or_default();
+            self.rotations.entry(share.filter.clone()).or_default();
         }
         self.trie.insert(inner, entry);
         self.forget();
@@ -170,7 +185,7 @@ impl SubIndex {
     pub(crate) fn remove(&mut self, filter: &str, sub: SubRef) -> bool {
         let share = is_shared(filter).then_some(filter);
         let removed = self.trie.remove(inner_filter(filter), |e| {
-            e.sub == sub && e.share.as_deref() == share
+            e.sub == sub && e.share_filter() == share
         });
         if removed > 0 {
             self.forget();
@@ -179,7 +194,7 @@ impl SubIndex {
                 let left = self
                     .trie
                     .get_mut(inner_filter(filter))
-                    .is_some_and(|v| v.iter().any(|e| e.share.as_deref() == Some(share)));
+                    .is_some_and(|v| v.iter().any(|e| e.share_filter() == Some(share)));
                 if !left {
                     self.rotations.remove(share);
                 }
@@ -261,7 +276,7 @@ fn fill(
     trie.for_each_match(topic, |e| match &e.share {
         Some(s) => groups
             .get_or_insert_default()
-            .entry(s.clone())
+            .entry(s.filter.clone())
             .or_default()
             .push(e.clone()),
         None => m.direct.push(e.clone()),
@@ -288,8 +303,11 @@ fn fill(
         let next = rotations.get(&share).cloned().unwrap_or_default();
         m.groups.push(Group { members, next });
     }
-    m.groups
-        .sort_by(|a, b| a.members[0].share.cmp(&b.members[0].share));
+    m.groups.sort_by(|a, b| {
+        a.members[0]
+            .share_filter()
+            .cmp(&b.members[0].share_filter())
+    });
 }
 
 fn inner_filter(filter: &str) -> &str {
@@ -316,8 +334,13 @@ mod tests {
             sub: sub(n),
             opts: SubscriptionOptions::from(qos),
             sub_id: SubIds::default(),
-            share: share.map(Arc::from),
-            online: None,
+            share: share.map(|f| {
+                Arc::new(Share {
+                    filter: Arc::from(f),
+                    online: Arc::new(AtomicBool::new(true)),
+                })
+            }),
+            journaled: false,
         }
     }
 

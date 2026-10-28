@@ -1064,6 +1064,50 @@ async fn a_burst_to_another_lane_is_acked_once_journaled() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("cross-hold");
+    let (ctx, _broker, uri) = setup(2, opts()).await;
+    let qos1 = SubscriptionOptions::from(QoS::AtLeastOnce);
+    let mut plain = Raw::connect(&uri, &id_on("plain-sub", 1, 2), Version::V5, 0).await;
+    plain.subscribe("plain/t", qos1).await;
+    let (mut kept, _) = Raw::connect_with(&uri, &durable(&id_on("kept-sub", 1, 2))).await;
+    kept.subscribe("kept/t", qos1).await;
+    let mut p = Raw::connect(&uri, &id_on("cross-pub", 0, 2), Version::V5, 0).await;
+    // Lane 1 stops until `go`.
+    let (stopped, on_stop) = tokio::sync::oneshot::channel();
+    let (go, on_go) = std::sync::mpsc::channel::<()>();
+    let lanes = ctx.clone();
+    let stall = tokio::spawn(async move {
+        let lane = lanes.lane(1);
+        lane.call(move || {
+            let _ = stopped.send(());
+            let _ = on_go.recv_timeout(WAIT);
+        })
+        .await
+    });
+    on_stop.await.unwrap();
+    let ack = |pkid| Got::Ack {
+        kind: PacketType::PubAck,
+        pkid,
+        reason: 0,
+    };
+    p.pub_("plain/t", b"x", QoS::AtLeastOnce, 1).await;
+    assert_eq!(p.next().await, ack(1));
+    p.pub_("kept/t", b"x", QoS::AtLeastOnce, 2).await;
+    p.quiet(300).await;
+    go.send(()).unwrap();
+    stall.await.unwrap().unwrap();
+    assert_eq!(p.next().await, ack(2));
+    assert_eq!(plain.publish().await.payload, b"x");
+    assert_eq!(kept.publish().await.payload, b"x");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stored_topics_deeper_than_allowed_are_not_loaded() {
     let dir = std::env::temp_dir().join(format!("zzq-deep-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
