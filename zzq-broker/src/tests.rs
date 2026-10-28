@@ -943,6 +943,122 @@ async fn a_lane_snapshot_replaces_the_segments_before_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The inode of `path`.
+fn ino(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path).unwrap().ino()
+}
+
+/// Waits until `path` is gone.
+async fn gone(path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while path.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "{path:?} stays");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_journal_without_room_for_a_segment_snapshots_into_its_spare() {
+    use zzq_proto::SubscriptionOptions;
+
+    use crate::durable::JournalId;
+    use support::Raw;
+
+    let (dir, opts) = on_disk("lane-full");
+    let file = |name: &str| dir.join("lanes-1/lane-0").join(name);
+    {
+        let (ctx, broker, uri) = setup(1, opts()).await;
+        let (mut c, _) = Raw::connect_with(&uri, &durable("full")).await;
+        c.subscribe("a", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        let reserve = ino(&file("0000000000000000.spare"));
+        // The segment the snapshot asks for fails as on a full device, so
+        // it starts in the spare kept back.
+        broker.shared().fail_next_segment(JournalId::Lane(0));
+        lane_until(&ctx, &broker, 0, |l| l.snapshot_journal(true).then_some(())).await;
+        gone(&file("0000000000000001.seg")).await;
+        assert_eq!(ino(&file("0000000000000002.seg")), reserve);
+        assert!(broker.stats().await.unwrap().write_errors >= 1);
+        c.subscribe("b", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        drop(c);
+        broker.shutdown().await.unwrap();
+    }
+    let (ctx, broker, _uri) = setup(1, opts()).await;
+    let subs = on_lane(&ctx, &broker, 0, |l| {
+        let key = l.sessions.keys().next()?;
+        let mut f: Vec<String> = l
+            .sessions
+            .get(key)?
+            .subs
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        f.sort();
+        Some(f)
+    })
+    .await;
+    assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare() {
+    use zzq_proto::{PacketType, Version};
+
+    use crate::durable::JournalId;
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("retained-full");
+    let stripe = crate::retain::Retained::stripe_of("r/full");
+    let file = |name: &str| dir.join(format!("retained-{stripe}")).join(name);
+    let ack = |pkid| Got::Ack {
+        kind: PacketType::PubAck,
+        pkid,
+        reason: 0,
+    };
+    {
+        let (_ctx, broker, uri) = setup(1, opts()).await;
+        let mut p = Raw::connect(&uri, "full-pub", Version::V5, 0).await;
+        let publish = |pkid, payload: &[u8]| {
+            let h = zzq_proto::encode::PublishHeader {
+                version: Version::V5,
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: true,
+                topic: "r/full",
+                pkid,
+                properties: &[],
+            };
+            let mut out = Vec::new();
+            zzq_proto::encode::publish(&h, payload, &mut out);
+            out
+        };
+        p.send(&publish(1, b"first")).await;
+        assert_eq!(p.next().await, ack(1));
+        let reserve = ino(&file("0000000000000000.spare"));
+        broker
+            .shared()
+            .fail_next_segment(JournalId::Retained(stripe));
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !broker.shared().retained.snapshot(true) {
+            assert!(tokio::time::Instant::now() < deadline, "no snapshot");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        gone(&file("0000000000000001.seg")).await;
+        assert_eq!(ino(&file("0000000000000002.seg")), reserve);
+        p.send(&publish(2, b"second")).await;
+        assert_eq!(p.next().await, ack(2));
+    }
+    let (_ctx, broker, _uri) = setup(1, opts()).await;
+    let got = broker.shared().retained.matching("r/full");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].payload(), b"second");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
     use zzq_proto::{PacketType, SubscriptionOptions, Version, reason};

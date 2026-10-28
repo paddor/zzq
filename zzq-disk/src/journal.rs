@@ -70,13 +70,24 @@ struct Tail {
     /// The segment after `active`, made ahead of need.
     next: Option<Segment>,
     creating: bool,
+    /// The last segment asked for could not be made, as on a full device.
+    full: bool,
     /// Groups of the records after this one start a new segment.
     roll_after: Option<u64>,
-    /// The next write goes to a place the kernel refuses.
     #[cfg(feature = "testing")]
-    fail: bool,
+    faults: Faults,
     /// Number of the next group.
     group: u64,
+}
+
+/// Failures a test asked for.
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct Faults {
+    /// The next write goes to a place the kernel refuses.
+    write: bool,
+    /// The next segment asked for fails as on a full device.
+    segment: bool,
 }
 
 /// Records not yet written.
@@ -198,7 +209,7 @@ impl Journal {
         // One byte past its place, which the kernel refuses for direct IO,
         // when a test asked for a failure.
         #[cfg(feature = "testing")]
-        let skew = u64::from(std::mem::take(&mut t.fail));
+        let skew = u64::from(std::mem::take(&mut t.faults.write));
         #[cfg(not(feature = "testing"))]
         let skew = 0;
         let write = Write {
@@ -207,10 +218,11 @@ impl Journal {
             offset: t.offset + skew,
             buf: group.buf,
         };
-        let half = t.offset + length > active.capacity / 2;
+        // Not again while full: the writes need it only once this one is.
+        let half = t.offset + length > active.capacity / 2 && !t.full;
         send(&mut self.links.aio, AioJob::Write(write))?;
         self.in_flight = Some(InFlight {
-            first: group.last + 1 - u64::from(group.records),
+            first,
             last: group.last,
             length,
             bytes: group.bytes,
@@ -292,7 +304,9 @@ impl Journal {
     /// records from here on replace is durable, [`Journal::trim`] retires
     /// those. `None` while the next segment is still being made, or while
     /// the records before do not fit the current one, so writes need not
-    /// wait: ask again later.
+    /// wait: ask again later. On a device too full for another segment,
+    /// the new one comes from the spare kept back for a roll, and the
+    /// records from here on wait for it.
     ///
     /// # Errors
     ///
@@ -300,23 +314,25 @@ impl Journal {
     pub fn roll(&mut self) -> Result<Option<u64>, Error> {
         let ahead = self.ahead();
         let t = &mut self.tail;
-        match (&t.active, &t.next) {
-            (None, _) => Ok(Some(1)),
+        let Some(a) = &t.active else {
+            return Ok(Some(1));
+        };
+        let id = a.id + 1;
+        if t.roll_after.is_some() {
             // Records from an earlier roll go there already.
-            (Some(_), Some(next)) if t.roll_after.is_some() => Ok(Some(next.id)),
-            (Some(a), _) if t.offset == PAGE as u64 && ahead == 0 => Ok(Some(a.id)),
-            (Some(a), Some(next)) if t.offset + ahead <= a.capacity => {
-                t.roll_after = Some(self.appended);
-                let id = next.id;
-                self.pending.seal();
-                Ok(Some(id))
-            }
-            (Some(_), Some(_)) => Ok(None),
-            (Some(_), None) => {
-                self.create_next()?;
-                Ok(None)
-            }
+            return Ok(Some(id));
         }
+        if t.offset == PAGE as u64 && ahead == 0 {
+            return Ok(Some(a.id));
+        }
+        let ready = t.offset + ahead <= a.capacity && (t.next.is_some() || t.full);
+        if ready {
+            t.roll_after = Some(self.appended);
+            self.pending.seal();
+        }
+        // For these records, or for a later roll.
+        self.create_next()?;
+        Ok(ready.then_some(id))
     }
 
     /// Bytes the groups in flight and waiting take in a segment.
@@ -366,7 +382,14 @@ impl Journal {
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub const fn fail_next_write(&mut self) {
-        self.tail.fail = true;
+        self.tail.faults.write = true;
+    }
+
+    /// Makes the next segment it asks for fail, as on a full device.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub const fn fail_next_segment(&mut self) {
+        self.tail.faults.segment = true;
     }
 
     /// Groups written to the directory so far.
@@ -433,6 +456,7 @@ impl Journal {
             }
             Done::Created(result) => {
                 self.tail.creating = false;
+                self.tail.full = result.is_err();
                 self.tail.next = Some(result?);
                 self.send()?;
                 Ok(false)
@@ -466,11 +490,20 @@ impl Journal {
             .done_tx
             .try_register()
             .map_err(|_| Error::Closed)?;
+        #[cfg(feature = "testing")]
+        if std::mem::take(&mut t.faults.segment) {
+            let mut reply = reply;
+            let full = io::Error::from(io::ErrorKind::StorageFull);
+            send(&mut reply, Done::Created(Err(full)))?;
+            t.creating = true;
+            return Ok(());
+        }
         let job = FileJob::Create {
             dir: self.dir.clone(),
             id: t.active.as_ref().map_or(1, |a| a.id + 1),
             capacity: self.config.segment_bytes,
             zero: t.active.is_none(),
+            last_spare: t.roll_after.is_some(),
             reply,
         };
         send(&mut self.links.files, job)?;
@@ -614,9 +647,10 @@ impl Disk {
             offset,
             next,
             creating: false,
+            full: false,
             roll_after: None,
             #[cfg(feature = "testing")]
-            fail: false,
+            faults: Faults::default(),
             group: found.last.map_or(1, |g| g + 1),
         })
     }

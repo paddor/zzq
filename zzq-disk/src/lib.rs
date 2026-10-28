@@ -8,7 +8,8 @@
 //! meanwhile wait behind it. Writes use `O_DIRECT | O_DSYNC`, so a
 //! completed write is on disk and [`Journal::durable`] moves to its last
 //! record. Trimmed segments stay as spares for later ones, so writes
-//! land in blocks written before.
+//! land in blocks written before. One spare stays back for a roll, so a
+//! snapshot can start a segment on a full device.
 //!
 //! The directory must take `O_DIRECT`. Linux only.
 //!

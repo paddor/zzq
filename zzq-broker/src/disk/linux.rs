@@ -93,6 +93,12 @@ impl Log {
         self.0.fail_next_write();
     }
 
+    /// Makes the next segment it asks for fail, as on a full device.
+    #[cfg(test)]
+    pub(crate) const fn fail_next_segment(&mut self) {
+        self.0.fail_next_segment();
+    }
+
     /// Number of the last record appended, and groups written.
     #[cfg(test)]
     pub(crate) const fn counts(&self) -> (u64, u64) {

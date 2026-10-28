@@ -1,4 +1,5 @@
 use std::os::unix::fs::MetadataExt;
+use std::path::PathBuf;
 
 use super::*;
 use crate::testing::TempDir;
@@ -35,7 +36,7 @@ fn one_empty_segment_stays_as_the_next_and_others_go() {
     drop(j);
     // A crash after the next segments were made, before writes reached them.
     for id in 2..=4 {
-        segment::create(dir.path(), id, small().segment_bytes, false).unwrap();
+        segment::create(dir.path(), id, small().segment_bytes, false, false).unwrap();
     }
     let mut j = open(&disk, dir.path()).unwrap();
     assert_eq!(segment::list(dir.path()).unwrap(), [1, 2]);
@@ -75,13 +76,15 @@ fn an_empty_journal_starts_in_its_first_empty_segment() {
     };
     drop(j);
     for id in 1..=2 {
-        segment::create(dir.path(), id, small().segment_bytes, false).unwrap();
+        segment::create(dir.path(), id, small().segment_bytes, false, false).unwrap();
     }
-    let j = open(&disk, dir.path()).unwrap();
+    let mut j = open(&disk, dir.path()).unwrap();
     let active = j.tail.active.as_ref().map(|a| a.id);
     assert_eq!((active, j.tail.offset), (Some(1), PAGE as u64));
     assert_eq!(j.tail.next.as_ref().map(|s| s.id), Some(2));
     assert_eq!(j.tail.group, 1);
+    // Nothing comes before a roll, so it starts there.
+    assert_eq!(j.roll().unwrap(), Some(1));
 }
 
 #[test]
@@ -93,7 +96,7 @@ fn a_roll_skips_the_empty_segment_a_write_goes_to() {
     };
     drop(j);
     for id in 1..=2 {
-        segment::create(dir.path(), id, small().segment_bytes, false).unwrap();
+        segment::create(dir.path(), id, small().segment_bytes, false, false).unwrap();
     }
     let mut j = open(&disk, dir.path()).unwrap();
     j.append(1, &[b"before"]).unwrap();
@@ -174,10 +177,11 @@ fn a_written_segment_after_an_empty_one_fails_the_open() {
         return;
     };
     drop(j);
-    segment::create(dir.path(), 1, small().segment_bytes, true).unwrap();
+    segment::create(dir.path(), 1, small().segment_bytes, true, false).unwrap();
     let mut j = open(&disk, dir.path()).unwrap();
     // Writes skip segment 1, which a journal never does.
-    j.tail.next = Some(segment::create(dir.path(), 2, small().segment_bytes, false).unwrap());
+    j.tail.next =
+        Some(segment::create(dir.path(), 2, small().segment_bytes, false, false).unwrap());
     j.tail.offset = j.tail.active.as_ref().unwrap().capacity;
     j.append(1, &[b"x"]).unwrap();
     j.sync().unwrap();
@@ -201,29 +205,66 @@ fn a_new_segment_takes_the_newest_spare_that_fits() {
     drop(j);
     let d = dir.path();
     let cap = small().segment_bytes;
-    let ino = |id: u64| fs::metadata(segment::path(d, id)).unwrap().ino();
-    segment::create(d, 1, cap, true).unwrap();
-    segment::create(d, 2, cap, false).unwrap();
-    segment::create(d, 3, 2 * cap, false).unwrap();
-    let two = ino(2);
-    segment::trim(d, 4).unwrap();
-    assert_eq!(segment::list(d).unwrap(), [0; 0]);
-    assert_eq!(segment::spares(d).unwrap(), [1, 2, 3]);
-    // Spare 3 is too large; 2 is the newest that fits.
-    segment::create(d, 4, cap, false).unwrap();
-    assert_eq!(ino(4), two);
-    assert_eq!(segment::spares(d).unwrap(), [1]);
-    // What a trim takes replaces the spares left.
-    segment::trim(d, 5).unwrap();
-    assert_eq!(segment::spares(d).unwrap(), [4]);
+    let spare = |id: u64| d.join(format!("{id:016x}.spare"));
+    let ino = |path: PathBuf| fs::metadata(path).unwrap().ino();
+    let spares = || segment::spares(d).unwrap();
+    // The first segment comes with a spare kept back.
+    segment::create(d, 1, cap, true, false).unwrap();
+    assert_eq!(spares(), [0]);
+    let reserve = ino(spare(0));
+    for id in 2..=3 {
+        segment::create(d, id, cap, false, false).unwrap();
+    }
+    let two = ino(segment::path(d, 2));
+    // The spare kept back stays.
+    segment::trim(d, 3).unwrap();
+    assert_eq!(spares(), [0, 1, 2]);
+    // The newest goes first, down to the spare kept back.
+    segment::create(d, 4, cap, false, false).unwrap();
+    assert_eq!(ino(segment::path(d, 4)), two);
+    for id in 5..=6 {
+        segment::create(d, id, cap, false, false).unwrap();
+    }
+    assert_eq!(spares(), [0]);
+    // The segment after a roll takes it.
+    segment::create(d, 7, cap, false, true).unwrap();
+    assert_eq!(ino(segment::path(d, 7)), reserve);
+    assert_eq!(spares(), [0; 0]);
+    // What a trim takes replaces the spares left but the newest.
+    segment::trim(d, 7).unwrap();
+    assert_eq!(spares(), [3, 4, 5, 6]);
     // A trim that takes none keeps them.
-    segment::trim(d, 5).unwrap();
-    assert_eq!(segment::spares(d).unwrap(), [4]);
+    segment::trim(d, 7).unwrap();
+    assert_eq!(spares(), [3, 4, 5, 6]);
     // A spare not older than the new segment could hold groups that name
     // it.
-    let spare = |id: u64| d.join(format!("{id:016x}.spare"));
-    fs::rename(spare(4), spare(9)).unwrap();
-    segment::create(d, 5, cap, false).unwrap();
-    assert_eq!(segment::spares(d).unwrap(), [0; 0]);
-    assert_eq!(segment::list(d).unwrap(), [5]);
+    fs::rename(spare(6), spare(9)).unwrap();
+    segment::create(d, 8, cap, false, false).unwrap();
+    assert_eq!(spares(), [3, 4]);
+    // Spares of another size do not fit.
+    segment::create(d, 9, 2 * cap, false, false).unwrap();
+    assert_eq!(spares(), [0]);
+    assert_eq!(fs::metadata(spare(0)).unwrap().len(), 2 * cap);
+    assert_eq!(segment::list(d).unwrap(), [7, 8, 9]);
+}
+
+#[test]
+fn a_roll_on_a_full_device_starts_in_the_spare_kept_back() {
+    let dir = TempDir::new("full-roll");
+    let disk = Disk::new(small()).unwrap();
+    let Some(mut j) = open(&disk, dir.path()) else {
+        return;
+    };
+    j.append(1, &[b"x"]).unwrap();
+    j.sync().unwrap();
+    let ino = |path: PathBuf| fs::metadata(path).unwrap().ino();
+    let reserve = ino(dir.path().join(format!("{:016x}.spare", 0)));
+    // As after a segment that could not be made: the roll does not wait
+    // for one.
+    j.tail.full = true;
+    assert_eq!(j.roll().unwrap(), Some(2));
+    j.append(1, &[b"y"]).unwrap();
+    j.sync().unwrap();
+    assert_eq!(ino(segment::path(dir.path(), 2)), reserve);
+    assert!(!j.tail.full);
 }

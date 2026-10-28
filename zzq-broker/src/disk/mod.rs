@@ -33,7 +33,8 @@ pub(crate) enum Completion {
     Written(u64),
     /// Writing records `.0..=.1` failed. They may be on disk or not.
     Failed(u64, u64),
-    /// A segment file could not be made. Writes wait for the next try.
+    /// A segment file could not be made, as on a full device. Writes wait
+    /// for the next try; a snapshot starts in the spare kept back.
     Stalled,
     /// The disk threads stopped.
     Closed,

@@ -16,6 +16,8 @@ use crate::format;
 pub(crate) const MAX_BYTES: u64 = 1 << 30;
 const SUFFIX: &str = "seg";
 const SPARE: &str = "spare";
+/// The id of a spare allocated to stay back, older than any segment.
+const RESERVE: u64 = 0;
 /// A segment being made; a crash leaves it behind, and [`list`] removes it.
 const PARTIAL: &str = "tmp";
 /// Zeros written per call while a segment is made.
@@ -78,15 +80,42 @@ fn ids(dir: &Path, suffix: &str) -> io::Result<Vec<u64>> {
 
 /// Makes segment `id` of `capacity` bytes, synced, then renamed into place.
 ///
-/// It takes a spare when there is one, so direct writes land in blocks
-/// written before. They cost no metadata write; blocks only allocated
-/// do. Otherwise `zero` writes zeros through it, for a first segment
-/// that nothing writes beside, and without `zero` the blocks are only
-/// allocated: zeros would hold up the writes to the active segment.
-pub(crate) fn create(dir: &Path, id: u64, capacity: u64, zero: bool) -> io::Result<Segment> {
+/// It takes the newest spare when there is one, so direct writes land in
+/// blocks written before. They cost no metadata write; blocks only
+/// allocated do. Otherwise `zero` writes zeros through it, for a first
+/// segment that nothing writes beside, and without `zero` the blocks are
+/// only allocated: zeros would hold up the writes to the active segment.
+///
+/// One spare stays back, so a snapshot can always start a segment and
+/// the trim behind it can make room on a full device: only `last_spare`,
+/// for the records after a roll, takes it. Without one, it is allocated
+/// beside the segment.
+pub(crate) fn create(
+    dir: &Path,
+    id: u64,
+    capacity: u64,
+    zero: bool,
+    last_spare: bool,
+) -> io::Result<Segment> {
     let done = path(dir, id);
     let partial = done.with_extension(PARTIAL);
-    made(&partial, || prepare(dir, id, capacity, zero, &partial))?;
+    let spares = fitting(dir, id, capacity)?;
+    let keep = usize::from(!last_spare);
+    let reserve = (spares.len() < keep).then(|| spare_path(dir, RESERVE));
+    let from = spares
+        .last()
+        .filter(|_| spares.len() > keep)
+        .map(|&old| spare_path(dir, old));
+    let made = made(&partial, || {
+        if let Some(reserve) = &reserve {
+            fresh(reserve, capacity, false)?;
+        }
+        prepare(id, capacity, zero, from.as_deref(), &partial)
+    });
+    if let (Err(_), Some(reserve)) = (&made, &reserve) {
+        let _ = fs::remove_file(reserve);
+    }
+    made?;
     fs::rename(&partial, &done)?;
     sync_dir(dir)?;
     open(dir, id, capacity)
@@ -100,30 +129,34 @@ fn made(partial: &Path, make: impl FnOnce() -> io::Result<()>) -> io::Result<()>
     })
 }
 
-/// Segment `id` at `to`, with its header, synced.
-fn prepare(dir: &Path, id: u64, capacity: u64, zero: bool, to: &Path) -> io::Result<()> {
-    let file = match reuse(dir, id, capacity, to)? {
-        Some(file) => file,
+/// Segment `id` at `to`, from spare `from` or a new file, with its header,
+/// synced.
+fn prepare(id: u64, capacity: u64, zero: bool, from: Option<&Path>, to: &Path) -> io::Result<()> {
+    let file = match from {
+        Some(from) => {
+            fs::rename(from, to)?;
+            OpenOptions::new().write(true).open(to)?
+        }
         None => fresh(to, capacity, zero)?,
     };
     file.write_all_at(&format::segment_header(id, capacity), 0)?;
     file.sync_all()
 }
 
-/// The newest spare older than segment `id`, renamed to `to`. Removes the
-/// spares it passes over: one not older could hold groups that name `id`,
-/// and one of another capacity does not fit.
-fn reuse(dir: &Path, id: u64, capacity: u64, to: &Path) -> io::Result<Option<File>> {
-    let mut spares = spares(dir)?;
-    while let Some(old) = spares.pop() {
+/// The spares segment `id` can take, oldest first. Removes the others:
+/// one not older could hold groups that name `id`, and one of another
+/// capacity does not fit.
+fn fitting(dir: &Path, id: u64, capacity: u64) -> io::Result<Vec<u64>> {
+    let mut fit = Vec::new();
+    for old in spares(dir)? {
         let from = spare_path(dir, old);
         if old < id && fs::metadata(&from)?.len() == capacity {
-            fs::rename(&from, to)?;
-            return OpenOptions::new().write(true).open(to).map(Some);
+            fit.push(old);
+        } else {
+            fs::remove_file(&from)?;
         }
-        fs::remove_file(&from)?;
     }
-    Ok(None)
+    Ok(fit)
 }
 
 /// A new file at `to` of `capacity` bytes, of zeros or allocated blocks.
@@ -192,14 +225,16 @@ pub(crate) fn remove(dir: &Path, id: u64) -> io::Result<()> {
 }
 
 /// Turns the segments before `before` into spares, oldest first, so the
-/// rest stay in a row. They replace the spares left: about as many new
-/// segments come before the next trim.
+/// rest stay in a row. They replace the spares left but the newest, which
+/// stays back: about as many new segments come before the next trim.
 pub(crate) fn trim(dir: &Path, before: u64) -> io::Result<()> {
     let trimmed: Vec<u64> = list(dir)?.into_iter().filter(|&id| id < before).collect();
     if trimmed.is_empty() {
         return Ok(());
     }
-    for id in spares(dir)? {
+    let mut left = spares(dir)?;
+    left.pop();
+    for id in left {
         fs::remove_file(spare_path(dir, id))?;
     }
     for id in trimmed {

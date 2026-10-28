@@ -164,6 +164,18 @@ impl Shared {
         }
     }
 
+    /// Makes the next segment journal `j` asks for fail, as on a full
+    /// device.
+    #[cfg(test)]
+    pub(crate) fn fail_next_segment(&self, j: JournalId) {
+        match j {
+            JournalId::Retained(i) => self.retained.fail_next_segment(i),
+            JournalId::Lane(i) | JournalId::Pair { to: i, .. } => {
+                self.lane_logs[i].fail_next_segment();
+            }
+        }
+    }
+
     /// Stops `task` with the broker, or now if the broker stopped already,
     /// as a bind cancelled before its listener was up may find it.
     fn own_task(&self, task: AbortHandle) {

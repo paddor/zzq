@@ -18,9 +18,11 @@ Notable changes to zzq. The format follows
   one for the records appended after it, and `Journal::trim` keeps those
   before it as spares for the next. Writes into a spare cost no metadata
   write, and a new segment without one gets its blocks allocated, not
-  zeroed, so no zeros hold up the writes beside it. On a full device,
-  writes that need a new segment wait until a trim or freed space makes
-  room, and a segment or mark it could not make takes no space.
+  zeroed, so no zeros hold up the writes beside it. One spare stays back,
+  allocated beside the first segment, and only the segment after a roll
+  takes it, so a snapshot can start on a full device. Other writes that
+  need a new segment then wait until a trim or freed space makes room,
+  and a segment or mark it could not make takes no space.
 - `zzq-broker`: `BrokerOptions::data_dir` and `zzq_broker --data-dir` keep
   state in journals: retained messages in one per stripe of topics, each
   behind a lock of its own, and the sessions that outlive their
@@ -33,8 +35,9 @@ Notable changes to zzq. The format follows
   crash may send a QoS 1 message it had acked again. If a write
   fails, a v5 publisher gets Unspecified error, other clients are
   disconnected, and `Stats::write_errors` counts it. Once a journal grew
-  well past what it holds, it writes a snapshot and drops the segments
-  before it. A connection a crash ended counts as lost at the next start,
+  well past what it holds, checked as each write finishes, it writes a
+  snapshot and drops the segments before it. A journal that cannot get a
+  new segment, as on a full device, writes one at once. A connection a crash ended counts as lost at the next start,
   so its will goes out. A changed lane count moves the sessions to their
   new lanes. Linux only; not with `state_file`.
 - `zzq-bench`: `zzq_loadbench` runs the fixed-load test against any broker:

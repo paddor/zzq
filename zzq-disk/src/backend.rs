@@ -87,9 +87,11 @@ pub(crate) enum FileJob {
         capacity: u64,
         /// Zeros for a first segment, if no spare is left.
         zero: bool,
+        /// May take the spare kept back: for the records after a roll.
+        last_spare: bool,
         reply: Sender<Done>,
     },
-    /// Remove the segments before `before`, oldest first.
+    /// Turn the segments before `before` into spares, oldest first.
     Trim {
         dir: Arc<Path>,
         before: u64,
@@ -347,9 +349,10 @@ fn run_files(mut jobs: Receiver<FileJob>) {
                 id,
                 capacity,
                 zero,
+                last_spare,
                 mut reply,
             } => {
-                let made = segment::create(&dir, id, capacity, zero);
+                let made = segment::create(&dir, id, capacity, zero, last_spare);
                 let _ = reply.try_send(Done::Created(made));
             }
             // A failure leaves segments the next trim or open finds; they

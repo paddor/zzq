@@ -268,7 +268,11 @@ impl Retained {
             match done {
                 Completion::Written(n) => {
                     stripe.cursor.advance(n);
-                    if stripe.lock().written(n).is_err() {
+                    let mut st = stripe.lock();
+                    let trimmed = st.written(n);
+                    // As soon as the journal grew enough, not at the next
+                    // sweep.
+                    if trimmed.is_err() || st.snapshot(false).is_err() {
                         self.write_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -284,6 +288,12 @@ impl Retained {
                 }
                 Completion::Stalled => {
                     self.write_errors.fetch_add(1, Ordering::Relaxed);
+                    // No new segment, as on a full device: a snapshot starts
+                    // in the spare kept back, and the trim behind it makes
+                    // room.
+                    if stripe.lock().snapshot(true).is_err() {
+                        self.write_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                     tokio::time::sleep(RETRY).await;
                     if let Some(log) = stripe.lock().log.as_mut() {
                         let _ = log.flush();
@@ -331,6 +341,15 @@ impl Retained {
     pub(crate) fn fail_next_write(&self, i: usize) {
         if let Some(log) = self.stripes[i].lock().log.as_mut() {
             log.fail_next_write();
+        }
+    }
+
+    /// Makes the next segment stripe `i` asks for fail, as on a full
+    /// device.
+    #[cfg(test)]
+    pub(crate) fn fail_next_segment(&self, i: usize) {
+        if let Some(log) = self.stripes[i].lock().log.as_mut() {
+            log.fail_next_segment();
         }
     }
 
@@ -393,10 +412,11 @@ impl State {
     }
 
     /// Writes a snapshot from a new segment, if the journal grew enough
-    /// past what the tree holds, or with `force`: the segments before go
-    /// once it is written. False if it waits for that segment.
+    /// past what the tree holds, or with `force`, unless one waits for its
+    /// trim: the segments before go once it is written. False if it waits
+    /// for that segment.
     fn snapshot(&mut self, force: bool) -> io::Result<bool> {
-        let Some(log) = self.log.as_mut() else {
+        let Some(log) = self.log.as_mut().filter(|_| self.trim.is_none()) else {
             return Ok(true);
         };
         let since = log.written_bytes() - self.snapshot_at;

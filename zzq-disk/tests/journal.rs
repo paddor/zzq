@@ -395,7 +395,7 @@ fn records_appended_before_a_roll_stay_before_its_segment() {
     assert!(got == expected(8)[5..], "{} records read back", got.len());
 }
 
-/// Bytes of the device [`a_full_device_holds_writes_until_space_returns`]
+/// Bytes of the device [`a_full_device_holds_writes_until_room_comes`]
 /// mounts: four segments of [`kill_config`], and room for marks.
 const DEVICE: u64 = (1 << 20) + (64 << 10);
 
@@ -416,7 +416,7 @@ fn settle(j: &mut Journal) -> u64 {
     }
 }
 
-/// The child of [`a_full_device_holds_writes_until_space_returns`], on a
+/// The child of [`a_full_device_holds_writes_until_room_comes`], on a
 /// tmpfs of [`DEVICE`] bytes at `root`.
 fn on_a_full_device(root: &Path) {
     let filler = root.join("filler");
@@ -439,45 +439,50 @@ fn on_a_full_device(root: &Path) {
         }
         r => assert_eq!(r.unwrap(), 1),
     }
-    // Segments fill the device. Once the last has no room, the records
-    // after it wait.
+    // Segments fill the device, until the next has no room.
     let mut n = 1;
     loop {
         n += 1;
-        assert!(n < 10_000, "writes never waited");
+        assert!(n < 10_000, "the device never filled");
         append(&mut j, n, n);
         if let Err(e) = j.sync() {
             assert!(full(&e), "{e}");
-            let durable = settle(&mut j);
-            assert_eq!(files(&dir, "tmp"), Vec::<PathBuf>::new());
-            if durable < j.appended() {
-                break;
-            }
+            break;
         }
     }
-    // A trim of the segments before the last makes spares, and the records
-    // waiting go on in them.
-    let last = files(&dir, "seg").pop().unwrap();
-    let stem = last.file_stem().unwrap().to_str().unwrap();
-    j.trim(u64::from_str_radix(stem, 16).unwrap()).unwrap();
-    for _ in 0..3 {
-        match j.sync() {
-            Ok(_) => break,
-            // A try made before the trim.
-            Err(e) => assert!(full(&e), "{e}"),
+    settle(&mut j);
+    assert_eq!(files(&dir, "tmp"), Vec::<PathBuf>::new());
+    // A roll starts in the spare kept back, and the trim behind it makes
+    // room for the segments after.
+    let roll = loop {
+        if let Some(id) = j.roll().unwrap() {
+            break id;
         }
-    }
-    assert_eq!(j.durable(), n);
+        settle(&mut j);
+    };
+    let from = n + 1;
+    n += 10;
+    append(&mut j, from, n);
+    j.sync().unwrap();
+    j.trim(roll).unwrap();
+    append(&mut j, n + 1, n + 200);
+    n += 200;
+    j.sync().unwrap();
+    assert!(segments(&dir) > 1, "no segment after the roll");
+    assert_eq!(files(&dir, "spare").len(), 2);
     drop(j);
     let (_, got) = open(&disk, &dir);
-    let all = expected(n);
-    assert!(got.len() > 1 && got == all[all.len() - got.len()..]);
+    assert!(
+        got == expected(n)[from as usize - 1..],
+        "{} records",
+        got.len()
+    );
 }
 
 #[test]
-fn a_full_device_holds_writes_until_space_returns() {
+fn a_full_device_holds_writes_until_room_comes() {
     const CHILD: &str = "ZZQ_DISK_FULL_CHILD";
-    const NAME: &str = "a_full_device_holds_writes_until_space_returns";
+    const NAME: &str = "a_full_device_holds_writes_until_room_comes";
     if let Some(root) = std::env::var_os(CHILD) {
         on_a_full_device(Path::new(&root));
         return;
