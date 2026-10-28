@@ -14,6 +14,27 @@ impl Drop for Running {
     }
 }
 
+/// Starts the broker on a free port with `args`, and returns it with the
+/// endpoint it bound.
+#[cfg(unix)]
+#[expect(clippy::unwrap_used, reason = "tests fail loudly")]
+fn spawn(args: &[&str]) -> (Running, String) {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    let mut child = Command::new(EXE)
+        .args(["--bind", "tcp://127.0.0.1:0"])
+        .args(args)
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut uri = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut uri)
+        .unwrap();
+    (Running(child), uri.trim().to_owned())
+}
+
 #[test]
 fn bad_flags_print_usage() {
     let out = Command::new(EXE).args(["--nope", "x"]).output().unwrap();
@@ -34,28 +55,13 @@ fn bind_errors_name_the_cause() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_keeps_sessions_in_the_state_file() {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
-
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
     let dir = std::env::temp_dir().join(format!("zzq-bin-state-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("state");
-    let start = || {
-        let mut child = Command::new(EXE)
-            .args(["--lanes", "2", "--bind", "tcp://127.0.0.1:0"])
-            .args(["--state-file", file.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut uri = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut uri)
-            .unwrap();
-        (Running(child), uri.trim().to_owned())
-    };
+    let start = || spawn(&["--lanes", "2", "--state-file", file.to_str().unwrap()]);
     // SIGTERM, then a clean exit.
     let stop = |mut b: Running| {
         let pid = b.0.id().to_string();
@@ -90,8 +96,6 @@ async fn sigterm_keeps_sessions_in_the_state_file() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn sigterm_writes_every_retained_change_first() {
-    use std::io::{BufRead, BufReader};
-    use std::process::Stdio;
     use std::time::Duration;
 
     use zzq_broker::Context;
@@ -102,19 +106,7 @@ async fn sigterm_writes_every_retained_change_first() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("retained.log");
-    let start = || {
-        let mut child = Command::new(EXE)
-            .args(["--lanes", "1", "--bind", "tcp://127.0.0.1:0"])
-            .args(["--retained-file", file.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut uri = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut uri)
-            .unwrap();
-        (Running(child), uri.trim().to_owned())
-    };
+    let start = || spawn(&["--lanes", "1", "--retained-file", file.to_str().unwrap()]);
     let ctx = Context::new().unwrap();
     let (mut broker, uri) = start();
     let c = Client::connect(&ctx, &uri, ClientOptions::new("pub"))
@@ -152,6 +144,48 @@ async fn sigterm_writes_every_retained_change_first() {
         got += 1;
     }
     assert_eq!(got, N + 1, "retained messages after the restart");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn sigkill_keeps_acked_retained_messages() {
+    use std::time::Duration;
+
+    use zzq_broker::Context;
+    use zzq_client::{Client, ClientOptions, QoS};
+
+    let dir = std::env::temp_dir().join(format!("zzq-bin-sigkill-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("retained.log");
+    let args = ["--retained-file", file.to_str().unwrap()];
+    // Big, so a log write behind the ack is still running when the kill
+    // lands.
+    let payload: Vec<u8> = (0..=u8::MAX).cycle().take(15 << 20).collect();
+    let ctx = Context::new().unwrap();
+    let (mut broker, uri) = spawn(&args);
+    let c = Client::connect(&ctx, &uri, ClientOptions::new("pub"))
+        .await
+        .unwrap();
+    c.publish_retained("k/big", &payload, QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    // No shutdown: the PUBACK alone has to mean the message is stored.
+    broker.0.kill().unwrap();
+    broker.0.wait().unwrap();
+    drop(c);
+    let (_broker, uri) = spawn(&args);
+    let mut c = Client::connect(&ctx, &uri, ClientOptions::new("sub"))
+        .await
+        .unwrap();
+    c.subscribe("k/#", QoS::AtMostOnce).await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), c.recv())
+        .await
+        .ok()
+        .flatten()
+        .expect("the acked retained message after the restart");
+    assert!(got.payload == payload, "payload changed");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
