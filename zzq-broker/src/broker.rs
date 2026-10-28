@@ -210,8 +210,13 @@ pub struct Stats {
     /// Approximate bytes of state counted against `max_state_bytes`.
     pub state_bytes: u64,
     /// Writes to the data directory that failed. Their v5 publishers got
-    /// Unspecified error, and v3.1.1 ones were disconnected.
+    /// Unspecified error, and v3.1.1 ones were disconnected. A journal that
+    /// could not make a new segment counts each try.
     pub write_errors: u64,
+    /// Journals in the data directory that could not make a new segment,
+    /// as on a full device. Their writes go on in the spare segment each
+    /// keeps back, and wait once that is full too, until space comes back.
+    pub full_journals: u64,
 }
 
 /// Messages the broker dropped, by reason.
@@ -523,6 +528,8 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
             .iter()
             .map(|l| l.write_errors.load(Ordering::Relaxed))
             .sum::<u64>();
+    total.full_journals =
+        r.full_journals() + shared.lane_logs.iter().filter(|l| l.full()).count() as u64;
     total.state_bytes += r.bytes() as u64;
     Ok(total)
 }
@@ -643,7 +650,8 @@ impl Drop for Broker {
         for lane in &self.shared.lanes {
             let _ = lane.control.push(Control::Shutdown(None));
         }
-        // The data directory is free for another broker at once.
+        // The data directory is free for another broker once the writes
+        // and trims under way are done; one opened sooner waits for them.
         for log in &self.shared.lane_logs {
             log.release();
         }

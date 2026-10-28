@@ -203,6 +203,12 @@ impl Retained {
         self.write_errors.load(Ordering::Relaxed)
     }
 
+    /// Journals that could not make a new segment, as on a full device.
+    pub(crate) fn full_journals(&self) -> u64 {
+        let full = |s: &Stripe| s.lock().log.as_ref().is_some_and(Log::full);
+        self.stripes.iter().filter(|s| full(s)).count() as u64
+    }
+
     /// Every stored message, except the `$SYS/` ones the broker writes
     /// itself.
     pub(crate) fn messages(&self) -> Vec<Msg> {

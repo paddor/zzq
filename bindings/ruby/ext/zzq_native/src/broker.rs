@@ -63,6 +63,7 @@ pub fn stats_hash(s: &Stats) -> RbResult<VALUE> {
         ("retained_rejected", s.retained_rejected),
         ("state_bytes", s.state_bytes),
         ("write_errors", s.write_errors),
+        ("full_journals", s.full_journals),
     ] {
         rb::hash_aset(h, rb::symbol(key)?, rb::u64_value(value))?;
     }

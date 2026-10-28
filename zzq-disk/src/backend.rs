@@ -5,7 +5,6 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io;
 use std::os::fd::OwnedFd;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll, Wake, Waker};
@@ -18,7 +17,7 @@ use rustix::io::Errno;
 use crate::Error;
 use crate::aio::{AioContext, AlignedBuf};
 use crate::format::PAGE;
-use crate::segment::{self, Segment};
+use crate::segment::{self, Dir, Segment};
 
 /// Jobs a sender may queue. Each journal has at most one write and one
 /// segment request outstanding, so this never fills.
@@ -75,14 +74,20 @@ pub(crate) enum AioJob {
 
 pub(crate) struct Write {
     pub(crate) journal: u64,
+    /// Keeps the journal's directory locked until the write is done.
+    pub(crate) dir: Arc<Dir>,
     pub(crate) file: Arc<File>,
     pub(crate) offset: u64,
     pub(crate) buf: AlignedBuf,
 }
 
+/// What a write in flight carries: its journal, and that journal's
+/// directory, locked until the write is done.
+type Job = (u64, Arc<Dir>);
+
 pub(crate) enum FileJob {
     Create {
-        dir: Arc<Path>,
+        dir: Arc<Dir>,
         id: u64,
         capacity: u64,
         /// Zeros for a first segment, if no spare is left.
@@ -93,12 +98,12 @@ pub(crate) enum FileJob {
     },
     /// Turn the segments before `before` into spares, oldest first.
     Trim {
-        dir: Arc<Path>,
+        dir: Arc<Dir>,
         before: u64,
     },
     /// Note that groups up to `group` are on disk.
     Mark {
-        dir: Arc<Path>,
+        dir: Arc<Dir>,
         group: u64,
     },
     Stop,
@@ -232,7 +237,7 @@ impl Signal {
 }
 
 /// The AIO thread. Whatever ends it, the journals hear [`Done::Stopped`].
-fn run_aio(mut context: AioContext<u64>, signal: &Arc<Signal>, jobs: Receiver<AioJob>) {
+fn run_aio(mut context: AioContext<Job>, signal: &Arc<Signal>, jobs: Receiver<AioJob>) {
     let mut owners = HashMap::new();
     let _ = aio_turns(&mut context, signal, jobs, &mut owners);
     // Waits for writes still in flight after a failure.
@@ -243,7 +248,7 @@ fn run_aio(mut context: AioContext<u64>, signal: &Arc<Signal>, jobs: Receiver<Ai
 }
 
 fn aio_turns(
-    context: &mut AioContext<u64>,
+    context: &mut AioContext<Job>,
     signal: &Arc<Signal>,
     jobs: Receiver<AioJob>,
     owners: &mut HashMap<u64, Sender<Done>>,
@@ -262,7 +267,7 @@ fn aio_turns(
             // Stop: later sends fail, accepted writes still go out.
             jobs = None;
         }
-        context.reap(|(journal, buf, result)| {
+        context.reap(|((journal, _), buf, result)| {
             let result = result.and_then(|n| {
                 if n == buf.len() {
                     Ok(())
@@ -275,7 +280,8 @@ fn aio_turns(
         while !context.is_full()
             && let Some(w) = waiting.pop_front()
         {
-            if let Err((journal, buf, e)) = context.submit_write(w.file, w.offset, w.buf, w.journal)
+            let job = (w.journal, w.dir);
+            if let Err(((journal, _), buf, e)) = context.submit_write(w.file, w.offset, w.buf, job)
             {
                 deliver(owners, journal, Done::Written(buf, Err(e)));
             }
@@ -318,7 +324,7 @@ fn deliver(owners: &mut HashMap<u64, Sender<Done>>, journal: u64, done: Done) {
 }
 
 /// Blocks until a wake or a kernel completion is ready.
-fn wait(signal: &Signal, context: &AioContext<u64>) -> io::Result<()> {
+fn wait(signal: &Signal, context: &AioContext<Job>) -> io::Result<()> {
     let mut fds = [
         PollFd::new(&signal.fd, PollFlags::IN),
         PollFd::new(context, PollFlags::IN),
@@ -352,17 +358,17 @@ fn run_files(mut jobs: Receiver<FileJob>) {
                 last_spare,
                 mut reply,
             } => {
-                let made = segment::create(&dir, id, capacity, zero, last_spare);
+                let made = segment::create(dir.path(), id, capacity, zero, last_spare);
                 let _ = reply.try_send(Done::Created(made));
             }
             // A failure leaves segments the next trim or open finds; they
             // replay before what replaced them.
             FileJob::Trim { dir, before } => {
-                let _ = segment::trim(&dir, before);
+                let _ = segment::trim(dir.path(), before);
             }
             // A failure leaves an older mark, which asks less.
             FileJob::Mark { dir, group } => {
-                let _ = segment::write_mark(&dir, group);
+                let _ = segment::write_mark(dir.path(), group);
             }
             FileJob::Stop => return,
         }

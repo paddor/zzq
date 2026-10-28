@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use rustix::fs::{FallocateFlags, FlockOperation};
 use rustix::io::Errno;
@@ -289,23 +289,82 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
-/// Takes `dir`'s lock for as long as the file lives. Fails if another
-/// journal holds it.
-pub(crate) fn lock(dir: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(dir.join("LOCK"))?;
-    rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
-        if e == rustix::io::Errno::WOULDBLOCK {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "another journal uses this directory",
-            )
-        } else {
-            e.into()
+/// A journal's directory, locked for as long as this lives. The journal
+/// shares it with the writes and file work it starts.
+#[derive(Debug)]
+pub(crate) struct Dir {
+    path: PathBuf,
+    _lock: File,
+}
+
+/// Directories whose journal was dropped while work it started still
+/// holds them. A journal opened there, on any disk of this process, waits
+/// for that work.
+#[derive(Debug)]
+struct Closing {
+    dirs: Mutex<Vec<PathBuf>>,
+    done: Condvar,
+}
+
+static CLOSING: Closing = Closing {
+    dirs: Mutex::new(Vec::new()),
+    done: Condvar::new(),
+};
+
+impl Closing {
+    fn dirs(&self) -> MutexGuard<'_, Vec<PathBuf>> {
+        self.dirs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Waits until no work of a dropped journal holds `path`.
+    fn wait(&self, path: &Path) {
+        let mut dirs = self.dirs();
+        while dirs.iter().any(|d| d == path) {
+            dirs = self.done.wait(dirs).unwrap_or_else(PoisonError::into_inner);
         }
-    })?;
-    Ok(file)
+    }
+}
+
+impl Dir {
+    /// Takes the lock of `path`, a canonical path, once the work of a
+    /// journal dropped there is done. Fails if another journal holds it.
+    pub(crate) fn lock(path: &Path) -> io::Result<Dir> {
+        CLOSING.wait(path);
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.join("LOCK"))?;
+        rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|e| {
+            if e == rustix::io::Errno::WOULDBLOCK {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another journal uses this directory",
+                )
+            } else {
+                e.into()
+            }
+        })?;
+        Ok(Dir {
+            path: path.to_owned(),
+            _lock: file,
+        })
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Notes that its journal was dropped: a journal opened here waits
+    /// until the work it left lets go.
+    pub(crate) fn closed(&self) {
+        CLOSING.dirs().push(self.path.clone());
+    }
+}
+
+impl Drop for Dir {
+    fn drop(&mut self) {
+        CLOSING.dirs().retain(|d| *d != self.path);
+        CLOSING.done.notify_all();
+    }
 }

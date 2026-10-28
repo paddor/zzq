@@ -76,6 +76,11 @@ impl Log {
         self.0.backlog()
     }
 
+    /// Whether it could not make a new segment, as on a full device.
+    pub(crate) const fn full(&self) -> bool {
+        self.0.full()
+    }
+
     /// Bytes written since the journal opened, padding included.
     pub(crate) const fn written_bytes(&self) -> u64 {
         self.0.written_bytes()

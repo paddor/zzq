@@ -13,7 +13,9 @@
 //! across a restart: SIGTERM or SIGINT write it, and the next start loads
 //! it. `--max-state-mib` sets `max_state_bytes`. `--spin-us` sets how long
 //! a lane polls on after work before it sleeps. Prints each bound endpoint
-//! on its own line, then runs until SIGTERM or SIGINT.
+//! on its own line, then runs until SIGTERM or SIGINT. With `--data-dir`,
+//! it says on stderr when journals there could not make a new segment, as
+//! on a full device, and when they can again.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -142,11 +144,47 @@ async fn serve(a: Args, opts: BrokerOptions) -> Result<(), String> {
             .map_err(|e| format!("bind {uri}: {}", chain(&e)))?;
         println!("{ep}");
     }
-    stopped.await;
+    tokio::select! {
+        () = stopped => {}
+        () = watch(&broker, a.data_dir.as_deref()) => {}
+    }
     broker
         .shutdown()
         .await
         .map_err(|e| format!("shutdown: {}", chain(&e)))
+}
+
+/// Says on stderr, checked each second, when journals in the data directory
+/// `dir` could not make a new segment, and when they can again. Ends never.
+async fn watch(broker: &Broker, dir: Option<&str>) {
+    let Some(dir) = dir else {
+        return std::future::pending().await;
+    };
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut was = 0;
+    loop {
+        tick.tick().await;
+        // A broker that stopped has nothing more to say.
+        let Ok(stats) = broker.stats().await else {
+            return std::future::pending().await;
+        };
+        if let Some(line) = full_change(dir, was, stats.full_journals) {
+            eprintln!("{line}");
+        }
+        was = stats.full_journals;
+    }
+}
+
+/// What to say when the journals in `dir` that could not make a new
+/// segment went from `was` to `now`.
+fn full_change(dir: &str, was: u64, now: u64) -> Option<String> {
+    match (was, now) {
+        (0, 1..) => Some(format!(
+            "data directory {dir} is full: {now} journals could not make a new segment"
+        )),
+        (1.., 0) => Some(format!("data directory {dir} has room again")),
+        _ => None,
+    }
 }
 
 /// Handles SIGTERM and SIGINT from now on, and returns the wait for either.
@@ -192,5 +230,25 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_change;
+
+    #[test]
+    fn a_full_data_dir_is_said_once_when_it_fills_and_once_when_it_empties() {
+        let said = |was, now| full_change("d", was, now);
+        assert_eq!(
+            said(0, 2).as_deref(),
+            Some("data directory d is full: 2 journals could not make a new segment")
+        );
+        assert_eq!(said(2, 3), None);
+        assert_eq!(
+            said(3, 0).as_deref(),
+            Some("data directory d has room again")
+        );
+        assert_eq!(said(0, 0), None);
     }
 }

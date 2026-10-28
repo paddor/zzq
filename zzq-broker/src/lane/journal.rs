@@ -70,6 +70,12 @@ impl LaneLog {
         self.lock().log.is_some()
     }
 
+    /// Whether its journal could not make a new segment, as on a full
+    /// device.
+    pub(crate) fn full(&self) -> bool {
+        self.lock().log.as_ref().is_some_and(Log::full)
+    }
+
     /// Sends what was appended, unless a write is in flight.
     fn flush(&self) {
         if let Some(log) = self.lock().log.as_mut()

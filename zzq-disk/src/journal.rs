@@ -1,7 +1,7 @@
 //! A journal: one owner's records, written in groups.
 
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use fanring::mpsc::{self, Receiver, Sender, TrySendError};
 use crate::aio::AlignedBuf;
 use crate::backend::{AioJob, Done, FileJob, QUEUE, Write, locked};
 use crate::format::{self, GROUP_HEADER, PAGE, RECORD_HEADER, ScanError};
-use crate::segment::{self, Segment};
+use crate::segment::{self, Dir, Segment};
 use crate::{Config, Disk, Error, ReplayError};
 
 /// A record read back when a journal opens.
@@ -35,7 +35,9 @@ pub struct Record<'a> {
 /// its last record.
 pub struct Journal {
     id: u64,
-    dir: Arc<Path>,
+    /// Locked while it, or a write or file job it started, lives: one
+    /// journal per directory.
+    dir: Arc<Dir>,
     config: Config,
     links: Links,
     tail: Tail,
@@ -48,8 +50,6 @@ pub struct Journal {
     /// Bytes of the groups written, padding included.
     written_bytes: u64,
     stopped: bool,
-    /// Held while open: one journal per directory.
-    _lock: File,
 }
 
 /// The journal's ends of the channels to the disk threads.
@@ -71,6 +71,9 @@ struct Tail {
     next: Option<Segment>,
     creating: bool,
     /// The last segment asked for could not be made, as on a full device.
+    failed: bool,
+    /// A segment could not be made, and none came since but the one after
+    /// a roll, which may take the spare kept back.
     full: bool,
     /// Groups of the records after this one start a new segment.
     roll_after: Option<u64>,
@@ -124,7 +127,7 @@ struct InFlight {
 impl std::fmt::Debug for Journal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Journal")
-            .field("dir", &self.dir)
+            .field("dir", &self.dir.path())
             .field("appended", &self.appended)
             .field("durable", &self.durable)
             .finish_non_exhaustive()
@@ -214,12 +217,13 @@ impl Journal {
         let skew = 0;
         let write = Write {
             journal: self.id,
+            dir: self.dir.clone(),
             file: active.file.clone(),
             offset: t.offset + skew,
             buf: group.buf,
         };
-        // Not again while full: the writes need it only once this one is.
-        let half = t.offset + length > active.capacity / 2 && !t.full;
+        // Not again after a failure: the writes need it once this one is full.
+        let half = t.offset + length > active.capacity / 2 && !t.failed;
         send(&mut self.links.aio, AioJob::Write(write))?;
         self.in_flight = Some(InFlight {
             first,
@@ -293,7 +297,7 @@ impl Journal {
         }
         let group = self.tail.group - 1;
         if group > 0 {
-            segment::write_mark(&self.dir, group)?;
+            segment::write_mark(self.dir.path(), group)?;
         }
         Ok(self.durable)
     }
@@ -325,7 +329,7 @@ impl Journal {
         if t.offset == PAGE as u64 && ahead == 0 {
             return Ok(Some(a.id));
         }
-        let ready = t.offset + ahead <= a.capacity && (t.next.is_some() || t.full);
+        let ready = t.offset + ahead <= a.capacity && (t.next.is_some() || t.failed);
         if ready {
             t.roll_after = Some(self.appended);
             self.pending.seal();
@@ -405,6 +409,13 @@ impl Journal {
         self.written_bytes
     }
 
+    /// Whether it could not make a new segment, as on a full device. Its
+    /// writes go on in the spare kept back for a roll, or wait. It is
+    /// false again once a segment comes from free space or other spares.
+    pub const fn full(&self) -> bool {
+        self.tail.full
+    }
+
     /// Number of the last record appended, 0 for none.
     pub const fn appended(&self) -> u64 {
         self.appended
@@ -455,9 +466,11 @@ impl Journal {
                 }
             }
             Done::Created(result) => {
-                self.tail.creating = false;
-                self.tail.full = result.is_err();
-                self.tail.next = Some(result?);
+                let t = &mut self.tail;
+                t.creating = false;
+                t.failed = result.is_err();
+                t.full = t.failed || (t.full && t.roll_after.is_some());
+                t.next = Some(result?);
                 self.send()?;
                 Ok(false)
             }
@@ -545,6 +558,7 @@ impl Pending {
 impl Drop for Journal {
     fn drop(&mut self) {
         let _ = self.links.aio.try_send(AioJob::Close(self.id));
+        self.dir.closed();
     }
 }
 
@@ -573,25 +587,28 @@ impl Disk {
     /// # Errors
     ///
     /// [`Error::Io`] if the directory cannot be read or written, takes no
-    /// `O_DIRECT`, or another journal holds it; [`Error::Corrupt`] for
-    /// damage inside what was written; [`Error::Replay`] if `replay`
-    /// refuses a record; [`Error::Closed`] once the disk threads stopped.
+    /// `O_DIRECT`, or another journal holds it (`WouldBlock`). One dropped
+    /// there in this process holds it until the writes and trims it left
+    /// are done, which this waits for. [`Error::Corrupt`] for damage inside
+    /// what was written; [`Error::Replay`] if `replay` refuses a record;
+    /// [`Error::Closed`] once the disk threads stopped.
     pub fn open(
         &self,
         dir: impl AsRef<Path>,
         mut replay: impl FnMut(Record<'_>) -> Result<(), ReplayError>,
     ) -> Result<Journal, Error> {
-        let dir: Arc<Path> = dir.as_ref().into();
-        if !dir.is_dir() {
-            fs::create_dir_all(&dir)?;
+        let path = dir.as_ref();
+        if !path.is_dir() {
+            fs::create_dir_all(path)?;
             // The new directory itself has to survive a crash.
-            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 segment::sync_dir(parent)?;
             }
         }
-        let lock = segment::lock(&dir)?;
-        let found = recover(&dir, &mut replay)?;
-        let tail = Self::tail(&dir, found)?;
+        let path = &fs::canonicalize(path)?;
+        let dir = Arc::new(Dir::lock(path)?);
+        let found = recover(path, &mut replay)?;
+        let tail = Self::tail(path, found)?;
         let (done_tx, done) = mpsc::channel(QUEUE);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut aio = locked(&self.aio)
@@ -620,7 +637,6 @@ impl Disk {
             durable: 0,
             written_bytes: 0,
             stopped: false,
-            _lock: lock,
         })
     }
 
@@ -647,6 +663,7 @@ impl Disk {
             offset,
             next,
             creating: false,
+            failed: false,
             full: false,
             roll_after: None,
             #[cfg(feature = "testing")]

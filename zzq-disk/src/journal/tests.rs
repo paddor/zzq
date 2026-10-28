@@ -261,10 +261,15 @@ fn a_roll_on_a_full_device_starts_in_the_spare_kept_back() {
     let reserve = ino(dir.path().join(format!("{:016x}.spare", 0)));
     // As after a segment that could not be made: the roll does not wait
     // for one.
-    j.tail.full = true;
+    (j.tail.failed, j.tail.full) = (true, true);
     assert_eq!(j.roll().unwrap(), Some(2));
     j.append(1, &[b"y"]).unwrap();
     j.sync().unwrap();
     assert_eq!(ino(segment::path(dir.path(), 2)), reserve);
-    assert!(!j.tail.full);
+    // The spare kept back shows no room on the device.
+    assert!(j.full());
+    // A segment made from free space does.
+    j.create_next().unwrap();
+    j.wait().unwrap();
+    assert!(!j.full());
 }

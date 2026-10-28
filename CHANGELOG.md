@@ -22,7 +22,9 @@ Notable changes to zzq. The format follows
   allocated beside the first segment, and only the segment after a roll
   takes it, so a snapshot can start on a full device. Other writes that
   need a new segment then wait until a trim or freed space makes room,
-  and a segment or mark it could not make takes no space.
+  and a segment or mark it could not make takes no space;
+  `Journal::full` tells. A journal opened where one was dropped waits
+  for the writes and trims that one left.
 - `zzq-broker`: `BrokerOptions::data_dir` and `zzq_broker --data-dir` keep
   state in journals: retained messages in one per stripe of topics, each
   behind a lock of its own, and the sessions that outlive their
@@ -37,9 +39,13 @@ Notable changes to zzq. The format follows
   disconnected, and `Stats::write_errors` counts it. Once a journal grew
   well past what it holds, checked as each write finishes, it writes a
   snapshot and drops the segments before it. A journal that cannot get a
-  new segment, as on a full device, writes one at once. A connection a crash ended counts as lost at the next start,
-  so its will goes out. A changed lane count moves the sessions to their
-  new lanes. Linux only; not with `state_file`.
+  new segment, as on a full device, writes one at once.
+  `Stats::full_journals` and `$SYS/broker/store/full` count such
+  journals, `$SYS/broker/store/errors` the failed writes, and
+  `zzq_broker` says on stderr when the data directory fills and when it
+  has room again. A connection a crash ended counts as lost at the next
+  start, so its will goes out. A changed lane count moves the sessions to
+  their new lanes. Linux only; not with `state_file`.
 - `zzq-bench`: `zzq_loadbench` runs the fixed-load test against any broker:
   up to tens of thousands of connections, each publishing on a schedule,
   in steps of offered load, with latency from each send to its delivery.

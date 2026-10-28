@@ -980,7 +980,10 @@ async fn a_lane_journal_without_room_for_a_segment_snapshots_into_its_spare() {
         lane_until(&ctx, &broker, 0, |l| l.snapshot_journal(true).then_some(())).await;
         gone(&file("0000000000000001.seg")).await;
         assert_eq!(ino(&file("0000000000000002.seg")), reserve);
-        assert!(broker.stats().await.unwrap().write_errors >= 1);
+        let stats = broker.stats().await.unwrap();
+        assert!(stats.write_errors >= 1);
+        // The spare kept back shows no room on the device.
+        assert_eq!(stats.full_journals, 1);
         c.subscribe("b", SubscriptionOptions::from(QoS::AtLeastOnce))
             .await;
         drop(c);
@@ -1049,6 +1052,7 @@ async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare(
         }
         gone(&file("0000000000000001.seg")).await;
         assert_eq!(ino(&file("0000000000000002.seg")), reserve);
+        assert_eq!(broker.stats().await.unwrap().full_journals, 1);
         p.send(&publish(2, b"second")).await;
         assert_eq!(p.next().await, ack(2));
     }

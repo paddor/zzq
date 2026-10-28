@@ -59,6 +59,10 @@ impl Log {
         match *self {}
     }
 
+    pub(crate) const fn full(&self) -> bool {
+        match *self {}
+    }
+
     pub(crate) fn roll(&mut self) -> io::Result<Option<u64>> {
         match *self {}
     }

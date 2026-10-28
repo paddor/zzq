@@ -515,6 +515,37 @@ fn a_full_device_holds_writes_until_room_comes() {
 }
 
 #[test]
+fn a_reopen_waits_for_the_work_of_the_journal_dropped_before() {
+    let dir = TempDir::new("reopen-busy");
+    let disk = Disk::new(small()).unwrap();
+    let (mut j, _) = open(&disk, &dir.0);
+    append(&mut j, 1, 300);
+    j.sync().unwrap();
+    let next = loop {
+        if let Some(id) = j.roll().unwrap() {
+            break id;
+        }
+        j.wait().unwrap();
+    };
+    append(&mut j, 301, 310);
+    j.sync().unwrap();
+    // Dropped while the trim of many segments and a write still run.
+    assert!(segments(&dir.0) > 3, "too few segments to trim");
+    j.trim(next).unwrap();
+    append(&mut j, 311, 312);
+    j.flush().unwrap();
+    drop(j);
+    // From another disk, as a broker started after one dropped.
+    let other = Disk::new(small()).unwrap();
+    let (_, got) = open(&other, &dir.0);
+    assert!(
+        got == expected(312)[300..],
+        "{} records read back",
+        got.len()
+    );
+}
+
+#[test]
 fn written_bytes_count_whole_pages() {
     let dir = TempDir::new("written");
     let disk = Disk::new(small()).unwrap();
