@@ -1,5 +1,5 @@
-<svg viewBox="0 0 1440 1263" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, sans-serif">
-<rect x="0" y="0" width="1440" height="1263" opacity="1" fill="#000000" stroke="none"/>
+<svg viewBox="0 0 1440 1292" xmlns="http://www.w3.org/2000/svg" font-family="system-ui, -apple-system, sans-serif">
+<rect x="0" y="0" width="1440" height="1292" opacity="1" fill="#000000" stroke="none"/>
 <text x="174" y="63" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#E5E7EB">
 latency: p99, whiskers p50 to p99.9
 </text>
@@ -60,6 +60,8 @@ latency: p99, whiskers p50 to p99.9
 80K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="333,292 333,297 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="70" y1="73" x2="80" y2="83"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="70" y1="83" x2="80" y2="73"/>
 <polyline fill="none" opacity="0.65" stroke="#FF11FF" stroke-width="1" points="75,154 75,113 "/>
 <polyline fill="none" opacity="0.65" stroke="#FF11FF" stroke-width="1" points="73,154 78,154 "/>
 <polyline fill="none" opacity="0.65" stroke="#FF11FF" stroke-width="1" points="73,113 78,113 "/>
@@ -305,6 +307,8 @@ broker CPU
 80K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="736,292 736,297 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="474" y1="191" x2="484" y2="201"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="474" y1="201" x2="484" y2="191"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="667" y1="75" x2="677" y2="85"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="667" y1="85" x2="677" y2="75"/>
 <polyline fill="none" opacity="1" stroke="#FF11FF" stroke-width="2" points="479,94 543,121 608,106 "/>
@@ -425,6 +429,8 @@ broker memory (RSS)
 80K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="1139,292 1139,297 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="877" y1="145" x2="887" y2="155"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="877" y1="155" x2="887" y2="145"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="1070" y1="92" x2="1080" y2="102"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="1070" y1="102" x2="1080" y2="92"/>
 <polyline fill="none" opacity="1" stroke="#FF11FF" stroke-width="2" points="882,98 946,98 1011,98 "/>
@@ -534,6 +540,10 @@ Sagüin, 60K/s: p50 155 ms
 <text x="1230" y="204" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#E5E7EB">
 TBMQ, 60K/s: 77% delivered
 </text>
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="1210,218 1224,218 "/>
+<text x="1230" y="218" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#E5E7EB">
+NATS, 10K/s: 0% delivered, 10000 closed
+</text>
 <text x="174" y="373" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#E5E7EB">
 latency: p99, whiskers p50 to p99.9
 </text>
@@ -599,6 +609,8 @@ latency: p99, whiskers p50 to p99.9
 80K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="333,602 333,607 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="70" y1="383" x2="80" y2="393"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="70" y1="393" x2="80" y2="383"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="70" y1="402" x2="80" y2="412"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="70" y1="412" x2="80" y2="402"/>
 <polyline fill="none" opacity="0.65" stroke="#BBAA99" stroke-width="1" points="75,560 75,480 "/>
@@ -828,6 +840,8 @@ broker CPU
 80K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="736,602 736,607 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="474" y1="566" x2="484" y2="576"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="474" y1="576" x2="484" y2="566"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="474" y1="387" x2="484" y2="397"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="474" y1="397" x2="484" y2="387"/>
 <line opacity="1" stroke="#BBAA99" stroke-width="2" x1="667" y1="460" x2="677" y2="470"/>
@@ -947,6 +961,8 @@ broker memory (RSS)
 80K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="1139,602 1139,607 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="877" y1="458" x2="887" y2="468"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="877" y1="468" x2="887" y2="458"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="877" y1="384" x2="887" y2="394"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="877" y1="394" x2="887" y2="384"/>
 <line opacity="1" stroke="#BBAA99" stroke-width="2" x1="1070" y1="404" x2="1080" y2="414"/>
@@ -1063,6 +1079,10 @@ HiveMQ CE, 60K/s: 1% delivered
 <text x="1230" y="542" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#E5E7EB">
 TBMQ, 10K/s: p50 1 s
 </text>
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="1210,556 1224,556 "/>
+<text x="1230" y="556" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#E5E7EB">
+NATS, 10K/s: 0% delivered
+</text>
 <text x="174" y="683" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="9.67741935483871" opacity="1" fill="#E5E7EB">
 latency: p99, whiskers p50 to p99.9
 </text>
@@ -1123,6 +1143,25 @@ latency: p99, whiskers p50 to p99.9
 200K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="333,912 333,917 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="75,791 75,759 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="73,791 78,791 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="73,759 78,759 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="140,789 140,748 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="137,789 142,789 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="137,748 142,748 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="204,761 204,724 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="201,761 207,761 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="201,724 207,724 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="268,745 268,729 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="266,745 271,745 "/>
+<polyline fill="none" opacity="0.65" stroke="#9AA01E" stroke-width="1" points="266,729 271,729 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="328" y1="693" x2="338" y2="703"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="328" y1="703" x2="338" y2="693"/>
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="75,767 140,758 204,727 268,732 "/>
+<circle cx="75" cy="767" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="140" cy="758" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="204" cy="727" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="268" cy="732" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
 <polyline fill="none" opacity="0.65" stroke="#FF11FF" stroke-width="1" points="75,782 75,768 "/>
 <polyline fill="none" opacity="0.65" stroke="#FF11FF" stroke-width="1" points="73,782 78,782 "/>
 <polyline fill="none" opacity="0.65" stroke="#FF11FF" stroke-width="1" points="73,768 78,768 "/>
@@ -1446,6 +1485,13 @@ broker CPU
 200K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="736,912 736,917 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="731" y1="752" x2="741" y2="762"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="731" y1="762" x2="741" y2="752"/>
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="479,824 543,778 608,752 672,750 "/>
+<circle cx="479" cy="824" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="543" cy="778" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="608" cy="752" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="672" cy="750" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="731" y1="697" x2="741" y2="707"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="731" y1="707" x2="741" y2="697"/>
 <polyline fill="none" opacity="1" stroke="#FF11FF" stroke-width="2" points="479,856 543,819 608,759 672,706 "/>
@@ -1586,6 +1632,13 @@ broker memory (RSS)
 200K/s
 </text>
 <polyline fill="none" opacity="1" stroke="#9CA3AF" stroke-width="1" points="1139,912 1139,917 "/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="1134" y1="761" x2="1144" y2="771"/>
+<line opacity="1" stroke="#9AA01E" stroke-width="2" x1="1134" y1="771" x2="1144" y2="761"/>
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="882,788 946,788 1011,788 1075,787 "/>
+<circle cx="882" cy="788" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="946" cy="788" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="1011" cy="788" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
+<circle cx="1075" cy="787" r="2.5" opacity="1" fill="#9AA01E" stroke="none" stroke-width="1"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="1134" y1="694" x2="1144" y2="704"/>
 <line opacity="1" stroke="#FF11FF" stroke-width="2" x1="1134" y1="704" x2="1144" y2="694"/>
 <polyline fill="none" opacity="1" stroke="#FF11FF" stroke-width="2" points="882,700 946,699 1011,699 1075,699 "/>
@@ -1694,6 +1747,10 @@ VerneMQ, 50K/s: 73% delivered
 <text x="1230" y="768" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#E5E7EB">
 TBMQ, 200K/s: 94% delivered
 </text>
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="1210,782 1224,782 "/>
+<text x="1230" y="782" dy="0.5ex" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#E5E7EB">
+NATS, 200K/s: 89% delivered
+</text>
 <text x="290" y="940" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#9CA3AF">
 runs on
 </text>
@@ -1795,20 +1852,30 @@ TBMQ v2.4.1
 <text x="290" y="1164" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#9CA3AF">
 CPUs 0-3, with Kafka, Valkey, PostgreSQL
 </text>
-<text x="78" y="1188" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
-QoS 1, 16 B, MQTT 5 (rumqttd 3.1.1). Each publisher sends on a fixed schedule; the offered rate counts deliveries. Steps run 2 s, then measure 8 s, on the same connections.
+<polyline fill="none" opacity="1" stroke="#9AA01E" stroke-width="2" points="78,1186 92,1186 "/>
+<text x="98" y="1180" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#E5E7EB">
+NATS v2.15.2
 </text>
-<text x="78" y="1201" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
+<text x="290" y="1180" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.870967741935484" opacity="1" fill="#9CA3AF">
+CPUs 0-3, MQTT 3.1.1
+</text>
+<text x="78" y="1204" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
+QoS 1, 16 B, MQTT 5 (rumqttd and NATS 3.1.1). Each publisher sends on a fixed schedule; the offered rate counts deliveries. Steps run 2 s, then measure 8 s, on the same connections.
+</text>
+<text x="78" y="1217" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
 Latency runs from the send to delivery, or from when it was due if the broker held it back. Seconds with host CPU steal are left out. Broker on CPUs 0-3, load generator on CPUs 4-5.
 </text>
-<text x="78" y="1214" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
+<text x="78" y="1230" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
 A step fails under 95% delivered, on a closed connection, or at a median over 100 ms; a cross marks it and no higher step runs.
 </text>
-<text x="78" y="1227" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
+<text x="78" y="1243" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
 A broker that drops clients while they connect fails its first step with 0% delivered. Fan-out latency includes the generator reading each burst of 1000 deliveries.
 </text>
-<text x="78" y="1240" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
+<text x="78" y="1256" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
 Tuned configs, except where they run out of memory at 20K connections: NanoMQ&apos;s queue (2048), FluxMQ&apos;s send queue (1000), VerneMQ&apos;s socket buffers (128 KiB). See COMPARISONS.md.
+</text>
+<text x="78" y="1269" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="8.064516129032258" opacity="1" fill="#9CA3AF">
+NATS has no shared subscriptions: it takes the fan-in filter as a plain one, which matches no topic.
 </text>
 
 <text x="720" y="17" text-anchor="middle" font-family="sans-serif" font-size="14" font-weight="bold" fill="#F9FAFB">MQTT brokers at fixed load, TCP loopback</text>

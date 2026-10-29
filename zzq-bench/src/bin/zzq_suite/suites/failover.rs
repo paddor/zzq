@@ -48,7 +48,8 @@ impl Suite<'_> {
                 .arg(format!("subs={SUBS}"))
                 .arg(format!("secs={secs}"))
                 .arg(format!("at={at}"))
-                .arg(format!("offline={}", u8::from(offline)));
+                .arg(format!("offline={}", u8::from(offline)))
+                .args(cluster::client_args(name));
             let ran = self.bench(std::slice::from_ref(&cmd), 0, Duration::from_secs(120))?;
             drop(running);
             let mut row = ran

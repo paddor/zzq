@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use super::{Ctr, data, env_args, store};
-use crate::paths::Paths;
 
 /// TBMQ's REST API.
 const API: &str = "http://127.0.0.1:8083/api";
@@ -172,33 +171,6 @@ pub(super) fn open() -> Result<(), String> {
     Ok(())
 }
 
-/// Waits until a QoS 1 message gets through. TBMQ listens before its
-/// Kafka consumers have their partitions, and what is sent before then
-/// is never delivered.
-pub(super) fn ready(p: &Paths) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(300);
-    loop {
-        let probe = Command::new("timeout")
-            .arg("30")
-            .arg(p.tool("zzq_brokerbench"))
-            .args(["rtt", "qos=1", "size=16", "iters=20"])
-            .output();
-        if probe.is_ok_and(|o| o.status.success() && delivered(&String::from_utf8_lossy(&o.stdout)))
-        {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err("TBMQ delivers nothing after 300s".to_owned());
-        }
-        thread::sleep(Duration::from_secs(2));
-    }
-}
-
-/// Whether a round-trip result lost none.
-fn delivered(out: &str) -> bool {
-    out.split_whitespace().skip_while(|&w| w != "lost").nth(1) == Some("0")
-}
-
 /// The ID of the basic auth provider in a list of providers.
 fn basic_id(providers: &Value) -> Option<&str> {
     providers["data"]
@@ -261,9 +233,6 @@ mod tests {
         assert_eq!(basic_id(&providers), Some("b"));
         assert_eq!(basic_id(&json!({"data": []})), None);
         assert_eq!(env(&["A=1"]), ["-e", "A=1"]);
-        assert!(delivered("rtt v5  p50 9.0us  max 20.0us  lost 0  gen 1%"));
-        assert!(!delivered("rtt v5  p50 9.0us  lost 3  gen 1%"));
-        assert!(!delivered("error: closed"));
     }
 
     #[test]

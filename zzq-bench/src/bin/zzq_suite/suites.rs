@@ -148,9 +148,12 @@ pub(crate) fn broker_cells(shape: &Shape) -> Vec<Load> {
 /// The cells of the durability suite: QoS 1 and 2 to subscribers whose
 /// sessions outlive their connection, so a broker with storage keeps
 /// each message, and the time to the PUBACK. `pinned` goes on the
-/// single-pair and round-trip commands.
-pub(crate) fn durable_cells(pinned: &[String]) -> Vec<Load> {
-    let timed = ["warmup=1", "secs=5", "persist=1"].map(String::from);
+/// single-pair and round-trip commands, `extra` on all.
+pub(crate) fn durable_cells(pinned: &[String], extra: &[String]) -> Vec<Load> {
+    let mut timed = ["warmup=1", "secs=5", "persist=1"]
+        .map(String::from)
+        .to_vec();
+    timed.extend(extra.iter().cloned());
     let mut cells = Vec::new();
     for (scenario, peers) in [
         ("pairs", None),
@@ -158,9 +161,9 @@ pub(crate) fn durable_cells(pinned: &[String]) -> Vec<Load> {
         ("fanout", Some(16)),
         ("fanin", Some(16)),
     ] {
-        let mut extra = timed.to_vec();
+        let mut args = timed.clone();
         if peers.is_none() {
-            extra.extend(pinned.iter().cloned());
+            args.extend(pinned.iter().cloned());
         }
         for size in SIZES {
             for qos in 1..3 {
@@ -169,13 +172,13 @@ pub(crate) fn durable_cells(pinned: &[String]) -> Vec<Load> {
                     qos,
                     size,
                     peers,
-                    extra: extra.clone(),
+                    extra: args.clone(),
                 });
             }
         }
     }
     let mut rtt = vec!["persist=1".to_owned(), "ack=1".to_owned()];
-    rtt.extend(pinned.iter().cloned());
+    rtt.extend(pinned.iter().chain(extra).cloned());
     for size in SIZES {
         cells.push(Load {
             scenario: "rtt",
@@ -307,7 +310,7 @@ impl Suite<'_> {
         &self,
         who: &Row,
         broker: (&str, &str, usize),
-        extra: &[&str],
+        extra: &[String],
     ) -> Result<(), String> {
         let (name, config, lanes) = broker;
         for (scenario, pubs, subs, rates) in FIXED {
@@ -511,7 +514,7 @@ mod tests {
 
     #[test]
     fn a_durable_suite_keeps_sessions_and_times_the_puback() {
-        let cells = durable_cells(&["lanes=2".into(), "cross=1".into()]);
+        let cells = durable_cells(&["lanes=2".into(), "cross=1".into()], &["v=4".into()]);
         assert_eq!(cells.len(), 4 * 4 * 2 + 4);
         assert!(
             cells
@@ -522,13 +525,16 @@ mod tests {
         let first = cells[0].cmd(&p, "7,8").to_string();
         assert!(
             first.ends_with(
-                "pairs qos=1 size=16 warmup=1 secs=5 persist=1 lanes=2 cross=1 cpu_pid=7,8"
+                "pairs qos=1 size=16 warmup=1 secs=5 persist=1 v=4 lanes=2 cross=1 cpu_pid=7,8"
             ),
             "{first}"
         );
         assert!(!cells[8].extra.contains(&"cross=1".into()), "16 pairs");
         let rtt = cells.last().unwrap();
-        assert_eq!(rtt.extra, ["persist=1", "ack=1", "lanes=2", "cross=1"]);
+        assert_eq!(
+            rtt.extra,
+            ["persist=1", "ack=1", "lanes=2", "cross=1", "v=4"]
+        );
         assert_eq!(
             Value::Object(rtt.cell()),
             json!({"kind": "rtt", "qos": 1, "msg_size": 4096})

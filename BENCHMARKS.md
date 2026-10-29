@@ -15,8 +15,8 @@ them.
 - Before each run, the runner waits for 90% idle CPU and no compiler
   processes. A run that overlaps a compiler is repeated.
 - Each cell is one run. The charts show the newest run per cell: zzq,
-  HiveMQ CE, TBMQ and every run with storage on from 2026-10-28 and 29,
-  the rest from 2026-10-26.
+  HiveMQ CE, TBMQ, NATS and every run with storage on from 2026-10-28
+  and 29, the rest from 2026-10-26.
 - Rivals run tuned configs: in-flight windows of about 1000, queues of about
   100K, no rate limits, and Nagle off where they have the knob. Several
   defaults drop messages or pace subscribers, which would measure the
@@ -40,6 +40,7 @@ them.
 | Sagüin | 0.1.0-rc.1 | Go | source build |
 | HiveMQ CE | 2026.5 | Java | official image |
 | TBMQ | 2.4.1 | Java | official images, with Kafka, Valkey and PostgreSQL |
+| NATS | 2.15.2 | Go | release binary, MQTT 3.1.1, with JetStream |
 
 [^vernemq]: VerneMQ's binary packages and images come under an EULA that
     forbids competitive analysis. The source is Apache-2.0.
@@ -53,7 +54,7 @@ this load, and why some configs differ from the tuned ones.
 
 - Load generator: `zzq_brokerbench` from `zzq-bench`, raw sockets, one
   thread per connection, pre-encoded batches. MQTT 5.0, except 3.1.1 for
-  rumqttd.
+  rumqttd and NATS.
 - 1 s warmup (5 s for rumqttd, whose memory grows for a few seconds
   first), then a 5 s window. The rate is deliveries at the subscribers.
   Loss compares all deliveries with all sends once 2 s pass without a

@@ -19,7 +19,7 @@ pub(crate) const PORT: u16 = 1883;
 /// CPUs of the broker.
 const CPUS: &str = "0-3";
 /// Rival versions, as built or pulled for the runs.
-pub(crate) const VERSIONS: [(&str, &str); 15] = [
+pub(crate) const VERSIONS: [(&str, &str); 16] = [
     ("rmqtt", "0.24.0"),
     ("emqx", "6.3.2"),
     ("mosquitto", "2.1.2"),
@@ -32,6 +32,7 @@ pub(crate) const VERSIONS: [(&str, &str); 15] = [
     ("saguin", "0.1.0-rc.1"),
     ("hivemq", "2026.5"),
     ("tbmq", "2.4.1"),
+    ("nats", "2.15.2"),
     ("rumqttc", "0.25.1"),
     ("ntex-mqtt", "9.3.0"),
     ("emqtt", "1.14.6"),
@@ -164,6 +165,35 @@ fn process(
     wait_port(PORT, START)?;
     thread::sleep(settle);
     Ok(running)
+}
+
+/// Waits until a QoS 1 message gets through the broker on [`PORT`], with
+/// `extra` options to the load generator. TBMQ listens before its Kafka
+/// consumers have their partitions, and what is sent before then is never
+/// delivered; a NATS cluster before its MQTT streams have their replicas.
+pub(crate) fn delivers(p: &Paths, name: &str, extra: &[&str]) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    loop {
+        let probe = Command::new("timeout")
+            .arg("30")
+            .arg(p.tool("zzq_brokerbench"))
+            .args(["rtt", "qos=1", "size=16", "iters=20"])
+            .args(extra)
+            .output();
+        if probe.is_ok_and(|o| o.status.success() && delivered(&String::from_utf8_lossy(&o.stdout)))
+        {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{name} delivers nothing after 300s"));
+        }
+        thread::sleep(Duration::from_secs(2));
+    }
+}
+
+/// Whether a round-trip result lost none.
+fn delivered(out: &str) -> bool {
+    out.split_whitespace().skip_while(|&w| w != "lost").nth(1) == Some("0")
 }
 
 /// How long a broker, or a store it needs, may take to listen.
@@ -341,7 +371,7 @@ pub(crate) fn start(name: &str, config: &str, lanes: usize, p: &Paths) -> Result
     let running = containers(&ctrs, Duration::from_secs(settle))?;
     if name == "tbmq" {
         tbmq::open()?;
-        tbmq::ready(p)?;
+        delivers(p, "TBMQ", &[])?;
     }
     Ok(running)
 }
@@ -514,6 +544,11 @@ fn broker_cmd(name: &str, config: &str, lanes: usize, p: &Paths) -> Result<Cmd, 
                 .arg(conf("yaml"))
                 .dir(store("fluxmq")?)
         }
+        // MQTT runs on JetStream, which keeps its streams in an empty
+        // store each start.
+        "nats" => rival("nats/bin/nats-server")?
+            .arg("-c")
+            .arg(in_store("nats", &conf("conf"))?),
         _ => return Err(format!("unknown broker {name}")),
     })
 }
@@ -593,6 +628,9 @@ mod tests {
         assert_eq!(volume(Path::new("/c"), "/etc/x")[1], "/c:/etc/x:ro,Z");
         assert_eq!(version("emqx"), Some("6.3.2"));
         assert!(start("nope", "tuned", 1, &p).is_err());
+        assert!(delivered("rtt v5  p50 9.0us  max 20.0us  lost 0  gen 1%"));
+        assert!(!delivered("rtt v5  p50 9.0us  lost 3  gen 1%"));
+        assert!(!delivered("error: closed"));
     }
 
     #[test]
@@ -622,6 +660,10 @@ mod tests {
             cmd("fluxmq", "fixed")
                 .unwrap()
                 .ends_with("fluxmq-fixed.yaml")
+        );
+        let nats = cmd("nats", "durable").unwrap();
+        assert!(
+            nats.contains("/r/nats/bin/nats-server -c ") && nats.ends_with("nats-durable.conf")
         );
         assert!(
             cmd("vernemq", "tuned")

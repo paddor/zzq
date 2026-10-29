@@ -4,12 +4,12 @@ How the brokers in [BENCHMARKS.md](BENCHMARKS.md) compare:
 
 - **Under load:** what they do with messages they cannot deliver, where
   the memory goes, and which defaults decide a benchmark. Measured on
-  one machine with tuned configs: zzq, HiveMQ CE and TBMQ on 2026-10-28
-  and 29, the rest on 2026-10-26.
+  one machine with tuned configs: zzq, HiveMQ CE, TBMQ and NATS on
+  2026-10-28 and 29, the rest on 2026-10-26.
 - **With storage on:** the same load with each broker's most durable
   setting, measured on 2026-10-28 and 29.
 - **What a crash or a failed node loses:** from each release's source,
-  docs and issues. Failover is also measured, for three clusters.
+  docs and issues. Failover is also measured, for four clusters.
 
 Source links point to the release that ran.
 
@@ -31,6 +31,7 @@ Source links point to the release that ran.
 | Sagüin | 90 / 90 / 83% | 460 MiB | yes | 60K / 20K / - |
 | HiveMQ CE | 100 / 78 / 74% | 6.9 GiB | yes | - / 60K / - |
 | TBMQ | 57 / 69 / 65% | 18.4 GiB, with its stores | no | 60K / 10K / 200K |
+| NATS | 0 / 0 / 0% | 1.1 GiB | no | 10K / n/a / 200K |
 
 - Fan-in: 16 publishers to one subscriber, the worst of 16 B to 4 KiB.
   Loss is what was not delivered once 2 s passed without a delivery, or
@@ -42,12 +43,12 @@ Source links point to the release that ran.
   and one subscriber on a topic of their own.
 - Fixed load: the first failed step for point to point, fan-in and
   fan-out with 20K connections. "-" passed every step (80K, 80K and
-  200K/s).
+  200K/s). Fan-in uses a shared subscription, which NATS lacks.
 
 ## Patterns
 
 - **Ack, then drop.** A PUBACK tells a publisher the broker took the
-  message. Nine of twelve brokers then dropped acked messages once a
+  message. Nine of thirteen brokers then dropped acked messages once a
   fan-in subscriber's queue filled: rmqtt, EMQX, Mosquitto, NanoMQ,
   rumqttd, FlashMQ (QoS 2), Sagüin, HiveMQ CE and TBMQ. Sagüin acked
   151K msg/s at QoS 1 while its subscriber got 1.7K/s. Mosquitto's man
@@ -56,7 +57,8 @@ Source links point to the release that ran.
   publisher never learns.
 - **Ack, then starve.** VerneMQ acked 128K QoS 1 msg/s on fan-in and
   delivered none in the 5 s window. One QoS 1 pair: 59.7K/s acked, 20/s
-  delivered. The backlog drains after the publishers stop.
+  delivered. NATS acked 32K QoS 2 msg/s on fan-in and delivered 1.7K/s.
+  The backlog drains after the publishers stop.
 - **Memory as the queue.** Without backpressure, overload goes to RAM. Peak
   RSS in the throughput suite: FlashMQ 10.1 GiB, FluxMQ 7.3 GiB, HiveMQ
   CE 6.9 GiB, rumqttd 6.2 GiB, VerneMQ 6.1 GiB and rmqtt 3.6 GiB. TBMQ
@@ -67,9 +69,9 @@ Source links point to the release that ran.
   limit of 100K). HiveMQ CE closed it too, and every subscriber of 16
   and 64 QoS 0 pairs, without a DISCONNECT or a log line.
 - **Stall the publisher.** At QoS 0 a broker's only backpressure is to
-  read a socket less. With 64 pairs, eight of twelve read less than 64 KiB
-  from one publisher in 10 s, while the load fell. FlashMQ did it with
-  one pair too. Such a client cannot send anything else, not even
+  read a socket less. With 64 pairs, eight of thirteen read less than
+  64 KiB from one publisher in 10 s, while the load fell. FlashMQ did it
+  with one pair too. Such a client cannot send anything else, not even
   PINGREQ or DISCONNECT.
 - **Allocate per connection.** Queue sizes that suit throughput break at
   20K connections, so three brokers needed their own config for the
@@ -111,6 +113,7 @@ The runs in BENCHMARKS.md raise them.
 | HiveMQ CE | `persistence/mode` | `file` | every QoS 1/2 message goes through a disk queue: one QoS 1 pair delivers 4.8K msg/s at 342% CPU, 96K in memory |
 | TBMQ | `MQTT_FLOW_CONTROL_DELAYED_QUEUE_MAX_SIZE` | 1000 | messages past a subscriber's window are dropped, one log line each |
 | TBMQ | MQTT basic auth provider | on | clients without credentials are refused |
+| NATS | `jetstream.limits.default_max_consumers` | 1000 | each QoS 1/2 subscription is a consumer of one stream: the 1001st gets SUBACK 0x80 |
 
 ## With storage on
 
@@ -132,18 +135,22 @@ sessions. Rates are deliveries per second in the 5 s window.
 | Sagüin | no | 142 µs | 2.5K / 2.0K | 13K | 14K | 0 / 0% |
 | HiveMQ CE | no | 164 µs | 4.6K / 4.4K | 9.8K | 331 | 0 / 0% |
 | TBMQ | yes | 8.1 ms | 6.5K / 511 | 6.6K | 8.8K | 0 / 0% |
+| NATS | yes | 3.4 ms | 297 / 280 | 320 | 205 | 0 / 47% |
 
 - **Group commit.** zzq's PUBACK waits for its write, but each write
   carries every record that came in while the one before was in flight.
-  The two others whose PUBACK waits for a synced write, XMQ and TBMQ, ran
-  390 and 6.5K msg/s on one pair.
+  The three others whose PUBACK waits for a synced write, NATS, XMQ and
+  TBMQ, ran 297, 390 and 6.5K msg/s on one pair. NATS syncs each message
+  alone, so 16 pairs ran no faster than one.
 - **Ack before the disk.** The others respond in 45-177 µs because their
   PUBACK waits for no synced write. What a crash then loses is in the
   next section.
 - **Starved by the store.** VerneMQ, with each LevelDB write synced,
   acked 50K msg/s on one pair and delivered none in the window or the
   drain after it. NanoMQ delivered 130 msg/s on one pair and lost 95% of
-  QoS 1 fan-in, with the publishers acked.
+  QoS 1 fan-in, with the publishers acked. NATS at QoS 2 ran 0-282 msg/s
+  from run to run and stalled for seconds; its 47% had not arrived 2 s
+  after the last delivery, and a rerun of that cell lost nothing.
 - **zzq pays at 4 KiB.** One pair on one lane runs 14K msg/s, below
   Mosquitto (23K) and rmqtt (18K), which do not wait for the disk.
 
@@ -166,12 +173,14 @@ What a crash loses that a publisher already has its PUBACK for.
 | Sagüin | none until configured | memory or SQLite | for the commit, not the fsync | 150 ms on power loss with SQLite |
 | HiveMQ CE | files | files | for the write, not the fsync | about 1 s on power loss |
 | TBMQ | Kafka, Valkey | Kafka, Valkey | for the Kafka write, not the fsync | Valkey writes since its last snapshot |
+| NATS | JetStream files, synced every 2 min | `sync_interval: always` | for the write; the fsync too with `sync_interval: always` | nothing it acked; by default, 2 min on power loss |
 
 - **Ack, then write.** Of the brokers with storage, only XMQ in
   Super-Durable mode with `max_queued_writes: 0`, Sagüin, HiveMQ CE, TBMQ,
-  FluxMQ queues in `fsync` mode and zzq write before the PUBACK. Of those,
-  only zzq, XMQ with Redis on `appendfsync always`, FluxMQ queues, and
-  TBMQ with Kafka syncing each message wait for the write to be synced.
+  NATS, FluxMQ queues in `fsync` mode and zzq write before the PUBACK. Of
+  those, only zzq, XMQ with Redis on `appendfsync always`, FluxMQ queues,
+  TBMQ with Kafka syncing each message and NATS with `sync_interval:
+  always` wait for the write to be synced.
 - Each broker's storage, with sources, is under [Brokers](#brokers).
 
 ## Clustering
@@ -193,6 +202,7 @@ What the open release offers, and what happens when a node fails.
 | Sagüin | none | - | - |
 | HiveMQ CE | none | - | - |
 | TBMQ | yes, nodes share Kafka, Valkey and PostgreSQL | everything, in the shared stores | its clients reconnect to another node |
+| NATS | JetStream, Raft per stream and consumer | sessions, QoS 1/2 and retained messages, in streams on all three; an ack waits for two | its clients reconnect to another node; what it led waits 4-9 s for an election |
 
 ### Failover, measured
 
@@ -230,6 +240,10 @@ come back 2 s after.
 | TBMQ | KILL, away | 1K | 8.9K | 0 | 2.0K | 5.1K | 340 ms |
 | TBMQ | KILL | 10K | 9.7K | 0 | 8 | 0 | 436 ms |
 | TBMQ | TERM | 1K | 7.1K | 0 | 2.8K | 2.1K | 369 ms |
+| NATS | KILL | 1K | 8.5K | 0 | 18 | 3 | 10.1 s |
+| NATS | KILL, away | 1K | 18.1K | 0 | 0 | 9 | 1.0 s |
+| NATS | KILL | 10K | 42.1K | 0 | 45 | 32 | 6.1 s |
+| NATS | TERM | 1K | 19.9K | 0 | 0 | 0 | 128 ms |
 
 - Not measured: rmqtt and FluxMQ. EMQX's open release refuses to
   cluster.
@@ -710,3 +724,87 @@ to the release that ran.
     or stopped, and nothing acked lost, at about 470 PUBACKs a second.
     With the subscribers away, or after a stop, they got thousands of
     messages twice and out of order.
+
+### NATS 2.15.2
+
+- **Under load**
+  - MQTT 3.1.1 only: a CONNECT at protocol level 5 is refused
+    ([mqtt.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/mqtt.go#L3879-L3882)).
+    MQTT needs JetStream on.
+  - QoS 0 goes through core NATS and lost nothing at any size: 1.0M msg/s
+    on one pair, 2.8M on 64 pairs and 1.45M on fan-in.
+  - Every QoS 1/2 message of every session goes through one JetStream
+    stream on disk, `$MQTT_msgs`
+    ([mqtt.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/mqtt.go#L1462-L1476)).
+    One QoS 1 pair ran 66K msg/s; 16 pairs ran 48K and 64 pairs 30K,
+    together.
+  - QoS 1 fan-in lost nothing: the publishers were acked at 107K msg/s,
+    the subscriber got 42K/s, and the rest waited in the stream.
+  - QoS 2 delivery stays near 9K msg/s per subscriber at every size, as
+    each PUBREC waits in the read loop for a JetStream write
+    ([mqtt.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/mqtt.go#L5585-L5591)).
+  - A subscriber with more than 64 MiB pending, or a write blocked for
+    10 s, is disconnected
+    ([client.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/client.go#L2665-L2679)).
+    A QoS 1/2 message without a PUBACK is sent again after 30 s, also on
+    the same connection
+    ([mqtt.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/mqtt.go#L152-L156)).
+  - Each QoS 1/2 subscription is a JetStream consumer, and 2.15 caps a
+    stream at 1000 of them
+    ([jetstream_api.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/jetstream_api.go#L426-L427)).
+    By default the 1001st QoS 1/2 subscription gets SUBACK 0x80; the
+    tuned config lifts the cap.
+  - Fixed load: point to point fails at the first step, 10K/s, with
+    nothing delivered. Each subscriber PUBACK takes the stream's write
+    lock
+    ([stream.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/stream.go#L9386-L9387))
+    and checks every consumer for interest
+    ([stream.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/stream.go#L9274-L9287)),
+    40% of its CPU with 10K subscribers. The publishers got no ack for
+    their writes within 5 s and were closed. Fan-out passes 150K/s at an
+    80 ms median.
+  - Fixed-load fan-in gets nothing: NATS has no shared subscriptions
+    ([#6859](https://github.com/nats-io/nats-server/issues/6859)),
+    and grants a `$share/` filter as a plain one that matches no topic.
+  - With 10K subscribers connecting at once, the queue of JetStream
+    requests passed its limit of 10K, and NATS dropped all of them
+    ([jetstream_api.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/jetstream_api.go#L1030-L1033)).
+  - After the fixed-load point-to-point step it took 106 s to exit on
+    SIGTERM.
+- **Storage**
+  - JetStream keeps sessions and QoS 1/2 and retained messages in files.
+    The PUBACK waits for the write to the file, which is synced every
+    2 minutes
+    ([filestore.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/filestore.go#L338-L339)).
+    A process crash loses nothing acked; a power loss loses up to
+    2 minutes.
+  - Every session is stored, also with clean session, for as long as its
+    connection lasts ([docs](https://docs.nats.io/running-a-nats-service/configuration/mqtt)).
+  - With `sync_interval: always`, each message is a synced write of its
+    own
+    ([filestore.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/filestore.go#L8925-L8927)):
+    one QoS 1 pair ran 297 msg/s, 16 pairs 320 together, with 3.4 ms to
+    the PUBACK.
+  - QoS 2 then ran 0-282 msg/s from run to run. In one run of 16 pairs,
+    7 publishers were closed when a write waited 5 s for its ack.
+  - A retained PUBLISH stops the connection's read loop until JetStream
+    has stored it ([#8790](https://github.com/nats-io/nats-server/issues/8790)).
+- **Cluster**
+  - JetStream replicates each stream and consumer with Raft, on up to
+    three nodes; the MQTT streams take the cluster's size
+    ([mqtt.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/mqtt.go#L1643-L1666)).
+    A PUBACK waits for two of three.
+  - Raft elects a new leader 4-9 s after the old one goes quiet
+    ([raft.go](https://github.com/nats-io/nats-server/blob/v2.15.2/server/raft.go#L317-L318)).
+    Measured: 1-10 s without a PUBACK after a node was killed, depending
+    on what it led, and nothing acked lost. After a stop, 128 ms.
+  - Some messages came twice or out of order: "JetStream QoS redelivery
+    happens out of (original) order"
+    ([README-MQTT.md](https://github.com/nats-io/nats-server/blob/v2.15.2/server/README-MQTT.md#L588-L590)).
+  - With the streams on all three nodes, four QoS 1 publishers that each
+    wait for their PUBACK got about 3K PUBACKs a second.
+  - "retained messages in clustering mode is best-effort" ([docs](https://docs.nats.io/running-a-nats-service/configuration/mqtt)).
+  - The Will of a client still connected at a graceful shutdown is never
+    published ([#8706](https://github.com/nats-io/nats-server/issues/8706)), fixed on `main` after 2.15.2.
+  - Open: MQTT clients of a 3-node cluster stopped getting messages until
+    they took another client ID ([#6989](https://github.com/nats-io/nats-server/issues/6989)).

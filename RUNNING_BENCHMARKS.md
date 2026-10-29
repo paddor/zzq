@@ -70,7 +70,10 @@ of order, into `failover.jsonl`. zzq nodes keep state files in
 in `$TMPDIR/zzq-suite/failover-vernemq`, joined to node 0, with the
 `cluster` config (its netsplit defaults) or `netsplit` (it serves during
 one). TBMQ runs as three containers beside one PostgreSQL, Kafka and
-Valkey, with 2 GiB heaps; node 0 installs the database.
+Valkey, with 2 GiB heaps; node 0 installs the database. NATS runs as
+three processes routed to each other, with the MQTT streams on all three
+(`nats-cluster.conf`) and their stores in
+`$TMPDIR/zzq-suite/failover-nats`.
 
 ## Rivals
 
@@ -86,13 +89,16 @@ others are builds under `ZZQ_RIVALS`:
 | `flashmq/bin/flashmq` | FlashMQ 1.27.3 |
 | `fluxmq/bin/fluxmq` | FluxMQ 1.0.0 |
 | `saguin/bin/saguin` | Sagüin 0.1.0-rc.1 |
+| `nats/bin/nats-server` | NATS 2.15.2, the `linux-amd64` release binary |
 | `vernemq-src/_build/default/rel/vernemq` | VerneMQ 2.2.1 built from source, with its generated `etc/vernemq.conf` copied to `etc/vernemq.conf.orig` |
 | `emqtt-bench/lib` | emqtt 1.14.6 and its dependencies, from an emqtt-bench release |
 
 - VerneMQ is built from source: its official images and packages come
   under an EULA that forbids competitive analysis.
-- FluxMQ, HiveMQ CE and TBMQ keep their stores in `$TMPDIR/zzq-suite` in
-  every config, so set `TMPDIR` to a disk.
+- FluxMQ, HiveMQ CE, TBMQ and NATS keep their stores in
+  `$TMPDIR/zzq-suite` in every config, so set `TMPDIR` to a disk. NATS
+  needs JetStream for MQTT, and speaks MQTT 3.1.1 only, so its runs do
+  too.
 - TBMQ runs with PostgreSQL 17, Kafka 4.0 and Valkey 8 containers, all on
   the broker CPUs, and needs ports 5432, 6379, 8083, 8084, 9092 and 9093.
   After start, the suite turns off its basic auth provider over the REST

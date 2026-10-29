@@ -77,8 +77,15 @@ pub(crate) fn start(name: &str, config: &str, p: &Paths) -> Result<Cluster, Stri
         "zzq" => zzq(p),
         "vernemq" => vernemq(config, p),
         "tbmq" => tbmq(p),
+        "nats" => nats(p),
         _ => Err(format!("no cluster of {name}")),
     }
+}
+
+/// The options `zzq_failover` needs for broker `name`: `v=4` for one that
+/// speaks MQTT 3.1.1 only.
+pub(crate) fn client_args(name: &str) -> &'static [&'static str] {
+    if name == "nats" { &["v=4"] } else { &[] }
 }
 
 fn spawn(cmd: &Cmd, cluster: &mut Cluster) -> Result<(), String> {
@@ -214,7 +221,7 @@ fn tbmq(p: &Paths) -> Result<Cluster, String> {
     let ctrs = super::tbmq::cluster_ctrs(&p.conf("tbmq-cluster.env"))?;
     let running = super::containers(&ctrs, Duration::from_secs(2))?;
     super::tbmq::open()?;
-    super::tbmq::ready(p)?;
+    super::delivers(p, "TBMQ", &[])?;
     Ok(Cluster {
         nodes: Vec::new(),
         containers: Some(running),
@@ -222,6 +229,35 @@ fn tbmq(p: &Paths) -> Result<Cluster, String> {
             .map(|i| super::tbmq::signal(i, "SIGNAL"))
             .collect(),
     })
+}
+
+/// `nats-server` nodes with `JetStream`, routed to each other, the MQTT
+/// streams on all three, once a QoS 1 message gets through node 0.
+fn nats(p: &Paths) -> Result<Cluster, String> {
+    let bin = p.rival("nats/bin/nats-server")?;
+    let conf = fs::read_to_string(p.conf("nats-cluster.conf"))
+        .map_err(|e| format!("nats-cluster.conf: {e}"))?;
+    let dir = store("failover-nats")?;
+    let mut cluster = empty();
+    for i in 0..NODES {
+        let node = dir.join(format!("n{i}"));
+        let path = dir.join(format!("n{i}.conf"));
+        let text = conf
+            .replace("@I@", &i.to_string())
+            .replace("@STORE@", &node.to_string_lossy())
+            .replace("@CLIENT@", &(4222 + i).to_string())
+            .replace("@ROUTE@", &(6222 + i).to_string())
+            .replace("@MQTT@", &(MQTT + i).to_string());
+        fs::write(&path, text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let cmd = Cmd::pinned(&i.to_string(), &bin).arg("-c").arg(path);
+        spawn(&cmd, &mut cluster)?;
+    }
+    for i in 0..NODES {
+        wait_port(MQTT + i, FORM)?;
+    }
+    // The MQTT streams wait for a JetStream leader and all three nodes.
+    super::delivers(p, "NATS", &["v=4"])?;
+    Ok(cluster)
 }
 
 /// `vmq-admin` of node `i` under `dir`.

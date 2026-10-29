@@ -5,11 +5,11 @@
 //! of what was acked the subscribers lack, got twice or out of order.
 //!
 //! Usage: `zzq_failover uris=URI,URI,URI stop=CMD|CMD|CMD [rate=1000]
-//! [pubs=4] [subs=4] [secs=20] [at=8] [offline=0]`
+//! [pubs=4] [subs=4] [secs=20] [at=8] [offline=0] [v=5]`
 //!
 //! With `offline=1` the subscribers go away 2 s before the stop and come
 //! back 2 s after it, so what is published meanwhile waits in their
-//! sessions.
+//! sessions. `v=4` speaks MQTT 3.1.1, whose sessions do not expire.
 //!
 //! Prints `failover rate=… offline=… pubs=… subs=… acked=… lost=… dup=… reordered=…
 //! down_ms=… stall_ms=… resends=…`: `down_ms` the longest time without
@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use zzq_client::{Client, ClientOptions, Context, QoS};
+use zzq_client::{Client, ClientOptions, Context, QoS, Version};
 
 /// How long a publish may take before its connection counts as lost.
 const ACK_WAIT: Duration = Duration::from_secs(5);
@@ -41,6 +41,7 @@ struct Args {
     secs: u64,
     at: u64,
     offline: bool,
+    version: Version,
 }
 
 fn parse(args: &[String]) -> Option<Args> {
@@ -53,6 +54,7 @@ fn parse(args: &[String]) -> Option<Args> {
         secs: 20,
         at: 8,
         offline: false,
+        version: Version::V5,
     };
     for arg in args {
         let (k, v) = arg.split_once('=')?;
@@ -65,6 +67,13 @@ fn parse(args: &[String]) -> Option<Args> {
             "secs" => a.secs = v.parse().ok()?,
             "at" => a.at = v.parse().ok()?,
             "offline" => a.offline = v == "1",
+            "v" => {
+                a.version = match v {
+                    "4" => Version::V311,
+                    "5" => Version::V5,
+                    _ => return None,
+                }
+            }
             _ => return None,
         }
     }
@@ -108,7 +117,7 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(args) = parse(&args) else {
         eprintln!(
-            "usage: zzq_failover uris=URI,URI,URI stop=CMD|CMD|CMD [rate=1000] [pubs=4] [subs=4] [secs=20] [at=8]"
+            "usage: zzq_failover uris=URI,URI,URI stop=CMD|CMD|CMD [rate=1000] [pubs=4] [subs=4] [secs=20] [at=8] [offline=0] [v=5]"
         );
         return ExitCode::FAILURE;
     };
@@ -143,8 +152,11 @@ async fn run(args: Args) -> Result<String, String> {
         args,
         away: tokio::sync::watch::Sender::new(false),
     });
+    // Under MQTT 3.1.1 a clean session ends with its connection, so the
+    // subscriptions go to a kept one; each run's cluster is new.
+    let clean = run.args.version == Version::V5;
     for s in 0..run.args.subs {
-        let (_, c) = run.connect(&format!("fo-sub{s}"), true).await;
+        let (_, c) = run.connect(&format!("fo-sub{s}"), clean).await;
         c.subscribe("fo/#", QoS::AtLeastOnce)
             .await
             .map_err(|e| format!("subscribe: {e}"))?;
@@ -196,6 +208,7 @@ impl Run {
         let mut i = from;
         loop {
             let opts = ClientOptions {
+                version: self.args.version,
                 clean_start: clean,
                 session_expiry: 600,
                 connect_timeout: Duration::from_secs(1),
@@ -420,6 +433,12 @@ mod tests {
         let words = |s: &str| s.split(' ').map(str::to_owned).collect::<Vec<_>>();
         let a = parse(&words("uris=a,b,c stop=x|y|z rate=10 at=2 offline=1")).unwrap();
         assert_eq!((a.rate, a.at, a.stop.len(), a.offline), (10, 2, 3, true));
+        assert_eq!(a.version, Version::V5);
+        assert_eq!(
+            parse(&words("uris=a stop=x v=4")).unwrap().version,
+            Version::V311
+        );
+        assert!(parse(&words("uris=a stop=x v=3")).is_none());
         assert!(parse(&words("uris=a stop=x at=1 offline=1")).is_none());
         assert!(parse(&words("uris=a,b stop=x")).is_none());
         assert!(parse(&words("uris=a stop=x nope=1")).is_none());

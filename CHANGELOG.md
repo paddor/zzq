@@ -30,7 +30,8 @@ Notable changes to zzq. The format follows
 - `zzq_failover` and `zzq_suite failover`: QoS 1 under load on a cluster
   of three, the node the publishers use killed or stopped mid-run; the gap
   without PUBACKs and what the subscribers lost, got twice or out of
-  order. zzq, VerneMQ and TBMQ clusters.
+  order. zzq, VerneMQ, TBMQ and NATS clusters.
+- NATS 2.15 among the rivals of `zzq_suite`, over MQTT 3.1.1.
 
 ### Changed
 

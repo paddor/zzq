@@ -5,14 +5,14 @@
 //! - `zzq [lanes]`: the broker suite against `zzq_broker` (4 IO lanes).
 //! - `<rival> [default|tuned]`: the broker suite against rmqtt, emqx,
 //!   mosquitto, nanomq, rumqttd, xmq, flashmq, vernemq, fluxmq, saguin,
-//!   hivemq or tbmq (tuned).
+//!   hivemq, tbmq or nats (tuned).
 //! - `clients`, `zzqclient`: client libraries against `zzq_fakebroker`.
 //! - `fixed <broker> [config|lanes]`: the fixed-load test, zzq with 1 IO
 //!   lane, a rival tuned.
 //! - `durable <broker> [lanes]`: QoS 1 and 2 to persistent sessions with
 //!   the broker's storage on, zzq with 1 IO lane and a data directory, a
 //!   fresh broker for each cell.
-//! - `failover <zzq | vernemq [cluster|netsplit] | tbmq>`: QoS 1 under load on a
+//! - `failover <zzq | vernemq [cluster|netsplit] | tbmq | nats>`: QoS 1 under load on a
 //!   cluster of three, the node the publishers use killed or stopped
 //!   mid-run, a fresh cluster per cell.
 //! - `all [name...]`: every suite above, or the named ones (`zzq-1`,
@@ -50,7 +50,7 @@ use record::{Cache, fields};
 use suites::{Shape, Suite};
 
 /// Rival brokers, in the order `all` runs them.
-const RIVALS: [&str; 12] = [
+const RIVALS: [&str; 13] = [
     "rmqtt",
     "emqx",
     "mosquitto",
@@ -63,6 +63,7 @@ const RIVALS: [&str; 12] = [
     "saguin",
     "hivemq",
     "tbmq",
+    "nats",
 ];
 /// Rivals with a fixed-load config of their own, as the tuned one runs out
 /// of memory at 20K connections.
@@ -71,7 +72,7 @@ const OWN_FIXED: [&str; 3] = ["nanomq", "fluxmq", "vernemq"];
 /// in the order `all` runs them. rumqttd has none, `FlashMQ` only writes a
 /// snapshot each hour, and `FluxMQ` 1.0.0 refuses persistent sessions on
 /// one node.
-const DURABLE: [&str; 9] = [
+const DURABLE: [&str; 10] = [
     "rmqtt",
     "emqx",
     "mosquitto",
@@ -81,11 +82,14 @@ const DURABLE: [&str; 9] = [
     "saguin",
     "hivemq",
     "tbmq",
+    "nats",
 ];
+/// Rivals that speak MQTT 3.1.1, not 5.
+const V311: [&str; 2] = ["rumqttd", "nats"];
 /// Rivals also run with their default config.
 const DEFAULTS: [&str; 3] = ["vernemq", "fluxmq", "saguin"];
 
-const USAGE: &str = "usage: zzq_suite [--fill] [--smoke] <zzq [lanes] | <rival> [default|tuned] | clients | zzqclient | fixed <broker> [config|lanes] | durable <broker> [lanes] | failover <zzq | vernemq [cluster|netsplit] | tbmq> | all [name...]>";
+const USAGE: &str = "usage: zzq_suite [--fill] [--smoke] <zzq [lanes] | <rival> [default|tuned] | clients | zzqclient | fixed <broker> [config|lanes] | durable <broker> [lanes] | failover <zzq | vernemq [cluster|netsplit] | tbmq | nats> | all [name...]>";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -157,11 +161,7 @@ fn run(suite: &Suite<'_>, args: &[&str]) -> Result<(), String> {
             let rumqttd = rival == "rumqttd";
             let shape = Shape {
                 full: config == "tuned",
-                extra: if rumqttd {
-                    vec!["v=4".to_owned()]
-                } else {
-                    Vec::new()
-                },
+                extra: v311(rival),
                 warmup: if rumqttd { 5 } else { 1 },
                 pinned: Vec::new(),
             };
@@ -183,6 +183,15 @@ fn header(words: &[&str], opt: Option<&str>) {
     let mut words = words.to_vec();
     words.extend(opt);
     println!("# {} {}", words.join(" "), record::now());
+}
+
+/// `v=4` for a rival that speaks MQTT 3.1.1 only.
+fn v311(name: &str) -> Vec<String> {
+    if V311.contains(&name) {
+        vec!["v=4".to_owned()]
+    } else {
+        Vec::new()
+    }
 }
 
 fn lanes(s: &str) -> Result<usize, String> {
@@ -227,8 +236,8 @@ fn fixed(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), String>
         suite.fixed(&zzq_who(suite, lanes, "default"), ("zzq", "", lanes), &[])?;
     } else if RIVALS.contains(&name) {
         let config = opt.unwrap_or("tuned");
-        let extra: &[&str] = if name == "rumqttd" { &["v=4"] } else { &[] };
-        suite.fixed(&rival_who(name, config), (name, config, 0), extra)?;
+        let extra = v311(name);
+        suite.fixed(&rival_who(name, config), (name, config, 0), &extra)?;
     } else {
         return Err(format!("unknown broker {name}"));
     }
@@ -249,7 +258,8 @@ fn durable(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), Strin
     } else {
         return Err(format!("no durable config for {name}"));
     };
-    suite.brokers(&who, broker, &suites::durable_cells(&pinned), true)?;
+    let cells = suites::durable_cells(&pinned, &v311(name));
+    suite.brokers(&who, broker, &cells, true)?;
     println!("# done {}", record::now());
     Ok(())
 }
@@ -263,7 +273,7 @@ fn failover(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), Stri
             let config = opt.unwrap_or("cluster");
             suite.failover(&rival_who(name, config), name, config)?;
         }
-        "tbmq" => suite.failover(&rival_who(name, "cluster"), name, "cluster")?,
+        "tbmq" | "nats" => suite.failover(&rival_who(name, "cluster"), name, "cluster")?,
         _ => return Err(format!("no cluster of {name}")),
     }
     println!("# done {}", record::now());
@@ -304,6 +314,7 @@ fn all_suites() -> Vec<(String, Vec<String>)> {
         &["failover", "vernemq", "netsplit"],
     ));
     out.push(s("failover-tbmq".into(), &["failover", "tbmq"]));
+    out.push(s("failover-nats".into(), &["failover", "nats"]));
     out
 }
 
@@ -359,7 +370,7 @@ mod tests {
     #[test]
     fn all_runs_every_suite_once() {
         let suites = all_suites();
-        assert_eq!(suites.len(), 2 + 12 + 3 + 2 + 2 + 12 + 2 + 9 + 4);
+        assert_eq!(suites.len(), 2 + 13 + 3 + 2 + 2 + 13 + 2 + 10 + 5);
         let find = |n: &str| suites.iter().find(|(name, _)| name == n).unwrap().1.clone();
         assert_eq!(find("fixed-nanomq"), ["fixed", "nanomq", "fixed"]);
         assert_eq!(find("fixed-emqx"), ["fixed", "emqx", "tuned"]);
