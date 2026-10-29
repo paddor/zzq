@@ -533,3 +533,27 @@ fn older_view_traffic_at_an_installed_newer_view_replica_is_inert() {
         assert_eq!(replica.scope().view, 1);
     }
 }
+
+#[test]
+fn an_isolated_primary_asks_to_leave_its_view_until_a_backup_acks() {
+    let mut primary = driver(normal(0));
+    let now = Duration::from_millis(1);
+    primary.observe_isolation(now).unwrap();
+    assert_eq!(primary.poll(now).unwrap(), Some(Action::Broadcast(wish(0))));
+    let ack = Control::PrepareOk {
+        ack: zzq_cluster::PrepareOk {
+            scope: configuration().scope(),
+            durable: Prefix::GENESIS,
+        },
+    };
+    primary.receive(node(1), ack, now).unwrap();
+    let later = now + timing().retransmit;
+    assert!(matches!(
+        primary.poll(later).unwrap(),
+        Some(Action::Broadcast(Control::Commit(_)))
+    ));
+    // A backup never counts as isolated: its timeout is its own.
+    let mut backup = driver(normal(1));
+    backup.observe_isolation(now).unwrap();
+    assert_eq!(backup.poll(now).unwrap(), None);
+}

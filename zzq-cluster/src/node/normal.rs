@@ -128,7 +128,7 @@ impl Node {
         let received = self.driver.receive(from, control, now);
         match control {
             Control::PrepareOk { ack } if received.is_ok() => {
-                self.heard_at = self.heard_at.max(now);
+                self.lease.heard_at = self.lease.heard_at.max(now);
                 self.note_ack(from, ack.durable.op, now);
             }
             // A heartbeat. The ack tells the leader this follower is there,
@@ -187,6 +187,30 @@ impl Node {
         }
     }
 
+    /// Primary: no follower acked within the primary timeout. Its view may
+    /// be one the others left, which they tell it only by supporting its
+    /// exit, so its driver asks them.
+    pub(super) fn check_isolation(&mut self, now: Duration) {
+        let Some(normal) = self.driver.normal() else {
+            return;
+        };
+        let view = normal.snapshot().scope.view;
+        if self.config.configuration.primary(view) != self.config.local {
+            return;
+        }
+        let since = match self.lease.led {
+            Some((v, since)) if v == view => since,
+            _ => {
+                self.lease.led = Some((view, now));
+                now
+            }
+        };
+        if now >= self.lease.heard_at.max(since) + self.config.timing.primary_timeout {
+            // Only a faulted driver refuses, and its poll reports that.
+            let _ = self.driver.observe_isolation(now);
+        }
+    }
+
     /// Follower: sends the leader its stored prefix.
     pub(super) fn send_ack(&mut self) {
         let Some(normal) = self.driver.normal() else {
@@ -201,7 +225,7 @@ impl Node {
             // The ack extends the leader's lease: help elect no other until
             // it ran out, with a heartbeat for the ack's way there.
             let timing = self.config.timing;
-            self.follow_until = self.now + timing.primary_timeout / 2 + timing.heartbeat;
+            self.lease.follow_until = self.now + timing.primary_timeout / 2 + timing.heartbeat;
         }
     }
 

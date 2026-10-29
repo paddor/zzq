@@ -248,6 +248,19 @@ impl Node {
 
     /// The application holds ops the selected history does not: it starts
     /// over from the first op, or from an image.
+    /// The application dropped its state, as an old leader must whose
+    /// lanes held changes not committed: committed ops come again from the
+    /// first, or after an image when the log no longer holds them. No
+    /// [`Event::Reset`] follows; the application reset itself.
+    pub fn reset_application(&mut self) {
+        let replayable = self.log.base().op.0 == 0;
+        self.reset_app(replayable);
+        if self.events.back() == Some(&Event::Reset) {
+            self.events.pop_back();
+        }
+        self.own_from = None;
+    }
+
     fn reset_app(&mut self, replayable: bool) {
         self.events.push_back(Event::Reset);
         self.app_applied = OpNumber(0);

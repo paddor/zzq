@@ -3,7 +3,7 @@
 
 use super::{Action, DriverError, ReplicaDriver, Role};
 use crate::wire::Control;
-use crate::{ReplicaSnapshot, ReplicationError, Status, ViewChangeError, VoterIndex};
+use crate::{ReplicaSnapshot, ReplicationError, Status, ViewChangeError, VoterIndex, VoterSet};
 use std::time::Duration;
 
 impl ReplicaDriver {
@@ -53,8 +53,8 @@ impl ReplicaDriver {
             return Ok(Some(action));
         }
         if now >= self.retry_at {
-            self.start_pending = true;
-            self.report_pending = true;
+            self.pending.start = true;
+            self.pending.report = true;
             self.retry_at = now.saturating_add(self.timing.retransmit);
         }
         self.poll_election()
@@ -84,8 +84,8 @@ impl ReplicaDriver {
         if VoterIndex::primary(snapshot.scope.view) != self.local {
             return Ok(None);
         }
-        if self.commit_pending {
-            self.commit_pending = false;
+        if self.pending.commit {
+            self.pending.commit = false;
             return self.announcement().map(Some);
         }
         if let Some(action) = self.activation_action()? {
@@ -95,8 +95,9 @@ impl ReplicaDriver {
             return Ok(None);
         }
         self.retry_at = now.saturating_add(self.timing.heartbeat);
+        self.activation_sent = VoterSet::EMPTY;
         if let Some(start) = self.require_normal()?.start_view()? {
-            self.commit_pending = true;
+            self.pending.commit = true;
             return Ok(Some(Action::Broadcast(Control::StartView(start))));
         }
         self.announcement().map(Some)
@@ -120,15 +121,15 @@ impl ReplicaDriver {
                 Err(error) => Err(error.into()),
             };
         }
-        if self.start_pending {
+        if self.pending.start {
             let message = changing.start_message()?;
-            self.start_pending = false;
+            self.pending.start = false;
             return Ok(Some(Action::Broadcast(Control::StartViewChange(message))));
         }
-        if self.report_pending {
+        if self.pending.report {
             match changing.report() {
                 Ok(report) => {
-                    self.report_pending = false;
+                    self.pending.report = false;
                     let primary = VoterIndex::primary(report.scope.view);
                     if primary != self.local {
                         return Ok(Some(Action::Send {

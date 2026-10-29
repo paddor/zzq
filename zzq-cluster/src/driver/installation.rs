@@ -60,6 +60,7 @@ impl ReplicaDriver {
         let Some(voter) = self.activation_pending.pop_first() else {
             return Ok(None);
         };
+        self.activation_sent.insert(voter);
         Ok(Some(Action::Send {
             to: self.configuration.voter(voter),
             message: Control::Commit(Commit {
@@ -233,10 +234,11 @@ impl ReplicaDriver {
         self.progress_deadline = now.saturating_add(self.progress_timeout());
         self.election_deadline = now.saturating_add(self.election_delay);
         self.retry_at = now;
-        self.start_pending = changing;
-        self.report_pending = changing;
-        self.commit_pending = false;
+        self.pending.start = changing;
+        self.pending.report = changing;
+        self.pending.commit = false;
         self.activation_pending = VoterSet::EMPTY;
+        self.activation_sent = VoterSet::EMPTY;
         Ok(())
     }
 
@@ -258,10 +260,11 @@ impl ReplicaDriver {
         self.role = Role::ViewChanging(changing);
         self.election_deadline = now.saturating_add(self.election_delay);
         self.retry_at = now;
-        self.start_pending = true;
-        self.report_pending = true;
-        self.commit_pending = false;
+        self.pending.start = true;
+        self.pending.report = true;
+        self.pending.commit = false;
         self.activation_pending = VoterSet::EMPTY;
+        self.activation_sent = VoterSet::EMPTY;
         Ok(())
     }
 

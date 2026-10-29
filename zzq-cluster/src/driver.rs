@@ -100,6 +100,17 @@ pub enum Role {
     Fenced(Scope),
 }
 
+/// Messages due at the next poll.
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    /// The first-phase election message.
+    start: bool,
+    /// The second-phase election report.
+    report: bool,
+    /// A commit announcement after an installed view.
+    commit: bool,
+}
+
 /// Timer and election-message driver for one fixed three-voter group.
 ///
 /// No clocks, allocations, I/O, or automatic durability assertions on transitions.
@@ -119,12 +130,17 @@ pub struct ReplicaDriver {
     election_deadline: Duration,
     election_delay: Duration,
     retry_at: Duration,
-    start_pending: bool,
-    report_pending: bool,
-    commit_pending: bool,
+    pending: Pending,
     // At most one selected-tail activation response per remote voter. A late
     // installed voter cannot receive fresh payload until that tail is applied.
     activation_pending: VoterSet,
+    /// Voters sent an activation since the last heartbeat. A voter acks
+    /// each commit, so answering every ack would ping-pong one per round
+    /// trip until the resent prepares arrive.
+    activation_sent: VoterSet,
+    /// The adapter found this primary heard by no backup: it suspects its
+    /// view until a backup acks.
+    isolated: bool,
     /// Current-view timeout suspicions. Never durable or history-selection votes.
     exit_votes: VoterSet,
     /// When each peer's suspicion of the current view last arrived.
@@ -210,10 +226,14 @@ impl ReplicaDriver {
                 } else {
                     timing.heartbeat
                 },
-            start_pending: changing,
-            report_pending: changing,
-            commit_pending: false,
+            pending: Pending {
+                start: changing,
+                report: changing,
+                commit: false,
+            },
             activation_pending: VoterSet::EMPTY,
+            activation_sent: VoterSet::EMPTY,
+            isolated: false,
             exit_votes: VoterSet::EMPTY,
             exit_heard_at: Voters::splat(Duration::ZERO),
             exit_retry_at: None,
@@ -384,6 +404,7 @@ impl ReplicaDriver {
         let primary = VoterIndex::primary(snapshot.scope.view) == self.local;
         let outstanding = snapshot.accepted != snapshot.committed || !snapshot.ready_for_appends;
         (!primary && self.now >= self.contact_deadline)
+            || self.isolated
             || (outstanding && self.now >= self.progress_deadline)
             || (snapshot.accepted.op > snapshot.journal.durable
                 && self.now >= self.persistence_deadline)
@@ -418,12 +439,14 @@ impl ReplicaDriver {
         }
         self.exit_votes = VoterSet::EMPTY;
         self.exit_retry_at = None;
+        self.isolated = false;
         self.election_deadline = self.now.saturating_add(self.election_delay);
         self.retry_at = self.now.saturating_add(self.timing.retransmit);
-        self.start_pending = true;
-        self.report_pending = true;
-        self.commit_pending = false;
+        self.pending.start = true;
+        self.pending.report = true;
+        self.pending.commit = false;
         self.activation_pending = VoterSet::EMPTY;
+        self.activation_sent = VoterSet::EMPTY;
         Ok(())
     }
 }

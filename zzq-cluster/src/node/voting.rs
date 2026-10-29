@@ -57,6 +57,12 @@ impl Driver {
         self.inner.as_ref()?.installation_ticket()
     }
 
+    pub(super) fn observe_isolation(&mut self, now: Duration) -> Result<(), DriverError> {
+        self.inner
+            .as_mut()
+            .map_or(Ok(()), |d| d.observe_isolation(now))
+    }
+
     pub(super) fn next_deadline(&self) -> Option<Duration> {
         self.inner.as_ref()?.next_deadline()
     }

@@ -54,6 +54,27 @@ impl ReplicaDriver {
         self.advance_if_exit_quorum()
     }
 
+    /// No backup acked this primary within the primary timeout. It cannot
+    /// commit, and may lead a view the others left: a voter past the view
+    /// tells it only by supporting its exit. It suspects the view until a
+    /// backup acks. Leaving still needs a second voter's suspicion.
+    ///
+    /// # Errors
+    ///
+    /// [`DriverError`] when the event does not fit the driver's role, view, timing or history.
+    pub fn observe_isolation(&mut self, now: Duration) -> Result<(), DriverError> {
+        self.observe_time(now)?;
+        self.require_healthy()?;
+        let local = self.local;
+        if self
+            .normal()
+            .is_some_and(|n| VoterIndex::primary(n.snapshot().scope.view) == local)
+        {
+            self.isolated = true;
+        }
+        Ok(())
+    }
+
     /// `from` asked for recovery as a nonvoting copy. When it is the primary of the
     /// view this replica elects, it cannot install that view, so suspect the
     /// view now instead of at the election deadline. Leaving the view still

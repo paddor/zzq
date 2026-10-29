@@ -12,9 +12,9 @@
 mod sim;
 
 use bytes::Bytes;
-use sim::{Faults, Sim};
+use sim::{Faults, Sim, timing};
 use zzq_cluster::OpNumber;
-use zzq_cluster::node::{LogLimits, Role};
+use zzq_cluster::node::{LogLimits, Node, Role};
 
 const CLEAN: Faults = Faults { drop: 0, jitter: 0 };
 
@@ -249,6 +249,62 @@ fn a_cut_off_leader_whose_log_moved_on_rebuilds_from_an_image() {
 
 /// Every node holds state close to the leader: losing one more keeps
 /// two that can serve recovery.
+#[test]
+fn a_rejoining_node_gets_no_commit_per_round_trip_while_it_catches_up() {
+    let mut sim = Sim::new(5, CLEAN);
+    sim.run(5);
+    assert_eq!(propose_for(&mut sim, 10, 100), 10);
+    assert!(sim.run_until(100, |s| s.apps[0].committed == OpNumber(10)));
+    sim.isolate(0, true);
+    assert!(sim.run_until(2000, |s| s.leader().is_some_and(|l| l != 0)));
+    let leader = sim.leader().unwrap();
+    assert_eq!(propose_for(&mut sim, 10, 1000), 10);
+    assert!(sim.run_until(1000, |s| s.apps[leader].committed == OpNumber(20)));
+    sim.isolate(0, false);
+    sim.trace = true;
+    let start = sim.now;
+    assert!(
+        sim.run_until(1000, |s| s.apps[0].ops.len() == 20),
+        "it catches up"
+    );
+    let commits = sim
+        .traced
+        .iter()
+        .filter(|&&(from, to, op)| from == leader && to == 0 && op == 0x34)
+        .count();
+    // A heartbeat, and at most one commit of the tail it installed.
+    let heartbeats =
+        (sim.now.saturating_sub(start).as_millis() / timing().heartbeat.as_millis()) as usize + 1;
+    assert!(
+        commits <= 2 * heartbeats,
+        "{commits} commits in {heartbeats} heartbeats"
+    );
+}
+
+#[test]
+fn leadership_moves_around_the_ring_as_each_leader_is_cut_off_in_turn() {
+    let mut sim = Sim::new(5, CLEAN);
+    sim.run(5);
+    assert_eq!(propose_for(&mut sim, 4, 100), 4);
+    for next in [1, 2, 0] {
+        let l = sim.leader().unwrap();
+        sim.isolate(l, true);
+        let led = sim.run_until(5000, |s| s.leader() == Some(next));
+        let st: Vec<_> = sim
+            .nodes
+            .iter()
+            .map(|n| n.as_ref().map(Node::status))
+            .collect();
+        assert!(
+            led,
+            "node {next} leads at {:?}: {st:?}\n{}",
+            sim.now,
+            report(&sim)
+        );
+        sim.isolate(l, false);
+    }
+}
+
 fn caught_up(sim: &Sim) -> bool {
     let Some(l) = sim.leader() else {
         return false;
@@ -577,4 +633,32 @@ fn seeded_stops_crashes_and_splits_end_in_a_full_restart() {
         }
         sim.check();
     }
+}
+
+#[test]
+fn an_application_that_dropped_its_state_gets_the_committed_ops_again() {
+    let mut sim = Sim::new(14, CLEAN);
+    sim.run(5);
+    assert_eq!(propose_for(&mut sim, 30, 500), 30);
+    assert!(settle(&mut sim, 1000));
+    sim.apps[1].ops.clear();
+    sim.node(1).reset_application();
+    assert!(settle(&mut sim, 1000), "it replays from the first op");
+    assert_eq!(sim.apps[1].ops, sim.apps[0].ops);
+}
+
+#[test]
+fn an_application_that_dropped_its_state_past_the_log_gets_an_image() {
+    let mut sim = Sim::with_log(15, CLEAN, small_log());
+    sim.run(5);
+    assert_eq!(propose_for(&mut sim, 100, 1000), 100);
+    assert!(settle(&mut sim, 1000));
+    sim.apps[1].ops.clear();
+    sim.node(1).reset_application();
+    assert!(settle(&mut sim, 3000), "an image, then the ops after it");
+    assert_eq!(sim.images[1], 1);
+    assert_eq!(sim.apps[1].ops, sim.apps[0].ops);
+    assert_eq!(propose_for(&mut sim, 10, 500), 10);
+    assert!(settle(&mut sim, 1000));
+    sim.check();
 }

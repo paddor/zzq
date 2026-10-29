@@ -235,10 +235,7 @@ pub struct Node {
     send_floor: OpNumber,
     /// Images given and taken.
     images: Images,
-    /// Leader: when a follower last acked in its view.
-    heard_at: Duration,
-    /// Follower: until when its last ack backs the leader's lease.
-    follow_until: Duration,
+    lease: Lease,
     /// The time of the last input.
     now: Duration,
     out: VecDeque<Outgoing>,
@@ -297,9 +294,12 @@ impl Node {
             out: VecDeque::new(),
             events: VecDeque::new(),
             images: Images::default(),
-            heard_at: now,
-            // It may have acked a leader just before its process went.
-            follow_until: now + config.timing.primary_timeout / 2 + config.timing.heartbeat,
+            lease: Lease {
+                heard_at: now,
+                // It may have acked a leader just before its process went.
+                follow_until: now + config.timing.primary_timeout / 2 + config.timing.heartbeat,
+                led: None,
+            },
             now,
         };
         node.update_role();
@@ -400,7 +400,7 @@ impl Node {
                 crate::wire::Control::ExitView(_)
                 | crate::wire::Control::StartViewChange(_)
                 | crate::wire::Control::DoViewChange(_),
-            ) if self.role != Role::Leader && now < self.follow_until => {}
+            ) if self.role != Role::Leader && now < self.lease.follow_until => {}
             ReplicaMessage::Control(control) => self.on_control(from, control, now)?,
             ReplicaMessage::Prepare(batch) => self.on_prepare(from, batch, &frames[2], now)?,
             ReplicaMessage::FetchOps(request) => self.serve_fetch(from, request),
@@ -423,6 +423,7 @@ impl Node {
     /// nothing until it restarts.
     pub fn poll(&mut self, now: Duration) -> Result<(), NodeError> {
         self.now = self.now.max(now);
+        self.check_isolation(now);
         for _ in 0..DRIVER_ACTIONS {
             match self.driver.poll(now)? {
                 None => break,
@@ -579,7 +580,7 @@ impl Node {
                 } else if primary != self.config.local {
                     Role::Follower
                 } else if s.ready_for_appends
-                    && self.now < self.heard_at + self.config.timing.primary_timeout / 2
+                    && self.now < self.lease.heard_at + self.config.timing.primary_timeout / 2
                 {
                     Role::Leader
                 } else {
@@ -603,6 +604,17 @@ impl Node {
         self.role = role;
         self.events.push_back(Event::Role(role));
     }
+}
+
+/// The leader lease, from both sides.
+#[derive(Debug)]
+struct Lease {
+    /// Leader: when a follower last acked in its view.
+    heard_at: Duration,
+    /// Follower: until when its last ack backs the leader's lease.
+    follow_until: Duration,
+    /// Primary: its view, and when it became its primary.
+    led: Option<(u64, Duration)>,
 }
 
 /// A writer incarnation no other process uses.
