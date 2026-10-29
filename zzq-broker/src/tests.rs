@@ -271,6 +271,74 @@ async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
     again.quiet(300).await;
 }
 
+/// With a data directory, an ack waits for a congested subscriber too, not
+/// only for the disk, on the publisher's lane or another. Without that, a
+/// subscriber's queue fills to `max_queued` and drops acked messages.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_disk_an_ack_waits_for_a_congested_subscriber() {
+    for lanes in [1, 2] {
+        acks_wait_for_a_congested_subscriber_on_disk(lanes).await;
+    }
+}
+
+async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize) {
+    use zzq_proto::{PacketType, SubscriptionOptions, Version};
+
+    use support::{Got, Raw};
+
+    let name = format!("congested-{lanes}");
+    let (dir, opts) = on_disk(&name);
+    let opts = BrokerOptions {
+        max_inflight: 1,
+        qos_queue_high: 2,
+        ..opts()
+    };
+    let (_ctx, _broker, uri) = setup(lanes, opts).await;
+    let (mut sub, code) = Raw::connect_with(&uri, &durable("sub")).await;
+    assert_eq!(code, 0);
+    sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
+        .await;
+    // With two lanes, the publisher is on the other one.
+    let id = (0..64)
+        .map(|i| format!("pub-{i}"))
+        .find(|id| lanes == 1 || crate::lane_for(id, lanes) != crate::lane_for("sub", lanes))
+        .unwrap();
+    let mut publisher = Raw::connect(&uri, &id, Version::V5, 0).await;
+    // The acks of `want`, in any order: an ack released while later ones
+    // wait for the disk goes behind them.
+    let acks = async |p: &mut Raw, want: &[u16]| {
+        let mut pkids = Vec::new();
+        while pkids.len() < want.len() {
+            match p.next().await {
+                Got::Ack { pkid, .. } => pkids.push(pkid),
+                other => panic!("{lanes} lanes: {other:?}"),
+            }
+        }
+        pkids.sort_unstable();
+        assert_eq!(pkids, want, "{lanes} lanes");
+    };
+    for pkid in 1..=3 {
+        publisher.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+    }
+    // The third makes the subscriber congested. Its own lane holds that
+    // ack; another lane learns of it after routing the third.
+    acks(
+        &mut publisher,
+        if lanes == 1 { &[1, 2] } else { &[1, 2, 3] },
+    )
+    .await;
+    publisher.quiet(300).await;
+    publisher.pub_("t", b"x", QoS::AtLeastOnce, 4).await;
+    publisher.quiet(300).await;
+    for _ in 0..4 {
+        let p = sub.publish().await;
+        sub.ack(PacketType::PubAck, p.pkid).await;
+    }
+    acks(&mut publisher, if lanes == 1 { &[3, 4] } else { &[4] }).await;
+    publisher.quiet(100).await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A subscriber that never acks and is congested from its third message,
 /// and the options that make it so, with a Receive Maximum of 10.
 async fn congested_subscriber() -> (Context, Broker, String, support::Raw) {
@@ -940,6 +1008,185 @@ async fn a_lane_snapshot_replaces_the_segments_before_it() {
     })
     .await;
     assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The inode of `path`.
+fn ino(path: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path).unwrap().ino()
+}
+
+/// Waits until `path` is gone.
+async fn gone(path: &std::path::Path) {
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while path.exists() {
+        assert!(tokio::time::Instant::now() < deadline, "{path:?} stays");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lane_journal_without_room_for_a_segment_snapshots_into_its_spare() {
+    use zzq_proto::SubscriptionOptions;
+
+    use crate::durable::JournalId;
+    use support::Raw;
+
+    let (dir, opts) = on_disk("lane-full");
+    let file = |name: &str| dir.join("lanes-1/lane-0").join(name);
+    {
+        let (ctx, broker, uri) = setup(1, opts()).await;
+        let (mut c, _) = Raw::connect_with(&uri, &durable("full")).await;
+        c.subscribe("a", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        let reserve = ino(&file("0000000000000000.spare"));
+        // The segment the snapshot asks for fails as on a full device, so
+        // it starts in the spare kept back.
+        broker.shared().fail_next_segment(JournalId::Lane(0));
+        lane_until(&ctx, &broker, 0, |l| l.snapshot_journal(true).then_some(())).await;
+        gone(&file("0000000000000001.seg")).await;
+        assert_eq!(ino(&file("0000000000000002.seg")), reserve);
+        let stats = broker.stats().await.unwrap();
+        assert!(stats.write_errors >= 1);
+        // The spare kept back shows no room on the device.
+        assert_eq!(stats.full_journals, 1);
+        c.subscribe("b", SubscriptionOptions::from(QoS::AtLeastOnce))
+            .await;
+        drop(c);
+        broker.shutdown().await.unwrap();
+    }
+    let (ctx, broker, _uri) = setup(1, opts()).await;
+    let subs = on_lane(&ctx, &broker, 0, |l| {
+        let key = l.sessions.keys().next()?;
+        let mut f: Vec<String> = l
+            .sessions
+            .get(key)?
+            .subs
+            .keys()
+            .map(ToString::to_string)
+            .collect();
+        f.sort();
+        Some(f)
+    })
+    .await;
+    assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare() {
+    use zzq_proto::{PacketType, Version};
+
+    use crate::durable::JournalId;
+    use support::{Got, Raw};
+
+    let (dir, opts) = on_disk("retained-full");
+    let stripe = crate::retain::Retained::stripe_of("r/full");
+    let file = |name: &str| dir.join(format!("retained-{stripe}")).join(name);
+    let ack = |pkid| Got::Ack {
+        kind: PacketType::PubAck,
+        pkid,
+        reason: 0,
+    };
+    {
+        let (_ctx, broker, uri) = setup(1, opts()).await;
+        let mut p = Raw::connect(&uri, "full-pub", Version::V5, 0).await;
+        let publish = |pkid, payload: &[u8]| {
+            let h = zzq_proto::encode::PublishHeader {
+                version: Version::V5,
+                dup: false,
+                qos: QoS::AtLeastOnce,
+                retain: true,
+                topic: "r/full",
+                pkid,
+                properties: &[],
+            };
+            let mut out = Vec::new();
+            zzq_proto::encode::publish(&h, payload, &mut out);
+            out
+        };
+        p.send(&publish(1, b"first")).await;
+        assert_eq!(p.next().await, ack(1));
+        let reserve = ino(&file("0000000000000000.spare"));
+        broker
+            .shared()
+            .fail_next_segment(JournalId::Retained(stripe));
+        // This stripe only: the empty ones would each zero a first segment
+        // on the file thread ahead of this one's.
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while !broker.shared().retained.snapshot_stripe(stripe) {
+            assert!(tokio::time::Instant::now() < deadline, "no snapshot");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        gone(&file("0000000000000001.seg")).await;
+        assert_eq!(ino(&file("0000000000000002.seg")), reserve);
+        assert_eq!(broker.stats().await.unwrap().full_journals, 1);
+        p.send(&publish(2, b"second")).await;
+        assert_eq!(p.next().await, ack(2));
+    }
+    let (_ctx, broker, _uri) = setup(1, opts()).await;
+    let got = broker.shared().retained.matching("r/full");
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].payload(), b"second");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
+    use zzq_proto::ReasonCode;
+
+    let (dir, opts) = on_disk("room");
+    let (ctx, broker, uri) = setup(1, opts()).await;
+    let durable = |id: &str| ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        ..ClientOptions::new(id)
+    };
+    let d = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
+    d.subscribe("q", QoS::AtLeastOnce).await.unwrap();
+    d.disconnect().await;
+    // No room for another copy of the state: it stops growing.
+    broker.shared().set_free_bytes(Some(0));
+    lane_until(&ctx, &broker, 0, |l| l.budget.full.then_some(())).await;
+    assert_eq!(broker.stats().await.unwrap().state_limit, 0);
+    let refused = Client::connect(&ctx, &uri, durable("e")).await;
+    assert!(
+        matches!(
+            refused,
+            Err(zzq_client::Error::Refused(ReasonCode::QUOTA_EXCEEDED))
+        ),
+        "{refused:?}"
+    );
+    let mut live = Client::connect(&ctx, &uri, ClientOptions::new("live"))
+        .await
+        .unwrap();
+    live.subscribe("live", QoS::AtLeastOnce).await.unwrap();
+    live.publish("live", "x", QoS::AtLeastOnce).await.unwrap();
+    assert_eq!(support::next(&mut live).await.payload, "x");
+    // A message dropped for the full state costs the journal nothing.
+    let journaled = broker.shared().lane_logs[0].counts().0;
+    live.publish("q", "dropped", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    assert_eq!(broker.shared().lane_logs[0].counts().0, journaled);
+    live.publish_retained("live", "kept?", QoS::AtLeastOnce)
+        .await
+        .unwrap();
+    assert_eq!(support::next(&mut live).await.payload, "kept?");
+    stats_until(&broker, |s| {
+        s.dropped.state_full == 1 && (s.retained, s.retained_rejected) == (0, 1)
+    })
+    .await;
+    // Room again: the state grows again.
+    broker.shared().set_free_bytes(None);
+    lane_until(&ctx, &broker, 0, |l| (!l.budget.full).then_some(())).await;
+    assert!(broker.stats().await.unwrap().state_limit > 0);
+    live.publish("q", "kept", QoS::AtLeastOnce).await.unwrap();
+    let mut d = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
+    assert!(d.connected().session_present);
+    assert_eq!(support::next(&mut d).await.payload, "kept");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

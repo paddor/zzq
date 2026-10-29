@@ -33,7 +33,7 @@ pub(crate) async fn run(shared: Arc<Shared>, every: Duration) {
     }
 }
 
-fn values(s: &Stats, uptime: Duration) -> [(&'static str, String); 11] {
+fn values(s: &Stats, uptime: Duration) -> [(&'static str, String); 13] {
     [
         (
             "$SYS/broker/version",
@@ -64,5 +64,7 @@ fn values(s: &Stats, uptime: Duration) -> [(&'static str, String); 11] {
             s.dropped.expired.to_string(),
         ),
         ("$SYS/broker/state/bytes", s.state_bytes.to_string()),
+        ("$SYS/broker/store/errors", s.write_errors.to_string()),
+        ("$SYS/broker/store/full", s.full_journals.to_string()),
     ]
 }

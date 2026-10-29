@@ -7,7 +7,9 @@
 //! [`Journal::flush`] sends them at once, even one, and records appended
 //! meanwhile wait behind it. Writes use `O_DIRECT | O_DSYNC`, so a
 //! completed write is on disk and [`Journal::durable`] moves to its last
-//! record.
+//! record. Trimmed segments stay as spares for later ones, so writes
+//! land in blocks written before. One spare stays back for a roll, so a
+//! snapshot can start a segment on a full device.
 //!
 //! The directory must take `O_DIRECT`. Linux only.
 //!
@@ -37,10 +39,21 @@ mod segment;
 mod testing;
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use backend::{Config, Disk};
 pub use journal::{Journal, Record};
+
+/// Bytes an unprivileged writer may still take on the device that holds
+/// `path`, such as a journal's directory.
+///
+/// # Errors
+///
+/// [`Error::Io`] if the device cannot tell, as for a missing path.
+pub fn free_bytes(path: impl AsRef<Path>) -> Result<u64, Error> {
+    let st = rustix::fs::statvfs(path.as_ref()).map_err(io::Error::from)?;
+    Ok(st.f_bavail.saturating_mul(st.f_frsize))
+}
 
 /// Why replaying a record failed, from the callback of [`Disk::open`].
 pub type ReplayError = Box<dyn std::error::Error + Send + Sync>;

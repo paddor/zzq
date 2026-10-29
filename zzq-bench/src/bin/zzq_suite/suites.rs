@@ -58,7 +58,7 @@ impl Load {
         cell
     }
 
-    fn cmd(&self, p: &Paths, broker_pid: u32) -> Cmd {
+    fn cmd(&self, p: &Paths, broker_pids: &str) -> Cmd {
         let mut cmd = Cmd::pinned(LOAD_CPUS, p.tool("zzq_brokerbench"))
             .arg(self.scenario)
             .arg(format!("qos={}", self.qos))
@@ -71,7 +71,7 @@ impl Load {
             };
             cmd = cmd.arg(format!("{key}={n}"));
         }
-        cmd.args(&self.extra).arg(format!("cpu_pid={broker_pid}"))
+        cmd.args(&self.extra).arg(format!("cpu_pid={broker_pids}"))
     }
 }
 
@@ -139,6 +139,49 @@ pub(crate) fn broker_cells(shape: &Shape) -> Vec<Load> {
         for qos in 0..2 {
             cells.push(load("rtt", qos, size, None, &rtt));
         }
+    }
+    cells
+}
+
+/// The cells of the durability suite: QoS 1 and 2 to subscribers whose
+/// sessions outlive their connection, so a broker with storage keeps
+/// each message, and the time to the PUBACK. `pinned` goes on the
+/// single-pair and round-trip commands.
+pub(crate) fn durable_cells(pinned: &[String]) -> Vec<Load> {
+    let timed = ["warmup=1", "secs=5", "persist=1"].map(String::from);
+    let mut cells = Vec::new();
+    for (scenario, peers) in [
+        ("pairs", None),
+        ("pairs", Some(16)),
+        ("fanout", Some(16)),
+        ("fanin", Some(16)),
+    ] {
+        let mut extra = timed.to_vec();
+        if peers.is_none() {
+            extra.extend(pinned.iter().cloned());
+        }
+        for size in SIZES {
+            for qos in 1..3 {
+                cells.push(Load {
+                    scenario,
+                    qos,
+                    size,
+                    peers,
+                    extra: extra.clone(),
+                });
+            }
+        }
+    }
+    let mut rtt = vec!["persist=1".to_owned(), "ack=1".to_owned()];
+    rtt.extend(pinned.iter().cloned());
+    for size in SIZES {
+        cells.push(Load {
+            scenario: "rtt",
+            qos: 1,
+            size,
+            peers: None,
+            extra: rtt.clone(),
+        });
     }
     cells
 }
@@ -238,8 +281,11 @@ impl Suite<'_> {
                 continue;
             }
             let own: Option<Running> = if fresh { Some(start()?) } else { None };
-            let pid = own.as_ref().or(shared.as_ref()).map_or(0, |b| b.pid);
-            let cmd = load.cmd(self.paths, pid);
+            let pids = own
+                .as_ref()
+                .or(shared.as_ref())
+                .map_or_else(|| "0".to_owned(), Running::cpu_pids);
+            let cmd = load.cmd(self.paths, &pids);
             let ran = self.bench(std::slice::from_ref(&cmd), 0, Duration::from_secs(120))?;
             drop(own);
             let row = ran
@@ -285,7 +331,9 @@ impl Suite<'_> {
                 (true, Some(first)) => cmd.arg(format!("rates={first}")).arg("secs=2"),
                 _ => cmd.arg(format!("rates={rates}")),
             };
-            let cmd = cmd.args(extra).arg(format!("cpu_pid={}", running.pid));
+            let cmd = cmd
+                .args(extra)
+                .arg(format!("cpu_pid={}", running.cpu_pids()));
             let ran = self.bench(std::slice::from_ref(&cmd), 0, Duration::from_secs(300))?;
             drop(running);
             let rows: Vec<Row> = ran.out.lines().filter_map(parse::fixed_row).collect();
@@ -432,7 +480,7 @@ mod tests {
         let cells = broker_cells(&shape);
         assert_eq!(cells.len(), 4 * 4 * 3 + 3 + 4 * 2);
         let p = Paths::from_env();
-        let first = cells[0].cmd(&p, 7).to_string();
+        let first = cells[0].cmd(&p, "7").to_string();
         assert!(
             first.ends_with(
                 "zzq_brokerbench pairs qos=0 size=16 warmup=5 secs=5 v=4 lanes=2 cross=1 cpu_pid=7"
@@ -442,7 +490,7 @@ mod tests {
         let fanout = cells.iter().find(|l| l.scenario == "fanout").unwrap();
         assert!(
             fanout
-                .cmd(&p, 7)
+                .cmd(&p, "7")
                 .to_string()
                 .contains("size=16 subs=16 warmup=5")
         );
@@ -453,6 +501,32 @@ mod tests {
         );
         let rtt = cells.last().unwrap();
         assert_eq!(rtt.extra, ["v=4", "lanes=2", "cross=1"]);
+        assert_eq!(
+            Value::Object(rtt.cell()),
+            json!({"kind": "rtt", "qos": 1, "msg_size": 4096})
+        );
+    }
+
+    #[test]
+    fn a_durable_suite_keeps_sessions_and_times_the_puback() {
+        let cells = durable_cells(&["lanes=2".into(), "cross=1".into()]);
+        assert_eq!(cells.len(), 4 * 4 * 2 + 4);
+        assert!(
+            cells
+                .iter()
+                .all(|l| l.qos > 0 && l.extra.contains(&"persist=1".into()))
+        );
+        let p = Paths::from_env();
+        let first = cells[0].cmd(&p, "7,8").to_string();
+        assert!(
+            first.ends_with(
+                "pairs qos=1 size=16 warmup=1 secs=5 persist=1 lanes=2 cross=1 cpu_pid=7,8"
+            ),
+            "{first}"
+        );
+        assert!(!cells[8].extra.contains(&"cross=1".into()), "16 pairs");
+        let rtt = cells.last().unwrap();
+        assert_eq!(rtt.extra, ["persist=1", "ack=1", "lanes=2", "cross=1"]);
         assert_eq!(
             Value::Object(rtt.cell()),
             json!({"kind": "rtt", "qos": 1, "msg_size": 4096})

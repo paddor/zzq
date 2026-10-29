@@ -7,9 +7,9 @@
 //! rates=10000,20000,50000,100000,200000 warmup=2 secs=8 connect_rate=5000
 //! cpu_pid=0 trace=0`
 //!
-//! `rates` are offered deliveries per second, one step each. `cpu_pid` is
-//! the broker's PID, for its CPU and memory. `trace=1` also prints where a
-//! window's time went.
+//! `rates` are offered deliveries per second, one step each. `cpu_pid` has
+//! the broker's PIDs, comma-separated, for its CPU and memory. `trace=1`
+//! also prints where a window's time went.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -106,7 +106,7 @@ fn parse(args: &[String]) -> Option<(Scenario, Fixed)> {
         warmup: secs("warmup", d.warmup)?,
         measure: secs("secs", d.measure)?,
         connect_rate: get("connect_rate").map_or(Some(d.connect_rate), |v| v.parse().ok())?,
-        broker_pid: u32::try_from(num("cpu_pid", 0)?).ok().filter(|&p| p > 0),
+        broker_pids: zzq_bench::cpu::pids(get("cpu_pid").unwrap_or("0"))?,
         trace: get("trace") == Some("1"),
     };
     Some((scenario.parse().ok()?, cfg))

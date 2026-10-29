@@ -142,6 +142,24 @@ impl Shared {
         self.data.is_some()
     }
 
+    /// Bytes the state may take: `max_state_bytes`, and no more than the
+    /// room on the device of the data directory.
+    pub(crate) fn state_limit(&self) -> usize {
+        let room = self.data.as_ref().map_or(u64::MAX, DataDir::room);
+        self.opts
+            .max_state_bytes
+            .min(usize::try_from(room).unwrap_or(usize::MAX))
+    }
+
+    /// Makes the data directory's device seem to have `free` bytes, or
+    /// what it has with `None`.
+    #[cfg(test)]
+    pub(crate) fn set_free_bytes(&self, free: Option<u64>) {
+        if let Some(data) = &self.data {
+            data.set_free(free);
+        }
+    }
+
     /// Closes the cursors of the lane journals and their pairs: what they
     /// did not write by now they never will.
     fn close_cursors(&self) {
@@ -160,6 +178,18 @@ impl Shared {
             JournalId::Retained(i) => self.retained.fail_next_write(i),
             JournalId::Lane(i) | JournalId::Pair { to: i, .. } => {
                 self.lane_logs[i].fail_next_write();
+            }
+        }
+    }
+
+    /// Makes the next segment journal `j` asks for fail, as on a full
+    /// device.
+    #[cfg(test)]
+    pub(crate) fn fail_next_segment(&self, j: JournalId) {
+        match j {
+            JournalId::Retained(i) => self.retained.fail_next_segment(i),
+            JournalId::Lane(i) | JournalId::Pair { to: i, .. } => {
+                self.lane_logs[i].fail_next_segment();
             }
         }
     }
@@ -198,8 +228,17 @@ pub struct Stats {
     /// Approximate bytes of state counted against `max_state_bytes`.
     pub state_bytes: u64,
     /// Writes to the data directory that failed. Their v5 publishers got
-    /// Unspecified error, and v3.1.1 ones were disconnected.
+    /// Unspecified error, and v3.1.1 ones were disconnected. A journal that
+    /// could not make a new segment counts each try.
     pub write_errors: u64,
+    /// Journals in the data directory that could not make a new segment,
+    /// as on a full device. Their writes go on in the spare segment each
+    /// keeps back, and wait once that is full too, until space comes back.
+    pub full_journals: u64,
+    /// Bytes the state may take before it stops growing:
+    /// `max_state_bytes`, or less while the device of the data directory
+    /// has less room.
+    pub state_limit: u64,
 }
 
 /// Messages the broker dropped, by reason.
@@ -511,7 +550,10 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
             .iter()
             .map(|l| l.write_errors.load(Ordering::Relaxed))
             .sum::<u64>();
+    total.full_journals =
+        r.full_journals() + shared.lane_logs.iter().filter(|l| l.full()).count() as u64;
     total.state_bytes += r.bytes() as u64;
+    total.state_limit = u64::try_from(shared.state_limit()).unwrap_or(u64::MAX);
     Ok(total)
 }
 
@@ -631,7 +673,8 @@ impl Drop for Broker {
         for lane in &self.shared.lanes {
             let _ = lane.control.push(Control::Shutdown(None));
         }
-        // The data directory is free for another broker at once.
+        // The data directory is free for another broker once the writes
+        // and trims under way are done; one opened sooner waits for them.
         for log in &self.shared.lane_logs {
             log.release();
         }
@@ -676,6 +719,9 @@ fn install(
         }
     });
 
+    // A run takes at most `DATA_BATCHES`, each at most one read per
+    // connection of the sending lane, then lets this lane's connections
+    // run. A byte cap on top cost cross-lane QoS 0 fan-in up to 25%.
     let l = lane.clone();
     tokio::task::spawn_local(async move {
         let mut batches = Vec::new();

@@ -29,6 +29,10 @@ impl DataDir {
         match *self {}
     }
 
+    pub(crate) const fn room(&self) -> u64 {
+        match *self {}
+    }
+
     pub(crate) fn journal(
         &self,
         _name: &str,
@@ -55,7 +59,11 @@ impl Log {
         match *self {}
     }
 
-    pub(crate) const fn appended_bytes(&self) -> u64 {
+    pub(crate) const fn written_bytes(&self) -> u64 {
+        match *self {}
+    }
+
+    pub(crate) const fn full(&self) -> bool {
         match *self {}
     }
 

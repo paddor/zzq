@@ -17,6 +17,13 @@ const STALL: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const STALL: Duration = Duration::from_millis(200);
 
+/// Longest wait for deliveries after the publishers stop, so a broker that
+/// trickles out a backlog cannot hold up a run.
+#[cfg(not(test))]
+const DRAIN: Duration = Duration::from_secs(90);
+#[cfg(test)]
+const DRAIN: Duration = Duration::from_millis(300);
+
 /// Connection notes a run keeps.
 const NOTES: usize = 32;
 
@@ -62,9 +69,9 @@ pub struct Load {
     pub topics: usize,
     /// What the broker has to keep.
     pub keep: Keep,
-    /// The broker's PID. Its CPU and memory, with its descendants', go into
-    /// the results.
-    pub broker_pid: Option<u32>,
+    /// The PIDs of the broker's processes. Their CPU and memory, with
+    /// their descendants', go into the results.
+    pub broker_pids: Vec<u32>,
 }
 
 impl Default for Load {
@@ -83,7 +90,7 @@ impl Default for Load {
             cross: false,
             topics: 1,
             keep: Keep::default(),
-            broker_pid: None,
+            broker_pids: Vec::new(),
         }
     }
 }
@@ -376,7 +383,7 @@ fn client_id(prefix: &str, lane: usize, lanes: usize) -> String {
 fn sample(run: &Run, load: &Load) -> (Vec<(u64, u64, f64)>, CpuUse) {
     let start = Instant::now();
     thread::sleep(load.warmup);
-    let window = CpuWindow::start(load.broker_pid);
+    let window = CpuWindow::start(&load.broker_pids);
     let snap = || {
         (
             run.sent.load(Relaxed),
@@ -396,10 +403,16 @@ fn sample(run: &Run, load: &Load) -> (Vec<(u64, u64, f64)>, CpuUse) {
     }
 }
 
+/// Waits until every expected delivery came, 2 s pass without one, or
+/// [`DRAIN`] is up.
 fn drain(run: &Run, expected: u64) {
-    let mut idle_since = Instant::now();
+    let start = Instant::now();
+    let mut idle_since = start;
     let mut prev = run.recv.load(Relaxed);
-    while run.recv.load(Relaxed) < expected && idle_since.elapsed() < Duration::from_secs(2) {
+    while run.recv.load(Relaxed) < expected
+        && idle_since.elapsed() < Duration::from_secs(2)
+        && start.elapsed() < DRAIN
+    {
         thread::sleep(Duration::from_millis(20));
         let now = run.recv.load(Relaxed);
         if now != prev {
@@ -604,6 +617,8 @@ pub struct Latency {
     pub max: f64,
     /// Messages not delivered within one second.
     pub lost: u64,
+    /// Round trips measured, after the warmup.
+    pub rounds: u64,
     /// Broker and load generator CPU over the measured round trips.
     pub cpu: CpuUse,
 }
@@ -637,24 +652,78 @@ pub fn latency(load: &Load, iters: usize, until: Until) -> io::Result<Latency> {
         ));
     }
     let mut rtt = Rtt::connect(load)?;
-    let warm = iters / 10;
+    let mut rounds = Rounds::new(iters / 10, iters, Instant::now());
     let mut rtts = Vec::with_capacity(iters);
     let mut lost = 0;
-    let mut window = CpuWindow::start(load.broker_pid);
-    for i in 0..(warm + iters) as u64 {
-        if i == warm as u64 {
-            window = CpuWindow::start(load.broker_pid);
+    let mut window = CpuWindow::start(&load.broker_pids);
+    let mut seq = 0;
+    while let Some(measured) = rounds.next(Instant::now()) {
+        if measured && rounds.done == 1 {
+            window = CpuWindow::start(&load.broker_pids);
         }
-        match rtt.round(i, load, until)? {
+        match rtt.round(seq, load, until)? {
             None => lost += 1,
-            Some(d) if i >= warm as u64 => rtts.push(d),
+            Some(d) if measured => rtts.push(d),
             Some(_) => {}
         }
+        seq += 1;
     }
     Ok(Latency {
+        rounds: rounds.done as u64,
         cpu: window.finish(),
         ..percentiles(rtts, lost)
     })
+}
+
+/// Longest warmup of a latency run.
+const RTT_WARM: Duration = Duration::from_secs(10);
+/// Longest measurement of a latency run, so a slow broker cannot hold up a
+/// suite.
+const RTT_TIME: Duration = Duration::from_secs(60);
+
+/// The round trips of a latency run: `warm` unmeasured ones, for at most
+/// [`RTT_WARM`], then `iters` measured ones, for at most [`RTT_TIME`].
+struct Rounds {
+    warm: usize,
+    iters: usize,
+    start: Instant,
+    warmed: usize,
+    measuring: Option<Instant>,
+    /// Measured rounds so far.
+    done: usize,
+}
+
+impl Rounds {
+    const fn new(warm: usize, iters: usize, start: Instant) -> Rounds {
+        Rounds {
+            warm,
+            iters,
+            start,
+            warmed: 0,
+            measuring: None,
+            done: 0,
+        }
+    }
+
+    /// Whether the next round is measured, or `None` to stop.
+    fn next(&mut self, now: Instant) -> Option<bool> {
+        if self.measuring.is_none()
+            && (self.warmed >= self.warm || now.duration_since(self.start) >= RTT_WARM)
+        {
+            self.measuring = Some(now);
+        }
+        match self.measuring {
+            None => {
+                self.warmed += 1;
+                Some(false)
+            }
+            Some(from) if self.done < self.iters && now.duration_since(from) < RTT_TIME => {
+                self.done += 1;
+                Some(true)
+            }
+            Some(_) => None,
+        }
+    }
 }
 
 /// The clients and buffers of a latency run.
@@ -779,6 +848,7 @@ fn percentiles(mut rtts: Vec<Duration>, lost: u64) -> Latency {
         p999: at(0.999),
         max: rtts.last().map_or(0.0, |d| us(*d)),
         lost,
+        rounds: 0,
         cpu: CpuUse::default(),
     }
 }
@@ -832,6 +902,38 @@ mod tests {
             rmax: None,
         };
         (c, server)
+    }
+
+    #[test]
+    fn a_latency_run_stops_at_its_count_or_its_time() {
+        let t0 = Instant::now();
+        let mut r = Rounds::new(2, 3, t0);
+        let seq: Vec<_> = std::iter::from_fn(|| r.next(t0)).collect();
+        assert_eq!(seq, [false, false, true, true, true]);
+        let mut r = Rounds::new(1000, 1000, t0);
+        assert_eq!(r.next(t0), Some(false));
+        assert_eq!(r.next(t0 + RTT_WARM), Some(true), "a slow warmup ends");
+        assert_eq!(r.next(t0 + RTT_WARM + RTT_TIME), None);
+        assert_eq!(r.done, 1);
+    }
+
+    #[test]
+    fn a_drain_ends_while_deliveries_still_trickle_in() {
+        let run = Arc::new(Run::default());
+        let trickle = {
+            let run = run.clone();
+            thread::spawn(move || {
+                while !run.sub_stop.load(Relaxed) {
+                    run.recv.fetch_add(1, Relaxed);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let t0 = Instant::now();
+        drain(&run, u64::MAX);
+        assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
+        run.sub_stop.store(true, Relaxed);
+        trickle.join().unwrap();
     }
 
     #[test]

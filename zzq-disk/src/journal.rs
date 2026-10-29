@@ -1,7 +1,7 @@
 //! A journal: one owner's records, written in groups.
 
 use std::collections::VecDeque;
-use std::fs::{self, File};
+use std::fs;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +13,7 @@ use fanring::mpsc::{self, Receiver, Sender, TrySendError};
 use crate::aio::AlignedBuf;
 use crate::backend::{AioJob, Done, FileJob, QUEUE, Write, locked};
 use crate::format::{self, GROUP_HEADER, PAGE, RECORD_HEADER, ScanError};
-use crate::segment::{self, Segment};
+use crate::segment::{self, Dir, Segment};
 use crate::{Config, Disk, Error, ReplayError};
 
 /// A record read back when a journal opens.
@@ -35,7 +35,9 @@ pub struct Record<'a> {
 /// its last record.
 pub struct Journal {
     id: u64,
-    dir: Arc<Path>,
+    /// Locked while it, or a write or file job it started, lives: one
+    /// journal per directory.
+    dir: Arc<Dir>,
     config: Config,
     links: Links,
     tail: Tail,
@@ -45,11 +47,9 @@ pub struct Journal {
     /// The last record a flush asked for.
     flushed: u64,
     durable: u64,
-    /// Framed bytes of all records appended.
-    appended_bytes: u64,
+    /// Bytes of the groups written, padding included.
+    written_bytes: u64,
     stopped: bool,
-    /// Held while open: one journal per directory.
-    _lock: File,
 }
 
 /// The journal's ends of the channels to the disk threads.
@@ -70,13 +70,27 @@ struct Tail {
     /// The segment after `active`, made ahead of need.
     next: Option<Segment>,
     creating: bool,
-    /// The next group starts a new segment.
-    roll: bool,
-    /// The next write goes to a place the kernel refuses.
+    /// The last segment asked for could not be made, as on a full device.
+    failed: bool,
+    /// A segment could not be made, and none came since but the one after
+    /// a roll, which may take the spare kept back.
+    full: bool,
+    /// Groups of the records after this one start a new segment.
+    roll_after: Option<u64>,
     #[cfg(feature = "testing")]
-    fail: bool,
+    faults: Faults,
     /// Number of the next group.
     group: u64,
+}
+
+/// Failures a test asked for.
+#[cfg(feature = "testing")]
+#[derive(Default)]
+struct Faults {
+    /// The next write goes to a place the kernel refuses.
+    write: bool,
+    /// The next segment asked for fails as on a full device.
+    segment: bool,
 }
 
 /// Records not yet written.
@@ -113,7 +127,7 @@ struct InFlight {
 impl std::fmt::Debug for Journal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Journal")
-            .field("dir", &self.dir)
+            .field("dir", &self.dir.path())
             .field("appended", &self.appended)
             .field("durable", &self.durable)
             .finish_non_exhaustive()
@@ -139,12 +153,8 @@ impl Journal {
             return Err(Error::TooLarge { len });
         }
         let p = &mut self.pending;
-        if p.open.records > 0 && p.open.buf.len() + framed > self.config.group_bytes {
-            let fresh = Group {
-                buf: p.free.pop().unwrap_or_default(),
-                ..Group::default()
-            };
-            p.queued.push_back(std::mem::replace(&mut p.open, fresh));
+        if p.open.buf.len() + framed > self.config.group_bytes {
+            p.seal();
         }
         let open = &mut p.open;
         if open.buf.is_empty() {
@@ -156,7 +166,6 @@ impl Journal {
         open.last = self.appended;
         open.bytes += framed;
         p.bytes += framed;
-        self.appended_bytes += framed as u64;
         Ok(self.appended)
     }
 
@@ -185,7 +194,9 @@ impl Journal {
         };
         let length = format::group_len(group.buf.len()) as u64;
         let t = &mut self.tail;
-        let fits = |a: &&Segment| !t.roll && t.offset + length <= a.capacity;
+        let first = group.last + 1 - u64::from(group.records);
+        let rolls = t.roll_after.is_some_and(|n| first > n);
+        let fits = |a: &&Segment| !rolls && t.offset + length <= a.capacity;
         let active = if let Some(a) = t.active.as_ref().filter(fits) {
             a
         } else {
@@ -194,26 +205,28 @@ impl Journal {
                 return self.create_next();
             };
             t.offset = PAGE as u64;
-            t.roll = false;
+            t.roll_after = None;
             t.active.insert(next)
         };
         format::seal(&mut group.buf, active.id, t.group, group.records)?;
         // One byte past its place, which the kernel refuses for direct IO,
         // when a test asked for a failure.
         #[cfg(feature = "testing")]
-        let skew = u64::from(std::mem::take(&mut t.fail));
+        let skew = u64::from(std::mem::take(&mut t.faults.write));
         #[cfg(not(feature = "testing"))]
         let skew = 0;
         let write = Write {
             journal: self.id,
+            dir: self.dir.clone(),
             file: active.file.clone(),
             offset: t.offset + skew,
             buf: group.buf,
         };
-        let half = t.offset + length > active.capacity / 2;
+        // Not again after a failure: the writes need it once this one is full.
+        let half = t.offset + length > active.capacity / 2 && !t.failed;
         send(&mut self.links.aio, AioJob::Write(write))?;
         self.in_flight = Some(InFlight {
-            first: group.last + 1 - u64::from(group.records),
+            first,
             last: group.last,
             length,
             bytes: group.bytes,
@@ -284,38 +297,65 @@ impl Journal {
         }
         let group = self.tail.group - 1;
         if group > 0 {
-            segment::write_mark(&self.dir, group)?;
+            segment::write_mark(self.dir.path(), group)?;
         }
         Ok(self.durable)
     }
 
-    /// Starts the next group in a new segment, unless the current one
-    /// holds none yet, and returns that segment's id. Once what the
-    /// records from here on replace is durable, [`Journal::trim`] removes
-    /// the segments before it. `None` while the next segment is still
-    /// being made, so writes need not wait for it: ask again later.
+    /// Starts a new segment for the records appended from here on, unless
+    /// the current one holds none yet, and returns that segment's id. The
+    /// records before stay in the segments before it. Once what the
+    /// records from here on replace is durable, [`Journal::trim`] retires
+    /// those. `None` while the next segment is still being made, or while
+    /// the records before do not fit the current one, so writes need not
+    /// wait: ask again later. On a device too full for another segment,
+    /// the new one comes from the spare kept back for a roll, and the
+    /// records from here on wait for it.
     ///
     /// # Errors
     ///
     /// [`Error::Closed`] once the disk threads stopped.
     pub fn roll(&mut self) -> Result<Option<u64>, Error> {
+        let ahead = self.ahead();
         let t = &mut self.tail;
-        match (&t.active, &t.next) {
-            (None, _) => Ok(Some(1)),
-            (Some(a), _) if t.offset == PAGE as u64 => Ok(Some(a.id)),
-            (Some(_), Some(next)) => {
-                t.roll = true;
-                Ok(Some(next.id))
-            }
-            (Some(_), None) => {
-                self.create_next()?;
-                Ok(None)
-            }
+        let Some(a) = &t.active else {
+            return Ok(Some(1));
+        };
+        let id = a.id + 1;
+        if t.roll_after.is_some() {
+            // Records from an earlier roll go there already.
+            return Ok(Some(id));
         }
+        if t.offset == PAGE as u64 && ahead == 0 {
+            return Ok(Some(a.id));
+        }
+        let ready = t.offset + ahead <= a.capacity && (t.next.is_some() || t.failed);
+        if ready {
+            t.roll_after = Some(self.appended);
+            self.pending.seal();
+        }
+        // For these records, or for a later roll.
+        self.create_next()?;
+        Ok(ready.then_some(id))
     }
 
-    /// Removes the segments before `before`, oldest first, on the file
-    /// thread, and notes the groups on disk so far.
+    /// Bytes the groups in flight and waiting take in a segment.
+    fn ahead(&self) -> u64 {
+        let p = &self.pending;
+        let open = (p.open.records > 0).then_some(&p.open);
+        let waiting = p
+            .queued
+            .iter()
+            .chain(open)
+            .map(|g| format::group_len(g.buf.len()) as u64)
+            .sum::<u64>();
+        self.in_flight.map_or(0, |w| w.length) + waiting
+    }
+
+    /// Retires the segments before `before`, oldest first, on the file
+    /// thread, and notes the groups on disk so far. They stay as spares
+    /// for the next segments, whose writes then land in blocks written
+    /// before: those cost no metadata write.
     ///
     /// # Errors
     ///
@@ -346,7 +386,14 @@ impl Journal {
     #[cfg(feature = "testing")]
     #[doc(hidden)]
     pub const fn fail_next_write(&mut self) {
-        self.tail.fail = true;
+        self.tail.faults.write = true;
+    }
+
+    /// Makes the next segment it asks for fail, as on a full device.
+    #[cfg(feature = "testing")]
+    #[doc(hidden)]
+    pub const fn fail_next_segment(&mut self) {
+        self.tail.faults.segment = true;
     }
 
     /// Groups written to the directory so far.
@@ -356,9 +403,17 @@ impl Journal {
         self.tail.group - 1
     }
 
-    /// Framed bytes of the records appended since the journal opened.
-    pub const fn appended_bytes(&self) -> u64 {
-        self.appended_bytes
+    /// Bytes of the groups written since the journal opened, padding
+    /// included: what it added to its segments.
+    pub const fn written_bytes(&self) -> u64 {
+        self.written_bytes
+    }
+
+    /// Whether it could not make a new segment, as on a full device. Its
+    /// writes go on in the spare kept back for a roll, or wait. It is
+    /// false again once a segment comes from free space or other spares.
+    pub const fn full(&self) -> bool {
+        self.tail.full
     }
 
     /// Number of the last record appended, 0 for none.
@@ -392,6 +447,7 @@ impl Journal {
                 self.durable = w.last;
                 match result {
                     Ok(()) => {
+                        self.written_bytes += w.length;
                         self.tail.offset += w.length;
                         self.tail.group += 1;
                         self.send()?;
@@ -410,8 +466,11 @@ impl Journal {
                 }
             }
             Done::Created(result) => {
-                self.tail.creating = false;
-                self.tail.next = Some(result?);
+                let t = &mut self.tail;
+                t.creating = false;
+                t.failed = result.is_err();
+                t.full = t.failed || (t.full && t.roll_after.is_some());
+                t.next = Some(result?);
                 self.send()?;
                 Ok(false)
             }
@@ -444,10 +503,20 @@ impl Journal {
             .done_tx
             .try_register()
             .map_err(|_| Error::Closed)?;
+        #[cfg(feature = "testing")]
+        if std::mem::take(&mut t.faults.segment) {
+            let mut reply = reply;
+            let full = io::Error::from(io::ErrorKind::StorageFull);
+            send(&mut reply, Done::Created(Err(full)))?;
+            t.creating = true;
+            return Ok(());
+        }
         let job = FileJob::Create {
             dir: self.dir.clone(),
             id: t.active.as_ref().map_or(1, |a| a.id + 1),
             capacity: self.config.segment_bytes,
+            zero: t.active.is_none(),
+            last_spare: t.roll_after.is_some(),
             reply,
         };
         send(&mut self.links.files, job)?;
@@ -457,6 +526,19 @@ impl Journal {
 }
 
 impl Pending {
+    /// Queues the open group, if it has records, so later ones start
+    /// another.
+    fn seal(&mut self) {
+        if self.open.records > 0 {
+            let fresh = Group {
+                buf: self.free.pop().unwrap_or_default(),
+                ..Group::default()
+            };
+            self.queued
+                .push_back(std::mem::replace(&mut self.open, fresh));
+        }
+    }
+
     /// The oldest group with records, taken out.
     fn take(&mut self) -> Option<Group> {
         if let Some(g) = self.queued.pop_front() {
@@ -476,6 +558,7 @@ impl Pending {
 impl Drop for Journal {
     fn drop(&mut self) {
         let _ = self.links.aio.try_send(AioJob::Close(self.id));
+        self.dir.closed();
     }
 }
 
@@ -504,25 +587,28 @@ impl Disk {
     /// # Errors
     ///
     /// [`Error::Io`] if the directory cannot be read or written, takes no
-    /// `O_DIRECT`, or another journal holds it; [`Error::Corrupt`] for
-    /// damage inside what was written; [`Error::Replay`] if `replay`
-    /// refuses a record; [`Error::Closed`] once the disk threads stopped.
+    /// `O_DIRECT`, or another journal holds it (`WouldBlock`). One dropped
+    /// there in this process holds it until the writes and trims it left
+    /// are done, which this waits for. [`Error::Corrupt`] for damage inside
+    /// what was written; [`Error::Replay`] if `replay` refuses a record;
+    /// [`Error::Closed`] once the disk threads stopped.
     pub fn open(
         &self,
         dir: impl AsRef<Path>,
         mut replay: impl FnMut(Record<'_>) -> Result<(), ReplayError>,
     ) -> Result<Journal, Error> {
-        let dir: Arc<Path> = dir.as_ref().into();
-        if !dir.is_dir() {
-            fs::create_dir_all(&dir)?;
+        let path = dir.as_ref();
+        if !path.is_dir() {
+            fs::create_dir_all(path)?;
             // The new directory itself has to survive a crash.
-            if let Some(parent) = dir.parent().filter(|p| !p.as_os_str().is_empty()) {
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 segment::sync_dir(parent)?;
             }
         }
-        let lock = segment::lock(&dir)?;
-        let found = recover(&dir, &mut replay)?;
-        let tail = Self::tail(&dir, found)?;
+        let path = &fs::canonicalize(path)?;
+        let dir = Arc::new(Dir::lock(path)?);
+        let found = recover(path, &mut replay)?;
+        let tail = Self::tail(path, found)?;
         let (done_tx, done) = mpsc::channel(QUEUE);
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut aio = locked(&self.aio)
@@ -549,13 +635,12 @@ impl Disk {
             appended: 0,
             flushed: 0,
             durable: 0,
-            appended_bytes: 0,
+            written_bytes: 0,
             stopped: false,
-            _lock: lock,
         })
     }
 
-    /// Opens the segments writes continue in and removes spare empty
+    /// Opens the segments writes continue in and removes further empty
     /// ones. A journal with none makes its first on the first write.
     fn tail(dir: &Path, found: Found) -> Result<Tail, Error> {
         let mut empty = found.empty.into_iter();
@@ -578,9 +663,11 @@ impl Disk {
             offset,
             next,
             creating: false,
-            roll: false,
+            failed: false,
+            full: false,
+            roll_after: None,
             #[cfg(feature = "testing")]
-            fail: false,
+            faults: Faults::default(),
             group: found.last.map_or(1, |g| g + 1),
         })
     }

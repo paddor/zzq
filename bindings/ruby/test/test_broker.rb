@@ -36,6 +36,8 @@ class BrokerTest < Minitest::Spec
     assert_equal 2, stats[:deliveries]
     assert_equal 0, stats[:dropped_session_ended]
     assert_equal 0, stats[:dropped_state_full]
+    assert_equal 0, stats[:full_journals]
+    assert_equal 2**64 - 1, stats[:state_limit]
     assert_operator stats[:state_bytes], :>, 0
   end
 

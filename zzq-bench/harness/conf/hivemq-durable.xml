@@ -1,0 +1,45 @@
+<?xml version="1.0"?>
+<!--
+  hivemq-tuned.xml with file persistence, the default and HiveMQ CE's most
+  durable mode. The PUBACK waits for the queue write, which is not synced.
+
+  HiveMQ CE 2026.5 with per-client caps raised like the other tuned rivals:
+  queues of 100000 (default 1000, then new messages are dropped), a server
+  Receive Maximum of 1000 (default 10, then publishers are disconnected).
+  Outbound in-flight stays at 50 per client, fixed in CE. File persistence,
+  the default, keeps QoS 1/2 queues on disk. Nagle is off in the code.
+-->
+<hivemq>
+    <listeners>
+        <tcp-listener>
+            <port>1883</port>
+            <bind-address>0.0.0.0</bind-address>
+        </tcp-listener>
+    </listeners>
+    <mqtt>
+        <queued-messages>
+            <max-queue-size>100000</max-queue-size>
+            <strategy>discard</strategy>
+        </queued-messages>
+        <receive-maximum>
+            <server-receive-maximum>1000</server-receive-maximum>
+        </receive-maximum>
+        <session-expiry>
+            <max-interval>4294967295</max-interval>
+        </session-expiry>
+        <keep-alive>
+            <allow-unlimited>true</allow-unlimited>
+            <max-keep-alive>65535</max-keep-alive>
+        </keep-alive>
+    </mqtt>
+    <restrictions>
+        <max-connections>-1</max-connections>
+        <incoming-bandwidth-throttling>0</incoming-bandwidth-throttling>
+    </restrictions>
+    <persistence>
+        <mode>file</mode>
+    </persistence>
+    <anonymous-usage-statistics>
+        <enabled>false</enabled>
+    </anonymous-usage-statistics>
+</hivemq>

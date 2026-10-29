@@ -70,6 +70,12 @@ impl LaneLog {
         self.lock().log.is_some()
     }
 
+    /// Whether its journal could not make a new segment, as on a full
+    /// device.
+    pub(crate) fn full(&self) -> bool {
+        self.lock().log.as_ref().is_some_and(Log::full)
+    }
+
     /// Sends what was appended, unless a write is in flight.
     fn flush(&self) {
         if let Some(log) = self.lock().log.as_mut()
@@ -155,6 +161,14 @@ impl LaneLog {
         }
     }
 
+    /// Makes the next segment it asks for fail, as on a full device.
+    #[cfg(test)]
+    pub(crate) fn fail_next_segment(&self) {
+        if let Some(log) = self.lock().log.as_mut() {
+            log.fail_next_segment();
+        }
+    }
+
     /// Number of the last record appended, and groups written.
     #[cfg(test)]
     pub(crate) fn counts(&self) -> (u64, u64) {
@@ -202,13 +216,14 @@ impl LogState {
     }
 
     /// Writes a snapshot from a new segment, if the journal grew enough
-    /// past what it holds live, or with `force`: the segments before go
-    /// once it is written. False if it waits for that segment.
+    /// past what it holds live, or with `force`, unless one waits for its
+    /// trim: the segments before go once it is written. False if it waits
+    /// for that segment.
     fn snapshot(&mut self, sessions: &Slab<Session>, live: u64, force: bool) -> io::Result<bool> {
-        let Some(log) = self.log.as_mut() else {
+        let Some(log) = self.log.as_mut().filter(|_| self.trim.is_none()) else {
             return Ok(true);
         };
-        let since = log.appended_bytes() - self.snapshot_at;
+        let since = log.written_bytes() - self.snapshot_at;
         if !force && !disk::snapshot_due(since, live) {
             return Ok(true);
         }
@@ -217,7 +232,7 @@ impl LogState {
         };
         let last = self.write_all(sessions)?;
         if let Some(log) = self.log.as_mut() {
-            self.snapshot_at = log.appended_bytes();
+            self.snapshot_at = log.written_bytes();
             log.flush()?;
         }
         self.trim = Some((segment, last));
@@ -465,7 +480,10 @@ pub(crate) async fn complete(lane: LaneRef) {
                 if log.lock().written(n).is_err() {
                     log.write_errors.fetch_add(1, Ordering::Relaxed);
                 }
-                lane.borrow_mut().pairs_written(0, n, false);
+                let mut l = lane.borrow_mut();
+                l.pairs_written(0, n, false);
+                // As soon as the journal grew enough, not at the next sweep.
+                l.snapshot_journal(false);
             }
             Completion::Failed(first, last) => {
                 log.write_errors.fetch_add(1, Ordering::Relaxed);
@@ -476,6 +494,9 @@ pub(crate) async fn complete(lane: LaneRef) {
             }
             Completion::Stalled => {
                 log.write_errors.fetch_add(1, Ordering::Relaxed);
+                // No new segment, as on a full device: a snapshot starts in
+                // the spare kept back, and the trim behind it makes room.
+                lane.borrow_mut().snapshot_journal(true);
                 tokio::time::sleep(RETRY).await;
                 log.flush();
             }

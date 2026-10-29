@@ -21,7 +21,7 @@ impl Lane {
     /// went to is congested. A publisher gets at most Receive Maximum acks
     /// held: a v5 one breaks the protocol past it, a v3.1.1 one, which has no
     /// such limit, gets the rest at once. A publish that needs journal
-    /// writes gets its ack once they are done instead.
+    /// writes gets its ack once they are done, and then as here.
     pub(super) fn ack_or_hold(&mut self, key: Key, p: &Publish<'_>) -> Result<(), Close> {
         if !self.needs.is_empty() {
             self.hold_publish(key, p);
@@ -32,14 +32,20 @@ impl Lane {
             QoS::AtLeastOnce => PacketType::PubAck,
             QoS::ExactlyOnce => PacketType::PubRec,
         };
+        let hit = self.congestion.hit.take();
+        self.ack_after(key, hit, (kind, p.pkid, 0))
+    }
+
+    /// Sends publisher `key` ack `kind` for `pkid` with `reason`, or holds it
+    /// while `hit` is still congested.
+    pub(super) fn ack_after(
+        &mut self,
+        key: Key,
+        hit: Option<Hit>,
+        (kind, pkid, reason): (PacketType, u16, u8),
+    ) -> Result<(), Close> {
         let max = u32::from(self.shared.opts.receive_maximum);
-        let hit = match self.congestion.hit.take() {
-            Some(Hit::Local(sub)) if sub != key && self.sessions.get(sub).is_some() => {
-                Some(Hit::Local(sub))
-            }
-            remote @ Some(Hit::Remote(_)) => remote,
-            _ => None,
-        };
+        let hit = hit.filter(|&h| self.still_congested(key, h));
         let Some(s) = self.sessions.get_mut(key) else {
             return Ok(());
         };
@@ -51,7 +57,7 @@ impl Lane {
             hit => hit,
         };
         let Some(hit) = hit else {
-            s.ack(kind, p.pkid, 0);
+            s.ack(kind, pkid, reason);
             self.mark(key);
             return Ok(());
         };
@@ -60,7 +66,7 @@ impl Lane {
             publisher: key,
             conn: s.conn.as_ref().map_or(0, |c| c.id),
             kind,
-            pkid: p.pkid,
+            pkid,
         };
         match hit {
             Hit::Local(sub) => {
@@ -79,6 +85,38 @@ impl Lane {
             }
         }
         Ok(())
+    }
+
+    /// Whether `hit` still holds the acks of publisher `key`: a congested
+    /// session other than the publisher.
+    fn still_congested(&self, key: Key, hit: Hit) -> bool {
+        match hit {
+            Hit::Local(sub) => {
+                sub != key
+                    && self
+                        .sessions
+                        .get(sub)
+                        .is_some_and(|s| s.backpressure.congested)
+            }
+            Hit::Remote(sub) => self.congestion.remote.contains(&sub),
+        }
+    }
+
+    /// The session `hit` names, as other lanes name it.
+    pub(super) const fn sub_of(&self, hit: Hit) -> SubRef {
+        match hit {
+            Hit::Local(key) => self.sub_ref(key),
+            Hit::Remote(sub) => sub,
+        }
+    }
+
+    /// What session `sub` is to this lane.
+    pub(super) const fn hit_of(&self, sub: SubRef) -> Hit {
+        if sub.lane == self.id {
+            Hit::Local(sub.key)
+        } else {
+            Hit::Remote(sub)
+        }
     }
 
     /// Sends held acks once a congested session drained or went away.

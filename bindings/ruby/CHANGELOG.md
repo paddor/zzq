@@ -5,7 +5,7 @@
 - `Broker.new` takes `data_dir:` in place of `persistence:`: retained
   messages, sessions and their QoS 1/2 messages stay on disk, and acks
   wait until what they stand for is there. Linux only. `Broker#stats` adds
-  `write_errors`.
+  `write_errors`, `full_journals` and `state_limit`.
 
 ## v0.5.0 — 2026-10-27
 

@@ -74,14 +74,14 @@ impl Lane {
             QoS::AtLeastOnce => PacketType::PubAck,
             QoS::ExactlyOnce => PacketType::PubRec,
         };
-        // The ack waits for the disk, not for congested subscribers.
-        self.congestion.hit = None;
+        // The ack waits for the disk, then for a congested subscriber.
+        let congested = self.congestion.hit.take().map(|hit| self.sub_of(hit));
         if let Some(h) = self.hold(key) {
             for &w in &needs.waits {
                 h.wait(w);
             }
             h.failed |= needs.failed;
-            h.push_durable(kind, p.pkid);
+            h.push_publish(kind, p.pkid, congested);
         }
         self.needs = needs;
     }
@@ -113,10 +113,11 @@ impl Lane {
     }
 
     /// Sends the held acks of connection `conn`, once the records they
-    /// wait for are `written` or failed. If not, a v5 publisher gets
-    /// Unspecified error for each, and a v3.1.1 one, which has no such
-    /// code, is disconnected, as is a client whose PUBREL or PUBCOMP
-    /// waited.
+    /// wait for are `written` or failed. A publish that went to a congested
+    /// subscriber keeps its ack held until that drains. If not written, a
+    /// v5 publisher gets Unspecified error for each, and a v3.1.1 one,
+    /// which has no such code, is disconnected, as is a client whose PUBREL
+    /// or PUBCOMP waited.
     pub(crate) fn release_acks(&mut self, key: Key, conn: u64, written: bool) -> Result<(), Close> {
         let Some(s) = self.sessions.get_mut(key) else {
             return Ok(());
@@ -128,9 +129,16 @@ impl Lane {
         let mut result = Ok(());
         for a in &hold.acks {
             if ok || !a.durable {
-                s.ack(a.kind, a.pkid, a.reason);
+                let hit = a.congested.map(|sub| self.hit_of(sub));
+                if let Err(close) = self.ack_after(key, hit, (a.kind, a.pkid, a.reason)) {
+                    result = Err(close);
+                    break;
+                }
                 continue;
             }
+            let Some(s) = self.sessions.get_mut(key) else {
+                break;
+            };
             if !s.version.is_v5() || !matches!(a.kind, PacketType::PubAck | PacketType::PubRec) {
                 result = Err(Close::Protocol(reason::UNSPECIFIED_ERROR));
                 break;

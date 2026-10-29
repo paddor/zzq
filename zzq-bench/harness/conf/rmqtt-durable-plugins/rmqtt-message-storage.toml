@@ -1,0 +1,6 @@
+## Messages in Redis at 127.0.0.1:6379, which the suite starts with every
+## write synced.
+storage.type = "redis"
+storage.redis.url = "redis://127.0.0.1:6379/"
+storage.redis.prefix = "message-{node}"
+cleanup_count = 5000

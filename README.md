@@ -1,22 +1,27 @@
 # zzq
 
-MQTT 3.1.1 and 5.0 broker and client in Rust, with an MQTT-SN 1.2 gateway.
-Connections run on IO lanes: threads with their own Tokio runtime, so a
-connection never moves between threads.
+An MQTT 3.1.1 and 5.0 broker and client in Rust, with an MQTT-SN 1.2
+gateway.
 
-## Crates
+The broker listens and the client connects on `tcp://`, `tls://`,
+`ws://`, `wss://`, `quic://`, `ipc://` and, within a process,
+`inproc://`. MQTT-SN runs over `udp://`. TLS and QUIC are behind the
+default `tls` and `quic` features.
 
-| Crate | Purpose |
-| --- | --- |
-| `zzq-proto` | `no_std` codec for MQTT 3.1.1, 5.0 and MQTT-SN, topic rules and a topic trie |
-| `zzq-tokio` | `Context`, IO lanes and transports |
-| `zzq-disk` | Durable append-only journals, written with Linux AIO |
-| `zzq-broker` | `Broker`: sessions, retained messages, wills, shared subscriptions, MQTT-SN gateway, auth hooks |
-| `zzq-client` | `Client`, async and blocking, with reconnect and session resume |
-| `zzq-bench` | Load generators and local performance gates |
+## Why zzq
 
-The Ruby gem `zzq` in [`bindings/ruby`](bindings/ruby) binds the client and
-the broker.
+- **Correct under load.** A slow subscriber slows its publishers, no
+  connection starves, and the broker avoids acking messages it would
+  later drop.
+- **Durable.** With a data directory, sessions and messages survive
+  restarts and crashes. An ack goes out once its message is on disk.
+- **Fast.** A connection stays on its IO lane, and messages pass without
+  locks, copies or allocations.
+- **Flat memory.** Overload slows publishers instead of filling RAM.
+- **Embeddable.** Run `zzq_broker`, or embed the `Broker` in an
+  application. The `Client` is async or blocking.
+- **Fuzzed.** AFL targets cover every input that reads bytes: packets,
+  MQTT-SN, WebSocket, journals, state files and topics.
 
 ## Example
 
@@ -34,24 +39,44 @@ client.publish("sensors/temp", "21.5", QoS::AtLeastOnce).await?;
 let message = client.recv().await;
 ```
 
-## Transports
+## Workspace
 
-`tcp://`, `tls://`, `ws://`, `wss://`, `quic://`, `ipc://`, `inproc://`,
-and `udp://` for MQTT-SN. TLS and QUIC are behind the default `tls` and
-`quic` features.
+Six Cargo workspace crates. `zzq-tokio`, `zzq-client` and `zzq-bench`
+forbid unsafe Rust. `zzq-proto` and `zzq-broker` each skip one UTF-8
+check on bytes known to be valid, and `zzq-disk` keeps its Linux AIO calls
+in one module.
+
+| Crate | What it does |
+| --- | --- |
+| [`zzq-proto`](zzq-proto/) | Sans-I/O `no_std` codec for MQTT 3.1.1, 5.0 and MQTT-SN, topic rules and a topic trie |
+| [`zzq-tokio`](zzq-tokio/) | `Context`, IO lanes and transports |
+| [`zzq-disk`](zzq-disk/) | Durable append-only journals, written with Linux AIO |
+| [`zzq-broker`](zzq-broker/) | `Broker`: sessions, retained messages, wills, shared subscriptions, MQTT-SN gateway, auth hooks |
+| [`zzq-client`](zzq-client/) | `Client`, async and blocking, with reconnect and session resume |
+| [`zzq-bench`](zzq-bench/) | Load generators, the benchmark suite, perf gates and charts |
+
+Language bindings:
+
+| Language | Binding |
+| --- | --- |
+| [Ruby](bindings/ruby/README.md) | The `zzq` gem: broker and client |
 
 ## Durability
 
-The broker keeps its state in memory. With `BrokerOptions::data_dir`
-(`zzq_broker --data-dir`, Linux only), it keeps retained messages, the
-sessions that outlive their connection, their subscriptions and their
-QoS 1/2 messages in journals written with `O_DIRECT | O_DSYNC`, and an ack
-waits until what it stands for is on disk. See
-[COMPARISONS.md](COMPARISONS.md#durability).
+By default the broker keeps everything in memory. Give it a data
+directory (`zzq_broker --data-dir`, Linux only) and it also keeps retained
+messages and persistent sessions on disk. An ack then goes out only once
+its message is written, so a crash loses nothing that was acked. When the
+disk runs low, the broker stops keeping new messages instead of failing.
 
-## Benchmarks
+## Further reading
 
-See [BENCHMARKS.md](BENCHMARKS.md).
+- [doc/architecture.md](doc/architecture.md): the threads, the queues
+  between them and the path of a message.
+- [BENCHMARKS.md](BENCHMARKS.md): throughput, latency and memory next to
+  twelve other brokers, with storage off and on.
+- [COMPARISONS.md](COMPARISONS.md): how those brokers handle overload,
+  what their storage keeps, and what a crash loses.
 
 ## Requirements
 
@@ -61,8 +86,3 @@ Rust 1.93 or newer.
 
 Licensed under either of [ISC](LICENSE-ISC) or
 [Apache-2.0](LICENSE-APACHE), at your option.
-
-Unless you explicitly state otherwise, any contribution intentionally
-submitted for inclusion in the work by you, as defined in the Apache-2.0
-license, shall be dual licensed as above, without any additional terms or
-conditions.

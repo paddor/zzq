@@ -6,9 +6,10 @@ use std::time::Instant;
 /// Clock ticks per second in `/proc` times (`USER_HZ`, 100 on Linux).
 const USER_HZ: f64 = 100.0;
 
-/// CPU ticks and resident bytes of a process and all its descendants, so a
-/// broker in a container or with helper processes counts in full.
-fn tree_usage(root: u32) -> (u64, u64) {
+/// CPU ticks and resident bytes of processes `roots` and all their
+/// descendants, so a broker in a container, with helper processes or with
+/// helper containers counts in full.
+fn tree_usage(roots: &[u32]) -> (u64, u64) {
     let mut procs = Vec::new();
     for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
         let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else {
@@ -29,7 +30,12 @@ fn tree_usage(root: u32) -> (u64, u64) {
         };
         procs.push((pid, num(4) as u32, num(14) + num(15), num(24) * 4096));
     }
-    let mut keep = vec![root];
+    let mut keep: Vec<u32> = Vec::new();
+    for &r in roots {
+        if !keep.contains(&r) {
+            keep.push(r);
+        }
+    }
     let (mut ticks, mut rss) = (0, 0);
     let mut i = 0;
     while let Some(&p) = keep.get(i) {
@@ -37,7 +43,7 @@ fn tree_usage(root: u32) -> (u64, u64) {
             if pid == p {
                 ticks += t;
                 rss += r;
-            } else if ppid == p {
+            } else if ppid == p && !keep.contains(&pid) {
                 keep.push(pid);
             }
         }
@@ -46,14 +52,23 @@ fn tree_usage(root: u32) -> (u64, u64) {
     (ticks, rss)
 }
 
+/// The PIDs in `1234,5678`, without zeros: `0` names none. None if one
+/// does not parse.
+pub fn pids(list: &str) -> Option<Vec<u32>> {
+    list.split(',')
+        .map(|p| p.parse::<u32>().ok())
+        .filter(|p| *p != Some(0))
+        .collect()
+}
+
 fn self_ticks() -> u64 {
-    tree_usage(std::process::id()).0
+    tree_usage(&[std::process::id()]).0
 }
 
 /// Broker and load generator CPU over a measured window.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CpuWindow {
-    broker: Option<u32>,
+    broker: Vec<u32>,
     start: Instant,
     broker_ticks: u64,
     own_ticks: u64,
@@ -62,7 +77,7 @@ pub struct CpuWindow {
 /// What a [`CpuWindow`] measured.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CpuUse {
-    /// Broker CPU in percent of one core, if a broker PID was given.
+    /// Broker CPU in percent of one core, if broker PIDs were given.
     pub broker: Option<f64>,
     /// Broker resident memory at the end, in MiB.
     pub rss_mib: Option<f64>,
@@ -71,12 +86,13 @@ pub struct CpuUse {
 }
 
 impl CpuWindow {
-    /// Starts a window. `broker` is the broker's PID, if known.
-    pub fn start(broker: Option<u32>) -> CpuWindow {
+    /// Starts a window. `broker` has the PIDs of the broker's processes,
+    /// none if unknown.
+    pub fn start(broker: &[u32]) -> CpuWindow {
         CpuWindow {
-            broker,
+            broker: broker.to_vec(),
             start: Instant::now(),
-            broker_ticks: broker.map_or(0, |p| tree_usage(p).0),
+            broker_ticks: tree_usage(broker).0,
             own_ticks: self_ticks(),
         }
     }
@@ -85,7 +101,7 @@ impl CpuWindow {
     pub fn finish(&self) -> CpuUse {
         let secs = self.start.elapsed().as_secs_f64();
         let pct = |ticks: u64| ticks as f64 / USER_HZ / secs * 100.0;
-        let usage = self.broker.map(tree_usage);
+        let usage = (!self.broker.is_empty()).then(|| tree_usage(&self.broker));
         CpuUse {
             broker: usage.map(|(t, _)| pct(t.saturating_sub(self.broker_ticks))),
             rss_mib: usage.map(|(_, r)| r as f64 / f64::from(1 << 20)),
@@ -110,7 +126,8 @@ mod tests {
 
     #[test]
     fn a_window_counts_its_own_process() {
-        let w = CpuWindow::start(Some(std::process::id()));
+        let me = std::process::id();
+        let w = CpuWindow::start(&[me, me]);
         let busy = Instant::now();
         while busy.elapsed().as_millis() < 50 {
             std::hint::black_box(0);
@@ -118,6 +135,10 @@ mod tests {
         let used = w.finish();
         assert!(used.rss_mib.is_some_and(|r| r > 0.0), "{used:?}");
         assert!(used.to_string().starts_with("cpu "), "{used}");
+        assert!(CpuWindow::start(&[]).finish().broker.is_none());
+        assert_eq!(pids("0"), Some(vec![]));
+        assert_eq!(pids("12,34"), Some(vec![12, 34]));
+        assert_eq!(pids("12,x"), None);
         let none = CpuUse::default().to_string();
         assert_eq!(none, "gen 0%");
     }

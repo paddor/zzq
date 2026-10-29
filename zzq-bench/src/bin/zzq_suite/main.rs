@@ -4,15 +4,18 @@
 //!
 //! - `zzq [lanes]`: the broker suite against `zzq_broker` (4 IO lanes).
 //! - `<rival> [default|tuned]`: the broker suite against rmqtt, emqx,
-//!   mosquitto, nanomq, rumqttd, xmq, flashmq, vernemq, fluxmq or saguin
-//!   (tuned).
+//!   mosquitto, nanomq, rumqttd, xmq, flashmq, vernemq, fluxmq, saguin,
+//!   hivemq or tbmq (tuned).
 //! - `clients`, `zzqclient`: client libraries against `zzq_fakebroker`.
 //! - `fixed <broker> [config|lanes]`: the fixed-load test, zzq with 1 IO
 //!   lane, a rival tuned.
+//! - `durable <broker> [lanes]`: QoS 1 and 2 to persistent sessions with
+//!   the broker's storage on, zzq with 1 IO lane and a data directory, a
+//!   fresh broker for each cell.
 //! - `all [name...]`: every suite above, or the named ones (`zzq-1`,
-//!   `rmqtt-tuned`, `fixed-zzq-2`, ...), one process each, logged to
-//!   `$XDG_CACHE_HOME/zzq/logs/<date>/<name>.log`. Stops at the first that
-//!   fails.
+//!   `rmqtt-tuned`, `fixed-zzq-2`, `durable-emqx`, ...), one process each,
+//!   logged to `$XDG_CACHE_HOME/zzq/logs/<date>/<name>.log`. Stops at the
+//!   first that fails.
 //!
 //! Each run waits for a quiet system first: no compiler running and at
 //! least 90% idle CPU. A run a compiler overlapped runs again. Harness
@@ -26,7 +29,8 @@
 //!
 //! Environment: `ZZQ_BENCH_BIN` (the zzq tools, `zzq_broker` and the rival
 //! client benches; default: this binary's directory), `ZZQ_RIVALS` (rival
-//! builds), `ZZQ_BROKER_LOG` (broker output) and `TMPDIR`.
+//! builds), `ZZQ_BROKER_LOG` (broker output) and `TMPDIR` (broker stores,
+//! under `zzq-suite`).
 
 mod brokers;
 mod parse;
@@ -43,7 +47,7 @@ use record::{Cache, fields};
 use suites::{Shape, Suite};
 
 /// Rival brokers, in the order `all` runs them.
-const RIVALS: [&str; 10] = [
+const RIVALS: [&str; 12] = [
     "rmqtt",
     "emqx",
     "mosquitto",
@@ -54,14 +58,31 @@ const RIVALS: [&str; 10] = [
     "vernemq",
     "fluxmq",
     "saguin",
+    "hivemq",
+    "tbmq",
 ];
 /// Rivals with a fixed-load config of their own, as the tuned one runs out
 /// of memory at 20K connections.
 const OWN_FIXED: [&str; 3] = ["nanomq", "fluxmq", "vernemq"];
+/// Rivals with storage that keeps QoS 1/2 messages of persistent sessions,
+/// in the order `all` runs them. rumqttd has none, `FlashMQ` only writes a
+/// snapshot each hour, and `FluxMQ` 1.0.0 refuses persistent sessions on
+/// one node.
+const DURABLE: [&str; 9] = [
+    "rmqtt",
+    "emqx",
+    "mosquitto",
+    "nanomq",
+    "xmq",
+    "vernemq",
+    "saguin",
+    "hivemq",
+    "tbmq",
+];
 /// Rivals also run with their default config.
 const DEFAULTS: [&str; 3] = ["vernemq", "fluxmq", "saguin"];
 
-const USAGE: &str = "usage: zzq_suite [--fill] [--smoke] <zzq [lanes] | <rival> [default|tuned] | clients | zzqclient | fixed <broker> [config|lanes] | all [name...]>";
+const USAGE: &str = "usage: zzq_suite [--fill] [--smoke] <zzq [lanes] | <rival> [default|tuned] | clients | zzqclient | fixed <broker> [config|lanes] | durable <broker> [lanes] | all [name...]>";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -93,6 +114,7 @@ fn run(suite: &Suite<'_>, args: &[&str]) -> Result<(), String> {
     match args {
         ["all", names @ ..] => return all(suite, names),
         ["fixed", name, rest @ ..] => return fixed(suite, name, rest.first().copied()),
+        ["durable", name, rest @ ..] => return durable(suite, name, rest.first().copied()),
         _ => {}
     }
     let (name, opt) = match args {
@@ -107,21 +129,13 @@ fn run(suite: &Suite<'_>, args: &[&str]) -> Result<(), String> {
         "zzq" => {
             let lanes = lanes(opt.unwrap_or("4"))?;
             println!("# zzq_broker --lanes {lanes}");
-            // With more lanes, a single pair crosses lanes, the case that
-            // differs from one lane. Client IDs alone would pick it by
-            // chance.
-            let pinned = if lanes > 1 {
-                vec![format!("lanes={lanes}"), "cross=1".to_owned()]
-            } else {
-                Vec::new()
-            };
             let shape = Shape {
                 full: true,
                 warmup: 1,
-                pinned,
+                pinned: zzq_pinned(lanes),
                 ..Shape::default()
             };
-            let who = zzq_who(suite, lanes);
+            let who = zzq_who(suite, lanes, "default");
             suite.brokers(
                 &who,
                 ("zzq", "", lanes),
@@ -148,7 +162,11 @@ fn run(suite: &Suite<'_>, args: &[&str]) -> Result<(), String> {
                 pinned: Vec::new(),
             };
             let cells = suites::broker_cells(&shape);
-            suite.brokers(&who, (rival, config, 0), &cells, rumqttd)?;
+            // HiveMQ CE works off a QoS 0 backlog for minutes after a run,
+            // and in one suite stopped listening after the 16-pair run, so
+            // it too gets a fresh broker per run.
+            let fresh = rumqttd || rival == "hivemq";
+            suite.brokers(&who, (rival, config, 0), &cells, fresh)?;
         }
         _ => return Err(USAGE.to_owned()),
     }
@@ -170,12 +188,22 @@ fn lanes(s: &str) -> Result<usize, String> {
         .ok_or_else(|| format!("bad lane count {s}"))
 }
 
-fn zzq_who(suite: &Suite<'_>, lanes: usize) -> parse::Row {
+/// With more lanes, a single pair crosses lanes, the case that differs from
+/// one lane. Client IDs alone would pick it by chance.
+fn zzq_pinned(lanes: usize) -> Vec<String> {
+    if lanes > 1 {
+        vec![format!("lanes={lanes}"), "cross=1".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+fn zzq_who(suite: &Suite<'_>, lanes: usize, config: &str) -> parse::Row {
     let rev = record::revision(&suite.paths.repo, &["zzq-proto", "zzq-tokio", "zzq-broker"]);
     fields(&[
         ("impl", format!("zzq-{lanes}io").into()),
         ("version", rev.into()),
-        ("config", "default".into()),
+        ("config", config.into()),
     ])
 }
 
@@ -192,7 +220,7 @@ fn fixed(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), String>
     header(&["fixed", name], opt);
     if name == "zzq" {
         let lanes = lanes(opt.unwrap_or("1"))?;
-        suite.fixed(&zzq_who(suite, lanes), ("zzq", "", lanes), &[])?;
+        suite.fixed(&zzq_who(suite, lanes, "default"), ("zzq", "", lanes), &[])?;
     } else if RIVALS.contains(&name) {
         let config = opt.unwrap_or("tuned");
         let extra: &[&str] = if name == "rumqttd" { &["v=4"] } else { &[] };
@@ -200,6 +228,24 @@ fn fixed(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), String>
     } else {
         return Err(format!("unknown broker {name}"));
     }
+    println!("# done {}", record::now());
+    Ok(())
+}
+
+/// `durable <broker> [lanes]`: a fresh broker for each cell, so no cell
+/// finds the sessions and messages of the one before.
+fn durable(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), String> {
+    header(&["durable", name], opt);
+    let (who, broker, pinned) = if name == "zzq" {
+        let lanes = lanes(opt.unwrap_or("1"))?;
+        let who = zzq_who(suite, lanes, "durable");
+        (who, ("zzq", "durable", lanes), zzq_pinned(lanes))
+    } else if DURABLE.contains(&name) {
+        (rival_who(name, "durable"), (name, "durable", 0), Vec::new())
+    } else {
+        return Err(format!("no durable config for {name}"));
+    };
+    suite.brokers(&who, broker, &suites::durable_cells(&pinned), true)?;
     println!("# done {}", record::now());
     Ok(())
 }
@@ -225,6 +271,9 @@ fn all_suites() -> Vec<(String, Vec<String>)> {
         };
         s(format!("fixed-{r}"), &["fixed", r, config])
     }));
+    out.push(s("durable-zzq-1".into(), &["durable", "zzq", "1"]));
+    out.push(s("durable-zzq-2".into(), &["durable", "zzq", "2"]));
+    out.extend(DURABLE.map(|r| s(format!("durable-{r}"), &["durable", r])));
     out
 }
 
@@ -280,11 +329,13 @@ mod tests {
     #[test]
     fn all_runs_every_suite_once() {
         let suites = all_suites();
-        assert_eq!(suites.len(), 2 + 10 + 3 + 2 + 2 + 10);
+        assert_eq!(suites.len(), 2 + 12 + 3 + 2 + 2 + 12 + 2 + 9);
         let find = |n: &str| suites.iter().find(|(name, _)| name == n).unwrap().1.clone();
         assert_eq!(find("fixed-nanomq"), ["fixed", "nanomq", "fixed"]);
         assert_eq!(find("fixed-emqx"), ["fixed", "emqx", "tuned"]);
         assert_eq!(find("saguin-default"), ["saguin", "default"]);
+        assert_eq!(find("durable-zzq-2"), ["durable", "zzq", "2"]);
+        assert_eq!(find("durable-tbmq"), ["durable", "tbmq"]);
     }
 
     #[test]
@@ -292,5 +343,7 @@ mod tests {
         assert_eq!(rival_who("emqx", "tuned")["version"], "6.3.2");
         assert_eq!(lanes("2"), Ok(2));
         assert!(lanes("0").is_err() && lanes("x").is_err());
+        assert_eq!(zzq_pinned(1), Vec::<String>::new());
+        assert_eq!(zzq_pinned(2), ["lanes=2", "cross=1"]);
     }
 }

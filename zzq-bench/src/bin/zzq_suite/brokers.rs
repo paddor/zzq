@@ -1,9 +1,11 @@
 //! Starts and stops the brokers under test, on CPUs 0-3 and port 1883.
 
+mod tbmq;
+
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -16,7 +18,7 @@ pub(crate) const PORT: u16 = 1883;
 /// CPUs of the broker.
 const CPUS: &str = "0-3";
 /// Rival versions, as built or pulled for the runs.
-pub(crate) const VERSIONS: [(&str, &str); 13] = [
+pub(crate) const VERSIONS: [(&str, &str); 15] = [
     ("rmqtt", "0.24.0"),
     ("emqx", "6.3.2"),
     ("mosquitto", "2.1.2"),
@@ -27,6 +29,8 @@ pub(crate) const VERSIONS: [(&str, &str); 13] = [
     ("vernemq", "2.2.1"),
     ("fluxmq", "1.0.0"),
     ("saguin", "0.1.0-rc.1"),
+    ("hivemq", "2026.5"),
+    ("tbmq", "2.4.1"),
     ("rumqttc", "0.25.1"),
     ("ntex-mqtt", "9.3.0"),
     ("emqtt", "1.14.6"),
@@ -40,23 +44,30 @@ pub(crate) fn version(name: &str) -> Option<&'static str> {
 /// A running broker, stopped on drop.
 #[derive(Debug)]
 pub(crate) struct Running {
-    /// The broker process, on the host, for CPU and memory.
-    pub(crate) pid: u32,
-    handle: Handle,
+    /// The broker's processes on the host, and those of the stores it
+    /// needs, for CPU and memory.
+    pids: Vec<u32>,
+    child: Option<Child>,
+    /// Removed in reverse order: the broker before its stores.
+    containers: Vec<String>,
     port: u16,
 }
 
-#[derive(Debug)]
-enum Handle {
-    Process(Child),
-    Container(String),
+impl Running {
+    /// The PIDs as the load generators take them: `12,34`.
+    pub(crate) fn cpu_pids(&self) -> String {
+        let pids: Vec<String> = self.pids.iter().map(u32::to_string).collect();
+        pids.join(",")
+    }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
-        match &mut self.handle {
-            Handle::Process(child) => stop(child),
-            Handle::Container(name) => remove(name),
+        if let Some(child) = &mut self.child {
+            stop(child);
+        }
+        for name in self.containers.iter().rev() {
+            remove(name);
         }
         if let Err(e) = port_free(self.port, Duration::from_secs(60)) {
             eprintln!("# {e}");
@@ -123,9 +134,14 @@ fn nofile() -> Option<u64> {
     line.split_whitespace().nth(4)?.parse().ok()
 }
 
-/// Starts `cmd` pinned to the broker CPUs, waits for its port, then lets it
-/// settle for `settle`.
-fn process(cmd: &Cmd, p: &Paths, settle: Duration) -> Result<Running, String> {
+/// Starts `cmd` pinned to the broker CPUs beside the stores in `running`,
+/// waits for its port, then lets it settle for `settle`.
+fn process(
+    mut running: Running,
+    cmd: &Cmd,
+    p: &Paths,
+    settle: Duration,
+) -> Result<Running, String> {
     let log = |p: &Path| OpenOptions::new().create(true).append(true).open(p);
     let (out, err) = match &p.broker_log {
         Some(path) => {
@@ -142,49 +158,122 @@ fn process(cmd: &Cmd, p: &Paths, settle: Duration) -> Result<Running, String> {
         .stderr(err)
         .spawn()
         .map_err(|e| format!("{cmd}: {e}"))?;
-    let running = Running {
-        pid: child.id(),
-        handle: Handle::Process(child),
-        port: PORT,
-    };
-    wait_port(PORT, Duration::from_secs(120))?;
+    running.pids.push(child.id());
+    running.child = Some(child);
+    wait_port(PORT, START)?;
     thread::sleep(settle);
     Ok(running)
 }
 
-/// Starts container `name` from `image` with host networking.
-fn container(name: &str, image: &str, args: &[String], cmd: &[&str]) -> Result<Running, String> {
-    remove(name);
-    let nofile = nofile().unwrap_or(65_536);
-    let run = Cmd::pinned(CPUS, "podman")
-        .args(["run", "-d", "--name", name, "--network", "host", "--ulimit"])
-        .arg(format!("nofile={nofile}:{nofile}"))
-        .args(args)
-        .arg(image)
-        .args(cmd);
-    let ok = run
-        .command()
-        .stdout(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
-    if !ok {
-        return Err(format!("{name} start failed"));
+/// How long a broker, or a store it needs, may take to listen.
+const START: Duration = Duration::from_secs(300);
+
+/// A container of a broker, or of a store it needs.
+#[derive(Debug, Default)]
+struct Ctr {
+    name: &'static str,
+    image: &'static str,
+    /// `podman run` options: volumes, environment, entrypoint.
+    args: Vec<String>,
+    /// The command after the image.
+    cmd: Vec<String>,
+    /// The port it listens on once ready.
+    port: u16,
+}
+
+impl Ctr {
+    /// The broker's container, on [`PORT`].
+    const fn broker(name: &'static str, image: &'static str, args: Vec<String>) -> Ctr {
+        Ctr {
+            name,
+            image,
+            args,
+            cmd: Vec::new(),
+            port: PORT,
+        }
     }
+}
+
+/// Starts `ctrs` in order with host networking, each once the one before
+/// listens, then lets them settle for `settle`.
+fn containers(ctrs: &[Ctr], settle: Duration) -> Result<Running, String> {
     let mut running = Running {
-        pid: 0,
-        handle: Handle::Container(name.to_owned()),
+        pids: Vec::new(),
+        child: None,
+        containers: Vec::new(),
         port: PORT,
     };
-    wait_port(PORT, Duration::from_secs(120))?;
-    let settle = if name == "zzq-emqx" { 10 } else { 2 };
-    thread::sleep(Duration::from_secs(settle));
-    let pid = Command::new("podman")
-        .args(["inspect", "-f", "{{.State.Pid}}", name])
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
-    running.pid = pid.ok_or_else(|| format!("no PID for container {name}"))?;
+    let nofile = nofile().unwrap_or(65_536);
+    for c in ctrs {
+        remove(c.name);
+        let ok = Cmd::pinned(CPUS, "podman")
+            .args([
+                "run",
+                "-d",
+                "--name",
+                c.name,
+                "--network",
+                "host",
+                "--ulimit",
+            ])
+            .arg(format!("nofile={nofile}:{nofile}"))
+            .args(&c.args)
+            .arg(c.image)
+            .args(&c.cmd)
+            .command()
+            .stdout(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return Err(format!("{} start failed", c.name));
+        }
+        running.containers.push(c.name.to_owned());
+        wait_port(c.port, START).map_err(|e| format!("{}: {e}", c.name))?;
+        let pid = Command::new("podman")
+            .args(["inspect", "-f", "{{.State.Pid}}", c.name])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok());
+        running
+            .pids
+            .push(pid.ok_or_else(|| format!("no PID for container {}", c.name))?);
+    }
+    thread::sleep(settle);
     Ok(running)
+}
+
+/// An empty directory for the store of `name`, in `zzq-suite` under
+/// `TMPDIR`, which should be on the disk under test.
+fn store(name: &str) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("zzq-suite").join(name);
+    if let Err(e) = fs::remove_dir_all(&dir)
+        && e.kind() != io::ErrorKind::NotFound
+    {
+        // A container wrote it as another user of its user namespace.
+        let _ = Command::new("podman")
+            .args(["unshare", "rm", "-rf"])
+            .arg(&dir)
+            .status();
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// `conf` copied into the empty store of `name`, with `@STORE@` replaced by
+/// the store's path.
+fn in_store(name: &str, conf: &Path) -> Result<PathBuf, String> {
+    let dir = store(name)?;
+    let text = fs::read_to_string(conf).map_err(|e| format!("{}: {e}", conf.display()))?;
+    let out = dir.join(conf.file_name().unwrap_or_default());
+    fs::write(&out, text.replace("@STORE@", &dir.to_string_lossy()))
+        .map_err(|e| format!("{}: {e}", out.display()))?;
+    Ok(out)
+}
+
+/// A volume that mounts `dir` read-write at `at`, owned by the container's
+/// user.
+fn data(dir: &Path, at: &str) -> [String; 2] {
+    ["-v".to_owned(), format!("{}:{at}:Z,U", dir.display())]
 }
 
 /// A volume that mounts `conf` read-only at `at`.
@@ -202,11 +291,21 @@ fn env_args(file: &Path) -> io::Result<Vec<String>> {
 }
 
 /// Writes `etc/vernemq.conf` of release `rel` as its original plus `extra`,
-/// and empties its data directory (message store and metadata).
-fn vernemq_conf(rel: &Path, extra: &Path) -> io::Result<()> {
+/// with its stores in `stores` if given, and empties its data directory
+/// (message store and metadata).
+fn vernemq_conf(rel: &Path, extra: &Path, stores: Option<&Path>) -> io::Result<()> {
     let etc = rel.join("etc");
     let mut conf = fs::read_to_string(etc.join("vernemq.conf.orig"))?;
     conf.push_str(&fs::read_to_string(extra)?);
+    if let Some(dir) = stores {
+        for (key, sub) in [
+            ("vmq_generic_msg_store.store_dir", "msgstore"),
+            ("vmq_swc.directory", "swc_meta"),
+            ("vmq_swc.dkm_directory", "swc_dkm"),
+        ] {
+            conf.extend([key, " = ", &dir.join(sub).to_string_lossy(), "\n"]);
+        }
+    }
     fs::write(etc.join("vernemq.conf"), conf)?;
     match fs::remove_dir_all(rel.join("data")) {
         Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
@@ -214,98 +313,232 @@ fn vernemq_conf(rel: &Path, extra: &Path) -> io::Result<()> {
     }
 }
 
-/// Starts broker `name` with `config` (`default`, `tuned` or `fixed`), or
-/// zzq with `lanes` IO lanes.
+/// Starts broker `name` with `config` (`default`, `tuned`, `fixed` or
+/// `durable`), or zzq with `lanes` IO lanes, after the stores it needs.
 ///
 /// # Errors
 ///
-/// If it cannot start, or nothing listens on 1883 within 2 minutes.
+/// If it cannot start, or a store or the broker does not listen within
+/// [`START`].
 pub(crate) fn start(name: &str, config: &str, lanes: usize, p: &Paths) -> Result<Running, String> {
-    let conf = |ext: &str| p.conf(&format!("{name}-{config}.{ext}"));
-    match name {
-        "emqx" => {
-            let args = if config == "tuned" {
-                env_args(&conf("env")).map_err(|e| format!("emqx env: {e}"))?
-            } else {
-                Vec::new()
-            };
-            container("zzq-emqx", "docker.io/emqx/emqx:6.3.2", &args, &[])
-        }
-        "mosquitto" => container(
-            "zzq-mosquitto",
-            "docker.io/library/eclipse-mosquitto:2",
-            &volume(&conf("conf"), "/mosquitto/config/mosquitto.conf"),
-            &[],
-        ),
-        "nanomq" => container(
-            "zzq-nanomq",
-            "docker.io/emqx/nanomq:latest",
-            &volume(&conf("conf"), "/etc/nanomq.conf"),
-            &[],
-        ),
-        "xmq" if config == "tuned" => {
-            // The entrypoint edits the config in place, so it gets a copy.
-            let mut args = vec!["-e".to_owned(), "XMQ_LOG_LEVEL=WARNING".to_owned()];
-            args.extend(volume(&conf("json"), "/conf/xmq.json"));
-            args.extend(["--entrypoint".to_owned(), "sh".to_owned()]);
-            let cmd = [
-                "-c",
-                "cp /conf/xmq.json /etc/xmq/xmq_server.conf && exec xmq-entrypoint.sh",
-            ];
-            container("zzq-xmq", XMQ, &args, &cmd)
-        }
-        "xmq" => container("zzq-xmq", XMQ, &[], &[]),
-        _ => process(
-            &broker_cmd(name, config, lanes, p)?,
-            p,
-            Duration::from_secs(2),
-        ),
+    let durable = config == "durable";
+    let mut ctrs = Vec::new();
+    if durable && matches!(name, "xmq" | "rmqtt") {
+        ctrs.push(redis(&["--appendonly", "yes", "--appendfsync", "always"])?);
     }
+    let Some(own) = broker_ctrs(name, config, p)? else {
+        let stores = containers(&ctrs, Duration::ZERO)?;
+        let cmd = broker_cmd(name, config, lanes, p)?;
+        return process(stores, &cmd, p, Duration::from_secs(2));
+    };
+    ctrs.extend(own);
+    let settle = if matches!(name, "emqx" | "hivemq") {
+        10
+    } else {
+        2
+    };
+    let running = containers(&ctrs, Duration::from_secs(settle))?;
+    if name == "tbmq" {
+        tbmq::open()?;
+        tbmq::ready(p)?;
+    }
+    Ok(running)
 }
 
 const XMQ: &str = "docker.io/alexeyparshin/xmq:latest";
+
+/// Redis on 6379 with `args`, its store emptied.
+fn redis(args: &[&str]) -> Result<Ctr, String> {
+    let mut cmd = vec![
+        "redis-server".to_owned(),
+        "--save".to_owned(),
+        String::new(),
+    ];
+    cmd.extend(args.iter().map(|&a| a.to_owned()));
+    Ok(Ctr {
+        name: "zzq-redis",
+        image: "docker.io/library/redis:8-alpine",
+        args: data(&store("redis")?, "/data").to_vec(),
+        cmd,
+        port: 6379,
+    })
+}
+
+/// The containers of a broker that runs in podman, None for one that runs
+/// as a process.
+fn broker_ctrs(name: &str, config: &str, p: &Paths) -> Result<Option<Vec<Ctr>>, String> {
+    let conf = |ext: &str| p.conf(&format!("{name}-{config}.{ext}"));
+    let durable = config == "durable";
+    let mut args = Vec::new();
+    let ctr = match name {
+        "emqx" => {
+            if config != "default" {
+                args = env_args(&conf("env")).map_err(|e| format!("emqx env: {e}"))?;
+            }
+            if durable {
+                args.extend(data(&store("emqx")?, "/opt/emqx/data"));
+            }
+            Ctr::broker("zzq-emqx", "docker.io/emqx/emqx:6.3.2", args)
+        }
+        "mosquitto" => {
+            args.extend(volume(&conf("conf"), "/mosquitto/config/mosquitto.conf"));
+            if durable {
+                args.extend(data(&store("mosquitto")?, "/mosquitto/data"));
+            }
+            Ctr::broker(
+                "zzq-mosquitto",
+                "docker.io/library/eclipse-mosquitto:2",
+                args,
+            )
+        }
+        "nanomq" => {
+            args.extend(volume(&conf("conf"), "/etc/nanomq.conf"));
+            // Only the full image is built with SQLite.
+            let image = if durable {
+                args.extend(data(&store("nanomq")?, "/data"));
+                "docker.io/emqx/nanomq:0.25.7-full"
+            } else {
+                "docker.io/emqx/nanomq:latest"
+            };
+            Ctr::broker("zzq-nanomq", image, args)
+        }
+        "xmq" => xmq(config, &conf("json")),
+        "hivemq" => {
+            // The heap TBMQ gets too; JMX would listen on the host.
+            for e in [
+                "JAVA_OPTS=-XX:+UnlockExperimentalVMOptions -XX:+UseNUMA -Xms8g -Xmx8g",
+                "HIVEMQ_JMX_ENABLED=false",
+            ] {
+                args.extend(["-e".to_owned(), e.to_owned()]);
+            }
+            args.extend(volume(&conf("xml"), "/opt/hivemq/conf/config.xml"));
+            args.extend(data(&store("hivemq")?, "/opt/hivemq/data"));
+            Ctr::broker("zzq-hivemq", "docker.io/hivemq/hivemq-ce:2026.5", args)
+        }
+        "tbmq" => return tbmq::ctrs(durable, &conf("env")).map(Some),
+        _ => return Ok(None),
+    };
+    Ok(Some(vec![ctr]))
+}
+
+/// XMQ, whose entrypoint edits its config in place, so it gets a copy, and
+/// sets persistence from the environment.
+fn xmq(config: &str, json: &Path) -> Ctr {
+    let mut args = Vec::new();
+    if config != "default" {
+        args.extend(["-e".to_owned(), "XMQ_LOG_LEVEL=WARNING".to_owned()]);
+        args.extend(volume(json, "/conf/xmq.json"));
+        args.extend(["--entrypoint".to_owned(), "sh".to_owned()]);
+    }
+    if config == "durable" {
+        for e in [
+            "XMQ_PERSISTENCE=true",
+            "XMQ_REDIS_URI=redis://127.0.0.1:6379",
+            "XMQ_CLEAN_START=true",
+        ] {
+            args.extend(["-e".to_owned(), e.to_owned()]);
+        }
+    }
+    let mut ctr = Ctr::broker("zzq-xmq", XMQ, args);
+    if config != "default" {
+        ctr.cmd = [
+            "-c",
+            "cp /conf/xmq.json /etc/xmq/xmq_server.conf && exec xmq-entrypoint.sh",
+        ]
+        .map(String::from)
+        .to_vec();
+    }
+    ctr
+}
 
 /// The command of a broker that runs as a process, after preparing its
 /// state.
 fn broker_cmd(name: &str, config: &str, lanes: usize, p: &Paths) -> Result<Cmd, String> {
     let conf = |ext: &str| p.conf(&format!("{name}-{config}.{ext}"));
     let rival = |bin: &str| p.rival(bin).map(|b| Cmd::pinned(CPUS, b));
+    let durable = config == "durable";
     Ok(match name {
-        "zzq" => Cmd::pinned(CPUS, p.tool("zzq_broker"))
-            .arg("--lanes")
-            .arg(lanes.to_string())
-            .args(["--bind", "tcp://0.0.0.0:1883"]),
-        "rmqtt" => rival("bin/rmqttd")?
-            .arg("-f")
-            .arg(conf("toml"))
-            .dir(p.rival("rmqtt")?),
+        "zzq" => {
+            let cmd = Cmd::pinned(CPUS, p.tool("zzq_broker"))
+                .arg("--lanes")
+                .arg(lanes.to_string())
+                .args(["--bind", "tcp://0.0.0.0:1883"]);
+            if durable {
+                cmd.arg("--data-dir").arg(store("zzq")?)
+            } else {
+                cmd
+            }
+        }
+        "rmqtt" => {
+            let dir = if durable {
+                rmqtt_dir(p)?
+            } else {
+                p.rival("rmqtt")?
+            };
+            rival("bin/rmqttd")?.arg("-f").arg(conf("toml")).dir(dir)
+        }
         "rumqttd" => rival("rumqttd/bin/rumqttd")?
             .args(["-q", "-c"])
             .arg(conf("toml")),
         "flashmq" => rival("flashmq/bin/flashmq")?
             .arg("--config-file")
             .arg(conf("conf")),
-        "saguin" => rival("saguin/bin/saguin")?.arg("-config").arg(conf("yaml")),
+        "saguin" => {
+            // Its database path must be absolute.
+            let yaml = if durable {
+                in_store("saguin", &conf("yaml"))?
+            } else {
+                conf("yaml")
+            };
+            rival("saguin/bin/saguin")?.arg("-config").arg(yaml)
+        }
         "vernemq" => {
             // Built from source: the official images and packages come
             // under an EULA that forbids competitive analysis.
             let rel = p.rival("vernemq-src/_build/default/rel/vernemq")?;
-            vernemq_conf(&rel, &conf("conf")).map_err(|e| format!("vernemq.conf: {e}"))?;
+            let stores = if durable {
+                Some(store("vernemq")?)
+            } else {
+                None
+            };
+            vernemq_conf(&rel, &conf("conf"), stores.as_deref())
+                .map_err(|e| format!("vernemq.conf: {e}"))?;
             Cmd::pinned(CPUS, rel.join("bin/vernemq")).args(["console", "-noshell", "-noinput"])
         }
         "fluxmq" => {
             // Its config keeps Badger in `fluxmq-data` under the working
             // directory; each start gets an empty one.
-            let dir = std::env::temp_dir().join("zzq-suite");
-            let _ = fs::remove_dir_all(dir.join("fluxmq-data"));
-            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
             rival("fluxmq/bin/fluxmq")?
                 .arg("-config")
                 .arg(conf("yaml"))
-                .dir(dir)
+                .dir(store("fluxmq")?)
         }
         _ => return Err(format!("unknown broker {name}")),
     })
+}
+
+/// A store for rmqtt to run in: the plugin configs of its source tree, those
+/// of `rmqtt-durable-plugins` over them, and its TLS files.
+fn rmqtt_dir(p: &Paths) -> Result<PathBuf, String> {
+    let dir = store("rmqtt")?;
+    let src = p.rival("rmqtt")?;
+    let copy = |from: &Path, to: &Path, only_toml: bool| -> io::Result<()> {
+        fs::create_dir_all(to)?;
+        for e in fs::read_dir(from)? {
+            let path = e?.path();
+            let toml = path.extension().is_some_and(|x| x == "toml");
+            if path.is_file() && (toml || !only_toml) {
+                fs::copy(&path, to.join(path.file_name().unwrap_or_default()))?;
+            }
+        }
+        Ok(())
+    };
+    let plugins = dir.join("rmqtt-plugins");
+    copy(&src.join("rmqtt-plugins"), &plugins, true)
+        .and_then(|()| copy(&p.conf("rmqtt-durable-plugins"), &plugins, true))
+        .and_then(|()| copy(&src.join("rmqtt-bin"), &dir.join("rmqtt-bin"), false))
+        .map_err(|e| format!("rmqtt plugins: {e}"))?;
+    Ok(dir)
 }
 
 #[cfg(test)]
@@ -338,11 +571,14 @@ mod tests {
             .local_addr()
             .unwrap()
             .port();
-        drop(Running {
-            pid,
-            handle: Handle::Process(child),
+        let running = Running {
+            pids: vec![pid, 7],
+            child: Some(child),
+            containers: Vec::new(),
             port: free,
-        });
+        };
+        assert_eq!(running.cpu_pids(), format!("{pid},7"));
+        drop(running);
         assert!(!Path::new(&format!("/proc/{pid}")).exists());
     }
 
@@ -404,13 +640,18 @@ mod tests {
         fs::write(rel.join("etc/vernemq.conf.orig"), "a = 1\n").unwrap();
         let extra = rel.join("extra.conf");
         fs::write(&extra, "b = 2\n").unwrap();
-        vernemq_conf(&rel, &extra).unwrap();
+        vernemq_conf(&rel, &extra, None).unwrap();
         assert_eq!(
             fs::read_to_string(rel.join("etc/vernemq.conf")).unwrap(),
             "a = 1\nb = 2\n"
         );
         assert!(!rel.join("data").exists());
-        vernemq_conf(&rel, &extra).unwrap();
+        vernemq_conf(&rel, &extra, Some(Path::new("/s"))).unwrap();
+        let conf = fs::read_to_string(rel.join("etc/vernemq.conf")).unwrap();
+        assert!(
+            conf.ends_with("vmq_swc.dkm_directory = /s/swc_dkm\n"),
+            "{conf}"
+        );
         fs::remove_dir_all(rel).unwrap();
     }
 }

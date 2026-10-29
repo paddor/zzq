@@ -11,10 +11,21 @@ Notable changes to zzq. The format follows
   Records go out in groups with Linux AIO and `O_DIRECT | O_DSYNC`, one
   write in flight per journal and no fill delay, so a completed write is
   on disk. Records appended after the last flush go along with a write
-  that one asked for, or wait for the next flush. Opening a journal replays its records and ends the log at a
-  torn last write, unless its `DURABLE` mark says that write was on disk.
-  A journal makes its first segment on its first write; `Journal::roll`
-  starts a new one, and `Journal::trim` removes those before it.
+  that one asked for, or wait for the next flush. Opening a journal
+  replays its records and ends the log at a torn last write, unless its
+  `DURABLE` mark says that write was on disk. A journal makes its first
+  segment, of zeros, on its first write; `Journal::roll` starts a new
+  one for the records appended after it, and `Journal::trim` keeps those
+  before it as spares for the next. Writes into a spare cost no metadata
+  write, and a new segment without one gets its blocks allocated, not
+  zeroed, so no zeros hold up the writes beside it. One spare stays back,
+  allocated beside the first segment, and only the segment after a roll
+  takes it, so a snapshot can start on a full device. Other writes that
+  need a new segment then wait until a trim or freed space makes room,
+  and a segment or mark it could not make takes no space;
+  `Journal::full` tells, and `free_bytes` gives the room on a device. A
+  journal opened where one was dropped waits for the writes and trims
+  that one left.
 - `zzq-broker`: `BrokerOptions::data_dir` and `zzq_broker --data-dir` keep
   state in journals: retained messages in one per stripe of topics, each
   behind a lock of its own, and the sessions that outlive their
@@ -22,15 +33,28 @@ Notable changes to zzq. The format follows
   packet IDs, in one per lane. A message goes in once per lane. An ack
   waits until what it stands for is on disk: the PUBACK or PUBREC of a
   retained publish or of one such sessions get, also on other lanes,
-  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. A subscriber's
+  PUBREL and PUBCOMP of QoS 2 flows, SUBACK and UNSUBACK. A publisher's
+  ack then still waits while a subscriber it fed is congested, as without
+  a data directory. A subscriber's
   ack of a delivery goes out with the next write, or within 50 ms, so a
   crash may send a QoS 1 message it had acked again. If a write
   fails, a v5 publisher gets Unspecified error, other clients are
   disconnected, and `Stats::write_errors` counts it. Once a journal grew
-  well past what it holds, it writes a snapshot and drops the segments
-  before it. A connection a crash ended counts as lost at the next start,
-  so its will goes out. A changed lane count moves the sessions to their
-  new lanes. Linux only; not with `state_file`.
+  well past what it holds, checked as each write finishes, it writes a
+  snapshot and drops the segments before it. A journal that cannot get a
+  new segment, as on a full device, writes one at once.
+  `Stats::full_journals` and `$SYS/broker/store/full` count such
+  journals, `$SYS/broker/store/errors` the failed writes, and
+  `zzq_broker` says on stderr when the data directory fills and when it
+  has room again. The state stops growing, as at `max_state_bytes`, while
+  the data directory's device has less room than the state takes and
+  two segments, so every journal can still write a snapshot;
+  `Stats::state_limit` shows the limit, and `zzq_broker` says when the
+  state reaches it and when it is down to half. A message
+  dropped for a full state costs no journal write. A connection a crash
+  ended counts as lost at the next start, so its will goes out. A changed
+  lane count moves the sessions to their new lanes. Linux only; not with
+  `state_file`.
 - `zzq-bench`: `zzq_loadbench` runs the fixed-load test against any broker:
   up to tens of thousands of connections, each publishing on a schedule,
   in steps of offered load, with latency from each send to its delivery.
@@ -44,9 +68,18 @@ Notable changes to zzq. The format follows
   records them into the result cache, with `zzq_fakebroker`,
   `zzq_client_bench`, the rival broker configs in `zzq-bench/harness`, and
   rumqttc and ntex-mqtt benches in a workspace of their own.
-  `RUNNING_BENCHMARKS.md` shows how to run them.
+  `RUNNING_BENCHMARKS.md` shows how to run them. `zzq_suite durable`
+  runs QoS 1/2 to persistent sessions with each broker's storage on, a
+  fresh broker per run, and `zzq_chart durable` draws it. HiveMQ CE and
+  TBMQ are among the rivals; TBMQ runs with its Kafka, Valkey and
+  PostgreSQL, whose CPU and memory count with it (`cpu_pid` takes several
+  PIDs). A run waits at most 90 s for deliveries after the publishers
+  stop, and an `rtt` run measures at most 60 s.
 - `COMPARISONS.md` lists how the other brokers in the benchmarks behave
-  under load, what survives a crash, and what their clustering offers.
+  under load and with storage on, what survives a crash, and what their
+  clustering offers.
+- `doc/architecture.md`: threads, channels, the path of a message, and
+  what makes zzq fast.
 
 ### Removed
 

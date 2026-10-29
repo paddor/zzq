@@ -412,6 +412,11 @@ impl Lane {
             bytes: o.max_queued_bytes.saturating_add(owned.extra.bytes),
             state_full: self.budget.full,
         };
+        // Dropped before the journal sees it: a full state keeps no new
+        // message waiting.
+        if limit.state_full && self.sessions.get(key).is_some_and(Session::would_queue) {
+            return Outcome::StateFull;
+        }
         let seq = self.journal_delivery(key, p, owned, (g.qos, g.retain, g.sub_id));
         let Some(s) = self.sessions.get_mut(key) else {
             return Outcome::Offline;

@@ -117,6 +117,12 @@ pub(crate) fn broker_row(line: &str) -> Option<Row> {
         _ => return None,
     };
     usage(&w, &mut r)?;
+    // What the broker had to keep, and what a round trip timed.
+    for flag in ["retain", "persist", "ack"] {
+        if w.iter().any(|x| x == flag) {
+            r.insert(flag.into(), true.into());
+        }
+    }
     Some(r)
 }
 
@@ -218,6 +224,10 @@ mod tests {
                    "rss_mib": 4, "gen_cpu_pct": 64})
         );
         assert_eq!(broker_row("connected 20000 in 4.1s"), None);
+        let kept = line.replace("iters=20000", "iters=20000 persist ack");
+        let r = broker_row(&kept).unwrap();
+        assert_eq!((&r["persist"], &r["ack"]), (&json!(true), &json!(true)));
+        assert!(!r.contains_key("retain"));
     }
 
     #[test]

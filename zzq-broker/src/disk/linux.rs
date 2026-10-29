@@ -18,6 +18,9 @@ const SEGMENT_SLACK: u64 = 1 << 20;
 pub(crate) struct DataDir {
     disk: zzq_disk::Disk,
     path: PathBuf,
+    /// Free bytes a test claims the device has, `u64::MAX` for none.
+    #[cfg(test)]
+    free: std::sync::atomic::AtomicU64,
 }
 
 impl DataDir {
@@ -34,11 +37,46 @@ impl DataDir {
         Ok(DataDir {
             disk: zzq_disk::Disk::new(config).map_err(to_io)?,
             path: path.to_owned(),
+            #[cfg(test)]
+            free: std::sync::atomic::AtomicU64::new(u64::MAX),
         })
     }
 
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Bytes the broker's state may take: what the device has free, less
+    /// a first segment and the spare kept back with it, for a journal that
+    /// has none yet. Every journal can then still write a snapshot, which
+    /// takes less than the state it holds, and trim the segments before.
+    /// None if the device cannot tell.
+    pub(crate) fn room(&self) -> u64 {
+        let free = self.free_bytes().unwrap_or(0);
+        free.saturating_sub(2 * self.disk.config().segment_bytes)
+    }
+
+    fn free_bytes(&self) -> Result<u64, zzq_disk::Error> {
+        #[cfg(test)]
+        {
+            // Relaxed: a test sets it before the state check it means.
+            let free = self.free.load(std::sync::atomic::Ordering::Relaxed);
+            if free != u64::MAX {
+                return Ok(free);
+            }
+        }
+        zzq_disk::free_bytes(&self.path)
+    }
+
+    /// Makes [`DataDir::room`] see `free` bytes on the device, or what it
+    /// has with `None`.
+    #[cfg(test)]
+    pub(crate) fn set_free(&self, free: Option<u64>) {
+        // Relaxed: the next state check reads it.
+        self.free.store(
+            free.unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     /// Opens journal `name`, handing the records it holds to `replay`.
@@ -76,9 +114,14 @@ impl Log {
         self.0.backlog()
     }
 
-    /// Bytes appended since the journal opened.
-    pub(crate) const fn appended_bytes(&self) -> u64 {
-        self.0.appended_bytes()
+    /// Whether it could not make a new segment, as on a full device.
+    pub(crate) const fn full(&self) -> bool {
+        self.0.full()
+    }
+
+    /// Bytes written since the journal opened, padding included.
+    pub(crate) const fn written_bytes(&self) -> u64 {
+        self.0.written_bytes()
     }
 
     /// Starts the next write in a new segment, and returns its id; `None`
@@ -93,13 +136,19 @@ impl Log {
         self.0.fail_next_write();
     }
 
+    /// Makes the next segment it asks for fail, as on a full device.
+    #[cfg(test)]
+    pub(crate) const fn fail_next_segment(&mut self) {
+        self.0.fail_next_segment();
+    }
+
     /// Number of the last record appended, and groups written.
     #[cfg(test)]
     pub(crate) const fn counts(&self) -> (u64, u64) {
         (self.0.appended(), self.0.groups())
     }
 
-    /// Removes the segments before `before`.
+    /// Retires the segments before `before`.
     pub(crate) fn trim(&mut self, before: u64) -> io::Result<()> {
         self.0.trim(before).map_err(to_io)
     }

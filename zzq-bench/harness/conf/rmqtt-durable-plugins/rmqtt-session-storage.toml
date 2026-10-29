@@ -1,0 +1,5 @@
+## Sessions in sled, in the directory rmqtt runs in. sled flushes every
+## 500 ms by default.
+storage.type = "sled"
+storage.sled.path = "session/{node}"
+storage.sled.cache_capacity = "3G"
