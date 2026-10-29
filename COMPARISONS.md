@@ -4,10 +4,12 @@ How the brokers in [BENCHMARKS.md](BENCHMARKS.md) compare:
 
 - **Under load:** what they do with messages they cannot deliver, where
   the memory goes, and which defaults decide a benchmark. Measured on
-  one machine with tuned configs: zzq on 2026-10-27, the rest on
-  2026-10-26.
-- **Durability and clustering:** from each release's source, docs and
-  issues. Not tested here.
+  one machine with tuned configs: zzq, HiveMQ CE and TBMQ on 2026-10-28
+  and 29, the rest on 2026-10-26.
+- **With storage on:** the same load with each broker's most durable
+  setting, measured on 2026-10-28 and 29.
+- **What a crash or a failed node loses:** from each release's source,
+  docs and issues. Not tested here.
 
 Source links point to the release that ran.
 
@@ -15,8 +17,8 @@ Source links point to the release that ran.
 
 | Broker | Fan-in loss, QoS 0 / 1 / 2 | Peak RSS | Stalls a publisher | Fixed load fails at |
 | --- | --- | --- | --- | --- |
-| zzq, 1 IO lane | 0 / 0 / 0% | 122 MiB | no | 60K / - / - |
-| zzq, 2 IO lanes | 0 / 0 / 0% | 359 MiB | no | - / - / - |
+| zzq, 1 IO lane | 0 / 0 / 0% | 119 MiB | no | 60K / 80K / - |
+| zzq, 2 IO lanes | 0.2 / 0 / 0% | 216 MiB | no | - / - / - |
 | rmqtt | 0 / 59 / 76% | 3.6 GiB | no | - / 40K / - |
 | EMQX | 99.7 / 75 / 61% | 1.6 GiB | no | 40K / 40K / 200K |
 | Mosquitto | 0 / 12 / 0% | 57 MiB | yes | 40K / 40K / 150K |
@@ -27,10 +29,13 @@ Source links point to the release that ran.
 | VerneMQ | 100 / 100 / 100% | 6.1 GiB | yes | 20K / 20K / 50K |
 | FluxMQ | 87 / 0 / 0% | 7.3 GiB | yes | 10K / 10K / - |
 | Sagüin | 90 / 90 / 83% | 460 MiB | yes | 60K / 20K / - |
+| HiveMQ CE | 100 / 78 / 74% | 6.9 GiB | yes | - / 60K / - |
+| TBMQ | 57 / 69 / 65% | 18.4 GiB, with its stores | no | 60K / 10K / 200K |
 
 - Fan-in: 16 publishers to one subscriber, the worst of 16 B to 4 KiB.
-  Loss is what was not delivered within 2 s after the publishers
-  stopped. At QoS 1 and 2, the publishers had their acks for all of it.
+  Loss is what was not delivered once 2 s passed without a delivery, or
+  90 s after the publishers stopped. At QoS 1 and 2, the publishers had
+  their acks for all of it.
 - Peak RSS: the largest broker RSS at the end of any throughput cell.
 - Stalls a publisher: with 64 QoS 0 pairs, a publisher's 64 KiB write
   was still blocked 10 s after the run stopped. A pair is one publisher
@@ -42,24 +47,27 @@ Source links point to the release that ran.
 ## Patterns
 
 - **Ack, then drop.** A PUBACK tells a publisher the broker took the
-  message. Seven of ten brokers then dropped acked messages once a
+  message. Nine of twelve brokers then dropped acked messages once a
   fan-in subscriber's queue filled: rmqtt, EMQX, Mosquitto, NanoMQ,
-  rumqttd, FlashMQ (QoS 2) and Sagüin. Sagüin acked 151K msg/s at QoS 1
-  while its subscriber got 1.7K/s. Mosquitto's man page calls these
-  messages "silently dropped". FlashMQ's source says: "The QoS system is
-  not between publisher and subscriber." The publisher never learns.
+  rumqttd, FlashMQ (QoS 2), Sagüin, HiveMQ CE and TBMQ. Sagüin acked
+  151K msg/s at QoS 1 while its subscriber got 1.7K/s. Mosquitto's man
+  page calls these messages "silently dropped". FlashMQ's source says:
+  "The QoS system is not between publisher and subscriber." The
+  publisher never learns.
 - **Ack, then starve.** VerneMQ acked 128K QoS 1 msg/s on fan-in and
   delivered none in the 5 s window. One QoS 1 pair: 59.7K/s acked, 20/s
   delivered. The backlog drains after the publishers stop.
 - **Memory as the queue.** Without backpressure, overload goes to RAM. Peak
-  RSS in the throughput suite: FlashMQ 10.1 GiB, FluxMQ 7.3 GiB, rumqttd
-  6.2 GiB, VerneMQ 6.1 GiB and rmqtt 3.6 GiB. rmqtt loses nothing on QoS
-  0 fan-in because its queue has no bound: 395K msg/s in, 122K/s out.
+  RSS in the throughput suite: FlashMQ 10.1 GiB, FluxMQ 7.3 GiB, HiveMQ
+  CE 6.9 GiB, rumqttd 6.2 GiB, VerneMQ 6.1 GiB and rmqtt 3.6 GiB. TBMQ
+  grew from 9.5 to 18.4 GiB, its stores included. rmqtt loses nothing on
+  QoS 0 fan-in because its queue has no bound: 395K msg/s in, 122K/s out.
 - **Kill the slow consumer.** On QoS 0 fan-in, EMQX closed the
   subscriber at every size (`mailbox_overflow`: 116K messages over a
-  limit of 100K).
+  limit of 100K). HiveMQ CE closed it too, and every subscriber of 16
+  and 64 QoS 0 pairs, without a DISCONNECT or a log line.
 - **Stall the publisher.** At QoS 0 a broker's only backpressure is to
-  read a socket less. With 64 pairs, seven of ten read less than 64 KiB
+  read a socket less. With 64 pairs, eight of twelve read less than 64 KiB
   from one publisher in 10 s, while the load fell. FlashMQ did it with
   one pair too. Such a client cannot send anything else, not even
   PINGREQ or DISCONNECT.
@@ -98,6 +106,11 @@ The runs in BENCHMARKS.md raise them.
 | FlashMQ | `client_max_write_buffer_size` | 1 MiB | QoS 0 messages are dropped, not counted |
 | Sagüin | `broker.qos2.max_inflight_per_client` | 20 | QoS 2 publishes get PUBREC 0x97 |
 | FluxMQ, rumqttd, Sagüin, VerneMQ | connections | about 10K | new clients cannot connect |
+| HiveMQ CE | `queued-messages/max-queue-size` | 1000 | new QoS 1/2 messages are dropped, the publisher is acked |
+| HiveMQ CE | `receive-maximum/server-receive-maximum` | 10 | a publisher with more in flight is disconnected (0x93) |
+| HiveMQ CE | `persistence/mode` | `file` | every QoS 1/2 message goes through a disk queue: one QoS 1 pair delivers 4.8K msg/s at 342% CPU, 96K in memory |
+| TBMQ | `MQTT_FLOW_CONTROL_DELAYED_QUEUE_MAX_SIZE` | 1000 | messages past a subscriber's window are dropped, one log line each |
+| TBMQ | MQTT basic auth provider | on | clients without credentials are refused |
 
 ## Brokers
 
@@ -238,6 +251,45 @@ The runs in BENCHMARKS.md raise them.
 - Fixed load: 814-861 MiB for 20K connections. Point-to-point p99 is
   47 ms from the first step, and fan-in fails at 20K/s.
 
+### HiveMQ CE 2026.5
+
+- File persistence is the default, and every QoS 1/2 message goes through
+  its disk queue, even between clean sessions. One QoS 1 pair: 4.8K
+  msg/s at 342% CPU, against 96K with queues in memory, as they run here.
+- QoS 1/2 fan-in loses 66-78% with the publishers acked, with a queue of
+  100K messages per client.
+- QoS 0 overload: it closes the subscriber without a DISCONNECT or a log
+  line and stops reading the publishers. With 16 pairs it closed all 16
+  subscribers, and a publisher's write was still blocked 10 s after the
+  run.
+- The window of messages in flight to a client is 50, fixed in CE.
+- Run in one process, the suite ran it out of memory after the 16-pair
+  QoS 0 cell, at 9.4 GiB RSS with an 8 GiB heap. Each cell here gets a
+  fresh process.
+- Fixed load: point to point and fan-out pass every step. Fan-in fails
+  at 60K/s, delivering 0.6%.
+
+### TBMQ 2.4.1
+
+- Every message goes through Kafka, even QoS 0 to a connected
+  subscriber. A round trip takes 5.8 ms at p50 at every size and QoS; the
+  other brokers take under 0.3 ms.
+- QoS 0 overload is queued at first: one pair took 340K msg/s, delivered
+  15K/s in the window and the rest after the publishers stopped. With 64
+  pairs, 96% was lost.
+- Fan-in loses 28-57% at QoS 0, and 33-69% at QoS 1 and 2 from 256 B
+  up, with the publishers acked.
+- RSS was 9.5-18.4 GiB with its stores: TBMQ's 8 GiB heap, touched at
+  start, plus Kafka, Valkey and PostgreSQL.
+- Fixed load: point to point passes 40K/s at a 15 ms median and fails
+  at 60K/s (77% delivered, 0.6 s median). Fan-in fails at the first
+  step, 10K/s, with a 1.1 s median. Fan-out passes 150K/s.
+- With its stores it took 65-100 s to start. Its port opens before its
+  Kafka consumers have their partitions, and what is sent before then
+  is never delivered.
+- Its basic auth provider is on after install and refuses clients
+  without credentials. Only the REST API turns it off.
+
 ## Clients
 
 - **rumqttc 0.25.1** acks a QoS 1/2 message when it reads it, before the
@@ -251,6 +303,41 @@ The runs in BENCHMARKS.md raise them.
   8 calling processes were no faster than 1.
 - **zzq-client** acks when the application takes the message, in
   batches.
+
+## With storage on
+
+Each broker with its most durable setting, its stores on the SSD, under
+the load of the throughput suite at QoS 1 and 2. Subscribers keep their
+sessions. Rates are deliveries per second in the 5 s window.
+[BENCHMARKS.md](BENCHMARKS.md#brokers-with-storage-on) has the chart.
+
+| Broker | PUBACK after a synced write | Time to PUBACK, p50 | One QoS 1 pair, 16 B / 4 KiB | 16 QoS 1 pairs, 16 B | QoS 1 fan-in, 16 B | Fan-in lost, QoS 1 / 2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| zzq, 1 IO lane | yes | 0.78 ms | 86K / 14K | 260K | 203K | 0 / 0% |
+| zzq, 2 IO lanes | yes | 0.83 ms | 62K / 20K | 228K | 352K | 0 / 0% |
+| rmqtt | no | 45 µs | 28K / 18K | 13K | 30K | 5.6 / 24.7% |
+| EMQX | no | 177 µs | 15K / 11K | 21K | 18K | 0 / 0% |
+| Mosquitto | no | 47 µs | 31K / 23K | 28K | 20K | 0 / 0% |
+| NanoMQ | no | 68 µs | 130 / 111 | 1.1K | 200 | 95 / 76% |
+| XMQ | yes | 1.9 ms | 390 / 374 | 1.2K | 1.2K | 0 / 0% |
+| VerneMQ | no | 167 µs | 0 / 0 | 40 | 20 | 100 / 100% |
+| Sagüin | no | 142 µs | 2.5K / 2.0K | 13K | 14K | 0 / 0% |
+| HiveMQ CE | no | 164 µs | 4.6K / 4.4K | 9.8K | 331 | 0 / 0% |
+| TBMQ | yes | 8.1 ms | 6.5K / 511 | 6.6K | 8.8K | 0 / 0% |
+
+- **Group commit.** zzq's PUBACK waits for its write, but each write
+  carries every record that came in while the one before was in flight.
+  The two others whose PUBACK waits for a synced write, XMQ and TBMQ, ran
+  390 and 6.5K msg/s on one pair.
+- **Ack before the disk.** The others answer in 45-177 µs because their
+  PUBACK waits for no synced write. What a crash then loses is in the
+  next section.
+- **Starved by the store.** VerneMQ, with each LevelDB write synced,
+  acked 50K msg/s on one pair and delivered none in the window or the
+  drain after it. NanoMQ delivered 130 msg/s on one pair and lost 95% of
+  QoS 1 fan-in, with the publishers acked.
+- **zzq pays at 4 KiB.** One pair on one lane runs 14K msg/s, below
+  Mosquitto (23K) and rmqtt (18K), which do not wait for the disk.
 
 ## Durability
 
@@ -269,11 +356,15 @@ What a crash loses that a publisher already has its PUBACK for.
 | VerneMQ | LevelDB | LevelDB | no | writes in flight, unsynced writes on power loss |
 | FluxMQ | Badger, without fsync | durable queues | only for a queue in `fsync` mode | queued and in-flight MQTT messages, 1 s of queue writes |
 | Sagüin | none until configured | memory or SQLite | for the commit, not the fsync | 150 ms on power loss with SQLite |
+| HiveMQ CE | files | files | for the write, not the fsync | about 1 s on power loss |
+| TBMQ | Kafka, Valkey | Kafka, Valkey | for the Kafka write, not the fsync | Valkey writes since its last snapshot |
 
 - **Ack, then write.** Of the brokers with storage, only XMQ in
-  Super-Durable mode with `max_queued_writes: 0`, Sagüin, FluxMQ queues in
-  `fsync` mode and zzq write before the PUBACK. XMQ's source says that
-  mode caps the broker at about 25K msg/s
+  Super-Durable mode with `max_queued_writes: 0`, Sagüin, HiveMQ CE, TBMQ,
+  FluxMQ queues in `fsync` mode and zzq write before the PUBACK. Of those,
+  only zzq, XMQ with Redis on `appendfsync always`, FluxMQ queues, and
+  TBMQ with Kafka syncing each message wait for the write to be synced.
+  XMQ's source says that mode caps the broker at about 25K msg/s
   ([MessageDelivery.cpp](https://github.com/alexparshin1/xmq_public/blob/version-1.0.0/server/MessageDelivery.cpp#L85-L107)).
 - **zzq.** Sessions and queues live in RAM. `--state-file` writes them at
   SIGTERM or SIGINT and loads them at the next start, so a crash loses
@@ -360,6 +451,30 @@ What a crash loses that a publisher already has its PUBACK for.
   ([config.go](https://github.com/ifnesi/saguin/blob/v0.1.0-rc.1/internal/config/config.go#L872-L879)).
   Its own tests lost 52 and 138 ms of acked publishes in two power cuts
   ([RFC](https://github.com/ifnesi/saguin/blob/v0.1.0-rc.1/docs/rfcs/0004-storage.md#L572-L577)).
+- **HiveMQ CE.** File persistence is the default: every QoS 1/2 message
+  goes through a queue in Xodus and RocksDB, even for clean sessions
+  ([PublishDistributorImpl.java](https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/java/com/hivemq/mqtt/services/PublishDistributorImpl.java#L146-L177)).
+  The PUBACK waits for that write
+  ([IncomingPublishService.java](https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/java/com/hivemq/mqtt/handler/publish/IncomingPublishService.java#L217-L266)),
+  which is not synced: Xodus syncs at most once a second, inside a
+  later write
+  ([InternalConfigurations.java](https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/java/com/hivemq/configuration/service/InternalConfigurations.java#L143-L147)),
+  and RocksDB never
+  ([PublishPayloadRocksDBLocalPersistence.java](https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/java/com/hivemq/persistence/payload/PublishPayloadRocksDBLocalPersistence.java#L127-L139)).
+  CE has no setting for either.
+- **TBMQ.** Every publish goes through Kafka, and the PUBACK waits for
+  the Kafka write, with `acks=1`
+  ([MqttPublishHandler.java](https://github.com/thingsboard/tbmq/blob/v2.4.1/application/src/main/java/org/thingsboard/mqtt/broker/actors/client/service/handlers/MqttPublishHandler.java#L233-L257)).
+  Messages for persistent sessions of plain clients then move to
+  Valkey, after the PUBACK
+  ([DeviceMsgQueueConsumerImpl.java](https://github.com/thingsboard/tbmq/blob/v2.4.1/application/src/main/java/org/thingsboard/mqtt/broker/service/mqtt/persistence/device/queue/DeviceMsgQueueConsumerImpl.java#L128-L154)).
+  The shipped compose file runs Kafka without a flush setting and
+  Valkey without an append-only file
+  ([docker-compose.yml](https://github.com/thingsboard/tbmq/blob/v2.4.1/msa/tbmq/configs/docker-compose.yml#L39-L63)),
+  so nothing is synced, and a crash loses what moved to Valkey since its
+  last snapshot. Kafka's `log.flush.interval.messages=1` syncs before
+  the PUBACK; the durable run here sets that and Valkey's
+  `appendfsync always`.
 
 ## Clustering
 
@@ -378,6 +493,8 @@ What the open release offers, and what happens when a node fails.
 | VerneMQ | yes | subscriptions | the cluster refuses CONNECT and PUBLISH; its queues wait for it |
 | FluxMQ | etcd | session ownership | its sessions are lost, and their client IDs cannot connect for 30 s |
 | Sagüin | none | - | - |
+| HiveMQ CE | none | - | - |
+| TBMQ | yes, nodes share Kafka, Valkey and PostgreSQL | everything, in the shared stores | its clients reconnect to another node; messages on their way through it are lost |
 
 - **rmqtt.** Neither mode replicates sessions, queues or in-flight
   messages. Broadcast mode sends every publish to every node
@@ -446,6 +563,16 @@ What the open release offers, and what happens when a node fails.
   client IDs fail until its 30 s lease expires
   ([session.go](https://github.com/absmach/fluxmq/blob/v1.0.0/mqtt/broker/session.go#L134-L137),
   [etcd.go](https://github.com/absmach/fluxmq/blob/v1.0.0/cluster/etcd.go#L1092)).
+- **HiveMQ CE.** Clustering is in the commercial edition. CE's cluster
+  service throws "Cluster discovery is not available in HiveMQ Community
+  Edition"
+  ([ClusterServiceNoopImpl.java](https://github.com/hivemq/hivemq-community-edition/blob/2026.5/src/main/java/com/hivemq/extensions/services/cluster/ClusterServiceNoopImpl.java#L29-L37)).
+- **TBMQ.** Nodes are equal and talk through Kafka topics
+  ([thingsboard-mqtt-broker.yml](https://github.com/thingsboard/tbmq/blob/v2.4.1/application/src/main/resources/thingsboard-mqtt-broker.yml#L546-L563)). Persistent sessions
+  keep their messages in Valkey or Kafka, so they outlive a node. A
+  `kill -9` of one node stalled the other for minutes while Kafka
+  rebalanced its consumer groups
+  ([#181](https://github.com/thingsboard/tbmq/issues/181)).
 - **Sagüin.** "One node and one process; no clustering, consensus, or
   automatic failover"
   ([README](https://github.com/ifnesi/saguin/blob/v0.1.0-rc.1/README.md#L172-L173)).
@@ -456,7 +583,15 @@ What the open release offers, and what happens when a node fails.
   messages queued, the publishers that feed it get their acks held until
   it is down to half. Publishers slow to the subscriber's pace.
 - QoS 0: past `max_out_bytes` waiting for one connection, QoS 0 messages
-  to it are dropped and counted.
+  to it are dropped and counted: 0.2% of QoS 0 fan-in at 4 KiB on 2
+  lanes.
+- One lane is one CPU. At fixed load it fails point to point at 60K/s
+  and, in the latest run, fan-in at 80K/s (103 ms median, at 100% CPU);
+  earlier runs of fan-in at 80K/s passed with 7-76 ms. Two lanes pass
+  every step.
+- With `--data-dir`, each PUBACK waits for a synced write: 0.8 ms at p50
+  here. One QoS 1 pair of 4 KiB messages on one lane runs 14K msg/s.
+- No clustering: a node is a single point of failure.
 - An offline session queues up to `max_queued` messages and
   `max_queued_bytes`; past that the oldest are dropped and counted.
   `max_state_bytes` bounds all sessions, queues and retained messages.

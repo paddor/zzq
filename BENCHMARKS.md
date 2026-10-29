@@ -10,14 +10,18 @@ them.
   Debian 13, Linux 6.12, performance governor, turbo off.
 - The broker runs on CPUs 0-3 (`taskset`), the load generator on CPUs 4-5.
   Brokers shipped as container images run in podman with host networking.
+  The stores a broker needs (Redis, Kafka, PostgreSQL) run on its CPUs,
+  and its CPU and memory include theirs.
 - Before each run, the runner waits for 90% idle CPU and no compiler
   processes. A run that overlaps a compiler is repeated.
-- Each cell is one run. The charts show the newest run per cell: zzq from
-  2026-10-27, the rest from 2026-10-26.
+- Each cell is one run. The charts show the newest run per cell: zzq,
+  HiveMQ CE, TBMQ and every run with storage on from 2026-10-28 and 29,
+  the rest from 2026-10-26.
 - Rivals run tuned configs: in-flight windows of about 1000, queues of about
   100K, no rate limits, and Nagle off where they have the knob. Several
   defaults drop messages or pace subscribers, which would measure the
-  config, not the broker.
+  config, not the broker. Like the others, HiveMQ CE keeps its queues in
+  RAM here; its default, file persistence, runs with storage on.
 - zzq runs its defaults with 1 or 2 IO lanes. With 2 lanes, the single
   pair and the round trip cross lanes.
 
@@ -34,6 +38,8 @@ them.
 | XMQ | 1.0.0 | C++ | official image |
 | FluxMQ | 1.0.0 | Go | source build |
 | Sagüin | 0.1.0-rc.1 | Go | source build |
+| HiveMQ CE | 2026.5 | Java | official image |
+| TBMQ | 2.4.1 | Java | official images, with Kafka, Valkey and PostgreSQL |
 
 [^vernemq]: VerneMQ's binary packages and images come under an EULA that
     forbids competitive analysis. The source is Apache-2.0.
@@ -51,13 +57,31 @@ this load, and why some configs differ from the tuned ones.
 - 1 s warmup (5 s for rumqttd, whose memory grows for a few seconds
   first), then a 5 s window. The rate is deliveries at the subscribers.
   Loss compares all deliveries with all sends once 2 s pass without a
-  delivery.
+  delivery, or 90 s after the publishers stop.
 - QoS 1 and 2 publishers keep up to 100 messages in flight. QoS 0 has no flow
   control, so it shows how a broker handles a subscriber that falls behind.
 - Round trip: one message in flight between two connections. The dot is
-  p99, the whiskers p50 and p99.9.
+  p99, the whiskers p50 and p99.9, on a log axis.
 - The CPU rows under each panel are the broker's CPU percent over the run,
   out of 400.
+
+## Brokers with storage on
+
+![Brokers with storage on](doc/charts/durable.svg)
+
+- Each broker runs its most durable storage setting, with its stores on
+  an SSD (XFS). A synced 4 KiB write takes 0.7 ms into allocated blocks
+  and 1.8 ms when it extends a file. zzq runs with `--data-dir`.
+  [COMPARISONS.md](COMPARISONS.md#with-storage-on) has the numbers and
+  which brokers send the PUBACK only after the write is synced.
+- Subscribers keep their sessions (clean start off, no expiry), so a
+  broker with storage keeps each QoS 1 and 2 message for them.
+- Each cell gets a fresh broker and empty stores. The load is as above,
+  at QoS 1 and 2.
+- Time to PUBACK: one QoS 1 publish in flight, from its send to its
+  PUBACK, with a persistent subscriber, on a log axis.
+- Not run: rumqttd has no storage, FlashMQ only writes a snapshot each
+  hour, and FluxMQ 1.0.0 refuses persistent sessions on one node.
 
 ## Fixed load with many connections
 
@@ -75,6 +99,7 @@ this load, and why some configs differ from the tuned ones.
 - A step fails below 95% delivered, on a closed connection, or at a median
   above 100 ms. A cross marks the failure, and the list right of the row
   says why. No higher step runs.
+- Latency and memory are on log axes.
 - Each scenario gets a fresh broker.
 
 ## Clients

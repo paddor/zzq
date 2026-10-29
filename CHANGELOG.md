@@ -76,7 +76,8 @@ Notable changes to zzq. The format follows
   PIDs). A run waits at most 90 s for deliveries after the publishers
   stop, and an `rtt` run measures at most 60 s.
 - `COMPARISONS.md` lists how the other brokers in the benchmarks behave
-  under load, what survives a crash, and what their clustering offers.
+  under load and with storage on, what survives a crash, and what their
+  clustering offers.
 - `doc/architecture.md`: threads, channels, the path of a message, and
   what makes zzq fast.
 
