@@ -294,7 +294,8 @@ pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
 #[derive(Debug)]
 pub(crate) struct Dir {
     path: PathBuf,
-    _lock: File,
+    /// Taken out on drop, so the lock is gone before waiters wake.
+    lock: Option<File>,
 }
 
 /// Directories whose journal was dropped while work it started still
@@ -347,7 +348,7 @@ impl Dir {
         })?;
         Ok(Dir {
             path: path.to_owned(),
-            _lock: file,
+            lock: Some(file),
         })
     }
 
@@ -364,7 +365,38 @@ impl Dir {
 
 impl Drop for Dir {
     fn drop(&mut self) {
+        drop(self.lock.take());
         CLOSING.dirs().retain(|d| *d != self.path);
         CLOSING.done.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::TempDir;
+
+    #[test]
+    fn a_journal_waiting_on_dropped_work_gets_the_lock() {
+        let dirs: Vec<TempDir> = (0..8)
+            .map(|i| TempDir::new(&format!("relock{i}")))
+            .collect();
+        std::thread::scope(|s| {
+            for d in &dirs {
+                s.spawn(move || {
+                    let path = fs::canonicalize(d.path()).unwrap();
+                    for _ in 0..300 {
+                        let dir = Arc::new(Dir::lock(&path).unwrap());
+                        dir.closed();
+                        let work = Arc::clone(&dir);
+                        drop(dir);
+                        let done = std::thread::spawn(move || drop(work));
+                        let again = Dir::lock(&path);
+                        done.join().unwrap();
+                        assert!(again.is_ok(), "{again:?}");
+                    }
+                });
+            }
+        });
     }
 }
