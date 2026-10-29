@@ -31,7 +31,7 @@ use crate::options::{BrokerOptions, ClusterOptions, ClusterStart};
 use crate::retain::Retained;
 use crate::{Error, Result};
 use app::Accumulators;
-use zzq_cluster::node::Node;
+use zzq_cluster::node::{Node, NodeConfig};
 use zzq_tokio::Endpoint;
 
 /// Journals that replicate to the cluster, for `n` lanes.
@@ -115,29 +115,89 @@ pub(crate) async fn save(shared: &Arc<Shared>, path: Option<&Path>) -> Result<()
     }
 }
 
-/// The node and its application state: from an unused exit dump in the
+/// The node and its application state, and whether its first leadership
+/// writes that state into a new epoch's history.
+pub(crate) struct Booted {
+    pub(crate) node: Node,
+    pub(crate) app: Accumulators,
+    pub(crate) rewrite: bool,
+}
+
+/// The node: forced as `opts.start` says, from an unused exit dump in the
 /// state file, which is set aside then, or else as `opts.start` says.
-fn boot(shared: &Shared, opts: &ClusterOptions) -> Result<(Node, Accumulators)> {
-    let now = Duration::ZERO;
+fn boot(shared: &Shared, opts: &ClusterOptions) -> Result<Booted> {
     let (lanes, levels) = (shared.lanes.len(), shared.opts.max_topic_levels);
     let mut config = opts.node;
     config.fingerprint = fingerprint(lanes, levels);
-    if let Some(path) = shared.opts.state_file.as_deref()
-        && let Some(bytes) = dump::read(path).map_err(Error::State)?
-    {
-        let d = dump::decode(&bytes).map_err(crate::dump::damaged)?;
-        let node = Node::restore(config, &d.node, now).map_err(crate::dump::damaged)?;
-        let parts = image::decode(&d.image).map_err(crate::dump::damaged)?;
-        let app = Accumulators::from_image(lanes, levels, &parts).map_err(crate::dump::damaged)?;
+    let path = shared.opts.state_file.as_deref();
+    let read = |p: &Path| dump::read(p).map_err(Error::State);
+    let unused = path.map(read).transpose()?.flatten();
+    let booted = match (opts.start, unused) {
+        (ClusterStart::Force, unused) => {
+            // The newest state it has: unused, or the one it last started from.
+            let loaded = || path.map(|p| read(&crate::dump::with_suffix(p, ".loaded")));
+            let bytes = match unused {
+                Some(b) => Some(b),
+                None => loaded().transpose()?.flatten(),
+            };
+            forced(&config, bytes.as_ref(), lanes, levels)?
+        }
+        (_, Some(bytes)) => restored(&config, &bytes, lanes, levels)?,
+        (start, None) => {
+            let node = if start == ClusterStart::Bootstrap {
+                Node::bootstrap(config, Duration::ZERO)
+            } else {
+                Node::recover(config, Duration::ZERO)
+            };
+            Booted {
+                node: node.map_err(|_| Error::InvalidOption("cluster"))?,
+                app: Accumulators::new(lanes, levels),
+                rewrite: false,
+            }
+        }
+    };
+    if let Some(path) = path.filter(|p| p.exists()) {
         dump::set_aside(path).map_err(Error::State)?;
-        return Ok((node, app));
     }
-    let node = match opts.start {
-        ClusterStart::Bootstrap => Node::bootstrap(config, now),
-        ClusterStart::Recover => Node::recover(config, now),
-    }
-    .map_err(|_| Error::InvalidOption("cluster"))?;
-    Ok((node, Accumulators::new(lanes, levels)))
+    Ok(booted)
+}
+
+/// A node from its exit dump `bytes`.
+fn restored(config: &NodeConfig, bytes: &Bytes, lanes: usize, levels: usize) -> Result<Booted> {
+    let d = dump::decode(bytes).map_err(crate::dump::damaged)?;
+    let node = Node::restore(*config, &d.node, Duration::ZERO).map_err(crate::dump::damaged)?;
+    let parts = image::decode(&d.image).map_err(crate::dump::damaged)?;
+    let app = Accumulators::from_image(lanes, levels, &parts).map_err(crate::dump::damaged)?;
+    Ok(Booted {
+        node,
+        app,
+        rewrite: false,
+    })
+}
+
+/// A node forced to a new epoch, with the state of dump `bytes`, if any.
+fn forced(
+    config: &NodeConfig,
+    bytes: Option<&Bytes>,
+    lanes: usize,
+    levels: usize,
+) -> Result<Booted> {
+    let Some(bytes) = bytes else {
+        return Ok(Booted {
+            node: Node::force(*config, None, Duration::ZERO).map_err(crate::dump::damaged)?,
+            app: Accumulators::new(lanes, levels),
+            rewrite: true,
+        });
+    };
+    let d = dump::decode(bytes).map_err(crate::dump::damaged)?;
+    let node = Node::force(*config, Some(&d.node), Duration::ZERO).map_err(crate::dump::damaged)?;
+    let parts = image::decode(&d.image).map_err(crate::dump::damaged)?;
+    let app = Accumulators::from_image(lanes, levels, &parts).map_err(crate::dump::damaged)?;
+    Ok(Booted {
+        node,
+        app: app.for_new_epoch(),
+        rewrite: true,
+    })
 }
 
 /// What the replicated state depends on besides the records: nodes that
@@ -153,10 +213,10 @@ fn fingerprint(lanes: usize, max_levels: usize) -> u64 {
 
 /// Starts the node and its replica task on the first lane.
 pub(crate) async fn start(shared: &Arc<Shared>, opts: &ClusterOptions) -> Result<()> {
-    let (mut node, app) = boot(shared, opts)?;
+    let mut booted = boot(shared, opts)?;
     for &peer in opts.node.configuration.voters() {
         if peer != opts.node.local {
-            let _ = node.connected(peer);
+            let _ = booted.node.connected(peer);
         }
     }
     let inbound = opts
@@ -179,7 +239,7 @@ pub(crate) async fn start(shared: &Arc<Shared>, opts: &ClusterOptions) -> Result
                 inbound,
                 exits,
             };
-            let replica = replica::Replica::new(s.clone(), node, app, links);
+            let replica = replica::Replica::new(s.clone(), booted, links);
             let task = tokio::task::spawn_local(replica.run());
             s.own_task(task.abort_handle());
         })

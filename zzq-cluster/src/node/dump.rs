@@ -22,7 +22,9 @@ use super::{Node, NodeConfig, NodeError};
 use crate::driver::ReplicaDriver;
 use crate::integrity::hash;
 use crate::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
-use crate::{Digest, FrozenLog, OpNumber, Prefix, RecoveredState, Scope, ViewChange};
+use crate::{
+    Configuration, Digest, FrozenLog, OpNumber, Prefix, RecoveredState, Scope, ViewChange,
+};
 
 const MAGIC: &[u8; 8] = b"ZZQNODE1";
 const CHECK_CONTEXT: &str = "zzq cluster node dump v1";
@@ -47,6 +49,8 @@ pub enum DumpError {
 
 /// What a dump holds, before it becomes a node.
 struct Parsed {
+    /// The configuration it ran: the given one or a forced epoch of it.
+    configuration: Configuration,
     promised: u64,
     last_normal: u64,
     accepted: Prefix,
@@ -108,8 +112,12 @@ impl Node {
     ///
     /// [`NodeError::Dump`] for a malformed or foreign dump;
     /// [`NodeError::Driver`] if the core rejects the history.
-    pub fn restore(config: NodeConfig, dump: &[u8], now: Duration) -> Result<Node, NodeError> {
-        let parsed = parse(&config, dump)?;
+    pub fn restore(base: NodeConfig, dump: &[u8], now: Duration) -> Result<Node, NodeError> {
+        let parsed = parse(&base, dump)?;
+        let config = NodeConfig {
+            configuration: parsed.configuration,
+            ..base
+        };
         let scope = config.configuration.scope();
         let recovered = RecoveredState {
             scope: Scope {
@@ -131,6 +139,7 @@ impl Node {
         )?;
         let driver = ReplicaDriver::from_view_change(changing, now, config.timing)?;
         let mut node = Node::bootstrap(config, now)?;
+        node.epochs.base = base.configuration;
         node.driver = Driver::new(driver);
         node.role = super::Role::Electing;
         node.own_from = None;
@@ -151,6 +160,28 @@ fn put_prefix(b: &mut BytesMut, p: Prefix) {
     b.extend_from_slice(p.digest.as_bytes());
 }
 
+/// The configuration a dump's head names: `config`'s, or a forced epoch
+/// of it, for this node.
+fn read_configuration(r: &mut Reader<'_>, config: &NodeConfig) -> Result<Configuration, DumpError> {
+    let scope = config.configuration.scope();
+    let group = r.take(16)?;
+    let epoch = r.u64()?;
+    let digest = Digest::from_bytes(r.take(32)?.try_into().map_err(|_| DumpError::Malformed)?);
+    let local = r.take(16)?;
+    if group != scope.group_id.as_bytes() || local != config.local.as_bytes() {
+        return Err(DumpError::Foreign);
+    }
+    super::epoch::named(&config.configuration, epoch, digest).ok_or(DumpError::Foreign)
+}
+
+/// The configuration epoch a dump for `config` ran.
+pub(super) fn epoch_of(config: &NodeConfig, dump: &[u8]) -> Result<u64, DumpError> {
+    Ok(parse(config, dump)?
+        .configuration
+        .scope()
+        .configuration_epoch)
+}
+
 /// Reads a dump for `config`, checking its checksum and history.
 fn parse(config: &NodeConfig, dump: &[u8]) -> Result<Parsed, DumpError> {
     let (body, check) = dump.split_last_chunk::<32>().ok_or(DumpError::Malformed)?;
@@ -161,21 +192,14 @@ fn parse(config: &NodeConfig, dump: &[u8]) -> Result<Parsed, DumpError> {
     if r.take(8)? != MAGIC {
         return Err(DumpError::Malformed);
     }
-    let scope = config.configuration.scope();
-    if r.take(16)? != scope.group_id.as_bytes()
-        || r.u64()? != scope.configuration_epoch
-        || r.take(32)? != scope.configuration_digest.as_bytes()
-        || r.take(16)? != config.local.as_bytes()
-    {
-        return Err(DumpError::Foreign);
-    }
+    let configuration = read_configuration(&mut r, config)?;
     let promised = r.u64()?;
     let last_normal = r.u64()?;
     let accepted = r.prefix()?;
     let committed = r.prefix()?;
     let app = r.prefix()?;
     let base = r.prefix()?;
-    let log = read_ops(&mut r, base, config)?;
+    let log = read_ops(&mut r, base, &configuration, config)?;
     if !r.0.is_empty() {
         return Err(DumpError::Malformed);
     }
@@ -184,6 +208,7 @@ fn parse(config: &NodeConfig, dump: &[u8]) -> Result<Parsed, DumpError> {
         return Err(DumpError::History);
     }
     Ok(Parsed {
+        configuration,
         promised,
         last_normal,
         accepted,
@@ -194,8 +219,13 @@ fn parse(config: &NodeConfig, dump: &[u8]) -> Result<Parsed, DumpError> {
 }
 
 /// The dumped ops after `base`, chained anew from it.
-fn read_ops(r: &mut Reader<'_>, base: Prefix, config: &NodeConfig) -> Result<Log, DumpError> {
-    let scope = config.configuration.scope();
+fn read_ops(
+    r: &mut Reader<'_>,
+    base: Prefix,
+    configuration: &Configuration,
+    config: &NodeConfig,
+) -> Result<Log, DumpError> {
+    let scope = configuration.scope();
     let count = r.u32()?;
     if (count as usize).saturating_mul(OP_HEAD_BYTES) > r.0.len() {
         return Err(DumpError::Malformed);
@@ -299,6 +329,9 @@ mod tests {
     /// The dump of a fresh leader that proposed three ops.
     fn dump() -> (Bytes, OpNumber) {
         let mut node = Node::bootstrap(config(1, 8), Duration::ZERO).unwrap();
+        // As if a follower acked: it leads.
+        node.lease.heard_at = Some(Duration::ZERO);
+        node.update_role();
         for n in 0..3u8 {
             node.propose(Bytes::from(vec![n; 5]), Duration::ZERO)
                 .unwrap();

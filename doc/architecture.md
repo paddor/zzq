@@ -200,9 +200,10 @@ the cluster instead, in RAM:
   becomes one op. A replica task on lane 0 owns the node, proposes the
   ops and turns their commits into the journals' completions, so a
   PUBACK waits for one follower to hold its message.
-- **Leader only.** The leader alone binds client listeners. A node that
-  loses the leadership closes them, drops its lanes' state and rebuilds
-  it from the ops.
+- **Leader only.** The leader alone binds client listeners. A leader
+  that misses its followers' acks closes them and waits; one that is no
+  longer the primary of its view drops its lanes' state and rebuilds it
+  from the ops.
 - **Followers.** A follower applies the committed ops with the replay a
   start from disk uses, into state no lane serves. Becoming leader hands
   that state to the lanes.
@@ -210,6 +211,9 @@ the cluster instead, in RAM:
   gets an image: each journal's state, cut at its own op.
 - **Exit dumps.** A clean stop writes the node's history and an image to
   the state file; the next start votes with it.
+- **Forced start.** When no two nodes have the state, one node starts a
+  new configuration epoch from the newest state it has and journals it
+  all as its first ops. Nodes without state join that epoch.
 - **Links.** The nodes talk over OMQ, one PEER socket per node, on a
   thread of its own.
 

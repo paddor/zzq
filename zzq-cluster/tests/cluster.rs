@@ -18,6 +18,11 @@ use zzq_cluster::node::{LogLimits, Node, Role};
 
 const CLEAN: Faults = Faults { drop: 0, jitter: 0 };
 
+/// Runs until the first leader leads, once a follower acked it.
+fn started(sim: &mut Sim) {
+    assert!(sim.run_until(1000, |s| s.leader().is_some()), "a leader");
+}
+
 fn body(n: u64) -> Bytes {
     Bytes::from(format!("op {n}"))
 }
@@ -25,7 +30,7 @@ fn body(n: u64) -> Bytes {
 #[test]
 fn the_first_node_leads_a_new_cluster_and_the_others_follow() {
     let mut sim = Sim::new(1, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(sim.leader(), Some(0));
     assert_eq!(sim.apps[1].role, Some(Role::Follower));
     assert_eq!(sim.apps[2].role, Some(Role::Follower));
@@ -34,7 +39,7 @@ fn the_first_node_leads_a_new_cluster_and_the_others_follow() {
 #[test]
 fn proposed_ops_commit_and_every_follower_applies_them_in_order() {
     let mut sim = Sim::new(2, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     for n in 1..=200 {
         assert!(sim.propose(0, body(n)));
         if n % 10 == 0 {
@@ -52,7 +57,7 @@ fn proposed_ops_commit_and_every_follower_applies_them_in_order() {
 #[test]
 fn a_full_pipeline_pushes_back_until_followers_ack() {
     let mut sim = Sim::new(3, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     let mut taken = 0;
     while sim.propose(0, body(taken)) {
         taken += 1;
@@ -66,7 +71,7 @@ fn a_full_pipeline_pushes_back_until_followers_ack() {
 #[test]
 fn one_follower_down_does_not_stop_commits() {
     let mut sim = Sim::new(4, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     sim.isolate(2, true);
     for n in 1..=50 {
         assert!(sim.propose(0, body(n)));
@@ -88,7 +93,7 @@ fn lost_and_late_prepares_are_resent_until_followers_hold_every_op() {
                 jitter: 5,
             },
         );
-        sim.run(5);
+        started(&mut sim);
         let mut n = 0;
         while n < 300 {
             if sim.propose(0, body(n)) {
@@ -130,7 +135,7 @@ fn propose_for(sim: &mut Sim, n: u64, ticks: u64) -> u64 {
 #[test]
 fn a_new_leader_takes_over_when_the_leader_is_cut_off() {
     let mut sim = Sim::new(5, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 50, 100), 50);
     assert!(sim.run_until(100, |s| s.apps[0].committed == OpNumber(50)));
     sim.isolate(0, true);
@@ -155,7 +160,7 @@ fn a_new_leader_takes_over_when_the_leader_is_cut_off() {
 #[test]
 fn a_cut_off_leader_drops_what_never_committed() {
     let mut sim = Sim::new(6, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 10, 100), 10);
     assert!(sim.run_until(100, |s| s.apps[0].committed == OpNumber(10)));
     sim.isolate(0, true);
@@ -179,7 +184,7 @@ fn seeded_splits_drops_and_delays_never_lose_an_acked_op() {
     for seed in 0..seeds(100) {
         eprintln!("seed {seed}");
         let mut sim = Sim::new(1000 + seed, Faults { drop: 5, jitter: 8 });
-        sim.run(5);
+        started(&mut sim);
         for round in 0..20 {
             let cut = sim.rng.below(5) as usize;
             for i in 0..3 {
@@ -223,7 +228,7 @@ fn a_cut_off_leader_whose_log_moved_on_rebuilds_from_an_image() {
         max_body_bytes: 1 << 20,
     };
     let mut sim = Sim::with_log(7, CLEAN, small);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 40, 200), 40);
     assert!(sim.run_until(200, |s| s.apps[0].committed == OpNumber(40)));
     sim.isolate(0, true);
@@ -252,7 +257,7 @@ fn a_cut_off_leader_whose_log_moved_on_rebuilds_from_an_image() {
 #[test]
 fn a_rejoining_node_gets_no_commit_per_round_trip_while_it_catches_up() {
     let mut sim = Sim::new(5, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 10, 100), 10);
     assert!(sim.run_until(100, |s| s.apps[0].committed == OpNumber(10)));
     sim.isolate(0, true);
@@ -284,7 +289,7 @@ fn a_rejoining_node_gets_no_commit_per_round_trip_while_it_catches_up() {
 #[test]
 fn leadership_moves_around_the_ring_as_each_leader_is_cut_off_in_turn() {
     let mut sim = Sim::new(5, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 4, 100), 4);
     for next in [1, 2, 0] {
         let l = sim.leader().unwrap();
@@ -345,7 +350,7 @@ fn settle(sim: &mut Sim, ticks: u64) -> bool {
 fn a_crashed_follower_recovers_from_the_others() {
     for log in [LogLimits::default(), small_log()] {
         let mut sim = Sim::with_log(8, CLEAN, log);
-        sim.run(5);
+        started(&mut sim);
         assert_eq!(propose_for(&mut sim, 100, 500), 100);
         assert!(sim.run_until(200, |s| s.apps[0].committed == OpNumber(100)));
         sim.crash(2);
@@ -367,7 +372,7 @@ fn a_crashed_follower_recovers_from_the_others() {
 #[test]
 fn a_crashed_leader_is_replaced_and_recovers_as_a_follower() {
     let mut sim = Sim::with_log(9, CLEAN, small_log());
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 100, 500), 100);
     assert!(sim.run_until(200, |s| s.apps[0].committed == OpNumber(100)));
     sim.crash(0);
@@ -384,7 +389,7 @@ fn seeded_crashes_and_splits_never_lose_an_acked_op() {
     for seed in 0..seeds(40) {
         eprintln!("seed {seed}");
         let mut sim = Sim::with_log(5000 + seed, Faults { drop: 3, jitter: 5 }, small_log());
-        sim.run(5);
+        started(&mut sim);
         let mut down: Option<usize> = None;
         for _ in 0..12 {
             for i in 0..3 {
@@ -452,7 +457,7 @@ fn seeds(n: u64) -> u64 {
 fn a_full_stop_in_any_order_keeps_every_acked_op() {
     for order in [[0, 1, 2], [2, 1, 0], [1, 0, 2]] {
         let mut sim = Sim::with_log(10, CLEAN, small_log());
-        sim.run(5);
+        started(&mut sim);
         assert_eq!(propose_for(&mut sim, 100, 1000), 100);
         assert!(settle(&mut sim, 1000));
         let acked = sim.acked.clone();
@@ -486,7 +491,7 @@ fn a_full_stop_in_any_order_keeps_every_acked_op() {
 #[test]
 fn any_two_dumps_bring_the_cluster_back() {
     let mut sim = Sim::with_log(11, CLEAN, small_log());
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 60, 1000), 60);
     assert!(settle(&mut sim, 1000));
     for i in 0..3 {
@@ -509,7 +514,7 @@ fn any_two_dumps_bring_the_cluster_back() {
 #[test]
 fn a_rolling_restart_moves_no_acked_op() {
     let mut sim = Sim::with_log(12, CLEAN, small_log());
-    sim.run(5);
+    started(&mut sim);
     for i in [2, 1, 0] {
         assert_eq!(propose_for(&mut sim, 40, 2000), 40);
         assert!(settle(&mut sim, 2000));
@@ -528,7 +533,7 @@ fn a_rolling_restart_moves_no_acked_op() {
 #[test]
 fn a_restored_node_that_crashes_recovers_instead_of_reusing_its_dump() {
     let mut sim = Sim::with_log(13, CLEAN, small_log());
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 50, 1000), 50);
     assert!(settle(&mut sim, 1000));
     assert!(sim.stop(2));
@@ -550,7 +555,7 @@ fn seeded_stops_crashes_and_splits_end_in_a_full_restart() {
     for seed in 0..seeds(40) {
         eprintln!("seed {seed}");
         let mut sim = Sim::with_log(9000 + seed, Faults { drop: 3, jitter: 5 }, small_log());
-        sim.run(5);
+        started(&mut sim);
         let mut stopped: Vec<usize> = Vec::new();
         let mut crashed: Option<usize> = None;
         for _ in 0..12 {
@@ -638,7 +643,7 @@ fn seeded_stops_crashes_and_splits_end_in_a_full_restart() {
 #[test]
 fn an_application_that_dropped_its_state_gets_the_committed_ops_again() {
     let mut sim = Sim::new(14, CLEAN);
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 30, 500), 30);
     assert!(settle(&mut sim, 1000));
     sim.apps[1].ops.clear();
@@ -650,7 +655,7 @@ fn an_application_that_dropped_its_state_gets_the_committed_ops_again() {
 #[test]
 fn an_application_that_dropped_its_state_past_the_log_gets_an_image() {
     let mut sim = Sim::with_log(15, CLEAN, small_log());
-    sim.run(5);
+    started(&mut sim);
     assert_eq!(propose_for(&mut sim, 100, 1000), 100);
     assert!(settle(&mut sim, 1000));
     sim.apps[1].ops.clear();
@@ -661,4 +666,130 @@ fn an_application_that_dropped_its_state_past_the_log_gets_an_image() {
     assert_eq!(propose_for(&mut sim, 10, 500), 10);
     assert!(settle(&mut sim, 1000));
     sim.check();
+}
+
+/// Proposes `n` ops at leader `l` and runs until every node applied them.
+fn commit_everywhere(sim: &mut Sim, l: usize, n: u64) {
+    let from = sim.apps[l].ops.len();
+    assert_eq!(propose_for(sim, n, 1000), n);
+    assert!(
+        sim.run_until(2000, |s| s
+            .apps
+            .iter()
+            .all(|a| a.ops.len() == from + n as usize)),
+        "every node applies the ops"
+    );
+}
+
+#[test]
+fn nodes_without_state_join_the_epoch_one_node_forced() {
+    let mut sim = Sim::new(21, CLEAN);
+    started(&mut sim);
+    commit_everywhere(&mut sim, 0, 10);
+    for i in 0..3 {
+        sim.crash(i);
+    }
+    for i in 0..3 {
+        sim.restart(i);
+    }
+    assert!(
+        !sim.run_until(2000, |s| s.leader().is_some()),
+        "no quorum knows the history"
+    );
+    sim.force(1);
+    assert!(
+        sim.run_until(2000, |s| s.leader() == Some(1)
+            && (0..3).all(|i| s.epoch(i) == Some(2))
+            && s.apps[0].role == Some(Role::Follower)
+            && s.apps[2].role == Some(Role::Follower)),
+        "node 1 leads epoch 2\n{}",
+        report(&sim)
+    );
+    commit_everywhere(&mut sim, 1, 10);
+    sim.check();
+}
+
+#[test]
+fn a_node_with_state_stays_out_of_an_epoch_another_forced() {
+    let mut sim = Sim::new(22, CLEAN);
+    started(&mut sim);
+    commit_everywhere(&mut sim, 0, 5);
+    sim.crash(2);
+    sim.force(2);
+    sim.run(1000);
+    assert_eq!(sim.leader(), Some(0), "the old epoch goes on");
+    assert_eq!(
+        (sim.epoch(0), sim.epoch(1), sim.epoch(2)),
+        (Some(1), Some(1), Some(2))
+    );
+    for i in 0..2 {
+        let status = sim.nodes[i].as_ref().unwrap().status();
+        assert_eq!(status.newer_epoch, Some(2), "node {i} says it saw epoch 2");
+    }
+    // Alone, the forced node never leads: no follower acks it.
+    assert_ne!(sim.apps[2].role, Some(Role::Leader));
+}
+
+#[test]
+fn a_forced_epoch_follows_the_dump_and_comes_back_from_its_own_dumps() {
+    let mut sim = Sim::new(23, CLEAN);
+    started(&mut sim);
+    commit_everywhere(&mut sim, 0, 5);
+    assert!(sim.stop(0), "node 0 dumps");
+    sim.crash(1);
+    sim.crash(2);
+    sim.force(0);
+    sim.restart(1);
+    sim.restart(2);
+    assert!(sim.run_until(2000, |s| s.leader() == Some(0)
+        && s.epoch(1) == Some(2)
+        && s.epoch(2) == Some(2)));
+    commit_everywhere(&mut sim, 0, 5);
+    for i in [2, 0, 1] {
+        assert!(sim.stop(i), "node {i} dumps epoch 2");
+    }
+    for i in 0..3 {
+        sim.start(i);
+    }
+    assert!(
+        sim.run_until(3000, |s| s.leader().is_some()),
+        "the dumps elect a leader"
+    );
+    assert!((0..3).all(|i| sim.epoch(i) == Some(2)));
+    sim.check();
+}
+
+#[test]
+fn a_leader_whose_application_dropped_its_state_leads_again_only_with_all_of_it() {
+    let mut sim = Sim::new(24, CLEAN);
+    started(&mut sim);
+    commit_everywhere(&mut sim, 0, 10);
+    for n in 0..5 {
+        assert!(sim.propose(0, body(100 + n)));
+    }
+    // Its followers' acks stop long enough to end its lease, not its view.
+    sim.links[1][0] = false;
+    sim.links[2][0] = false;
+    assert!(sim.run_until(100, |s| s.apps[0].role != Some(Role::Leader)));
+    assert!(
+        sim.nodes[0].as_ref().unwrap().primary(),
+        "still the primary"
+    );
+    // The application drops its state, as a broker's lanes do.
+    sim.node(0).reset_application();
+    sim.apps[0].ops.clear();
+    sim.links[1][0] = true;
+    sim.links[2][0] = true;
+    let mut led = false;
+    for _ in 0..1000 {
+        sim.step();
+        if sim.apps[0].role == Some(Role::Leader) {
+            let last = sim.nodes[0].as_ref().unwrap().status().log_last;
+            let held = sim.apps[0].held_at_lead.unwrap_or(0) as u64;
+            assert_eq!(held, last.0, "it leads with every op");
+            led = true;
+            break;
+        }
+    }
+    assert!(led, "it leads again");
 }

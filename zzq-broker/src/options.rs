@@ -259,6 +259,11 @@ pub enum ClusterStart {
     Bootstrap,
     /// Without state, as after a crash: it recovers from the other two.
     Recover,
+    /// As the leader of a new epoch, from the newest state it has: its
+    /// exit dump, the dump it last started from, or none. For when no two
+    /// nodes hold the state: what was acked after that dump is lost. The
+    /// others join once they start without state.
+    Force,
 }
 
 /// The links to the other nodes: frames go out on `outbound`, and come in

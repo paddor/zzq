@@ -20,8 +20,11 @@ Notable changes to zzq. The format follows
   replicate to RAM on another node before an ack. Only the leader binds
   client listeners. A node that loses the leadership drops its clients
   and rebuilds its state; a node without state gets it from the others;
-  `--state-file` keeps a node's state over a clean stop. The nodes link
-  over OMQ (`cluster` feature, on by default). Not with `--data-dir`.
+  `--state-file` keeps a node's state over a clean stop. When no two
+  nodes have the state, `--cluster-force-start` starts a new epoch on one
+  node from the newest state it has, and the others join once they start
+  without theirs. The nodes link over OMQ (`cluster` feature, on by
+  default). Not with `--data-dir`.
 - `Error::ClusterLinks`.
 
 ### Changed

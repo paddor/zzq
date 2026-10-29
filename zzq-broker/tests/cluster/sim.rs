@@ -262,6 +262,24 @@ impl Cluster {
         self.isolate(i, false);
     }
 
+    /// Starts node `i` forced to lead a new epoch, from its exit dump, or
+    /// the one it last started from, or none.
+    pub(crate) async fn force(&mut self, i: usize) {
+        let (tx, rx) = mpsc::channel(4096);
+        self.routes.lock().unwrap()[i] = tx;
+        let outbound = self.members[i].outbound.clone();
+        let broker = self
+            .start(i, ClusterStart::Force, links(&outbound, rx))
+            .await;
+        self.members[i].broker = Some(broker);
+        self.isolate(i, false);
+    }
+
+    /// Cuts what node `a` sends node `b`, or joins it again.
+    pub(crate) fn cut(&self, a: usize, b: usize, cut: bool) {
+        self.cuts.lock().unwrap()[a][b] = cut;
+    }
+
     /// Cuts node `i` off the others, or joins it again.
     pub(crate) fn isolate(&self, i: usize, cut: bool) {
         let mut cuts = self.cuts.lock().unwrap();

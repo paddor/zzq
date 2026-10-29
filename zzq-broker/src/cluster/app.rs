@@ -83,6 +83,12 @@ impl Accumulators {
         Ok(acc)
     }
 
+    /// The same state for a new epoch, whose op numbers start over.
+    pub(crate) fn for_new_epoch(mut self) -> Accumulators {
+        self.cuts.clear();
+        self
+    }
+
     /// An image of the state, every part through op `applied`, or the op
     /// an image gave its journal, if later.
     pub(crate) fn image(&self, applied: OpNumber) -> Vec<Part> {

@@ -78,7 +78,9 @@ another node holds it in RAM. When the leader goes, another node takes
 over with all that was acked, and the clients reconnect to it. Only the
 leader listens, so a load balancer's TCP health check finds it. A clean
 stop writes each node's state to its `--state-file`, so the whole cluster
-can stop and come back.
+can stop and come back. If two nodes lost their state at once, as in a
+power cut, `--cluster-force-start` brings the cluster back from the
+newest state one node has.
 
 ## Further reading
 

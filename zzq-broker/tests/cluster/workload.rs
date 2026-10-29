@@ -14,6 +14,8 @@ use bytes::Bytes;
 use zzq_client::{Client, ClientOptions};
 use zzq_proto::{QoS, Version};
 
+use zzq_cluster::node::Role;
+
 use super::sim::{Cluster, NODES};
 
 pub(crate) const PUBLISHERS: usize = 2;
@@ -57,8 +59,43 @@ pub(crate) struct Oracle {
     /// Payloads each subscriber got, in order, duplicates included.
     pub(crate) delivered: [Vec<Bytes>; SUBSCRIBERS],
     pub(crate) published: usize,
-    /// Faults, for a failure report.
+    /// Faults, role changes and acks, for a failure report.
     pub(crate) log: String,
+    /// When the run began.
+    pub(crate) start: Option<tokio::time::Instant>,
+    /// Each node's role and view, as last noted.
+    seen: [Option<(Role, u64)>; NODES],
+}
+
+impl Oracle {
+    fn note(&mut self, what: std::fmt::Arguments<'_>) {
+        let at = self.start.map(|s| s.elapsed()).unwrap_or_default();
+        let _ = writeln!(self.log, "{at:?}: {what}");
+    }
+
+    /// Notes the nodes whose role or view changed.
+    fn watch(&mut self, c: &Cluster) {
+        for i in 0..NODES {
+            let status = c.status(i);
+            let now = status.map(|s| (s.role, s.view));
+            if now != self.seen[i] {
+                self.seen[i] = now;
+                match status {
+                    Some(s) => self.note(format_args!(
+                        "node {i} {:?} view {} epoch {} committed {} applied {} log {}..{}",
+                        s.role,
+                        s.view,
+                        s.epoch,
+                        s.committed.0,
+                        s.applied.0,
+                        s.log_base.0,
+                        s.log_last.0
+                    )),
+                    None => self.note(format_args!("node {i} down")),
+                }
+            }
+        }
+    }
 }
 
 type Shared = Rc<RefCell<Oracle>>;
@@ -74,7 +111,7 @@ fn parse(payload: &[u8]) -> Option<(usize, u64)> {
 }
 
 /// A client of whichever node takes it, trying them in turn.
-async fn connect(ctx: &zzq_broker::Context, id: &str, clean: bool, from: usize) -> Client {
+async fn connect(ctx: &zzq_broker::Context, id: &str, clean: bool, from: usize) -> (usize, Client) {
     let mut i = from;
     loop {
         let opts = ClientOptions {
@@ -87,7 +124,7 @@ async fn connect(ctx: &zzq_broker::Context, id: &str, clean: bool, from: usize) 
         if let Ok(Ok(c)) =
             tokio::time::timeout(Duration::from_secs(1), Client::connect(ctx, &uri, opts)).await
         {
-            return c;
+            return (i % NODES, c);
         }
         i += 1;
         if i % NODES == from % NODES {
@@ -107,16 +144,19 @@ async fn publish(ctx: zzq_broker::Context, p: usize, mut rng: Rng, oracle: Share
         loop {
             let c = match client.take() {
                 Some(c) => c,
-                None => connect(&ctx, &id, true, p).await,
+                None => connect(&ctx, &id, true, p).await.1,
             };
             let sent = c.publish(&name, payload(p, n), QoS::AtLeastOnce);
             if let Ok(Ok(())) = tokio::time::timeout(Duration::from_secs(5), sent).await {
-                oracle.borrow_mut().acked.push((p, n, topic));
+                let mut o = oracle.borrow_mut();
+                o.acked.push((p, n, topic));
+                o.note(format_args!("acked p{p}-{n}"));
                 client = Some(c);
                 break;
             }
         }
-        tokio::time::sleep(rng.millis(0, 30)).await;
+        // Spread over the time the faults run.
+        tokio::time::sleep(rng.millis(0, 300)).await;
     }
     oracle.borrow_mut().published += 1;
 }
@@ -126,45 +166,79 @@ async fn publish(ctx: zzq_broker::Context, p: usize, mut rng: Rng, oracle: Share
 async fn subscribe(ctx: zzq_broker::Context, s: usize, oracle: Shared) {
     let id = format!("sub{s}");
     loop {
-        let mut c = connect(&ctx, &id, false, s).await;
+        let (node, mut c) = connect(&ctx, &id, false, s).await;
+        let present = c.connected().session_present;
+        oracle.borrow_mut().note(format_args!(
+            "sub{s} on node {node}, session present {present}"
+        ));
         while let Some(m) = c.recv().await {
             oracle.borrow_mut().delivered[s].push(m.payload);
         }
+        oracle
+            .borrow_mut()
+            .note(format_args!("sub{s} lost node {node}"));
     }
 }
 
-/// Cuts off, crashes or stops one node at a time, then brings it back.
-async fn faults(c: &mut Cluster, mut rng: Rng, oracle: &Shared) {
-    let end = tokio::time::Instant::now() + FAULTS_FOR;
+/// Waits `d`, noting role changes as they come.
+async fn pause(c: &Cluster, d: Duration, oracle: &Shared) {
+    let end = tokio::time::Instant::now() + d;
     while tokio::time::Instant::now() < end {
-        tokio::time::sleep(rng.millis(100, 1000)).await;
+        oracle.borrow_mut().watch(c);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Cuts off, crashes or stops one node at a time, then brings it back
+/// and waits until it follows again.
+async fn faults(c: &mut Cluster, mut rng: Rng, oracle: &Shared) -> Result<(), String> {
+    let start = tokio::time::Instant::now();
+    let end = start + FAULTS_FOR;
+    while tokio::time::Instant::now() < end {
+        pause(c, rng.millis(100, 1000), oracle).await;
         let i = rng.below(NODES as u64) as usize;
         let down = rng.millis(100, 2000);
         let kind = rng.below(4);
-        let at = tokio::time::Instant::now();
-        let _ = writeln!(
-            oracle.borrow_mut().log,
-            "{at:?}: fault {kind} on node {i} for {down:?}"
-        );
+        oracle
+            .borrow_mut()
+            .note(format_args!("fault {kind} on node {i} for {down:?}"));
         match kind {
             0 => {
                 c.isolate(i, true);
-                tokio::time::sleep(down).await;
+                pause(c, down, oracle).await;
                 c.isolate(i, false);
             }
             1 => {
                 c.crash(i);
-                tokio::time::sleep(down).await;
+                pause(c, down, oracle).await;
                 c.restart(i).await;
             }
             2 => {
                 c.stop(i).await;
-                tokio::time::sleep(down).await;
+                pause(c, down, oracle).await;
                 c.restart(i).await;
             }
             _ => {}
         }
+        let settled = c.until(10, |c| {
+            oracle.borrow_mut().watch(c);
+            settled(c)
+        });
+        if !settled.await {
+            let nodes: Vec<_> = (0..NODES).map(|i| c.status(i)).collect();
+            return Err(format!("node {i} did not come back\n{nodes:#?}"));
+        }
     }
+    Ok(())
+}
+
+/// Every node follows or leads, one leads, and none recovers.
+fn settled(c: &Cluster) -> bool {
+    c.leader().is_some()
+        && (0..NODES).all(|i| {
+            c.status(i)
+                .is_some_and(|s| !s.recovering && matches!(s.role, Role::Leader | Role::Follower))
+        })
 }
 
 /// Runs the workload from `seed`. Returns what went wrong, if anything.
@@ -174,13 +248,14 @@ pub(crate) async fn run(seed: u64) -> Result<(), String> {
         return Err("no first leader".into());
     }
     for s in 0..SUBSCRIBERS {
-        let sub = connect(&c.ctx, &format!("sub{s}"), true, 0).await;
+        let (_, sub) = connect(&c.ctx, &format!("sub{s}"), true, 0).await;
         sub.subscribe("t/#", QoS::AtLeastOnce)
             .await
             .map_err(|e| format!("subscribe: {e}"))?;
         sub.disconnect().await;
     }
     let oracle = Shared::default();
+    oracle.borrow_mut().start = Some(tokio::time::Instant::now());
     let mut rng = Rng::new(seed);
     for p in 0..PUBLISHERS {
         let r = Rng::new(rng.next());
@@ -191,16 +266,26 @@ pub(crate) async fn run(seed: u64) -> Result<(), String> {
     }
     let mut net = Rng::new(rng.next());
     c.lossy(net.below(10), net.below(20));
-    faults(&mut c, Rng::new(rng.next()), &oracle).await;
+    let faulted = faults(&mut c, Rng::new(rng.next()), &oracle).await;
     c.lossy(0, 0);
     let published = c
         .until(60, |_| oracle.borrow().published == PUBLISHERS)
         .await;
-    let delivered = c.until(60, |_| missing(&oracle.borrow()).is_empty()).await;
+    let delivered = c
+        .until(60, |c| {
+            let mut o = oracle.borrow_mut();
+            o.watch(c);
+            missing(&o).is_empty()
+        })
+        .await;
     let o = oracle.borrow();
+    if let Err(e) = faulted {
+        return Err(format!("{e}\n{}", o.log));
+    }
     if !published {
+        let nodes: Vec<_> = (0..NODES).map(|i| c.status(i)).collect();
         return Err(format!(
-            "publishers stuck at {} acks\n{}",
+            "publishers stuck at {} acks\n{}{nodes:#?}",
             o.acked.len(),
             o.log
         ));

@@ -10,6 +10,7 @@
 
 mod dump;
 mod election;
+mod epoch;
 mod history;
 mod image;
 mod link;
@@ -108,6 +109,11 @@ pub struct NodeStatus {
     pub log_base: OpNumber,
     /// The last op its log holds.
     pub log_last: OpNumber,
+    /// The configuration epoch it runs.
+    pub epoch: u64,
+    /// A newer epoch another node forced, which this node, holding state,
+    /// does not join.
+    pub newer_epoch: Option<u64>,
 }
 
 /// What the application acts on.
@@ -157,6 +163,10 @@ pub enum NodeError {
     /// The other node runs an application of another shape.
     #[error("node with another application fingerprint")]
     Fingerprint,
+    /// A HELLO of a newer epoch another node forced, which this node,
+    /// holding state, does not join.
+    #[error("another node forced a newer configuration epoch")]
+    NewerEpoch,
     /// An image the log cannot anchor, or an empty one.
     #[error("image not anchored in the log")]
     Image,
@@ -236,6 +246,7 @@ pub struct Node {
     /// Images given and taken.
     images: Images,
     lease: Lease,
+    epochs: epoch::Epochs,
     /// The time of the last input.
     now: Duration,
     out: VecDeque<Outgoing>,
@@ -294,8 +305,12 @@ impl Node {
             out: VecDeque::new(),
             events: VecDeque::new(),
             images: Images::default(),
+            epochs: epoch::Epochs {
+                base: config.configuration,
+                newer: None,
+            },
             lease: Lease {
-                heard_at: now,
+                heard_at: None,
                 // It may have acked a leader just before its process went.
                 follow_until: now + config.timing.primary_timeout / 2 + config.timing.heartbeat,
                 led: None,
@@ -314,6 +329,16 @@ impl Node {
     /// What it does now.
     pub const fn role(&self) -> Role {
         self.role
+    }
+
+    /// Whether it is the primary of its view: it leads, or leads again
+    /// once a follower acks.
+    pub fn primary(&self) -> bool {
+        self.driver.normal().is_some_and(|n| {
+            let s = n.snapshot();
+            s.status == Status::Normal
+                && self.config.configuration.primary(s.scope.view) == self.config.local
+        })
     }
 
     /// The current view: settled, or proposed in an election.
@@ -335,6 +360,8 @@ impl Node {
             applied: self.app_applied,
             log_base: self.log.base().op,
             log_last: self.log.last().op,
+            epoch: self.epoch(),
+            newer_epoch: self.epochs.newer,
         }
     }
 
@@ -364,8 +391,11 @@ impl Node {
         let borrowed = [&frames[0][..], &frames[1][..], &frames[2][..]];
         let packet =
             decode_packet(&borrowed, self.config.wire.envelope).map_err(WireError::from)?;
-        if let Some(hello) = link::read_hello(packet, &self.config.configuration)? {
-            return self.on_hello(hello, now);
+        if let Some(hello) = link::read_hello(packet)? {
+            if hello.digest == self.config.configuration.scope().configuration_digest {
+                return self.on_hello(hello, now);
+            }
+            return self.other_epoch(hello, now);
         }
         let from = packet.envelope.sender;
         let i = self.peer_index(from).ok_or(NodeError::UnknownNode)?;
@@ -487,6 +517,7 @@ impl Node {
                 incarnation: self.incarnation,
                 fingerprint: self.config.fingerprint,
                 known: peer.incarnation,
+                fresh: self.log.last().op.0 == 0 && self.view() == 0,
             },
         )?;
         self.out.push_back(out);
@@ -580,7 +611,13 @@ impl Node {
                 } else if primary != self.config.local {
                     Role::Follower
                 } else if s.ready_for_appends
-                    && self.now < self.lease.heard_at + self.config.timing.primary_timeout / 2
+                    && self
+                        .lease
+                        .heard_at
+                        .is_some_and(|at| self.now < at + self.config.timing.primary_timeout / 2)
+                    // It leads with all its log holds, so its application
+                    // holds every op before its own.
+                    && (self.role == Role::Leader || self.app_applied >= self.log.last().op)
                 {
                     Role::Leader
                 } else {
@@ -609,8 +646,9 @@ impl Node {
 /// The leader lease, from both sides.
 #[derive(Debug)]
 struct Lease {
-    /// Leader: when a follower last acked in its view.
-    heard_at: Duration,
+    /// Leader: when a follower last acked in its view. It leads only
+    /// once one did.
+    heard_at: Option<Duration>,
     /// Follower: until when its last ack backs the leader's lease.
     follow_until: Duration,
     /// Primary: its view, and when it became its primary.

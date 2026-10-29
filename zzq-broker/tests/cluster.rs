@@ -226,17 +226,19 @@ fn a_node_restarts_from_its_dump_and_catches_up_with_what_it_missed() {
     });
 }
 
-/// Seeds a sweep runs: `ZZQ_SIM_SEEDS`, or a few.
-fn seeds() -> u64 {
-    std::env::var("ZZQ_SIM_SEEDS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3)
+/// Seeds a sweep runs: `ZZQ_SIM_SEED` alone, or the first
+/// `ZZQ_SIM_SEEDS`, or a few.
+fn seeds() -> std::ops::Range<u64> {
+    let var = |name| std::env::var(name).ok().and_then(|s| s.parse().ok());
+    match (var("ZZQ_SIM_SEED"), var("ZZQ_SIM_SEEDS")) {
+        (Some(seed), _) => seed..seed + 1,
+        (None, n) => 0..n.unwrap_or(3),
+    }
 }
 
 #[test]
 fn seeded_faults_never_lose_an_acked_message() {
-    for seed in 0..seeds() {
+    for seed in seeds() {
         let mut result = Ok(());
         simulated(|| async {
             result = workload::run(seed).await;
@@ -245,4 +247,96 @@ fn seeded_faults_never_lose_an_acked_message() {
             panic!("seed {seed}: {e}");
         }
     }
+}
+
+#[test]
+fn a_forced_node_brings_back_its_state_when_the_others_lost_theirs() {
+    simulated(|| async {
+        let mut c = Cluster::with_log(small_log()).await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        fill(&c, 0, 20).await;
+        assert!(c.stop(0).await, "node 0 dumps");
+        c.crash(1);
+        c.crash(2);
+        c.restart(1).await;
+        c.restart(2).await;
+        assert!(
+            !c.until(3, |c| c.leader().is_some()).await,
+            "no two nodes have the state"
+        );
+        c.force(0).await;
+        assert!(c.until(10, |c| c.leader() == Some(0)).await, "node 0 leads");
+        assert!(
+            c.until(10, |c| c.caught_up(1, 0) && c.caught_up(2, 0))
+                .await,
+            "both follow"
+        );
+        assert_eq!(c.status(1).map(|s| s.epoch), Some(2));
+        c.lead(1).await;
+        check(&c, 1, 20).await;
+    });
+}
+
+#[test]
+fn after_all_three_crash_a_forced_node_starts_from_the_dump_it_last_loaded() {
+    simulated(|| async {
+        let mut c = Cluster::with_log(small_log()).await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        fill(&c, 0, 10).await;
+        for i in [1, 2, 0] {
+            assert!(c.stop(i).await, "node {i} dumps");
+        }
+        for i in 0..NODES {
+            c.restart(i).await;
+        }
+        assert!(
+            c.until(10, |c| c.leader().is_some()).await,
+            "the dumps elect a leader"
+        );
+        // Power goes: no node dumps, but each set aside the dump it loaded.
+        for i in 0..NODES {
+            c.crash(i);
+        }
+        for i in 1..NODES {
+            c.restart(i).await;
+        }
+        c.force(0).await;
+        assert!(c.until(10, |c| c.leader() == Some(0)).await, "node 0 leads");
+        check(&c, 0, 10).await;
+    });
+}
+
+#[test]
+fn a_leader_that_misses_acks_for_a_moment_keeps_its_sessions_and_clients() {
+    simulated(|| async {
+        let c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        let sub = c.client(0, "sub", true).await;
+        sub.subscribe("orders/#", QoS::AtLeastOnce).await.unwrap();
+        sub.disconnect().await;
+        let mut sub = c.client(0, "sub", false).await;
+        let publisher = c.client(0, "pub", true).await;
+        publisher
+            .publish("orders/1", "m0", QoS::AtLeastOnce)
+            .await
+            .unwrap();
+        assert_eq!(next(&mut sub).await.payload, "m0");
+        // The followers still hear it, but their acks are lost: its lease
+        // ends, its view does not.
+        c.cut(1, 0, true);
+        c.cut(2, 0, true);
+        assert!(c.until(1, |c| c.leader().is_none()).await, "the lease ends");
+        let pending = publisher.publish("orders/1", "m1", QoS::AtLeastOnce);
+        let heal = async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            c.cut(1, 0, false);
+            c.cut(2, 0, false);
+        };
+        let (acked, ()) = tokio::join!(pending, heal);
+        acked.unwrap();
+        assert_eq!(c.leader(), Some(0), "it leads again");
+        assert_eq!(next(&mut sub).await.payload, "m1", "its client stayed");
+        let again = c.client(0, "sub2", true).await;
+        again.disconnect().await;
+    });
 }

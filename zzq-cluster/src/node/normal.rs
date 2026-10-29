@@ -128,7 +128,7 @@ impl Node {
         let received = self.driver.receive(from, control, now);
         match control {
             Control::PrepareOk { ack } if received.is_ok() => {
-                self.lease.heard_at = self.lease.heard_at.max(now);
+                self.lease.heard_at = Some(self.lease.heard_at.map_or(now, |at| at.max(now)));
                 self.note_ack(from, ack.durable.op, now);
             }
             // A heartbeat. The ack tells the leader this follower is there,
@@ -205,7 +205,8 @@ impl Node {
                 now
             }
         };
-        if now >= self.lease.heard_at.max(since) + self.config.timing.primary_timeout {
+        let heard = self.lease.heard_at.map_or(since, |at| at.max(since));
+        if now >= heard + self.config.timing.primary_timeout {
             // Only a faulted driver refuses, and its poll reports that.
             let _ = self.driver.observe_isolation(now);
         }

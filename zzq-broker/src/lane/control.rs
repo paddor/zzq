@@ -95,6 +95,8 @@ pub(crate) enum Control {
     Reset(oneshot::Sender<()>),
     /// Answer with the lane's part of a cluster image.
     CutImage(oneshot::Sender<(u64, bytes::Bytes)>),
+    /// Journal every session again, then answer.
+    Rewrite(oneshot::Sender<()>),
 }
 
 /// A lane's share of the state file being written.
@@ -176,6 +178,10 @@ impl Lane {
             }
             Control::CutImage(done) => {
                 let _ = done.send(self.cut_image());
+            }
+            Control::Rewrite(done) => {
+                self.rewrite_journal();
+                let _ = done.send(());
             }
             Control::Shutdown(done) => {
                 self.shutdown();

@@ -492,8 +492,9 @@ impl Lane {
         (last, part.finish())
     }
 
-    /// Writes every journaled session again after a failed write.
-    fn rewrite_journal(&mut self) {
+    /// Writes every journaled session again: after a failed write, or as
+    /// the start of a forced cluster epoch's history.
+    pub(super) fn rewrite_journal(&mut self) {
         let log = &self.shared.lane_logs[usize::from(self.id)];
         let mut st = log.lock();
         st.stale = true;

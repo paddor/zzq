@@ -89,6 +89,8 @@ pub(crate) struct App {
     /// The last of its own ops that committed.
     pub(crate) committed: OpNumber,
     pub(crate) role: Option<Role>,
+    /// How many ops it held when it last came to lead.
+    pub(crate) held_at_lead: Option<usize>,
 }
 
 /// Network behavior.
@@ -257,6 +259,26 @@ impl Sim {
         }
     }
 
+    /// Forces node `i` to lead a new epoch, from its dump if it left one.
+    /// The new epoch's history starts empty, and so does the record of
+    /// what was acked: a forced start may lose it.
+    pub(crate) fn force(&mut self, i: usize) {
+        self.timeline.push(format!("{:?} force node {i}", self.now));
+        let dump = self.dumps[i].take().map(|(bytes, _)| bytes);
+        let node = Node::force(node_config(i, self.log), dump.as_deref(), self.now).unwrap();
+        self.nodes[i] = Some(node);
+        self.apps[i] = App::default();
+        self.acked.clear();
+        for j in (0..3).filter(|&j| j != i) {
+            self.node(i).connected(node_id(j)).unwrap();
+        }
+    }
+
+    /// The epoch node `i` runs, if it runs.
+    pub(crate) fn epoch(&self, i: usize) -> Option<u64> {
+        self.nodes[i].as_ref().map(Node::epoch)
+    }
+
     /// Splits node `i` off from the others, or heals it.
     pub(crate) fn isolate(&mut self, i: usize, cut: bool) {
         if cut {
@@ -414,6 +436,9 @@ impl Sim {
             }
             Event::Role(role) => {
                 self.apps[i].role = Some(role);
+                if role == Role::Leader {
+                    self.apps[i].held_at_lead = Some(self.apps[i].ops.len());
+                }
                 let view = self.nodes[i].as_ref().map_or(0, Node::view);
                 self.timeline
                     .push(format!("{:?} node {i} {role:?} view {view}", self.now));

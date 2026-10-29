@@ -12,16 +12,17 @@ use crate::wire::{
     encode_prepare,
 };
 use crate::{
-    Configuration, ENVELOPE_BYTES, Envelope, LinkSessionId, NodeId, OpNumber, Opcode, Packet,
-    RequestId,
+    Configuration, Digest, ENVELOPE_BYTES, Envelope, LinkSessionId, NodeId, OpNumber, Opcode,
+    Packet, RequestId,
 };
 
 use super::Outgoing;
 use crate::wire::Control;
 
 /// HELLO metadata: configuration digest, the application's fingerprint,
-/// and the receiver's incarnation as the sender knows it (zero: none).
-const HELLO_BYTES: usize = 32 + 8 + 16;
+/// the receiver's incarnation as the sender knows it (zero: none), the
+/// configuration epoch, and whether the sender's history is empty.
+const HELLO_BYTES: usize = 32 + 8 + 16 + 8 + 1;
 
 /// What a node knows of one other node.
 #[derive(Debug)]
@@ -142,6 +143,8 @@ pub(super) struct Greeting {
     pub(super) fingerprint: u64,
     /// The receiver's process, as far as this one knows it.
     pub(super) known: Option<RequestId>,
+    /// The sender's history is empty, at view zero.
+    pub(super) fresh: bool,
 }
 
 impl Encoder {
@@ -151,6 +154,7 @@ impl Encoder {
             incarnation,
             fingerprint,
             known,
+            fresh,
         } = greeting;
         let (sender, configuration, limits) = (self.local, &self.configuration, self.limits);
         let header = Envelope {
@@ -165,6 +169,8 @@ impl Encoder {
         metadata.extend_from_slice(configuration.scope().configuration_digest.as_bytes());
         metadata.extend_from_slice(&fingerprint.to_be_bytes());
         metadata.extend_from_slice(known.map_or([0; 16], |k| *k.as_bytes()).as_slice());
+        metadata.extend_from_slice(&configuration.scope().configuration_epoch.to_be_bytes());
+        metadata.push(u8::from(fresh));
         Ok(Outgoing {
             to,
             frames: [
@@ -184,13 +190,15 @@ pub(super) struct Hello {
     pub(super) fingerprint: u64,
     /// The receiver's incarnation as the sender knows it.
     pub(super) known: Option<RequestId>,
+    /// The configuration the sender runs.
+    pub(super) digest: Digest,
+    pub(super) epoch: u64,
+    /// The sender's history is empty, at view zero.
+    pub(super) fresh: bool,
 }
 
-/// The HELLO in `packet`, if it is one for this configuration.
-pub(super) fn read_hello(
-    packet: Packet<'_>,
-    configuration: &Configuration,
-) -> Result<Option<Hello>, WireError> {
+/// The HELLO in `packet`, if it is one.
+pub(super) fn read_hello(packet: Packet<'_>) -> Result<Option<Hello>, WireError> {
     if packet.envelope.opcode != Opcode::Hello {
         return Ok(None);
     }
@@ -201,17 +209,25 @@ pub(super) fn read_hello(
         return Err(WireError::Length);
     };
     let (digest, rest) = metadata.split_at(32);
-    let (fingerprint, known) = rest.split_at(8);
-    let fingerprint = u64::from_be_bytes(fingerprint.try_into().map_err(|_| WireError::Length)?);
-    let known: [u8; 16] = known.try_into().map_err(|_| WireError::Length)?;
-    if digest != configuration.scope().configuration_digest.as_bytes() {
-        return Err(WireError::Peer);
-    }
+    let (fingerprint, rest) = rest.split_at(8);
+    let (known, rest) = rest.split_at(16);
+    let (epoch, fresh) = rest.split_at(8);
+    let length = |_| WireError::Length;
+    let fingerprint = u64::from_be_bytes(fingerprint.try_into().map_err(length)?);
+    let known: [u8; 16] = known.try_into().map_err(length)?;
+    let fresh = match fresh {
+        [0] => false,
+        [1] => true,
+        _ => return Err(WireError::Length),
+    };
     Ok(Some(Hello {
         from: packet.envelope.sender,
         incarnation,
         fingerprint,
         known: (known != [0; 16]).then(|| RequestId::from_bytes(known)),
+        digest: Digest::from_bytes(digest.try_into().map_err(length)?),
+        epoch: u64::from_be_bytes(epoch.try_into().map_err(length)?),
+        fresh,
     }))
 }
 
@@ -328,24 +344,22 @@ mod tests {
             incarnation: inc,
             fingerprint: 42,
             known: None,
+            fresh: true,
         };
         let out = encoder
             .hello(NodeId::from_bytes([2; 16]), greeting)
             .unwrap();
         let frames: Vec<&[u8]> = out.frames.iter().map(|f| &f[..]).collect();
         let packet = decode_packet(&frames, EnvelopeLimits::default()).unwrap();
-        let got = read_hello(packet, &c).unwrap().unwrap();
+        let got = read_hello(packet).unwrap().unwrap();
         assert_eq!(
             (got.from, got.incarnation, got.fingerprint, got.known),
             (me, inc, 42, None)
         );
-        let other = Configuration::new(
-            GroupId::from_bytes([7; 16]),
-            1,
-            Digest::from_bytes([9; 32]),
-            [1, 2, 3].map(|i| NodeId::from_bytes([i; 16])),
-        )
-        .unwrap();
-        assert_eq!(read_hello(packet, &other), Err(WireError::Peer));
+        let scope = c.scope();
+        assert_eq!(
+            (got.digest, got.epoch, got.fresh),
+            (scope.configuration_digest, scope.configuration_epoch, true)
+        );
     }
 }

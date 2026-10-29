@@ -4,7 +4,7 @@
 //! [--client-ca PEM] [--data-dir PATH] [--state-file PATH]
 //! [--max-state-mib N] [--busy-poll] [--spin-us N]
 //! [--cluster-node NAME --cluster-peers NAME=URI,NAME=URI,NAME=URI
-//! [--cluster-name NAME] [--cluster-bootstrap]]`
+//! [--cluster-name NAME] [--cluster-bootstrap | --cluster-force-start]]`
 //!
 //! Without `--bind`, it binds `tcp://0.0.0.0:1883`. `--cert` and `--key`,
 //! which go together, enable `tls://`, `wss://` and `quic://` binds.
@@ -25,8 +25,13 @@
 //! each binds for the others, the same on every node. Only the leader
 //! binds the `--bind` endpoints. `--cluster-bootstrap` starts a new
 //! cluster, once, on all three; a node restarts from `--state-file` if it
-//! left one there, else it recovers its state from the other two. It says
-//! on stderr when it leads, follows or elects.
+//! left one there, else it recovers its state from the other two.
+//! `--cluster-force-start` is for when no two nodes have the state: the
+//! node starts a new epoch from the newest state it has, its state file or
+//! the one it last started from, and the others join once they start
+//! without theirs. What was acked after that state is lost. It says on
+//! stderr when it leads, follows or elects, and when another node forced
+//! an epoch it does not join.
 
 use std::process::ExitCode;
 use std::time::Duration;
@@ -54,6 +59,7 @@ struct ClusterArgs {
     node: Option<String>,
     peers: Option<String>,
     bootstrap: bool,
+    force: bool,
 }
 
 fn parse() -> Option<Args> {
@@ -75,6 +81,7 @@ fn parse() -> Option<Args> {
         match flag.as_str() {
             "--busy-poll" => a.busy_poll = true,
             "--cluster-bootstrap" => a.cluster.bootstrap = true,
+            "--cluster-force-start" => a.cluster.force = true,
             _ => set(&mut a, &flag, args.next()?)?,
         }
     }
@@ -207,10 +214,13 @@ mod cluster {
             zzq_broker::omq_links(local, &nodes).map_err(|e| format!("cluster: {}", chain(&e)))?;
         Ok(Some(ClusterOptions {
             node: node_config(configuration, local)?,
-            start: if c.bootstrap {
-                ClusterStart::Bootstrap
-            } else {
-                ClusterStart::Recover
+            start: match (c.bootstrap, c.force) {
+                (true, true) => {
+                    return Err("--cluster-bootstrap or --cluster-force-start, not both".to_owned());
+                }
+                (true, false) => ClusterStart::Bootstrap,
+                (false, true) => ClusterStart::Force,
+                (false, false) => ClusterStart::Recover,
             },
             links,
         }))
@@ -333,16 +343,27 @@ async fn roles(broker: &Broker, node: Option<&str>) {
         return std::future::pending().await;
     };
     let mut tick = tokio::time::interval(Duration::from_millis(100));
-    let mut was = None;
+    let (mut was, mut told) = (None, None);
     loop {
         tick.tick().await;
-        let role = broker.cluster_status().map(|s| s.role);
+        let status = broker.cluster_status();
+        let role = status.map(|s| s.role);
         if role != was
             && let Some(line) = role.and_then(|r| role_line(node, r))
         {
             eprintln!("{line}");
         }
         was = role;
+        let newer = status.and_then(|s| s.newer_epoch.map(|n| (s.epoch, n)));
+        if newer != told
+            && let Some((epoch, newer)) = newer
+        {
+            eprintln!(
+                "cluster node {node} keeps epoch {epoch}: another node forced epoch {newer}; \
+                 restart this one without its state file to join it"
+            );
+        }
+        told = newer;
     }
 }
 
@@ -419,7 +440,7 @@ fn main() -> ExitCode {
              [--client-ca PEM] [--data-dir PATH] [--state-file PATH] \
              [--max-state-mib N] [--busy-poll] [--spin-us N] \
              [--cluster-node NAME --cluster-peers NAME=URI,NAME=URI,NAME=URI \
-             [--cluster-name NAME] [--cluster-bootstrap]]"
+             [--cluster-name NAME] [--cluster-bootstrap | --cluster-force-start]]"
         );
         return ExitCode::FAILURE;
     };

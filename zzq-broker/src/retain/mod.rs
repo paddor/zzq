@@ -145,6 +145,17 @@ impl Retained {
         Some((last, part.finish()))
     }
 
+    /// Journals every stripe's messages again: the start of a forced
+    /// cluster epoch's history.
+    pub(crate) fn rewrite(&self) {
+        for stripe in &self.stripes {
+            let mut st = stripe.lock();
+            if st.log.is_some() && st.write_all().is_err() {
+                self.write_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// The commits of stripe `i`'s cluster journal.
     pub(crate) fn commits(&self, i: usize) -> Option<std::sync::Arc<crate::cluster::Commits>> {
         self.stripes.get(i)?.lock().log.as_ref()?.commits()

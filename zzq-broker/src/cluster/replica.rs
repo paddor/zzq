@@ -18,6 +18,7 @@ use super::log::{Commits, Group, Journal};
 use crate::broker::Shared;
 
 mod exit;
+mod lead;
 
 use exit::Exiting;
 
@@ -68,6 +69,12 @@ pub(crate) struct Replica {
     exiting: Option<Exiting>,
     /// The last op that failed to apply.
     failed: Option<OpNumber>,
+    /// Since when a leader is without its lease, still the primary of its
+    /// view: it keeps its state and waits.
+    suspended: Option<Duration>,
+    /// A forced epoch's history starts empty: the first leadership writes
+    /// the whole state into it.
+    rewrite: bool,
     origin: tokio::time::Instant,
 }
 
@@ -80,11 +87,13 @@ impl std::fmt::Debug for Replica {
 }
 
 impl Replica {
-    /// The replica of `node`, whose application state is `app`.
-    pub(crate) fn new(shared: Arc<Shared>, node: Node, app: Accumulators, links: Links) -> Replica {
+    /// The replica of a node as it booted.
+    pub(crate) fn new(shared: Arc<Shared>, booted: super::Booted, links: Links) -> Replica {
+        let super::Booted { node, app, rewrite } = booted;
         Replica {
             shared,
             node,
+            rewrite,
             links,
             held: VecDeque::new(),
             proposed: VecDeque::new(),
@@ -93,6 +102,7 @@ impl Replica {
             cut: None,
             exiting: None,
             failed: None,
+            suspended: None,
             origin: tokio::time::Instant::now(),
         }
     }
@@ -150,6 +160,12 @@ impl Replica {
         while let Some(event) = self.node.next_event() {
             self.event(event).await;
         }
+        self.check_suspended(now).await;
+        // The primary's log holds its own view's history: what committed
+        // there is its own, also what committed while it had no lease.
+        if matches!(self.app, App::Leader) && self.node.primary() {
+            self.commit_through(self.node.committed().op);
+        }
         self.offer_cut();
         *groups
             .status
@@ -179,6 +195,8 @@ impl Replica {
                     });
                 }
                 Err(ProposeError::Full) => break,
+                // Still the primary, without its lease for now: they wait.
+                Err(_) if self.node.primary() => break,
                 // Not leading: these records never commit here.
                 Err(_) => {
                     self.fail_held();
@@ -216,21 +234,13 @@ impl Replica {
 
     async fn event(&mut self, event: Event) {
         match event {
-            Event::Committed(through) => {
-                while self.proposed.front().is_some_and(|p| p.op <= through) {
-                    if let Some(p) = self.proposed.pop_front()
-                        && let Some(c) = commits(&self.shared, p.journal)
-                    {
-                        c.commit(p.last);
-                    }
-                }
-            }
+            Event::Committed(through) => self.commit_through(through),
             Event::Apply { op, body } => self.apply(op.op, &body),
             Event::CutImage => self.cut_image().await,
             Event::Image { bytes, .. } => self.install(&bytes),
-            Event::Role(Role::Leader) => self.promote().await,
-            Event::Role(_) => self.demote().await,
-            Event::Reset => self.app = App::Follower(self.empty()),
+            Event::Role(Role::Leader) => self.lead().await,
+            Event::Role(_) => self.step_down().await,
+            Event::Reset => self.reset().await,
             _ => {}
         }
     }
@@ -315,53 +325,6 @@ impl Replica {
             self.cut = None;
             let _ = self.node.offer_image(predecessor, position, bytes);
         }
-    }
-
-    /// Hands the follower's state to the lanes, which serve it from now.
-    async fn promote(&mut self) {
-        let App::Follower(acc) = std::mem::replace(&mut self.app, App::Leader) else {
-            return;
-        };
-        let (sessions, retained) = acc.finish();
-        retained.install(&self.shared.retained);
-        let _ = crate::dump::restore(&self.shared, sessions).await;
-        super::open_listeners(&self.shared).await;
-    }
-
-    /// The node no longer leads: what it proposed and did not commit
-    /// fails, and the lanes drop their state, which may hold such changes.
-    /// The committed state comes back as a follower's, from the ops again
-    /// or an image.
-    async fn demote(&mut self) {
-        if !matches!(self.app, App::Leader) {
-            return;
-        }
-        self.fail_proposed();
-        super::close_listeners(&self.shared);
-        let mut done = Vec::new();
-        for lane in &self.shared.lanes {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if lane.control.push(crate::lane::Control::Reset(tx)).is_ok() {
-                done.push(rx);
-            }
-        }
-        for rx in done {
-            let _ = rx.await;
-        }
-        self.shared.retained.reset();
-        // What the lanes handed over before they dropped their state goes
-        // with it, and the numbers of what they discarded are passed.
-        self.held.extend(self.shared.cluster_groups().take());
-        self.fail_held();
-        for j in journals(&self.shared) {
-            if let Some(n) = appended(&self.shared, j) {
-                let taken = self.taken.entry(j).or_insert(0);
-                *taken = n.max(*taken);
-            }
-        }
-        self.cut = None;
-        self.node.reset_application();
-        self.app = App::Follower(self.empty());
     }
 }
 
