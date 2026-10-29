@@ -1,0 +1,27 @@
+# saguin-tuned.yaml with SQLite in the store the suite gives it, which it
+# puts for @STORE@. The WAL is synced every 10 ms, the least it takes. A QoS 1/2
+# message is stored once if a session that outlives its connection matches.
+# The PUBACK waits for the commit, not the sync.
+broker:
+  id: bench
+  log_level: warn
+  mqtt:
+    listen:
+      tcp:
+        - name: plain
+          address: 0.0.0.0:1883
+  storage:
+    default: disk
+    default_retention_period: none
+    default_retention_bytes: none
+    providers:
+      - disk:
+          type: sqlite
+          file_path: "@STORE@/saguin.db"
+          flush_interval: 10ms
+  qos2:
+    max_inflight_per_client: 1000
+  limits:
+    max_connect_rate: none
+    max_connections: 100000
+    session_queue_bytes: 160MiB

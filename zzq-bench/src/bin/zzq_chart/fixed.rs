@@ -111,16 +111,6 @@ fn rate_label(rates: &[u64], v: f64) -> String {
         .map_or_else(String::new, |&r| draw::fmt_msgs(r as f64))
 }
 
-fn fmt_us(v: f64) -> String {
-    if v >= 1e6 {
-        format!("{:.0} s", v / 1e6)
-    } else if v >= 1e3 {
-        format!("{:.0} ms", v / 1e3)
-    } else {
-        format!("{v:.0} \u{03bc}s")
-    }
-}
-
 /// p99 lines with whiskers from p50 to p99.9 on a log axis. A failed step
 /// is a cross at its p99, or at the top of the axis.
 fn latency_panel(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) -> Result {
@@ -136,7 +126,7 @@ fn latency_panel(area: &draw::Area<'_>, chart: &FixedChart<'_>, row: &Scenario) 
         .build_cartesian_2d(SizeAxis::new(n), (LAT_FLOOR..top).log_scale())?;
     cc.configure_mesh()
         .x_label_formatter(&|v| rate_label(&row.rates, *v))
-        .y_label_formatter(&|v| fmt_us(*v))
+        .y_label_formatter(&|v| draw::fmt_us(*v))
         .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .x_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .light_line_style(TRANSPARENT)
@@ -221,33 +211,36 @@ fn failure(s: &Step) -> String {
         why.push(format!("{} closed", s.closed));
     }
     if why.is_empty() {
-        why.push(format!("p50 {}", fmt_us(s.lat.p50)));
+        why.push(format!("p50 {}", draw::fmt_us(s.lat.p50)));
     }
     why.join(", ")
 }
 
-/// What a value panel shows: its caption, a step's value, and the unit on
-/// its axis.
+/// What a value panel shows: its caption, a step's value, the unit on its
+/// axis, and whether the axis is log, for values orders of magnitude apart.
 struct Metric {
     caption: &'static str,
     value: fn(&Step) -> Option<f64>,
     unit: &'static str,
+    log: bool,
 }
 
 const CPU: Metric = Metric {
     caption: "broker CPU",
     value: |s| s.cpu,
     unit: "%",
+    log: false,
 };
 
 const RSS: Metric = Metric {
     caption: "broker memory (RSS)",
     value: |s| s.rss,
     unit: " MiB",
+    log: true,
 };
 
-/// One value per step on a linear axis: lines over the passed steps, a
-/// cross on a failed one.
+/// One value per step: lines over the passed steps, a cross on a failed
+/// one.
 fn value_panel(
     area: &draw::Area<'_>,
     chart: &FixedChart<'_>,
@@ -255,39 +248,64 @@ fn value_panel(
     metric: &Metric,
 ) -> Result {
     let n = row.rates.len();
-    let peak = row
-        .steps
-        .values()
-        .filter_map(metric.value)
-        .fold(0.0, f64::max);
+    let values = || row.steps.values().filter_map(metric.value);
+    let peak = values().fold(0.0, f64::max);
+    let mut panel = draw::panel(area, metric.caption, false, 0);
+    let x_label = |v: &f64| rate_label(&row.rates, *v);
+    let y_label = |v: &f64| format!("{v:.0}{}", metric.unit);
+    if metric.log {
+        let low = values().filter(|&v| v > 0.0).fold(f64::MAX, f64::min);
+        let axis = draw::log_axis(low, peak);
+        let mut cc = panel.build_cartesian_2d(SizeAxis::new(n), axis.log_scale())?;
+        cc.configure_mesh()
+            .x_label_formatter(&x_label)
+            .y_label_formatter(&y_label)
+            .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
+            .x_label_style(("sans-serif", 10).into_font().color(&TEXT))
+            .light_line_style(TRANSPARENT)
+            .bold_line_style(GRID)
+            .axis_style(AXIS)
+            .draw()?;
+        return value_lines(&mut cc, chart, row, metric);
+    }
     let (top, ticks) = draw::nice_axis(peak, N_TICKS);
-    let mut cc = draw::panel(area, metric.caption, false, 0)
-        .build_cartesian_2d(SizeAxis::new(n), 0.0..top)?;
+    let mut cc = panel.build_cartesian_2d(SizeAxis::new(n), 0.0..top)?;
     cc.configure_mesh()
-        .x_label_formatter(&|v| rate_label(&row.rates, *v))
+        .x_label_formatter(&x_label)
         .y_labels(ticks + 1)
-        .y_label_formatter(&|v| format!("{v:.0}{}", metric.unit))
+        .y_label_formatter(&y_label)
         .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .x_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .light_line_style(TRANSPARENT)
         .bold_line_style(GRID)
         .axis_style(AXIS)
         .draw()?;
+    value_lines(&mut cc, chart, row, metric)
+}
 
+/// The values of `metric`, per impl. A log axis leaves out zeros.
+fn value_lines<C: CoordTranslate<From = (f64, f64)>>(
+    cc: &mut ChartContext<'_, SVGBackend<'_>, C>,
+    chart: &FixedChart<'_>,
+    row: &Scenario,
+    metric: &Metric,
+) -> Result {
     for imp in chart.impls.iter().rev() {
         let mut line = Vec::new();
         for (i, &rate) in row.rates.iter().enumerate() {
             let Some(s) = row.steps.get(&(imp.key, rate)) else {
                 continue;
             };
-            let Some(v) = (metric.value)(s) else { continue };
+            let Some(v) = (metric.value)(s).filter(|&v| !metric.log || v > 0.0) else {
+                continue;
+            };
             if s.failed {
-                cross(&mut cc, (i as f64, v), imp.color)?;
+                cross(cc, (i as f64, v), imp.color)?;
             } else {
                 line.push((i as f64, v));
             }
         }
-        polyline(&mut cc, &line, imp.color)?;
+        polyline(cc, &line, imp.color)?;
     }
     Ok(())
 }

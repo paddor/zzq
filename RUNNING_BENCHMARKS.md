@@ -26,6 +26,8 @@ zzq_suite clients          # rumqttc, ntex-mqtt and emqtt against zzq_fakebroker
 zzq_suite zzqclient        # zzq-client against zzq_fakebroker
 zzq_suite fixed zzq 2      # fixed load, zzq with 2 IO lanes
 zzq_suite fixed nanomq fixed
+zzq_suite durable zzq 1    # storage on, zzq with 1 IO lane and a data dir
+zzq_suite durable emqx     # a rival with its most durable storage
 zzq_suite all              # every suite, one log each
 zzq_chart                  # redraw doc/charts from the cache
 ```
@@ -45,12 +47,22 @@ zzq_chart                  # redraw doc/charts from the cache
   a quiet system, and prints the rows instead of recording them.
 - `ZZQ_BROKER_LOG` keeps the brokers' output.
 
+## Storage
+
+`durable` runs QoS 1 and 2 to subscribers whose sessions outlive their
+connection, with each broker's storage on (`durable` configs), and times
+the PUBACK. Each cell gets a fresh broker with empty stores, in
+`$TMPDIR/zzq-suite/<name>`: set `TMPDIR` to the disk under test. Stores
+that containers wrote are removed with `podman unshare`. XMQ and rmqtt
+keep messages in a Redis container that syncs every write. FluxMQ 1.0.0
+refuses persistent sessions on one node, so it has no durable run.
+
 ## Rivals
 
 Broker configs are in `zzq-bench/harness/conf`, one per broker and config
-(`default`, `tuned`, or `fixed` for the fixed-load test). EMQX, Mosquitto,
-NanoMQ and XMQ run as podman containers. The others are builds under
-`ZZQ_RIVALS`:
+(`default`, `tuned`, `durable`, or `fixed` for the fixed-load test). EMQX,
+Mosquitto, NanoMQ, XMQ, HiveMQ CE and TBMQ run as podman containers. The
+others are builds under `ZZQ_RIVALS`:
 
 | Path | What |
 | --- | --- |
@@ -64,7 +76,13 @@ NanoMQ and XMQ run as podman containers. The others are builds under
 
 - VerneMQ is built from source: its official images and packages come
   under an EULA that forbids competitive analysis.
-- FluxMQ keeps its store in `$TMPDIR/zzq-suite`, so set `TMPDIR` to a disk.
+- FluxMQ, HiveMQ CE and TBMQ keep their stores in `$TMPDIR/zzq-suite` in
+  every config, so set `TMPDIR` to a disk.
+- TBMQ runs with PostgreSQL 17, Kafka 4.0 and Valkey 8 containers, all on
+  the broker CPUs, and needs ports 5432, 6379, 8083, 8084, 9092 and 9093.
+  After start, the suite turns off its basic auth provider over the REST
+  API, so clients without credentials get in, and waits until a QoS 1
+  message gets through: TBMQ listens before its Kafka consumers are ready.
 
 ## Perf gate
 

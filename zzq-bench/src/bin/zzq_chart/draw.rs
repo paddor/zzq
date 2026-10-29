@@ -20,8 +20,6 @@ use plotters::style::text_anchor::{HPos, Pos, VPos};
 pub(crate) type Result<T = ()> = std::result::Result<T, Box<dyn Error>>;
 
 pub(crate) const WIDTH: u32 = 1440;
-/// Panels per row: QoS 0, 1 and 2.
-const COLUMNS: u8 = 3;
 /// Room for the title and hardware line above the first row.
 pub(crate) const TOP: u32 = 56;
 pub(crate) const PANEL_H: u32 = 260;
@@ -110,6 +108,8 @@ pub(crate) struct Chart<'a> {
     pub(crate) out: PathBuf,
     pub(crate) title: &'a str,
     pub(crate) sizes: &'a [u64],
+    /// The QoS levels with a column of panels.
+    pub(crate) qos: Range<u8>,
     pub(crate) impls: &'a [Impl],
     /// Version per impl key, from its newest run.
     pub(crate) versions: BTreeMap<&'static str, String>,
@@ -196,8 +196,8 @@ pub(crate) fn draw(chart: &Chart<'_>) -> Result {
         let y = TOP + i * (panel_h + ROW_GAP);
         titles.push((y - 6, row.title));
         let area = root.clone().shrink((0, y), (WIDTH, panel_h));
-        let panels = area.split_evenly((1, usize::from(COLUMNS)));
-        for (qos, panel) in (0..).zip(&panels) {
+        let panels = area.split_evenly((1, chart.qos.len()));
+        for (qos, panel) in chart.qos.clone().zip(&panels) {
             match &row.data {
                 RowData::Throughput(msgs) => throughput_panel(panel, chart, row, msgs, qos)?,
                 RowData::Rtt(lat) if qos < row.data.qos_levels() => {
@@ -349,8 +349,9 @@ fn configure_mesh(
 }
 
 /// One round-trip panel for one QoS level: p99 lines with whiskers from
-/// p50 to p99.9. The axis fits the p99 lines; a whisker past the top ends
-/// in a marker and a label with its p99.9.
+/// p50 to p99.9, on a log axis, so brokers milliseconds apart both show.
+/// The axis fits the p50s and p99 lines; a whisker past the top ends in a
+/// marker and a label with its p99.9.
 fn rtt_panel(
     area: &Area<'_>,
     chart: &Chart<'_>,
@@ -359,19 +360,20 @@ fn rtt_panel(
     qos: u8,
 ) -> Result {
     let sizes = chart.sizes;
-    let peak = lat
+    let (low, peak) = lat
         .iter()
         .filter(|((_, q, _), _)| *q == qos)
-        .map(|(_, l)| l.p99)
-        .fold(0.0, f64::max);
-    let (top, ticks) = nice_axis(peak * 1.6, N_TICKS);
+        .fold((f64::MAX, 0.0), |(low, peak), (_, l)| {
+            (low.min(l.p50), f64::max(peak, l.p99))
+        });
+    let axis = log_axis(low, peak * 1.6);
+    let top = axis.end;
 
     let mut cc = panel(area, &format!("QoS {qos}"), false, chart.cpu_h())
-        .build_cartesian_2d(SizeAxis::new(sizes.len()), 0.0..top)?;
+        .build_cartesian_2d(SizeAxis::new(sizes.len()), axis.log_scale())?;
     cc.configure_mesh()
         .x_label_formatter(&|v| size_label(sizes, *v))
-        .y_labels(ticks + 1)
-        .y_label_formatter(&|v| format!("{v:.0} \u{03bc}s"))
+        .y_label_formatter(&|v| fmt_us(*v))
         .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .x_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .light_line_style(TRANSPARENT)
@@ -496,7 +498,7 @@ pub(crate) fn clip_label<C: CoordTranslate<From = (f64, f64)>>(
     cc.draw_series(std::iter::once(
         EmptyElement::at(at)
             + Text::new(
-                format!("p99.9: {p999:.0} \u{03bc}s"),
+                format!("p99.9: {}", fmt_us(p999)),
                 (dx, 2 + 12 * row),
                 style,
             ),
@@ -624,6 +626,32 @@ fn fmt_gbs(v: f64) -> String {
     }
 }
 
+/// A log axis in microseconds from the power of ten at or below `low` to
+/// 1, 2 or 5 times the power of ten at or above `high`.
+pub(crate) fn log_axis(low: f64, high: f64) -> Range<f64> {
+    let low = low.clamp(1.0, f64::MAX / 10.0);
+    let floor = 10f64.powf(low.log10().floor());
+    let high = high.max(floor * 2.0);
+    let mag = 10f64.powf(high.log10().floor());
+    let top = [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|s| s * mag)
+        .find(|&t| t >= high)
+        .unwrap_or(mag * 10.0);
+    floor..top
+}
+
+/// Microseconds as µs, ms or s.
+pub(crate) fn fmt_us(v: f64) -> String {
+    if v >= 1e6 {
+        format!("{:.0} s", v / 1e6)
+    } else if v >= 1e3 {
+        format!("{:.0} ms", v / 1e3)
+    } else {
+        format!("{v:.0} \u{03bc}s")
+    }
+}
+
 /// A round axis maximum at or above `max` and its tick count.
 pub(crate) fn nice_axis(max: f64, target: usize) -> (f64, usize) {
     if max <= 0.0 {
@@ -730,6 +758,11 @@ mod tests {
     fn axes_round_up_and_labels_read_well() {
         assert_eq!(nice_axis(11.6e6, 6), (12e6, 6));
         assert_eq!(nice_axis(0.0, 6), (1.0, 1));
+        assert_eq!(log_axis(14.0, 12_100.0), 10.0..20_000.0);
+        assert_eq!(log_axis(45.0, 300.0), 10.0..500.0);
+        assert_eq!(log_axis(0.0, 0.0), 1.0..2.0);
+        assert_eq!(fmt_us(250.0), "250 \u{03bc}s");
+        assert_eq!(fmt_us(20_000.0), "20 ms");
         assert_eq!(fmt_msgs(2.5e6), "2.5M/s");
         assert_eq!(fmt_gbs(0.004), "4.0 MB/s");
         assert_eq!(fmt_gbs(4.4), "4.4 GB/s");

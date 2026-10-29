@@ -68,7 +68,13 @@ Notable changes to zzq. The format follows
   records them into the result cache, with `zzq_fakebroker`,
   `zzq_client_bench`, the rival broker configs in `zzq-bench/harness`, and
   rumqttc and ntex-mqtt benches in a workspace of their own.
-  `RUNNING_BENCHMARKS.md` shows how to run them.
+  `RUNNING_BENCHMARKS.md` shows how to run them. `zzq_suite durable`
+  runs QoS 1/2 to persistent sessions with each broker's storage on, a
+  fresh broker per run, and `zzq_chart durable` draws it. HiveMQ CE and
+  TBMQ are among the rivals; TBMQ runs with its Kafka, Valkey and
+  PostgreSQL, whose CPU and memory count with it (`cpu_pid` takes several
+  PIDs). A run waits at most 90 s for deliveries after the publishers
+  stop, and an `rtt` run measures at most 60 s.
 - `COMPARISONS.md` lists how the other brokers in the benchmarks behave
   under load, what survives a crash, and what their clustering offers.
 - `doc/architecture.md`: threads, channels, the path of a message, and

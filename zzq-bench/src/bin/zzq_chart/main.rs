@@ -2,13 +2,13 @@
 //!
 //! Reads the rows `zzq_suite` appends to `brokers.jsonl`,
 //! `clients.jsonl` and `fixed.jsonl` in `$XDG_CACHE_HOME/zzq`
-//! (`~/.cache/zzq`), and writes `doc/charts/brokers.svg`, `clients.svg` and
-//! `fixed-load.svg` under the current directory. Per cell, the newest run
+//! (`~/.cache/zzq`), and writes `doc/charts/brokers.svg`, `clients.svg`,
+//! `fixed-load.svg` and `durable.svg` under the current directory. Per cell, the newest run
 //! wins. The line under the title comes from `.chart_hw` in the repo root
 //! (ignored), with `prefix=` and `postfix=` lines, or from `ZZQ_HW_PREFIX`
 //! and `ZZQ_HW_POSTFIX`.
 //!
-//! Usage: `zzq_chart [brokers|clients|fixed]`
+//! Usage: `zzq_chart [brokers|clients|fixed|durable]`
 
 mod data;
 mod draw;
@@ -37,6 +37,8 @@ const PINK: RGBColor = RGBColor(244, 114, 182);
 const WHITE: RGBColor = RGBColor(243, 244, 246);
 const BROWN: RGBColor = RGBColor(180, 83, 9);
 const INDIGO: RGBColor = RGBColor(99, 102, 241);
+const TAN: RGBColor = RGBColor(187, 170, 153);
+const MAGENTA: RGBColor = RGBColor(255, 17, 255);
 
 const fn rival(
     key: &'static str,
@@ -81,6 +83,59 @@ const BROKERS: &[Impl] = &[
     rival("vernemq", "VerneMQ", "CPUs 0-3", WHITE),
     rival("fluxmq", "FluxMQ", "CPUs 0-3", BROWN),
     rival("saguin", "Sag\u{fc}in", "CPUs 0-3", INDIGO),
+    rival("hivemq", "HiveMQ CE", "CPUs 0-3", TAN),
+    rival(
+        "tbmq",
+        "TBMQ",
+        "CPUs 0-3, with Kafka, Valkey, PostgreSQL",
+        MAGENTA,
+    ),
+];
+
+const fn stored(
+    key: &'static str,
+    label: &'static str,
+    runs_on: &'static str,
+    color: RGBColor,
+) -> Impl {
+    Impl {
+        key,
+        config: "durable",
+        label,
+        runs_on,
+        color,
+        ours: false,
+    }
+}
+
+/// zzq and the rivals with their storage on, as `zzq_suite durable` runs
+/// them. The colors match [`BROKERS`].
+const DURABLE: &[Impl] = &[
+    Impl {
+        key: "zzq-1io",
+        config: "durable",
+        label: "zzq",
+        runs_on: "1 IO lane, data dir",
+        color: RED,
+        ours: true,
+    },
+    Impl {
+        key: "zzq-2io",
+        config: "durable",
+        label: "zzq",
+        runs_on: "2 IO lanes, data dir",
+        color: ORANGE,
+        ours: true,
+    },
+    stored("rmqtt", "rmqtt", "sled sessions, Redis messages", YELLOW),
+    stored("emqx", "EMQX", "durable sessions", PURPLE),
+    stored("mosquitto", "Mosquitto", "SQLite plugin", BLUE),
+    stored("nanomq", "NanoMQ", "SQLite", CYAN),
+    stored("xmq", "XMQ", "Redis, Super-Durable", LIME),
+    stored("vernemq", "VerneMQ", "LevelDB", WHITE),
+    stored("saguin", "Sag\u{fc}in", "SQLite", INDIGO),
+    stored("hivemq", "HiveMQ CE", "file persistence", TAN),
+    stored("tbmq", "TBMQ", "Kafka, Valkey, PostgreSQL", MAGENTA),
 ];
 
 /// Broker throughput rows: scenario, publishers, subscribers, title.
@@ -133,12 +188,13 @@ const CLIENT_ROWS: &[(&str, &str)] = &[
 
 fn main() -> ExitCode {
     let charts: &[fn() -> Result] = match std::env::args().nth(1).as_deref() {
-        None => &[brokers, clients, fixed_load],
+        None => &[brokers, clients, fixed_load, durable],
         Some("brokers") => &[brokers],
+        Some("durable") => &[durable],
         Some("clients") => &[clients],
         Some("fixed") => &[fixed_load],
         Some(_) => {
-            eprintln!("usage: zzq_chart [brokers|clients|fixed]");
+            eprintln!("usage: zzq_chart [brokers|clients|fixed|durable]");
             return ExitCode::FAILURE;
         }
     };
@@ -164,14 +220,18 @@ type BrokerCell = (
 );
 
 fn brokers() -> Result {
-    let rows = newest_brokers();
+    let rows = newest_brokers(BROKERS);
     let chart = Chart {
         out: out_path("brokers.svg"),
         title: "MQTT brokers, TCP loopback",
         sizes: SIZES,
+        qos: 0..3,
         impls: BROKERS,
         versions: versions(rows.values().map(|r| (&r.impl_name, &r.run_id, &r.version))),
-        rows: broker_rows(&rows),
+        rows: broker_rows(
+            &rows,
+            "round trip, 1 message in flight: p99, whiskers p50 to p99.9",
+        ),
         cpu: CpuShow::BelowAxis,
         cpu_of: "broker",
         notes: &[
@@ -188,13 +248,44 @@ fn brokers() -> Result {
     write(&chart)
 }
 
-/// The newest result per broker cell.
-fn newest_brokers() -> BTreeMap<BrokerCell, BrokerRow> {
+fn durable() -> Result {
+    let rows = newest_brokers(DURABLE);
+    let chart = Chart {
+        out: out_path("durable.svg"),
+        title: "MQTT brokers with storage on, TCP loopback",
+        sizes: SIZES,
+        qos: 1..3,
+        impls: DURABLE,
+        versions: versions(rows.values().map(|r| (&r.impl_name, &r.run_id, &r.version))),
+        rows: broker_rows(
+            &rows,
+            "time to PUBACK, 1 QoS 1 message in flight: p99, whiskers p50 to p99.9",
+        ),
+        cpu: CpuShow::BelowAxis,
+        cpu_of: "broker",
+        notes: DURABLE_NOTES,
+    };
+    write(&chart)
+}
+
+const DURABLE_NOTES: &[&str] = &[
+    "Subscribers keep their sessions (clean start off, no expiry), so a broker with storage keeps \
+     each QoS 1/2 message. Stores on an SSD (XFS): a synced 4 KiB write takes 0.7 ms into \
+     allocated blocks, 1.8 ms when it extends a file.",
+    "Each broker runs its most durable setting. Most send the PUBACK before the write is synced: \
+     COMPARISONS.md says which wait.",
+    "A fresh broker and store per cell. 1 s warmup, then 5 s. QoS 1/2 publishers keep 100 in \
+     flight. Broker on CPUs 0-3, with the stores it needs; its CPU sums them.",
+    "Time to PUBACK: one QoS 1 publish in flight, from its send to its PUBACK.",
+];
+
+/// The newest result per broker cell of `impls`.
+fn newest_brokers(impls: &'static [Impl]) -> BTreeMap<BrokerCell, BrokerRow> {
     data::newest(
         data::load::<BrokerRow>("brokers.jsonl")
             .into_iter()
             .filter_map(|r| {
-                let imp = BROKERS
+                let imp = impls
                     .iter()
                     .find(|i| i.key == r.impl_name && i.config == r.config)?;
                 let cell = (
@@ -212,8 +303,8 @@ fn newest_brokers() -> BTreeMap<BrokerCell, BrokerRow> {
     )
 }
 
-/// The throughput rows, then the round-trip row.
-fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>) -> Vec<Row> {
+/// The throughput rows, then the round-trip row titled `rtt`.
+fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>, rtt_title: &'static str) -> Vec<Row> {
     let mut tput: Vec<BTreeMap<Key, f64>> = vec![BTreeMap::new(); BROKER_ROWS.len()];
     let mut cpu: Vec<BTreeMap<Key, f64>> = vec![BTreeMap::new(); BROKER_ROWS.len() + 1];
     let mut rtt = BTreeMap::new();
@@ -250,7 +341,7 @@ fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>) -> Vec<Row> {
         })
         .collect();
     chart_rows.push(Row {
-        title: "round trip, 1 message in flight: p99, whiskers p50 to p99.9",
+        title: rtt_title,
         data: RowData::Rtt(rtt),
         cpu: cpu.next().unwrap_or_default(),
     });
@@ -290,6 +381,7 @@ fn clients() -> Result {
         out: out_path("clients.svg"),
         title: "MQTT clients, one connection, TCP loopback",
         sizes: SIZES,
+        qos: 0..3,
         impls: CLIENTS,
         versions,
         rows: chart_rows,
@@ -452,7 +544,7 @@ fn out_path(name: &str) -> PathBuf {
 fn write(chart: &Chart<'_>) -> Result {
     for row in &chart.rows {
         for imp in chart.impls {
-            for qos in 0..row.data.qos_levels() {
+            for qos in chart.qos.clone().filter(|&q| q < row.data.qos_levels()) {
                 let missing: Vec<String> = chart
                     .sizes
                     .iter()

@@ -134,8 +134,8 @@ pub struct Fixed {
     pub measure: Duration,
     /// Connections opened per second.
     pub connect_rate: f64,
-    /// The broker's PID, for its CPU and memory.
-    pub broker_pid: Option<u32>,
+    /// The PIDs of the broker's processes, for its CPU and memory.
+    pub broker_pids: Vec<u32>,
     /// Also report send lateness, run queue waits, steal, and the slowest
     /// deliveries in time.
     pub trace: bool,
@@ -155,7 +155,7 @@ impl Default for Fixed {
             warmup: Duration::from_secs(2),
             measure: Duration::from_secs(8),
             connect_rate: 5000.0,
-            broker_pid: None,
+            broker_pids: Vec::new(),
             trace: false,
         }
     }
@@ -504,7 +504,7 @@ fn measure(sh: &Shared, k: usize, rate: f64) -> Step {
     sh.window.0.store(start, Relaxed);
     sh.window.1.store(stop, Relaxed);
     let [sent0, recv0, closed0] = sh.counters();
-    let cpu = CpuWindow::start(cfg.broker_pid);
+    let cpu = CpuWindow::start(&cfg.broker_pids);
     let sched0 = cfg.trace.then(trace::Sched::now);
     until(stop);
     let [sent1, recv1, closed1] = sh.counters();

@@ -11,14 +11,17 @@
 //! - fanin: `pubs` publishers on distinct topics, one wildcard subscriber.
 //! - rtt: one message in flight between two connections, QoS 0 or 1,
 //!   timed to its delivery, or with `ack=1` to the publisher's PUBACK.
+//!   `iters` round trips after a tenth as many to warm up, for at most
+//!   60 s; the result line counts those measured.
 //!
 //! `retain` sets the retain flag on publishes. `persist` gives subscribers
 //! sessions that outlive their connection.
 //!
 //! `lanes` and `cross` place clients on the lanes of a zzq broker. `cpu_pid`
-//! names the broker process: its CPU over the measured window and its
-//! memory at the end go on the result line, next to the load generator's
-//! own CPU. Closed connections and a stalled publisher go to stderr.
+//! names the broker's processes, comma-separated: their CPU over the
+//! measured window and their memory at the end go on the result line, next
+//! to the load generator's own CPU. Closed connections and a stalled
+//! publisher go to stderr.
 
 use std::collections::HashMap;
 use std::process::ExitCode;
@@ -33,7 +36,7 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     };
     let result = match scenario.as_str() {
-        "rtt" => load::latency(&cfg, iters, until).map(|l| print_latency(&cfg, (iters, until), &l)),
+        "rtt" => load::latency(&cfg, iters, until).map(|l| print_latency(&cfg, until, &l)),
         "pairs" => {
             load::throughput(Scenario::Pairs, &cfg).map(|t| print_throughput("pairs", &cfg, &t))
         }
@@ -83,7 +86,7 @@ fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
             retain: get("retain", "0") == "1",
             sessions: get("persist", "0") == "1",
         },
-        broker_pid: Some(get("cpu_pid", "0").parse::<u32>().ok()?).filter(|&p| p > 0),
+        broker_pids: zzq_bench::cpu::pids(get("cpu_pid", "0"))?,
     };
     let until = if get("ack", "0") == "1" {
         Until::Acked
@@ -94,12 +97,13 @@ fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
     Some((scenario.clone(), cfg, (iters, until)))
 }
 
-fn print_latency(cfg: &Load, (iters, until): (usize, Until), l: &Latency) {
+fn print_latency(cfg: &Load, until: Until, l: &Latency) {
     println!(
-        "   rtt v{} qos={} size={:>5} iters={iters}{}{}{}  p50 {:.1}us  p90 {:.1}us  p99 {:.1}us  p99.9 {:.1}us  max {:.1}us  lost {}  {}",
+        "   rtt v{} qos={} size={:>5} iters={}{}{}{}  p50 {:.1}us  p90 {:.1}us  p99 {:.1}us  p99.9 {:.1}us  max {:.1}us  lost {}  {}",
         if cfg.v5 { 5 } else { 4 },
         cfg.qos,
         cfg.size,
+        l.rounds,
         if cfg.keep.retain { " retain" } else { "" },
         if cfg.keep.sessions { " persist" } else { "" },
         if until == Until::Acked { " ack" } else { "" },
