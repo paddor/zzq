@@ -719,6 +719,9 @@ fn install(
         }
     });
 
+    // A run takes at most `DATA_BATCHES`, each at most one read per
+    // connection of the sending lane, then lets this lane's connections
+    // run. A byte cap on top cost cross-lane QoS 0 fan-in up to 25%.
     let l = lane.clone();
     tokio::task::spawn_local(async move {
         let mut batches = Vec::new();

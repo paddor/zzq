@@ -57,9 +57,10 @@ flowchart LR
 
 - A sender queues under a lock and wakes the lane only when the queue was
   empty. A burst costs one wake. The lane takes all that is queued.
-- A data batch is what one lane routed for another from one socket read
-  (at most 256 KiB). A full data mailbox makes the sending lane wait,
-  which slows its publishers. Nothing is dropped.
+- A data batch holds what one lane routed for another since its last
+  send, at most one socket read (256 KiB) per connection. A full data
+  mailbox makes the sending lane wait, which slows its publishers.
+  Nothing is dropped.
 - The lane handles controls in runs of 64, letting its connections run in
   between. Data batches it handles all at once: up to 64, with no byte
   cap of their own.
@@ -145,11 +146,12 @@ Two lanes with a data directory:
 
 ```mermaid
 flowchart LR
-    L0["lane thread zzq-io-0"] <-->|data mailboxes| L1["lane thread zzq-io-1"]
-    L0 <-->|writes, completions| A["thread zzq-disk-aio"]
-    L1 <-->|writes, completions| A
-    L0 <-->|segment jobs| F["thread zzq-disk-files"]
-    L1 <-->|segment jobs| F
+    subgraph lanes [IO lanes]
+        direction TB
+        L0["lane thread zzq-io-0"] <-->|data mailboxes| L1["lane thread zzq-io-1"]
+    end
+    lanes <-->|writes, completions| A["thread zzq-disk-aio"]
+    lanes <-->|segment jobs| F["thread zzq-disk-files"]
     A -->|synced writes| D[("data directory")]
     F -->|segment files| D
 ```
