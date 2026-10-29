@@ -1,7 +1,7 @@
 [workspace]
-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-broker", "zzq-client", "zzq-bench"]
+members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-cluster", "zzq-broker", "zzq-client", "zzq-bench"]
 exclude = ["fuzz", "bindings", "zzq-bench/harness"]
-default-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-broker", "zzq-client"]
+default-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-cluster", "zzq-broker", "zzq-client"]
 resolver = "2"
 
 [workspace.package]

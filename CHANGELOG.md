@@ -5,6 +5,16 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `zzq-cluster`, not published yet: Viewstamped Replication for three
+  nodes, its cores copied from Ozzy. `node::Node` replicates opaque ops
+  through RAM on the leader and one follower, elects a new leader when
+  one goes, rebuilds a node's state from another's image, recovers a
+  crashed node from the other two, and restarts a node from its exit
+  dump. A seeded simulation drives three nodes through drops, delays,
+  splits, crashes and restarts.
+
 ## [0.4.0] - 2026-10-29
 
 ### Added
