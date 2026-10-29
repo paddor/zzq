@@ -14,6 +14,15 @@ Notable changes to zzq. The format follows
   crashed node from the other two, and restarts a node from its exit
   dump. A seeded simulation drives three nodes through drops, delays,
   splits, crashes and restarts.
+- Clustering: three `zzq_broker` nodes as one broker, with
+  `--cluster-node`, `--cluster-peers`, `--cluster-name` and
+  `--cluster-bootstrap`. Sessions, their messages and retained messages
+  replicate to RAM on another node before an ack. Only the leader binds
+  client listeners. A node that loses the leadership drops its clients
+  and rebuilds its state; a node without state gets it from the others;
+  `--state-file` keeps a node's state over a clean stop. The nodes link
+  over OMQ (`cluster` feature, on by default). Not with `--data-dir`.
+- `Error::ClusterLinks`.
 
 ### Changed
 

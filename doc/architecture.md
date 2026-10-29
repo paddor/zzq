@@ -190,6 +190,41 @@ sequenceDiagram
   done, so a publisher cannot outrun the journal. QoS 0 publishers wait
   only while records pile up for the disk.
 
+## Clustering
+
+Three nodes run as one broker, replicated with Viewstamped Replication
+(`zzq-cluster`). The journals that would go to a data directory go to
+the cluster instead, in RAM:
+
+- **Ops.** Each flushed group of a lane's or a retained stripe's records
+  becomes one op. A replica task on lane 0 owns the node, proposes the
+  ops and turns their commits into the journals' completions, so a
+  PUBACK waits for one follower to hold its message.
+- **Leader only.** The leader alone binds client listeners. A node that
+  loses the leadership closes them, drops its lanes' state and rebuilds
+  it from the ops.
+- **Followers.** A follower applies the committed ops with the replay a
+  start from disk uses, into state no lane serves. Becoming leader hands
+  that state to the lanes.
+- **Images.** A node behind the ops the others keep, or without state,
+  gets an image: each journal's state, cut at its own op.
+- **Exit dumps.** A clean stop writes the node's history and an image to
+  the state file; the next start votes with it.
+- **Links.** The nodes talk over OMQ, one PEER socket per node, on a
+  thread of its own.
+
+```mermaid
+flowchart LR
+    subgraph leader [leader]
+        LL["lanes"] -->|groups| LR["replica"]
+    end
+    subgraph follower [follower]
+        FR["replica"] -->|ops| FA["replayed state"]
+    end
+    LR <-->|prepares, acks, OMQ| FR
+    LR -->|commits| LL
+```
+
 ## Why it is fast
 
 - **Shared nothing.** A lane owns its connections and sessions, and holds

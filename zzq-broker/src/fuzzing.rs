@@ -137,3 +137,21 @@ fn state_image_seed() -> Vec<u8> {
     let _ = w.retained(&retained);
     w.finish().unwrap_or_default()
 }
+
+/// Reads `data` as a cluster node reads what its peers send and its exit
+/// dump: an op of journal records, an image, and a dump. A state an image
+/// rebuilt cuts an image that rebuilds it again.
+///
+/// # Panics
+///
+/// When it finds a bug.
+pub fn cluster_state(data: &[u8]) {
+    crate::cluster::fuzzing::state(data);
+}
+
+/// Seeds for [`cluster_state`]: ops of lane and retained records, an
+/// image of the state they leave, and a dump of it.
+#[must_use]
+pub fn cluster_state_seeds() -> Vec<Vec<u8>> {
+    crate::cluster::fuzzing::seeds()
+}

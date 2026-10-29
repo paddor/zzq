@@ -81,7 +81,7 @@ struct State {
 
 /// The stripe of `topic`: an FNV-1a hash, stable across builds, since a
 /// stripe's journal holds its topics.
-fn stripe_of(topic: &str) -> usize {
+pub(crate) fn stripe_of(topic: &str) -> usize {
     let hash = topic.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
     });

@@ -403,3 +403,115 @@ mod tls {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+/// A free TCP port on the loopback address.
+#[cfg(all(unix, feature = "cluster"))]
+#[expect(clippy::unwrap_used, reason = "tests fail loudly")]
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    l.local_addr().unwrap().port()
+}
+
+/// A client of whichever of `uris` takes it within ten seconds.
+#[cfg(all(unix, feature = "cluster"))]
+async fn connect_any(
+    ctx: &zzq_broker::Context,
+    uris: &[String],
+    opts: &zzq_client::ClientOptions,
+) -> Option<(usize, zzq_client::Client)> {
+    use std::time::{Duration, Instant};
+
+    let end = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < end {
+        for (i, uri) in uris.iter().enumerate() {
+            if let Ok(c) = zzq_client::Client::connect(ctx, uri, opts.clone()).await {
+                return Some((i, c));
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// Three nodes of a new cluster on the loopback address, and the MQTT
+/// endpoint each binds while it leads.
+#[cfg(all(unix, feature = "cluster"))]
+#[expect(clippy::unwrap_used, reason = "tests fail loudly")]
+fn start_cluster() -> (Vec<Option<Running>>, Vec<String>) {
+    let names = ["a", "b", "c"];
+    let peers = names
+        .map(|n| format!("{n}=tcp://127.0.0.1:{}", free_port()))
+        .join(",");
+    let uris = names.map(|_| format!("tcp://127.0.0.1:{}", free_port()));
+    let nodes = names
+        .iter()
+        .zip(&uris)
+        .map(|(n, uri)| {
+            let child = Command::new(EXE)
+                .args([
+                    "--bind",
+                    uri,
+                    "--cluster-node",
+                    n,
+                    "--cluster-peers",
+                    &peers,
+                ])
+                .arg("--cluster-bootstrap")
+                .spawn()
+                .unwrap();
+            Some(Running(child))
+        })
+        .collect();
+    (nodes, uris.to_vec())
+}
+
+#[cfg(all(unix, feature = "cluster"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cluster_of_three_processes_keeps_acked_messages_when_the_leader_dies() {
+    leader_dies().await;
+}
+
+#[cfg(all(unix, feature = "cluster"))]
+#[expect(clippy::unwrap_used, clippy::expect_used, reason = "tests fail loudly")]
+async fn leader_dies() {
+    use std::time::Duration;
+
+    use zzq_broker::Context;
+    use zzq_client::{ClientOptions, QoS};
+
+    let (mut nodes, uris) = start_cluster();
+    let ctx = Context::new().unwrap();
+    let durable = ClientOptions {
+        clean_start: false,
+        session_expiry: 600,
+        ..ClientOptions::new("c-sub")
+    };
+    let (_, sub) = connect_any(&ctx, &uris, &durable).await.expect("a leader");
+    sub.subscribe("q/#", QoS::AtLeastOnce).await.unwrap();
+    sub.disconnect().await;
+    let (leader, publisher) = connect_any(&ctx, &uris, &ClientOptions::new("c-pub"))
+        .await
+        .expect("a leader");
+    for i in 0..20 {
+        publisher
+            .publish("q/1", i.to_string(), QoS::AtLeastOnce)
+            .await
+            .unwrap();
+    }
+    let mut dead = nodes[leader].take().unwrap();
+    dead.0.kill().unwrap();
+    dead.0.wait().unwrap();
+    drop(publisher);
+    let others: Vec<String> = (0..3)
+        .filter(|&i| i != leader)
+        .map(|i| uris[i].clone())
+        .collect();
+    let (_, mut sub) = connect_any(&ctx, &others, &durable)
+        .await
+        .expect("a new leader");
+    for i in 0..20 {
+        let got = tokio::time::timeout(Duration::from_secs(5), sub.recv()).await;
+        let m = got.ok().flatten().expect("an acked message");
+        assert_eq!(m.payload, i.to_string());
+    }
+}

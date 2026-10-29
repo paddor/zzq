@@ -17,6 +17,10 @@ use super::image::{self, Cut};
 use super::log::{Commits, Group, Journal};
 use crate::broker::Shared;
 
+mod exit;
+
+use exit::Exiting;
+
 /// Polls of the node without a deadline wait at most this long.
 const IDLE: Duration = Duration::from_millis(50);
 
@@ -38,11 +42,19 @@ enum App {
     Leader,
 }
 
+/// The replica's ways in and out.
+#[derive(Debug)]
+pub(crate) struct Links {
+    pub(crate) outbound: mpsc::Sender<Outgoing>,
+    pub(crate) inbound: mpsc::Receiver<[Bytes; 3]>,
+    /// Asks for the exit dump.
+    pub(crate) exits: mpsc::Receiver<super::ExitReply>,
+}
+
 pub(crate) struct Replica {
     shared: Arc<Shared>,
     node: Node,
-    outbound: mpsc::Sender<Outgoing>,
-    inbound: mpsc::Receiver<[Bytes; 3]>,
+    links: Links,
     /// Groups not proposed yet: the pipeline was full.
     held: VecDeque<Group>,
     /// Ops proposed and not committed yet, oldest first.
@@ -53,6 +65,9 @@ pub(crate) struct Replica {
     app: App,
     /// The image a leader cut, until its groups are proposed.
     cut: Option<Cut>,
+    exiting: Option<Exiting>,
+    /// The last op that failed to apply.
+    failed: Option<OpNumber>,
     origin: tokio::time::Instant,
 }
 
@@ -65,24 +80,19 @@ impl std::fmt::Debug for Replica {
 }
 
 impl Replica {
-    pub(crate) fn new(
-        shared: Arc<Shared>,
-        node: Node,
-        outbound: mpsc::Sender<Outgoing>,
-        inbound: mpsc::Receiver<[Bytes; 3]>,
-    ) -> Replica {
-        let lanes = shared.lanes.len();
-        let levels = shared.opts.max_topic_levels;
+    /// The replica of `node`, whose application state is `app`.
+    pub(crate) fn new(shared: Arc<Shared>, node: Node, app: Accumulators, links: Links) -> Replica {
         Replica {
             shared,
             node,
-            outbound,
-            inbound,
+            links,
             held: VecDeque::new(),
             proposed: VecDeque::new(),
             taken: FxHashMap::default(),
-            app: App::Follower(Accumulators::new(lanes, levels)),
+            app: App::Follower(app),
             cut: None,
+            exiting: None,
+            failed: None,
             origin: tokio::time::Instant::now(),
         }
     }
@@ -91,7 +101,8 @@ impl Replica {
         self.origin.elapsed()
     }
 
-    /// Runs until the broker stops: input, node, output, events.
+    /// Runs until the broker stops or the node exits: input, node,
+    /// output, events.
     pub(crate) async fn run(mut self) {
         let groups = self.shared.cluster_groups();
         loop {
@@ -101,36 +112,50 @@ impl Replica {
                 .next_deadline()
                 .map_or(IDLE, |d| d.saturating_sub(now))
                 .min(IDLE);
+            // Each arm takes one item or none: losing one to another is fine.
             tokio::select! {
                 biased;
-                frames = self.inbound.recv() => match frames {
+                frames = self.links.inbound.recv() => match frames {
                     Some(frames) => {
                         let _ = self.node.receive(&frames, self.now());
                     }
                     None => return,
                 },
+                Some(reply) = self.links.exits.recv(), if self.exiting.is_none() => {
+                    self.begin_exit(reply).await;
+                }
                 () = groups.ready.ready() => self.held.extend(groups.take()),
                 () = tokio::time::sleep(wait) => {}
             }
-            let now = self.now();
-            if self.node.poll(now).is_err() {
-                // The core faulted: this node serves nothing until restart.
-                self.fail_proposed();
+            if self.step().await {
+                return;
             }
-            self.propose(now);
-            while let Some(out) = self.node.next_outgoing() {
-                // A full link drops; the node sends again.
-                let _ = self.outbound.try_send(out);
-            }
-            while let Some(event) = self.node.next_event() {
-                self.event(event).await;
-            }
-            self.offer_cut();
-            *groups
-                .status
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.node.status());
         }
+    }
+
+    /// The node's work after an input, then the exit if it is due. True
+    /// once the node exited.
+    async fn step(&mut self) -> bool {
+        let groups = self.shared.cluster_groups();
+        let now = self.now();
+        if self.node.poll(now).is_err() {
+            // The core faulted: this node serves nothing until restart.
+            self.fail_proposed();
+        }
+        self.propose(now);
+        while let Some(out) = self.node.next_outgoing() {
+            // A full link drops; the node sends again.
+            let _ = self.links.outbound.try_send(out);
+        }
+        while let Some(event) = self.node.next_event() {
+            self.event(event).await;
+        }
+        self.offer_cut();
+        *groups
+            .status
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.node.status());
+        self.poll_exit(now).await
     }
 
     /// Proposes the held groups while leading, as far as the pipeline
@@ -200,19 +225,28 @@ impl Replica {
                     }
                 }
             }
-            Event::Apply { op, body } => {
-                if let App::Follower(acc) = &mut self.app
-                    && acc.apply(op.op, &body).is_ok()
-                {
-                    let _ = self.node.applied(op.op);
-                }
-            }
+            Event::Apply { op, body } => self.apply(op.op, &body),
             Event::CutImage => self.cut_image().await,
             Event::Image { bytes, .. } => self.install(&bytes),
             Event::Role(Role::Leader) => self.promote().await,
             Event::Role(_) => self.demote().await,
             Event::Reset => self.app = App::Follower(self.empty()),
             _ => {}
+        }
+    }
+
+    /// Applies a committed op to a follower's state. State that does not
+    /// take it went wrong here: it is rebuilt, once per op. Failing again,
+    /// the node applies no more and serves nothing.
+    fn apply(&mut self, op: OpNumber, body: &[u8]) {
+        let App::Follower(acc) = &mut self.app else {
+            return;
+        };
+        if acc.apply(op, body).is_ok() {
+            let _ = self.node.applied(op);
+        } else if rebuild_after(&mut self.failed, op) {
+            self.app = App::Follower(self.empty());
+            self.node.reset_application();
         }
     }
 
@@ -331,6 +365,16 @@ impl Replica {
     }
 }
 
+/// Whether a follower whose state did not take op `op` rebuilds it:
+/// once per op, as it fails again from an image when the op is at fault.
+fn rebuild_after(failed: &mut Option<OpNumber>, op: OpNumber) -> bool {
+    if *failed == Some(op) {
+        return false;
+    }
+    *failed = Some(op);
+    true
+}
+
 /// Every journal of the broker.
 fn journals(shared: &Shared) -> impl Iterator<Item = Journal> {
     let lanes = (0..shared.lanes.len()).filter_map(|j| u16::try_from(j).ok().map(Journal::Lane));
@@ -352,5 +396,18 @@ pub(crate) fn commits(shared: &Shared, journal: Journal) -> Option<Arc<Commits>>
     match journal {
         Journal::Lane(i) => shared.lane_logs.get(usize::from(i))?.commits(),
         Journal::Retained(s) => shared.retained.commits(usize::from(s)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_follower_rebuilds_once_per_op_its_state_does_not_take() {
+        let mut failed = None;
+        assert!(rebuild_after(&mut failed, OpNumber(4)));
+        assert!(!rebuild_after(&mut failed, OpNumber(4)));
+        assert!(rebuild_after(&mut failed, OpNumber(9)));
     }
 }

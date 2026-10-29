@@ -12,6 +12,7 @@ the workspace, so AFL's instrumentation stays out of normal builds.
 | `state_image` | A state image | no panic, restored sessions encode and decode again |
 | `lane_records` | Records of a lane journal, each with its kind and length | no panic |
 | `journal_segment` | A journal segment file | no panic, written records read back, damage keeps a prefix or fails |
+| `cluster_state` | An op of journal records, an image or an exit dump of a cluster node | no panic, an image of a rebuilt state rebuilds it |
 | `endpoint` | An endpoint URI | no panic, print and parse round trip |
 | `topics` | A filter and a topic, one per line | trie and `topic::matches` agree |
 

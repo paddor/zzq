@@ -243,7 +243,7 @@ fn decode(file: File) -> Result<Vec<Record>> {
     image.finish().map_err(damaged)
 }
 
-fn damaged(why: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
+pub(crate) fn damaged(why: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> Error {
     Error::State(io::Error::new(io::ErrorKind::InvalidData, why))
 }
 
@@ -251,14 +251,14 @@ fn push(lane: &LaneTx, c: Control) -> Result<()> {
     lane.control.push(c).map_err(|_| Error::Closed)
 }
 
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = OsString::from(path.as_os_str());
     name.push(suffix);
     PathBuf::from(name)
 }
 
 /// Makes a rename in the directory of `path` durable.
-fn sync_dir(path: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     let dir = path
         .parent()
         .filter(|d| !d.as_os_str().is_empty())

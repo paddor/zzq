@@ -17,6 +17,7 @@ pub fn for_target(name: &str) -> Vec<Vec<u8>> {
         "state_image" => zzq_broker::fuzzing::state_image_seeds(),
         "lane_records" => zzq_broker::fuzzing::lane_records_seeds(),
         "journal_segment" => zzq_disk::fuzzing::journal_segment_seeds(),
+        "cluster_state" => zzq_broker::fuzzing::cluster_state_seeds(),
         "endpoint" => text(&[
             "tcp://localhost",
             "tls://[::1]:8883",

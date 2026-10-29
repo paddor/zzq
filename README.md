@@ -15,13 +15,14 @@ default `tls` and `quic` features.
   later drop.
 - **Durable.** With a data directory, sessions and messages survive
   restarts and crashes. An ack goes out once its message is on disk.
+  A cluster of three keeps it all in RAM on two nodes instead.
 - **Fast.** A connection stays on its IO lane, and messages pass without
   locks, copies or allocations.
 - **Flat memory.** Overload slows publishers instead of filling RAM.
 - **Embeddable.** Run `zzq_broker`, or embed the `Broker` in an
   application. The `Client` is async or blocking.
 - **Fuzzed.** AFL targets cover every input that reads bytes: packets,
-  MQTT-SN, WebSocket, journals, state files and topics.
+  MQTT-SN, WebSocket, journals, state files, cluster ops and topics.
 
 ## Example
 
@@ -68,6 +69,16 @@ directory (`zzq_broker --data-dir`, Linux only) and it also keeps retained
 messages and persistent sessions on disk. An ack then goes out only once
 its message is written, so a crash loses nothing that was acked. When the
 disk runs low, the broker stops keeping new messages instead of failing.
+
+## Clustering
+
+Three `zzq_broker` nodes can run as one broker (`--cluster-node`,
+`--cluster-peers`). The leader serves the clients and acks a message once
+another node holds it in RAM. When the leader goes, another node takes
+over with all that was acked, and the clients reconnect to it. Only the
+leader listens, so a load balancer's TCP health check finds it. A clean
+stop writes each node's state to its `--state-file`, so the whole cluster
+can stop and come back.
 
 ## Further reading
 

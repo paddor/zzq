@@ -483,14 +483,22 @@ impl Broker {
     /// [`Error::Closed`] if a lane stopped before it could. The broker stops
     /// anyway.
     pub async fn shutdown(self) -> Result<()> {
-        self.abort_tasks();
-        let saved = match &self.shared.opts.state_file {
-            Some(path) => crate::dump::save(&self.shared, path).await,
-            // Connections end as lost: journals get their ends, and wills go
-            // out once.
-            None if self.shared.data.is_some() => crate::dump::quiesce(&self.shared).await,
-            None => Ok(()),
+        let path = self.shared.opts.state_file.as_deref();
+        // A node of a cluster dumps what its replica holds, which runs
+        // until then.
+        let saved = if self.shared.clustered() {
+            crate::cluster::save(&self.shared, path).await
+        } else {
+            self.abort_tasks();
+            match path {
+                Some(path) => crate::dump::save(&self.shared, path).await,
+                // Connections end as lost: journals get their ends, and
+                // wills go out once.
+                None if self.shared.data.is_some() => crate::dump::quiesce(&self.shared).await,
+                None => Ok(()),
+            }
         };
+        self.abort_tasks();
         let mut done = Vec::with_capacity(self.shared.lanes.len());
         for lane in &self.shared.lanes {
             let (tx, rx) = oneshot::channel();

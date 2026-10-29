@@ -234,12 +234,18 @@ impl fmt::Debug for BrokerOptions {
 
 /// A broker as one node of a cluster: the node's settings, how it starts,
 /// and the links to the other two. Engine API, not semver.
+///
+/// With [`BrokerOptions::state_file`], [`Broker::shutdown`](crate::Broker::shutdown)
+/// writes the node's exit dump there, and the next start runs from it
+/// instead of as `start` says.
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub struct ClusterOptions {
-    /// The cluster and this node in it.
+    /// The cluster and this node in it. The broker sets its
+    /// `fingerprint` from what its state depends on: the lane count and
+    /// `max_topic_levels`.
     pub node: zzq_cluster::node::NodeConfig,
-    /// How the node starts.
+    /// How the node starts without an exit dump.
     pub start: ClusterStart,
     /// Frames to and from the other two nodes.
     pub links: ClusterLinks,

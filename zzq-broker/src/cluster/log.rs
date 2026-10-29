@@ -134,6 +134,8 @@ pub(crate) struct Groups {
     pub(crate) status: Mutex<Option<zzq_cluster::node::NodeStatus>>,
     /// Endpoints for clients, bound only while the node leads.
     pub(crate) listeners: Mutex<Listeners>,
+    /// Asks the replica for its exit dump, once.
+    pub(crate) exit: Mutex<Option<tokio::sync::mpsc::Sender<super::ExitReply>>>,
 }
 
 /// A node's client endpoints, and the accept tasks while it leads.

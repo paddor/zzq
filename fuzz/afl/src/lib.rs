@@ -11,7 +11,7 @@ use zzq_proto::{Packet, Version, decode, sn, topic};
 pub type Target = fn(&[u8]);
 
 /// Every target, by name.
-pub const TARGETS: [(&str, Target); 9] = [
+pub const TARGETS: [(&str, Target); 10] = [
     ("mqtt", mqtt),
     ("mqtt_sn", mqtt_sn),
     ("websocket", websocket),
@@ -19,6 +19,7 @@ pub const TARGETS: [(&str, Target); 9] = [
     ("state_image", state_image),
     ("lane_records", lane_records),
     ("journal_segment", journal_segment),
+    ("cluster_state", cluster_state),
     ("endpoint", endpoint),
     ("topics", topics),
 ];
@@ -98,6 +99,17 @@ pub fn lane_records(data: &[u8]) {
 /// When it finds a bug.
 pub fn state_image(data: &[u8]) {
     zzq_broker::fuzzing::state_image(data);
+}
+
+/// What a cluster node reads from its peers and its exit dump: an op of
+/// journal records, an image, and a dump. A state an image rebuilt cuts
+/// an image that rebuilds it again.
+///
+/// # Panics
+///
+/// When it finds a bug.
+pub fn cluster_state(data: &[u8]) {
+    zzq_broker::fuzzing::cluster_state(data);
 }
 
 /// A journal segment file, as a journal reads it when it opens. Records

@@ -482,7 +482,7 @@ What the open release offers, and what happens when a node fails.
 
 | Broker | Clustering | Shared between nodes | When a node fails |
 | --- | --- | --- | --- |
-| zzq | none | - | - |
+| zzq | three nodes, one leader (Viewstamped Replication) | everything, in RAM on two nodes before an ack | another node leads with all that was acked; clients reconnect to it |
 | rmqtt | Raft or broadcast | client registry, subscriptions | its sessions and queues are lost |
 | EMQX | one node without a commercial license | client registry, routes | its in-memory sessions are lost |
 | Mosquitto | none, bridges | - | - |

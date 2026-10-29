@@ -15,9 +15,11 @@ categories = ["network-programming", "asynchronous"]
 workspace = true
 
 [features]
-default = ["tls", "quic"]
+default = ["tls", "quic", "cluster"]
 tls = ["zzq-tokio/tls"]
 quic = ["tls", "zzq-tokio/quic"]
+# Links between the nodes of a cluster over OMQ.
+cluster = ["dep:omq-tokio"]
 # Entry points for the fuzz targets in `fuzz/afl`.
 fuzzing = []
 
@@ -25,6 +27,7 @@ fuzzing = []
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-tokio = { workspace = true, default-features = false }
 zzq-cluster = { path = "../zzq-cluster" }
+omq-tokio = { workspace = true, optional = true }
 bytes = { workspace = true, features = ["std"] }
 bytestring.workspace = true
 rustc-hash.workspace = true

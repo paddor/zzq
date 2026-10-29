@@ -25,7 +25,12 @@ pub(super) async fn start(shared: &Arc<Shared>, sessions: Vec<Vec<SessionState>>
     if let Some(cluster) = &shared.opts.cluster {
         crate::cluster::start(shared, cluster).await?;
     }
-    if let Some(path) = &shared.opts.state_file {
+    if let Some(path) = shared
+        .opts
+        .state_file
+        .as_ref()
+        .filter(|_| !shared.clustered())
+    {
         crate::dump::load(shared, path).await?;
     }
     if let Some(every) = shared.opts.sys_interval {
@@ -144,7 +149,7 @@ pub(super) fn check(o: &BrokerOptions) -> Result<()> {
         return Err(Error::InvalidOption("state_file"));
     }
     // A cluster keeps its state in the RAM of two nodes, not on disk.
-    if o.cluster.is_some() && (o.data_dir.is_some() || o.state_file.is_some()) {
+    if o.cluster.is_some() && o.data_dir.is_some() {
         return Err(Error::InvalidOption("cluster"));
     }
     // A v5 client must not get a Receive Maximum of 0.

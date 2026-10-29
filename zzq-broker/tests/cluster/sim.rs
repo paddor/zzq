@@ -2,6 +2,8 @@
 //! links run through a router that can cut them, and each has its own
 //! lanes and inproc endpoint for clients.
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -81,19 +83,31 @@ type Cuts = Arc<Mutex<[[bool; NODES]; NODES]>>;
 /// Where the router hands each node's inbound frames.
 type Routes = Arc<Mutex<Vec<mpsc::Sender<[Bytes; 3]>>>>;
 
-/// One node: its broker and lanes, while it runs.
+/// One node: its broker, while it runs.
 pub(crate) struct Member {
-    pub(crate) ctx: Context,
     pub(crate) broker: Option<Broker>,
     /// What the node sends, for the router.
     outbound: mpsc::Sender<Outgoing>,
 }
 
 pub(crate) struct Cluster {
+    /// The lanes of all three brokers, and the inproc endpoints clients
+    /// reach them on.
+    pub(crate) ctx: Context,
     pub(crate) members: Vec<Member>,
     cuts: Cuts,
     routes: Routes,
+    /// Percent of frames dropped, and the most they are delayed, in ms.
+    net: Arc<Mutex<(u64, u64)>>,
     log: LogLimits,
+    /// Where the nodes write their exit dumps.
+    dir: PathBuf,
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
 }
 
 impl Cluster {
@@ -104,23 +118,28 @@ impl Cluster {
 
     /// Three nodes of a new cluster whose logs keep at most `log`.
     pub(crate) async fn with_log(log: LogLimits) -> Cluster {
+        static CLUSTERS: AtomicUsize = AtomicUsize::new(0);
+        let n = CLUSTERS.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("zzq-sim-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
         let mut c = Cluster {
+            ctx: Context::local(2),
             members: Vec::new(),
             cuts: Cuts::default(),
             routes: Routes::default(),
+            net: Arc::default(),
             log,
+            dir,
         };
         for i in 0..NODES {
             let (outbound, out) = mpsc::channel(4096);
             c.route(i, out);
             let (tx, rx) = mpsc::channel(4096);
             c.routes.lock().unwrap().push(tx);
-            let ctx = Context::local(2);
             let broker = c
-                .start(i, &ctx, ClusterStart::Bootstrap, links(&outbound, rx))
+                .start(i, ClusterStart::Bootstrap, links(&outbound, rx))
                 .await;
             c.members.push(Member {
-                ctx,
                 broker: Some(broker),
                 outbound,
             });
@@ -129,42 +148,75 @@ impl Cluster {
     }
 
     /// Routes what node `i` sends, unless the link is cut.
+    /// Routes what node `i` sends, unless the link is cut, dropping and
+    /// delaying frames as [`Cluster::lossy`] says.
     fn route(&self, i: usize, mut out: mpsc::Receiver<Outgoing>) {
-        let (routes, cuts) = (self.routes.clone(), self.cuts.clone());
+        let (routes, cuts, net) = (self.routes.clone(), self.cuts.clone(), self.net.clone());
         tokio::task::spawn_local(async move {
+            let mut rng = 0x2545_f491_4f6c_dd1d_u64 ^ (i as u64 + 1);
+            let mut roll = move |n: u64| {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng % n.max(1)
+            };
             while let Some(Outgoing { to, frames }) = out.recv().await {
                 let Some(j) = (0..NODES).find(|&j| node_id(j) == to) else {
                     continue;
                 };
-                if cuts.lock().unwrap()[i][j] {
+                let (drop, delay) = *net.lock().unwrap();
+                if cuts.lock().unwrap()[i][j] || roll(100) < drop {
                     continue;
                 }
-                let tx = routes.lock().unwrap().get(j).cloned();
-                if let Some(tx) = tx {
+                let Some(tx) = routes.lock().unwrap().get(j).cloned() else {
+                    continue;
+                };
+                let after = Duration::from_millis(roll(delay + 1));
+                if after.is_zero() {
                     let _ = tx.try_send(frames);
+                } else {
+                    tokio::task::spawn_local(async move {
+                        tokio::time::sleep(after).await;
+                        let _ = tx.try_send(frames);
+                    });
                 }
             }
         });
     }
 
-    async fn start(
-        &self,
-        i: usize,
-        ctx: &Context,
-        start: ClusterStart,
-        links: ClusterLinks,
-    ) -> Broker {
+    /// Drops `percent` of the frames between nodes and delays the others
+    /// by up to `delay_ms`, which reorders them.
+    pub(crate) fn lossy(&self, percent: u64, delay_ms: u64) {
+        *self.net.lock().unwrap() = (percent, delay_ms);
+    }
+
+    async fn start(&self, i: usize, start: ClusterStart, links: ClusterLinks) -> Broker {
         let opts = BrokerOptions {
             cluster: Some(ClusterOptions {
                 node: node_config(i, self.log),
                 start,
                 links,
             }),
+            state_file: Some(self.dump(i)),
             ..BrokerOptions::default()
         };
-        let broker = Broker::new(ctx, opts).await.unwrap();
+        let broker = Broker::new(&self.ctx, opts).await.unwrap();
         broker.bind(&format!("inproc://node-{i}")).await.unwrap();
         broker
+    }
+
+    /// Node `i`'s exit dump.
+    pub(crate) fn dump(&self, i: usize) -> PathBuf {
+        self.dir.join(format!("node-{i}.state"))
+    }
+
+    /// Stops node `i` cleanly. True if it left a dump to restart from.
+    pub(crate) async fn stop(&mut self, i: usize) -> bool {
+        if let Some(broker) = self.members[i].broker.take() {
+            broker.shutdown().await.unwrap();
+        }
+        self.isolate(i, true);
+        self.dump(i).exists()
     }
 
     pub(crate) fn status(&self, i: usize) -> Option<NodeStatus> {
@@ -197,17 +249,15 @@ impl Cluster {
         self.isolate(i, true);
     }
 
-    /// Starts node `i` again without its state: it recovers from the
-    /// others.
+    /// Starts node `i` again: from its exit dump if it left one, else
+    /// without its state, which it recovers from the others.
     pub(crate) async fn restart(&mut self, i: usize) {
         let (tx, rx) = mpsc::channel(4096);
         self.routes.lock().unwrap()[i] = tx;
-        let ctx = Context::local(2);
         let outbound = self.members[i].outbound.clone();
         let broker = self
-            .start(i, &ctx, ClusterStart::Recover, links(&outbound, rx))
+            .start(i, ClusterStart::Recover, links(&outbound, rx))
             .await;
-        self.members[i].ctx = ctx;
         self.members[i].broker = Some(broker);
         self.isolate(i, false);
     }
@@ -239,7 +289,7 @@ impl Cluster {
             session_expiry: 3600,
             ..ClientOptions::new(id)
         };
-        Client::connect(&self.members[i].ctx, &format!("inproc://node-{i}"), opts).await
+        Client::connect(&self.ctx, &format!("inproc://node-{i}"), opts).await
     }
 
     /// Whether node `i` follows node `j` in its view and applied all it

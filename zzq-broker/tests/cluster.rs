@@ -5,10 +5,12 @@
 
 #[path = "cluster/sim.rs"]
 mod sim;
+#[path = "cluster/workload.rs"]
+mod workload;
 
 use std::time::Duration;
 
-use sim::{Cluster, simulated};
+use sim::{Cluster, NODES, simulated};
 use zzq_client::{Client, Message};
 use zzq_cluster::node::{LogLimits, Role};
 use zzq_proto::QoS;
@@ -178,4 +180,69 @@ fn a_node_that_lost_its_state_recovers_it_from_the_others_and_serves_it() {
         c.lead(2).await;
         check(&c, 2, 100).await;
     });
+}
+
+#[test]
+fn a_cluster_stopped_node_by_node_comes_back_from_its_dumps() {
+    for order in [[0, 1, 2], [2, 0, 1], [1, 2, 0]] {
+        simulated(|| async move {
+            let mut c = Cluster::with_log(small_log()).await;
+            assert!(c.until(2, |c| c.leader() == Some(0)).await);
+            fill(&c, 0, 20).await;
+            for (k, i) in order.into_iter().enumerate() {
+                assert!(c.stop(i).await, "{order:?}: node {i} dumps");
+                if k == 0 {
+                    assert!(c.until(5, |c| c.leader().is_some()).await, "{order:?}");
+                }
+            }
+            for i in 0..NODES {
+                c.restart(i).await;
+            }
+            assert!(c.until(10, |c| c.leader().is_some()).await, "{order:?}");
+            check(&c, c.leader().unwrap(), 20).await;
+        });
+    }
+}
+
+#[test]
+fn a_node_restarts_from_its_dump_and_catches_up_with_what_it_missed() {
+    simulated(|| async {
+        let mut c = Cluster::with_log(small_log()).await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        fill(&c, 0, 10).await;
+        assert!(c.stop(2).await, "node 2 dumps");
+        let publisher = c.client(0, "pub", false).await;
+        for i in 10..20 {
+            let payload = format!("m{i}");
+            publisher
+                .publish("orders/1", payload, QoS::AtLeastOnce)
+                .await
+                .unwrap();
+        }
+        c.restart(2).await;
+        assert!(c.until(10, |c| c.caught_up(2, 0)).await, "node 2 follows");
+        c.lead(2).await;
+        check(&c, 2, 20).await;
+    });
+}
+
+/// Seeds a sweep runs: `ZZQ_SIM_SEEDS`, or a few.
+fn seeds() -> u64 {
+    std::env::var("ZZQ_SIM_SEEDS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3)
+}
+
+#[test]
+fn seeded_faults_never_lose_an_acked_message() {
+    for seed in 0..seeds() {
+        let mut result = Ok(());
+        simulated(|| async {
+            result = workload::run(seed).await;
+        });
+        if let Err(e) = result {
+            panic!("seed {seed}: {e}");
+        }
+    }
 }
