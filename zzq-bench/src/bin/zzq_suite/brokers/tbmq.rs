@@ -53,6 +53,64 @@ fn env(vars: &[&str]) -> Vec<String> {
 /// settings in `conf`. With `durable`, Kafka syncs each message and Valkey
 /// each write.
 pub(super) fn ctrs(durable: bool, conf: &Path) -> Result<Vec<Ctr>, String> {
+    let mut ctrs = stores(durable)?;
+    let mut tbmq = env(&TBMQ);
+    tbmq.extend(env_args(conf).map_err(|e| format!("{}: {e}", conf.display()))?);
+    ctrs.push(Ctr::broker("zzq-tbmq", IMAGE, tbmq));
+    Ok(ctrs)
+}
+
+const IMAGE: &str = "docker.io/thingsboard/tbmq:2.4.1";
+
+/// The containers of a cluster's nodes.
+const NODES: [&str; 3] = ["zzq-tbmq-0", "zzq-tbmq-1", "zzq-tbmq-2"];
+
+/// The stores, then three TBMQ nodes with the settings in `conf`, node
+/// `i` with MQTT on 1883 + `i`. Node 0 keeps the REST API on 8083.
+pub(super) fn cluster_ctrs(conf: &Path) -> Result<Vec<Ctr>, String> {
+    let mut ctrs = stores(false)?;
+    let own = env_args(conf).map_err(|e| format!("{}: {e}", conf.display()))?;
+    for (i, name) in (0u16..).zip(NODES) {
+        let mut tbmq = env(&TBMQ[1..]);
+        tbmq.extend(own.iter().cloned());
+        let http = if i == 0 { 8083 } else { 8090 + i };
+        tbmq.extend(env(&[
+            &format!("TB_SERVICE_ID=tbmq{i}"),
+            &format!("LISTENER_TCP_BIND_PORT={}", super::PORT + i),
+            &format!("HTTP_BIND_PORT={http}"),
+        ]));
+        // Node 0 installs the shared database; the others start as if
+        // they had too.
+        let cmd = if i == 0 {
+            Vec::new()
+        } else {
+            tbmq.extend(env(&["DATA_FOLDER=/tmp/tbmq"]));
+            tbmq.extend(["--entrypoint".to_owned(), "sh".to_owned()]);
+            [
+                "-c",
+                "mkdir -p /tmp/tbmq && touch /tmp/tbmq/.firstlaunch && exec start-tbmq.sh",
+            ]
+            .map(String::from)
+            .to_vec()
+        };
+        ctrs.push(Ctr {
+            name,
+            image: IMAGE,
+            args: tbmq,
+            cmd,
+            port: super::PORT + i,
+        });
+    }
+    Ok(ctrs)
+}
+
+/// The command that sends TBMQ node `i` `signal`.
+pub(super) fn signal(i: usize, signal: &str) -> String {
+    format!("podman kill --signal {signal} {}", NODES[i % NODES.len()])
+}
+
+/// PostgreSQL, Kafka and Valkey with empty stores.
+fn stores(durable: bool) -> Result<Vec<Ctr>, String> {
     let mut pg = env(&[
         "POSTGRES_DB=thingsboard_mqtt_broker",
         "POSTGRES_PASSWORD=postgres",
@@ -73,8 +131,6 @@ pub(super) fn ctrs(durable: bool, conf: &Path) -> Result<Vec<Ctr>, String> {
         .to_vec();
     }
     kafka.extend(data(&store("tbmq-kafka")?, "/var/lib/kafka/data"));
-    let mut tbmq = env(&TBMQ);
-    tbmq.extend(env_args(conf).map_err(|e| format!("{}: {e}", conf.display()))?);
     Ok(vec![
         Ctr {
             name: "zzq-tbmq-postgres",
@@ -97,7 +153,6 @@ pub(super) fn ctrs(durable: bool, conf: &Path) -> Result<Vec<Ctr>, String> {
             cmd: valkey_cmd,
             port: 6379,
         },
-        Ctr::broker("zzq-tbmq", "docker.io/thingsboard/tbmq:2.4.1", tbmq),
     ])
 }
 

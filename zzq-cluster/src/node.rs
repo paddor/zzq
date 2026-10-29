@@ -80,8 +80,8 @@ pub struct Outgoing {
 #[non_exhaustive]
 pub enum Role {
     /// It leads: it serves clients and proposes ops. It stops once it
-    /// hears from neither follower for half the primary timeout, before
-    /// they could elect another.
+    /// hears from neither follower for half the leader timeout
+    /// ([`Timing::primary_timeout`]), before they could elect another.
     Leader,
     /// It follows the leader and applies what commits.
     Follower,
@@ -331,9 +331,9 @@ impl Node {
         self.role
     }
 
-    /// Whether it is the primary of its view: it leads, or leads again
+    /// Whether it is the leader of its view: it leads, or leads again
     /// once a follower acks.
-    pub fn primary(&self) -> bool {
+    pub fn leads_view(&self) -> bool {
         self.driver.normal().is_some_and(|n| {
             let s = n.snapshot();
             s.status == Status::Normal
@@ -651,7 +651,7 @@ struct Lease {
     heard_at: Option<Duration>,
     /// Follower: until when its last ack backs the leader's lease.
     follow_until: Duration,
-    /// Primary: its view, and when it became its primary.
+    /// Leader: its view, and when it came to lead it.
     led: Option<(u64, Duration)>,
 }
 

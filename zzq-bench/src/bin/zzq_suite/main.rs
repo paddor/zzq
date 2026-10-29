@@ -12,6 +12,9 @@
 //! - `durable <broker> [lanes]`: QoS 1 and 2 to persistent sessions with
 //!   the broker's storage on, zzq with 1 IO lane and a data directory, a
 //!   fresh broker for each cell.
+//! - `failover <zzq | vernemq [cluster|netsplit] | tbmq>`: QoS 1 under load on a
+//!   cluster of three, the node the publishers use killed or stopped
+//!   mid-run, a fresh cluster per cell.
 //! - `all [name...]`: every suite above, or the named ones (`zzq-1`,
 //!   `rmqtt-tuned`, `fixed-zzq-2`, `durable-emqx`, ...), one process each,
 //!   logged to `$XDG_CACHE_HOME/zzq/logs/<date>/<name>.log`. Stops at the
@@ -82,7 +85,7 @@ const DURABLE: [&str; 9] = [
 /// Rivals also run with their default config.
 const DEFAULTS: [&str; 3] = ["vernemq", "fluxmq", "saguin"];
 
-const USAGE: &str = "usage: zzq_suite [--fill] [--smoke] <zzq [lanes] | <rival> [default|tuned] | clients | zzqclient | fixed <broker> [config|lanes] | durable <broker> [lanes] | all [name...]>";
+const USAGE: &str = "usage: zzq_suite [--fill] [--smoke] <zzq [lanes] | <rival> [default|tuned] | clients | zzqclient | fixed <broker> [config|lanes] | durable <broker> [lanes] | failover <zzq | vernemq [cluster|netsplit] | tbmq> | all [name...]>";
 
 fn main() -> ExitCode {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
@@ -115,6 +118,7 @@ fn run(suite: &Suite<'_>, args: &[&str]) -> Result<(), String> {
         ["all", names @ ..] => return all(suite, names),
         ["fixed", name, rest @ ..] => return fixed(suite, name, rest.first().copied()),
         ["durable", name, rest @ ..] => return durable(suite, name, rest.first().copied()),
+        ["failover", name, rest @ ..] => return failover(suite, name, rest.first().copied()),
         _ => {}
     }
     let (name, opt) = match args {
@@ -250,6 +254,22 @@ fn durable(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), Strin
     Ok(())
 }
 
+/// `failover <broker> [config]`.
+fn failover(suite: &Suite<'_>, name: &str, opt: Option<&str>) -> Result<(), String> {
+    header(&["failover", name], opt);
+    match name {
+        "zzq" => suite.failover(&zzq_who(suite, 1, "cluster"), "zzq", "")?,
+        "vernemq" => {
+            let config = opt.unwrap_or("cluster");
+            suite.failover(&rival_who(name, config), name, config)?;
+        }
+        "tbmq" => suite.failover(&rival_who(name, "cluster"), name, "cluster")?,
+        _ => return Err(format!("no cluster of {name}")),
+    }
+    println!("# done {}", record::now());
+    Ok(())
+}
+
 /// Every suite of `all`: its name and arguments.
 fn all_suites() -> Vec<(String, Vec<String>)> {
     let s = |name: String, args: &[&str]| (name, args.iter().map(|&a| a.to_owned()).collect());
@@ -274,6 +294,16 @@ fn all_suites() -> Vec<(String, Vec<String>)> {
     out.push(s("durable-zzq-1".into(), &["durable", "zzq", "1"]));
     out.push(s("durable-zzq-2".into(), &["durable", "zzq", "2"]));
     out.extend(DURABLE.map(|r| s(format!("durable-{r}"), &["durable", r])));
+    out.push(s("failover-zzq".into(), &["failover", "zzq"]));
+    out.push(s(
+        "failover-vernemq-cluster".into(),
+        &["failover", "vernemq", "cluster"],
+    ));
+    out.push(s(
+        "failover-vernemq-netsplit".into(),
+        &["failover", "vernemq", "netsplit"],
+    ));
+    out.push(s("failover-tbmq".into(), &["failover", "tbmq"]));
     out
 }
 
@@ -329,7 +359,7 @@ mod tests {
     #[test]
     fn all_runs_every_suite_once() {
         let suites = all_suites();
-        assert_eq!(suites.len(), 2 + 12 + 3 + 2 + 2 + 12 + 2 + 9);
+        assert_eq!(suites.len(), 2 + 12 + 3 + 2 + 2 + 12 + 2 + 9 + 4);
         let find = |n: &str| suites.iter().find(|(name, _)| name == n).unwrap().1.clone();
         assert_eq!(find("fixed-nanomq"), ["fixed", "nanomq", "fixed"]);
         assert_eq!(find("fixed-emqx"), ["fixed", "emqx", "tuned"]);

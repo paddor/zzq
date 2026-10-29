@@ -38,6 +38,7 @@ missing_const_for_fn = "warn"
 zzq-proto = { path = "zzq-proto", version = "0.4.0", default-features = false }
 zzq-tokio = { path = "zzq-tokio", version = "0.4.0", default-features = false }
 zzq-disk = { path = "zzq-disk", version = "0.4.0" }
+zzq-cluster = { path = "zzq-cluster", version = "0.4.0" }
 zzq-broker = { path = "zzq-broker", version = "0.4.0" }
 zzq-client = { path = "zzq-client", version = "0.4.0" }
 bytes = { version = "1.12", default-features = false }

@@ -28,6 +28,8 @@ zzq_suite fixed zzq 2      # fixed load, zzq with 2 IO lanes
 zzq_suite fixed nanomq fixed
 zzq_suite durable zzq 1    # storage on, zzq with 1 IO lane and a data dir
 zzq_suite durable emqx     # a rival with its most durable storage
+zzq_suite failover zzq     # a cluster of three, its leader killed under load
+zzq_suite failover vernemq netsplit
 zzq_suite all              # every suite, one log each
 zzq_chart                  # redraw doc/charts from the cache
 ```
@@ -56,6 +58,19 @@ the PUBACK. Each cell gets a fresh broker with empty stores, in
 that containers wrote are removed with `podman unshare`. XMQ and rmqtt
 keep messages in a Redis container that syncs every write. FluxMQ 1.0.0
 refuses persistent sessions on one node, so it has no durable run.
+
+## Failover
+
+`failover` starts a fresh cluster of three for each cell, node `i` on CPU
+`i` with MQTT on port 1883 + `i`, and runs `zzq_failover` on the load
+CPUs. It kills or stops the node the publishers use mid-run and records
+the gap without PUBACKs, and what the subscribers lost, got twice or out
+of order, into `failover.jsonl`. zzq nodes keep state files in
+`$TMPDIR/zzq-suite/failover`. VerneMQ runs as three copies of its release
+in `$TMPDIR/zzq-suite/failover-vernemq`, joined to node 0, with the
+`cluster` config (its netsplit defaults) or `netsplit` (it serves during
+one). TBMQ runs as three containers beside one PostgreSQL, Kafka and
+Valkey, with 2 GiB heaps; node 0 installs the database.
 
 ## Rivals
 

@@ -187,9 +187,9 @@ impl Node {
         }
     }
 
-    /// Primary: no follower acked within the primary timeout. Its view may
-    /// be one the others left, which they tell it only by supporting its
-    /// exit, so its driver asks them.
+    /// Leader of its view: no follower acked within the leader timeout.
+    /// Its view may be one the others left, which they tell it only by
+    /// supporting its exit, so its driver asks them.
     pub(super) fn check_isolation(&mut self, now: Duration) {
         let Some(normal) = self.driver.normal() else {
             return;

@@ -1,13 +1,13 @@
 //! Leadership: a follower's state goes to the lanes when the node leads;
-//! a leader that loses its lease waits as long as it stays the primary,
-//! and drops its state once it no longer is.
+//! a leader that loses its lease waits as long as it stays the leader of
+//! its view, and drops its state once it no longer is.
 
 use std::time::Duration;
 
 use super::{App, Replica, appended, commits, journals};
 use zzq_cluster::OpNumber;
 
-/// How long a primary without its lease keeps its state and its clients
+/// How long a leader without its lease keeps its state and its clients
 /// before the others surely lead without it.
 const SUSPENDED_FOR: Duration = Duration::from_millis(1500);
 
@@ -22,10 +22,10 @@ impl Replica {
         self.promote().await;
     }
 
-    /// The node does not lead now. Still the primary of its view, it only
+    /// The node does not lead now. Still the leader of its view, it only
     /// missed acks: it stops taking clients and waits for them.
     pub(super) async fn step_down(&mut self) {
-        if matches!(self.app, App::Leader) && self.node.primary() {
+        if matches!(self.app, App::Leader) && self.node.leads_view() {
             self.suspended.get_or_insert(self.now());
             crate::cluster::close_listeners(&self.shared);
             return;
@@ -34,13 +34,13 @@ impl Replica {
         self.demote().await;
     }
 
-    /// A suspended leader that is no longer the primary, or that waited
+    /// A suspended leader that no longer leads its view, or that waited
     /// too long, steps down for good.
     pub(super) async fn check_suspended(&mut self, now: Duration) {
         let Some(since) = self.suspended else {
             return;
         };
-        if !self.node.primary() || now >= since + SUSPENDED_FOR {
+        if !self.node.leads_view() || now >= since + SUSPENDED_FOR {
             self.suspended = None;
             self.demote().await;
         }

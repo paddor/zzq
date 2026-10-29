@@ -1,5 +1,6 @@
 //! Starts and stops the brokers under test, on CPUs 0-3 and port 1883.
 
+pub(crate) mod cluster;
 mod tbmq;
 
 use std::fs::{self, OpenOptions};

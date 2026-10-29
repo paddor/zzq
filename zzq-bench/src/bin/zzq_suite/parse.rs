@@ -127,6 +127,29 @@ pub(crate) fn broker_row(line: &str) -> Option<Row> {
 }
 
 /// A `zzq_loadbench` step.
+/// A `zzq_failover` result line.
+pub(crate) fn failover_row(line: &str) -> Option<Row> {
+    let w = words(line);
+    if w.first()? != "failover" {
+        return None;
+    }
+    row(vec![
+        ("kind", Some("failover".into())),
+        ("rate", int(kv(&w, "rate"))),
+        ("offline", kv(&w, "offline").map(|o| Value::from(o == "1"))),
+        ("qos", Some(1.into())),
+        ("pubs", int(kv(&w, "pubs"))),
+        ("subs", int(kv(&w, "subs"))),
+        ("acked", int(kv(&w, "acked"))),
+        ("lost", int(kv(&w, "lost"))),
+        ("dup", int(kv(&w, "dup"))),
+        ("reordered", int(kv(&w, "reordered"))),
+        ("down_ms", int(kv(&w, "down_ms"))),
+        ("stall_ms", int(kv(&w, "stall_ms"))),
+        ("resends", int(kv(&w, "resends"))),
+    ])
+}
+
 pub(crate) fn fixed_row(line: &str) -> Option<Row> {
     let w = words(line);
     if w.first()? != "fixed" {

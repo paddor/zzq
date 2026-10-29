@@ -772,8 +772,8 @@ fn a_leader_whose_application_dropped_its_state_leads_again_only_with_all_of_it(
     sim.links[2][0] = false;
     assert!(sim.run_until(100, |s| s.apps[0].role != Some(Role::Leader)));
     assert!(
-        sim.nodes[0].as_ref().unwrap().primary(),
-        "still the primary"
+        sim.nodes[0].as_ref().unwrap().leads_view(),
+        "still the leader of its view"
     );
     // The application drops its state, as a broker's lanes do.
     sim.node(0).reset_application();
@@ -792,4 +792,29 @@ fn a_leader_whose_application_dropped_its_state_leads_again_only_with_all_of_it(
         }
     }
     assert!(led, "it leads again");
+}
+
+#[test]
+fn a_leader_whose_acks_are_lost_does_not_leave_its_view_alone() {
+    let mut sim = Sim::new(25, CLEAN);
+    started(&mut sim);
+    commit_everywhere(&mut sim, 0, 5);
+    // The followers hear it; it hears none of them, past its timeout.
+    sim.links[1][0] = false;
+    sim.links[2][0] = false;
+    sim.run(130);
+    let views: Vec<_> = (0..3)
+        .map(|i| sim.nodes[i].as_ref().unwrap().view())
+        .collect();
+    sim.links[1][0] = true;
+    sim.links[2][0] = true;
+    assert!(
+        views[0] == views[1] || views[0] == views[2],
+        "views {views:?}\n{}",
+        report(&sim)
+    );
+    assert!(
+        sim.run_until(2000, |s| s.leader().is_some()),
+        "it leads again, or another does"
+    );
 }

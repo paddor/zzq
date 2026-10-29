@@ -26,7 +26,7 @@ fuzzing = []
 [dependencies]
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-tokio = { workspace = true, default-features = false }
-zzq-cluster = { path = "../zzq-cluster" }
+zzq-cluster.workspace = true
 omq-tokio = { workspace = true, optional = true }
 bytes = { workspace = true, features = ["std"] }
 bytestring.workspace = true

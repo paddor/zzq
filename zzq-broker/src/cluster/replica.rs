@@ -69,7 +69,7 @@ pub(crate) struct Replica {
     exiting: Option<Exiting>,
     /// The last op that failed to apply.
     failed: Option<OpNumber>,
-    /// Since when a leader is without its lease, still the primary of its
+    /// Since when a leader is without its lease, still the leader of its
     /// view: it keeps its state and waits.
     suspended: Option<Duration>,
     /// A forced epoch's history starts empty: the first leadership writes
@@ -148,11 +148,12 @@ impl Replica {
     async fn step(&mut self) -> bool {
         let groups = self.shared.cluster_groups();
         let now = self.now();
+        // Before the poll, which sends what was proposed.
+        self.propose(now);
         if self.node.poll(now).is_err() {
             // The core faulted: this node serves nothing until restart.
             self.fail_proposed();
         }
-        self.propose(now);
         while let Some(out) = self.node.next_outgoing() {
             // A full link drops; the node sends again.
             let _ = self.links.outbound.try_send(out);
@@ -161,9 +162,9 @@ impl Replica {
             self.event(event).await;
         }
         self.check_suspended(now).await;
-        // The primary's log holds its own view's history: what committed
+        // The leader's log holds its own view's history: what committed
         // there is its own, also what committed while it had no lease.
-        if matches!(self.app, App::Leader) && self.node.primary() {
+        if matches!(self.app, App::Leader) && self.node.leads_view() {
             self.commit_through(self.node.committed().op);
         }
         self.offer_cut();
@@ -195,8 +196,9 @@ impl Replica {
                     });
                 }
                 Err(ProposeError::Full) => break,
-                // Still the primary, without its lease for now: they wait.
-                Err(_) if self.node.primary() => break,
+                // Still the leader of its view, without its lease for now:
+                // they wait.
+                Err(_) if self.node.leads_view() => break,
                 // Not leading: these records never commit here.
                 Err(_) => {
                     self.fail_held();

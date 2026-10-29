@@ -11,7 +11,7 @@ mod workload;
 use std::time::Duration;
 
 use sim::{Cluster, NODES, simulated};
-use zzq_client::{Client, Message};
+use zzq_client::{Client, ClientOptions, LastWill, Message};
 use zzq_cluster::node::{LogLimits, Role};
 use zzq_proto::QoS;
 
@@ -322,13 +322,14 @@ fn a_leader_that_misses_acks_for_a_moment_keeps_its_sessions_and_clients() {
             .unwrap();
         assert_eq!(next(&mut sub).await.payload, "m0");
         // The followers still hear it, but their acks are lost: its lease
-        // ends, its view does not.
+        // ends, its view does not, as long as its last op commits before
+        // the followers give up on it.
         c.cut(1, 0, true);
         c.cut(2, 0, true);
         assert!(c.until(1, |c| c.leader().is_none()).await, "the lease ends");
         let pending = publisher.publish("orders/1", "m1", QoS::AtLeastOnce);
         let heal = async {
-            tokio::time::sleep(Duration::from_millis(40)).await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
             c.cut(1, 0, false);
             c.cut(2, 0, false);
         };
@@ -338,5 +339,105 @@ fn a_leader_that_misses_acks_for_a_moment_keeps_its_sessions_and_clients() {
         assert_eq!(next(&mut sub).await.payload, "m1", "its client stayed");
         let again = c.client(0, "sub2", true).await;
         again.disconnect().await;
+    });
+}
+
+/// A client of node 0 with a will to `wills/<id>` after `delay` seconds,
+/// and a session that outlives its connection by `expiry` seconds.
+async fn with_will(c: &Cluster, id: &str, delay: u32, expiry: u32) -> Client {
+    let opts = ClientOptions {
+        clean_start: true,
+        session_expiry: expiry,
+        will: Some(LastWill {
+            topic: format!("wills/{id}"),
+            payload: "gone".into(),
+            qos: QoS::AtLeastOnce,
+            retain: false,
+            delay,
+        }),
+        ..sim::options(id)
+    };
+    c.connect_with(0, opts).await.unwrap()
+}
+
+/// A persistent subscriber to `wills/#`, gone for now.
+async fn will_watcher(c: &Cluster) {
+    let watch = c.client(0, "watch", true).await;
+    watch.subscribe("wills/#", QoS::AtLeastOnce).await.unwrap();
+    watch.disconnect().await;
+}
+
+/// The node that leads once leader 0 crashed.
+async fn fail_over(c: &mut Cluster) -> usize {
+    // Its records are on a follower.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c.crash(0);
+    assert!(c.until(5, |c| c.leader().is_some_and(|l| l != 0)).await);
+    c.leader().unwrap()
+}
+
+#[test]
+fn the_will_of_a_client_connected_at_a_dead_leader_goes_out_from_the_next() {
+    simulated(|| async {
+        let mut c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        will_watcher(&c).await;
+        let _dev = with_will(&c, "dev", 0, 60).await;
+        let l = fail_over(&mut c).await;
+        let mut watch = c.client(l, "watch", false).await;
+        let will = next(&mut watch).await;
+        assert_eq!(
+            (&*will.topic, &will.payload[..]),
+            ("wills/dev", &b"gone"[..])
+        );
+    });
+}
+
+#[test]
+fn a_client_back_within_its_will_delay_keeps_its_session_and_sends_no_will() {
+    simulated(|| async {
+        let mut c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        will_watcher(&c).await;
+        let _dev = with_will(&c, "dev", 30, 60).await;
+        let l = fail_over(&mut c).await;
+        let opts = ClientOptions {
+            clean_start: false,
+            session_expiry: 60,
+            ..sim::options("dev")
+        };
+        let dev = c.connect_with(l, opts).await.unwrap();
+        assert!(dev.connected().session_present, "its session moved");
+        let mut watch = c.client(l, "watch", false).await;
+        let got = tokio::time::timeout(Duration::from_secs(60), watch.recv()).await;
+        assert!(got.is_err(), "no will: {got:?}");
+    });
+}
+
+#[test]
+fn a_session_connected_at_a_dead_leader_expires_on_the_next() {
+    simulated(|| async {
+        let mut c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        let short = ClientOptions {
+            clean_start: true,
+            session_expiry: 3,
+            ..sim::options("short")
+        };
+        let _short = c.connect_with(0, short).await.unwrap();
+        let _long = c.client(0, "long", true).await;
+        let l = fail_over(&mut c).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let back = |id: &str| ClientOptions {
+            clean_start: false,
+            ..sim::options(id)
+        };
+        let short = c.connect_with(l, back("short")).await.unwrap();
+        assert!(
+            !short.connected().session_present,
+            "expired 3 s after the failover"
+        );
+        let long = c.connect_with(l, back("long")).await.unwrap();
+        assert!(long.connected().session_present, "kept for its hour");
     });
 }

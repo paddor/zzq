@@ -7,25 +7,30 @@ Notable changes to zzq. The format follows
 
 ### Added
 
-- `zzq-cluster`, not published yet: Viewstamped Replication for three
-  nodes, its cores copied from Ozzy. `node::Node` replicates opaque ops
-  through RAM on the leader and one follower, elects a new leader when
-  one goes, rebuilds a node's state from another's image, recovers a
-  crashed node from the other two, and restarts a node from its exit
-  dump. A seeded simulation drives three nodes through drops, delays,
-  splits, crashes and restarts.
+- `zzq-cluster`: Viewstamped Replication for three nodes, its cores
+  copied from Ozzy. `node::Node` replicates opaque ops through RAM on the
+  leader and one follower, elects a new leader when one goes, rebuilds a
+  node's state from another's image, recovers a crashed node from the
+  other two, restarts a node from its exit dump, and starts a new epoch
+  from one node when no two hold the state. A seeded simulation drives
+  three nodes through drops, delays, splits, crashes and restarts.
 - Clustering: three `zzq_broker` nodes as one broker, with
   `--cluster-node`, `--cluster-peers`, `--cluster-name` and
   `--cluster-bootstrap`. Sessions, their messages and retained messages
   replicate to RAM on another node before an ack. Only the leader binds
   client listeners. A node that loses the leadership drops its clients
-  and rebuilds its state; a node without state gets it from the others;
+  and rebuilds its state; the next leader runs the wills and expiry of
+  the sessions they had. A node without state gets it from the others;
   `--state-file` keeps a node's state over a clean stop. When no two
   nodes have the state, `--cluster-force-start` starts a new epoch on one
   node from the newest state it has, and the others join once they start
   without theirs. The nodes link over OMQ (`cluster` feature, on by
   default). Not with `--data-dir`.
 - `Error::ClusterLinks`.
+- `zzq_failover` and `zzq_suite failover`: QoS 1 under load on a cluster
+  of three, the node the publishers use killed or stopped mid-run; the gap
+  without PUBACKs and what the subscribers lost, got twice or out of
+  order. zzq, VerneMQ and TBMQ clusters.
 
 ### Changed
 

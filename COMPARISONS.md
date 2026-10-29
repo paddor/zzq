@@ -494,7 +494,7 @@ What the open release offers, and what happens when a node fails.
 | FluxMQ | etcd | session ownership | its sessions are lost, and their client IDs cannot connect for 30 s |
 | Sagüin | none | - | - |
 | HiveMQ CE | none | - | - |
-| TBMQ | yes, nodes share Kafka, Valkey and PostgreSQL | everything, in the shared stores | its clients reconnect to another node; messages on their way through it are lost |
+| TBMQ | yes, nodes share Kafka, Valkey and PostgreSQL | everything, in the shared stores | its clients reconnect to another node |
 
 - **rmqtt.** Neither mode replicates sessions, queues or in-flight
   messages. Broadcast mode sends every publish to every node
@@ -576,6 +576,48 @@ What the open release offers, and what happens when a node fails.
 - **Sagüin.** "One node and one process; no clustering, consensus, or
   automatic failover"
   ([README](https://github.com/ifnesi/saguin/blob/v0.1.0-rc.1/README.md#L172-L173)).
+
+### Failover, measured
+
+`zzq_suite failover`: three nodes on one host, one CPU each. Four QoS 1
+publishers, each waiting for its PUBACK before the next message, and four
+subscribers whose sessions outlive their connections. After 8 s of 20 the
+node the publishers use is killed (`KILL`) or stopped (`TERM`). With
+"away", the subscribers leave 2 s before the stop and come back 2 s after
+it. Gap: the longest time without any PUBACK. Lost: acked messages a
+subscriber never got, 30 s after the run.
+
+| Broker | Stop | Offered/s | Acked | Lost | Duplicates | Reordered | Gap |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| zzq | KILL | 1000 | 19336 | 0 | 16 | 0 | 662 ms |
+| zzq | KILL, away | 1000 | 19339 | 0 | 0 | 0 | 665 ms |
+| zzq | KILL | 10000 | 182064 | 0 | 12 | 0 | 675 ms |
+| zzq | TERM | 1000 | 19334 | 0 | 0 | 0 | 661 ms |
+| VerneMQ | KILL | 1000 | 7954 | 3 | 0 | 0 | 12 s |
+| VerneMQ | KILL, away | 1000 | 8004 | 2004 | 0 | 0 | 12 s |
+| VerneMQ | KILL | 10000 | 36654 | 36251 | 0 | 0 | 12 s |
+| VerneMQ | TERM | 1000 | 8597 | 597 | 2 | 13 | 11 s |
+| VerneMQ, netsplit on | KILL | 1000 | 19962 | 2 | 7 | 82 | 25 ms |
+| VerneMQ, netsplit on | KILL, away | 1000 | 19978 | 3987 | 0 | 64 | 26 ms |
+| VerneMQ, netsplit on | KILL | 10000 | 155594 | 138605 | 0 | 243 | 26 ms |
+| VerneMQ, netsplit on | TERM | 1000 | 19434 | 549 | 3 | 27 | 20 ms |
+| TBMQ | KILL | 1000 | 9316 | 0 | 6 | 0 | 347 ms |
+| TBMQ | KILL, away | 1000 | 8947 | 0 | 2039 | 5065 | 340 ms |
+| TBMQ | KILL | 10000 | 9728 | 0 | 8 | 0 | 436 ms |
+| TBMQ | TERM | 1000 | 7137 | 0 | 2779 | 2067 | 369 ms |
+
+- **zzq.** The gap is the 500 ms the followers wait for the leader, the
+  election and the clients' reconnect. A stop is no faster than a kill:
+  the followers wait out the timeout either way.
+- **VerneMQ.** As configured by default, no PUBACK came for the rest of
+  the run after the kill. With the four `allow_*_during_netsplit`
+  options on, the other nodes serve within 30 ms, and what waited in the
+  dead node's queues is lost.
+- **TBMQ.** These four publishers got about 470 PUBACKs a second, also
+  when 10000 were offered. With the subscribers away, or after a stop,
+  they got thousands of messages twice and out of order.
+- EMQX, rmqtt, FluxMQ: not measured. EMQX's open release refuses to
+  cluster.
 
 ## zzq
 

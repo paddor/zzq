@@ -10,7 +10,6 @@ readme = "README.md"
 description = "Viewstamped Replication for zzq clusters (engine crate of zzq-broker)."
 keywords = ["mqtt", "replication", "consensus", "vsr"]
 categories = ["network-programming"]
-publish = false
 
 [lints]
 workspace = true

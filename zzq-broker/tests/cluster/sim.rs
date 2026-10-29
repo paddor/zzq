@@ -78,6 +78,15 @@ fn links(outbound: &mpsc::Sender<Outgoing>, inbound: mpsc::Receiver<[Bytes; 3]>)
     }
 }
 
+/// A v5 client `id` whose session outlives its connection by an hour.
+pub(crate) fn options(id: &str) -> ClientOptions {
+    ClientOptions {
+        version: Version::V5,
+        session_expiry: 3600,
+        ..ClientOptions::new(id)
+    }
+}
+
 /// Cut links: `cut[a][b]` drops what node `a` sends node `b`.
 type Cuts = Arc<Mutex<[[bool; NODES]; NODES]>>;
 /// Where the router hands each node's inbound frames.
@@ -302,11 +311,18 @@ impl Cluster {
         clean: bool,
     ) -> zzq_client::Result<Client> {
         let opts = ClientOptions {
-            version: Version::V5,
             clean_start: clean,
-            session_expiry: 3600,
-            ..ClientOptions::new(id)
+            ..options(id)
         };
+        self.connect_with(i, opts).await
+    }
+
+    /// Connects a client with `opts` to node `i`.
+    pub(crate) async fn connect_with(
+        &self,
+        i: usize,
+        opts: ClientOptions,
+    ) -> zzq_client::Result<Client> {
         Client::connect(&self.ctx, &format!("inproc://node-{i}"), opts).await
     }
 

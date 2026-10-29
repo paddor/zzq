@@ -10,6 +10,8 @@ use crate::paths::Paths;
 use crate::record::{Cache, fields};
 use crate::runner::{self, Cmd, Ran};
 
+mod failover;
+
 /// Payload sizes of the full suites.
 const SIZES: [usize; 4] = [16, 256, 1024, 4096];
 /// CPUs of the load generator.

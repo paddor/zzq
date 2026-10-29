@@ -202,7 +202,7 @@ the cluster instead, in RAM:
   PUBACK waits for one follower to hold its message.
 - **Leader only.** The leader alone binds client listeners. A leader
   that misses its followers' acks closes them and waits; one that is no
-  longer the primary of its view drops its lanes' state and rebuilds it
+  longer leads its view drops its lanes' state and rebuilds it
   from the ops.
 - **Followers.** A follower applies the committed ops with the replay a
   start from disk uses, into state no lane serves. Becoming leader hands
