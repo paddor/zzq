@@ -1113,8 +1113,10 @@ async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare(
         broker
             .shared()
             .fail_next_segment(JournalId::Retained(stripe));
+        // This stripe only: the empty ones would each zero a first segment
+        // on the file thread ahead of this one's.
         let deadline = tokio::time::Instant::now() + WAIT;
-        while !broker.shared().retained.snapshot(true) {
+        while !broker.shared().retained.snapshot_stripe(stripe) {
             assert!(tokio::time::Instant::now() < deadline, "no snapshot");
             tokio::time::sleep(Duration::from_millis(5)).await;
         }

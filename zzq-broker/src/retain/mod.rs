@@ -240,14 +240,23 @@ impl Retained {
     pub(crate) fn snapshot(&self, force: bool) -> bool {
         let mut done = true;
         for s in &self.stripes {
-            match s.lock().snapshot(force) {
-                Ok(d) => done &= d,
-                Err(_) => {
-                    self.write_errors.fetch_add(1, Ordering::Relaxed);
-                }
-            }
+            done &= self.snapshot_of(s, force);
         }
         done
+    }
+
+    /// Writes a snapshot of stripe `i`, as [`Retained::snapshot`] with
+    /// `force` does for all, without making first segments for the others.
+    #[cfg(test)]
+    pub(crate) fn snapshot_stripe(&self, i: usize) -> bool {
+        self.snapshot_of(&self.stripes[i], true)
+    }
+
+    fn snapshot_of(&self, s: &Stripe, force: bool) -> bool {
+        s.lock().snapshot(force).unwrap_or_else(|_| {
+            self.write_errors.fetch_add(1, Ordering::Relaxed);
+            true
+        })
     }
 
     /// The cursor of the journal of stripe `stripe`.
