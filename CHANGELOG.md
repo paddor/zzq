@@ -5,6 +5,8 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-29
+
 ### Added
 
 - `zzq-disk`: append-only journals in segment files, for one owner each.
