@@ -1,4 +1,4 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zzq_proto::QoS;
 
@@ -10,7 +10,7 @@ fn replay(records: &[Vec<u8>]) -> Result<Vec<SessionState>, &'static str> {
     for r in records {
         sessions.apply(r[0], &r[1..], clock, |_| true)?;
     }
-    Ok(sessions.finish(Instant::now()))
+    Ok(sessions.finish(crate::time::now()))
 }
 
 fn seeds() -> Vec<Vec<u8>> {
@@ -29,9 +29,9 @@ fn a_connected_session_lost_its_connection_at_the_restart() {
     assert!(st.will.is_none(), "a lost connection has no will left");
     let (due, will) = st.delayed_will.as_ref().unwrap();
     assert_eq!(will.topic(), "will/t");
-    let delay = due.saturating_duration_since(Instant::now());
+    let delay = due.saturating_duration_since(crate::time::now());
     assert!(delay > Duration::from_secs(3) && delay <= Duration::from_secs(5));
-    let left = st.expires_at.unwrap() - Instant::now();
+    let left = st.expires_at.unwrap() - crate::time::now();
     assert!(left > Duration::from_secs(58), "{left:?}");
 }
 
@@ -42,7 +42,7 @@ fn records_follow_the_session_through_its_life() {
     let got = replay(&[s[0].clone(), s[1].clone(), s[2].clone(), s[4].clone()]).unwrap();
     assert_eq!(got[0].subs.len(), 0);
     assert!(got[0].delayed_will.is_some() && got[0].will.is_none());
-    let left = got[0].expires_at.unwrap() - Instant::now();
+    let left = got[0].expires_at.unwrap() - crate::time::now();
     assert!(left > Duration::from_secs(50), "{left:?}");
     // The delayed will went out.
     let got = replay(&[s[0].clone(), s[4].clone(), s[5].clone()]).unwrap();

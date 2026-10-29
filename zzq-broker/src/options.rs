@@ -164,6 +164,10 @@ pub struct BrokerOptions {
     pub transport: TransportOptions,
     /// The MQTT-SN gateway on `udp://` listeners.
     pub sn: SnOptions,
+    /// Runs the broker as one node of a three-node cluster. Engine API for
+    /// the `zzq_broker` binary and the simulator, not semver.
+    #[doc(hidden)]
+    pub cluster: Option<ClusterOptions>,
 }
 
 impl Default for BrokerOptions {
@@ -192,6 +196,7 @@ impl Default for BrokerOptions {
             sys_interval: Some(Duration::from_secs(10)),
             transport: TransportOptions::default(),
             sn: SnOptions::default(),
+            cluster: None,
         }
     }
 }
@@ -222,7 +227,48 @@ impl fmt::Debug for BrokerOptions {
             .field("sys_interval", &self.sys_interval)
             .field("transport", &self.transport)
             .field("sn", &self.sn)
+            .field("cluster", &self.cluster)
             .finish()
+    }
+}
+
+/// A broker as one node of a cluster: the node's settings, how it starts,
+/// and the links to the other two. Engine API, not semver.
+#[doc(hidden)]
+#[derive(Clone, Debug)]
+pub struct ClusterOptions {
+    /// The cluster and this node in it.
+    pub node: zzq_cluster::node::NodeConfig,
+    /// How the node starts.
+    pub start: ClusterStart,
+    /// Frames to and from the other two nodes.
+    pub links: ClusterLinks,
+}
+
+/// How a node starts.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClusterStart {
+    /// As one of three nodes of a new, empty cluster.
+    Bootstrap,
+    /// Without state, as after a crash: it recovers from the other two.
+    Recover,
+}
+
+/// The links to the other nodes: frames go out on `outbound`, and come in
+/// on the receiver the broker takes once.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ClusterLinks {
+    /// Frames for another node. A full channel drops; the node sends again.
+    pub outbound: tokio::sync::mpsc::Sender<zzq_cluster::node::Outgoing>,
+    /// Frames from the other nodes.
+    pub inbound: Arc<std::sync::Mutex<Option<tokio::sync::mpsc::Receiver<[bytes::Bytes; 3]>>>>,
+}
+
+impl fmt::Debug for ClusterLinks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClusterLinks").finish_non_exhaustive()
     }
 }
 

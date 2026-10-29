@@ -91,6 +91,10 @@ pub(crate) enum Control {
     /// Add sessions from a state file, then answer. Their subscriptions
     /// count down the ack on the other lanes.
     Restore(Vec<SessionState>, Arc<SyncAck>, oneshot::Sender<()>),
+    /// Drop every session and connection without journaling, then answer.
+    Reset(oneshot::Sender<()>),
+    /// Answer with the lane's part of a cluster image.
+    CutImage(oneshot::Sender<(u64, bytes::Bytes)>),
 }
 
 /// A lane's share of the state file being written.
@@ -110,6 +114,7 @@ impl Lane {
     }
 
     /// Handles a control message.
+    #[expect(clippy::too_many_lines, reason = "one arm per control message")]
     pub(crate) fn control(&mut self, c: Control) {
         match c {
             Control::SubAdd {
@@ -164,6 +169,13 @@ impl Lane {
             Control::Restore(states, sync, done) => {
                 self.restore(states, &sync);
                 let _ = done.send(());
+            }
+            Control::Reset(done) => {
+                self.reset();
+                let _ = done.send(());
+            }
+            Control::CutImage(done) => {
+                let _ = done.send(self.cut_image());
             }
             Control::Shutdown(done) => {
                 self.shutdown();

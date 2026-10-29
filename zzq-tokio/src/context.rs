@@ -205,6 +205,45 @@ impl Context {
         })
     }
 
+    /// A context whose `lanes` lanes are tasks on the caller's local task
+    /// set, not threads, for a simulation that runs everything on one
+    /// thread under one clock. Call it inside a `LocalSet`; lanes run as it
+    /// polls them. Busy polling and spin do not apply.
+    #[doc(hidden)]
+    pub fn local(lanes: usize) -> Context {
+        let lanes = (0..lanes.max(1))
+            .map(|index| {
+                let (tx, mut rx) = mpsc::unbounded_channel::<Job>();
+                let stop = Arc::new(DataSignal::new());
+                let stop2 = stop.clone();
+                tokio::task::spawn_local(async move {
+                    loop {
+                        tokio::select! {
+                            biased;
+                            () = stop2.ready() => break,
+                            job = rx.recv() => match job {
+                                Some(job) => job(),
+                                None => break,
+                            },
+                        }
+                    }
+                });
+                Lane {
+                    handle: LaneHandle { index, tx },
+                    stop,
+                }
+            })
+            .collect();
+        Context {
+            inner: Arc::new(Inner {
+                lanes,
+                next: AtomicUsize::new(0),
+                threads: Mutex::new(Vec::new()),
+                inproc: Arc::default(),
+            }),
+        }
+    }
+
     /// Number of lanes.
     pub fn lanes(&self) -> usize {
         self.inner.lanes.len()
@@ -364,6 +403,31 @@ impl<F: Future> Future for Spin<'_, F> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn local_lanes_run_on_the_callers_thread_under_its_clock() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let ctx = Context::local(2);
+                assert_eq!(ctx.lanes(), 2);
+                let me = thread::current().id();
+                let there = ctx.lane(1).call(|| thread::current().id()).await.unwrap();
+                assert_eq!(there, me);
+                let (tx, rx) = oneshot::channel();
+                ctx.lane(0)
+                    .spawn(move || async move {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                        let _ = tx.send(());
+                    })
+                    .unwrap();
+                let start = tokio::time::Instant::now();
+                rx.await.unwrap();
+                assert_eq!(start.elapsed(), Duration::from_secs(3600), "virtual time");
+                drop(ctx);
+            })
+            .await;
+    }
 
     #[tokio::test]
     async fn runs_on_lanes() {

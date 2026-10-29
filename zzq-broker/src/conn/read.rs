@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 use std::io;
 use std::pin::pin;
 use std::task::{Poll, ready};
-use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt};
@@ -167,7 +166,7 @@ pub(super) async fn read_loop<R: AsyncRead + Unpin>(
         conn.held.set(false);
         // Keep alive counts from the end of a wait the broker made.
         if waited {
-            conn.last_rx.set(Instant::now());
+            conn.last_rx.set(crate::time::now());
         }
         if let Err(close) = result {
             return close;
@@ -312,7 +311,7 @@ async fn read_more<R: AsyncRead + Unpin>(
         n = read => match n {
             Ok(0) | Err(_) => Some(Close::Lost),
             Ok(n) => {
-                conn.last_rx.set(Instant::now());
+                conn.last_rx.set(crate::time::now());
                 *chunk = if shared {
                     // A large read makes it a busy connection.
                     if n > MIN_CHUNK { 2 * MIN_CHUNK } else { MIN_CHUNK }

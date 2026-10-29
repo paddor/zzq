@@ -6,9 +6,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use zzq_proto::{QoS, SubscriptionOptions};
 
-use crate::disk::{self, Completion, Log};
+use crate::cluster::{GroupWriter, Journal};
+use crate::disk::{self, Append, Completion, Log};
 use crate::durable::{Cursor, JournalId, Journaled, RETRY, Wait};
 use crate::index::SubIds;
 use crate::msg::Publication;
@@ -65,6 +67,11 @@ impl LaneLog {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The commits of its cluster journal.
+    pub(crate) fn commits(&self) -> Option<std::sync::Arc<crate::cluster::Commits>> {
+        self.lock().log.as_ref().and_then(Log::commits)
+    }
+
     /// Whether the lane journals its sessions.
     pub(crate) fn is_open(&self) -> bool {
         self.lock().log.is_some()
@@ -92,6 +99,15 @@ impl LaneLog {
         }
     }
 
+    /// The next completion of its writes, or of a cluster journal's commits.
+    async fn next_completion(&self) -> Completion {
+        let commits = self.lock().log.as_ref().and_then(Log::commits);
+        match commits {
+            Some(c) => c.next().await,
+            None => std::future::poll_fn(|cx| self.poll_complete(cx)).await,
+        }
+    }
+
     /// Writes everything appended, blocking, then closes the journal,
     /// which lets go of its directory. Later changes fail.
     pub(crate) fn close(&self) {
@@ -100,6 +116,20 @@ impl LaneLog {
             && log.sync().is_err()
         {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The number of the last record a cluster journal appended.
+    pub(crate) fn cluster_appended(&self) -> Option<u64> {
+        self.lock().log.as_ref()?.cluster_appended()
+    }
+
+    /// Drops the records a cluster journal did not hand over yet.
+    pub(crate) fn discard(&self) {
+        let mut st = self.lock();
+        st.stale = false;
+        if let Some(log) = st.log.as_mut() {
+            log.discard();
         }
     }
 
@@ -201,16 +231,7 @@ impl LogState {
     fn write_all(&mut self, sessions: &Slab<Session>) -> io::Result<u64> {
         let LogState { log, buf, .. } = self;
         let log = log.as_mut().ok_or(io::ErrorKind::NotConnected)?;
-        let clock = Clock::now();
-        log.append(CLEAR, &[])?;
-        for key in sessions.keys() {
-            if let Some(s) = sessions.get(key).filter(|s| s.journaled) {
-                buf.clear();
-                rec::image(buf, s, clock);
-                log.append(IMAGE, &[buf])?;
-            }
-        }
-        let n = log.append(CLEARED, &[])?;
+        let n = put_sessions(log, sessions, buf, Clock::now())?;
         self.stale = false;
         Ok(n)
     }
@@ -452,6 +473,25 @@ impl Lane {
             })
     }
 
+    /// A cluster leader's part of an image: the records so far go to the
+    /// replica, and the lane's sessions after them become a group body.
+    /// Returns the number of the last record the part holds.
+    pub(crate) fn cut_image(&mut self) -> (u64, Bytes) {
+        let log = &self.shared.lane_logs[usize::from(self.id)];
+        let mut st = log.lock();
+        let st = &mut *st;
+        let last = match st.log.as_mut() {
+            Some(Log::Cluster(c)) => {
+                c.flush();
+                c.appended()
+            }
+            _ => 0,
+        };
+        let mut part = GroupWriter::new(Journal::Lane(self.id));
+        let _ = put_sessions(&mut part, &self.sessions, &mut st.buf, Clock::now());
+        (last, part.finish())
+    }
+
     /// Writes every journaled session again after a failed write.
     fn rewrite_journal(&mut self) {
         let log = &self.shared.lane_logs[usize::from(self.id)];
@@ -465,6 +505,25 @@ impl Lane {
     }
 }
 
+/// Appends a snapshot of the journaled sessions to `out`. Returns the
+/// number of its last record.
+fn put_sessions(
+    out: &mut impl Append,
+    sessions: &Slab<Session>,
+    buf: &mut Vec<u8>,
+    clock: Clock,
+) -> io::Result<u64> {
+    out.append(CLEAR, &[])?;
+    for key in sessions.keys() {
+        if let Some(s) = sessions.get(key).filter(|s| s.journaled) {
+            buf.clear();
+            rec::image(buf, s, clock);
+            out.append(IMAGE, &[buf])?;
+        }
+    }
+    out.append(CLEARED, &[])
+}
+
 /// Moves the cursor of `lane`'s journal as its writes finish, until the
 /// journal closes. The one task that takes its completions.
 pub(crate) async fn complete(lane: LaneRef) {
@@ -474,7 +533,7 @@ pub(crate) async fn complete(lane: LaneRef) {
     };
     let log = &shared.lane_logs[id];
     loop {
-        match std::future::poll_fn(|cx| log.poll_complete(cx)).await {
+        match log.next_completion().await {
             Completion::Written(n) => {
                 log.cursor.advance(n);
                 if log.lock().written(n).is_err() {
@@ -486,9 +545,13 @@ pub(crate) async fn complete(lane: LaneRef) {
                 l.snapshot_journal(false);
             }
             Completion::Failed(first, last) => {
-                log.write_errors.fetch_add(1, Ordering::Relaxed);
                 let mut l = lane.borrow_mut();
-                l.rewrite_journal();
+                // A cluster journal fails with the leadership, and the lane
+                // drops its state: nothing to write again.
+                if !shared.clustered() {
+                    log.write_errors.fetch_add(1, Ordering::Relaxed);
+                    l.rewrite_journal();
+                }
                 log.cursor.fail(first, last);
                 l.pairs_written(first, last, true);
             }

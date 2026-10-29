@@ -34,6 +34,7 @@
 
 mod broker;
 mod budget;
+mod cluster;
 mod conn;
 mod disk;
 mod dump;
@@ -54,6 +55,7 @@ mod state;
 mod sys;
 #[cfg(test)]
 mod tests;
+mod time;
 
 // The shared test support names the crate.
 #[cfg(test)]
@@ -63,6 +65,8 @@ pub use broker::{Broker, Dropped, Stats, lane_for};
 pub use options::{
     AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo, SnOptions,
 };
+#[doc(hidden)]
+pub use options::{ClusterLinks, ClusterOptions, ClusterStart};
 pub use zzq_proto::{QoS, ReasonCode};
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]

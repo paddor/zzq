@@ -103,7 +103,7 @@ impl Session {
                 if let Some(at) = f.expires_at {
                     // Forward the time left, not the time the publisher asked for.
                     let left = at
-                        .saturating_duration_since(Instant::now())
+                        .saturating_duration_since(crate::time::now())
                         .as_secs()
                         .max(1);
                     let parsed = zzq_proto::Properties::try_from(f.props).unwrap_or_default();

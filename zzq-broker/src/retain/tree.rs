@@ -86,7 +86,7 @@ impl Tree {
     /// Adds the retained messages matching `filter` to `out`.
     pub(super) fn matching(&self, filter: &str, out: &mut Vec<Msg>) {
         let levels: Vec<&str> = filter.split('/').collect();
-        collect(&self.root, &levels, true, Instant::now(), out);
+        collect(&self.root, &levels, true, crate::time::now(), out);
     }
 
     pub(super) const fn len(&self) -> usize {

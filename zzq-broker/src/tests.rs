@@ -38,7 +38,7 @@ async fn lane_until<T: Send + 'static>(
 async fn lane_refs(ctx: &Context, broker: &Broker, i: usize) -> usize {
     let id = broker.id();
     ctx.lane(i)
-        .call(move || crate::broker::lane_ref(id).map_or(0, |l| Rc::strong_count(&l) - 1))
+        .call(move || crate::broker::lane_ref(id, i).map_or(0, |l| Rc::strong_count(&l) - 1))
         .await
         .unwrap()
 }
@@ -53,7 +53,7 @@ pub(crate) async fn on_lane<T: Send + 'static>(
     let id = broker.id();
     ctx.lane(i)
         .call(move || {
-            let lane = crate::broker::lane_ref(id).expect("the broker runs on this lane");
+            let lane = crate::broker::lane_ref(id, i).expect("the broker runs on this lane");
             f(&mut lane.borrow_mut())
         })
         .await
@@ -140,7 +140,7 @@ async fn sessions_do_not_expire_while_the_lane_closes_for_a_dump() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let left = on_lane(&ctx, &broker, 0, |l| {
         for _ in 0..crate::lane::SWEEP_PARTS {
-            l.sweep(std::time::Instant::now());
+            l.sweep(crate::time::now());
         }
         l.sessions.len()
     })
@@ -487,7 +487,7 @@ async fn a_long_control_queue_lets_other_tasks_run() {
         // Queued behind the control loop, which the pushes woke.
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::task::spawn_local(async move {
-            let lane = crate::broker::lane_ref(id).unwrap();
+            let lane = crate::broker::lane_ref(id, 0).unwrap();
             let _ = tx.send(lane.borrow().stats.publishes);
         });
         rx
@@ -1443,7 +1443,7 @@ async fn an_idle_publisher_lets_go_of_stale_matches() {
         .await;
     let still = on_lane(&ctx, &broker, 0, move |l| {
         for _ in 0..crate::lane::SWEEP_PARTS {
-            l.sweep(std::time::Instant::now());
+            l.sweep(crate::time::now());
         }
         let key = l
             .sessions

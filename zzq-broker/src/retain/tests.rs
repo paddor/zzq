@@ -104,21 +104,21 @@ fn a_message_counts_until_no_session_holds_it() {
     r.set(&msg("a"), false);
     assert_eq!(r.bytes(), one + held.size());
     drop(held);
-    r.sweep(Instant::now());
+    r.sweep(crate::time::now());
     assert_eq!(r.bytes(), one);
     let held = r.matching("a").pop().unwrap();
     r.set(&clear("a"), false);
-    r.sweep(Instant::now());
+    r.sweep(crate::time::now());
     assert_eq!(r.bytes(), held.size());
     drop(held);
-    r.sweep(Instant::now());
+    r.sweep(crate::time::now());
     assert_eq!(r.bytes(), 0);
 }
 
 #[test]
 fn sweep_drops_expired_but_not_replaced() {
     let r = Retained::new(usize::MAX);
-    let now = Instant::now();
+    let now = crate::time::now();
     let soon = |topic: &str| {
         let mut m = msg(topic);
         m.expires_at = Some(now);
@@ -137,7 +137,7 @@ fn sweep_drops_expired_but_not_replaced() {
 #[test]
 fn republished_topic_keeps_one_expiry_entry() {
     let mut tree = Tree::default();
-    let now = Instant::now();
+    let now = crate::time::now();
     for i in 0..100 {
         let mut m = msg("status");
         m.expires_at = Some(now + Duration::from_secs(60 + i));
@@ -184,9 +184,9 @@ fn journals_hold_what_the_store_held() {
         return;
     };
     let mut expiring = Msg::new("e/1", b"soon", &[1, 1], QoS::AtLeastOnce, true);
-    expiring.expires_at = Some(Instant::now() + Duration::from_secs(600));
+    expiring.expires_at = Some(crate::time::now() + Duration::from_secs(600));
     let mut gone = msg("e/2");
-    gone.expires_at = Some(Instant::now() + Duration::from_millis(1));
+    gone.expires_at = Some(crate::time::now() + Duration::from_millis(1));
     let got = written(
         &data,
         &[
@@ -210,7 +210,7 @@ fn journals_hold_what_the_store_held() {
         (m.payload(), m.props(), m.qos),
         (&b"soon"[..], &[1, 1][..], QoS::AtLeastOnce)
     );
-    let left = m.expires_at.unwrap() - Instant::now();
+    let left = m.expires_at.unwrap() - crate::time::now();
     assert!(left > Duration::from_secs(300), "{left:?}");
     drop(r);
     // Topics deeper than allowed now stay out.
@@ -259,12 +259,9 @@ fn a_snapshot_takes_the_place_of_the_records_before_it() {
         r.set(&msg(&format!("s/{}", i % 10)), false);
     }
     r.set(&clear("s/3"), false);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = crate::time::now() + Duration::from_secs(10);
     while !r.snapshot(true) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no segment for the snapshot"
-        );
+        assert!(crate::time::now() < deadline, "no segment for the snapshot");
         std::thread::sleep(Duration::from_millis(5));
     }
     r.set(&msg("s/after"), false);

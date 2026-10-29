@@ -1,7 +1,7 @@
 //! `$SYS/broker/...` status topics, published as retained messages.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use zzq_proto::QoS;
 
@@ -10,7 +10,7 @@ use crate::msg::Msg;
 
 /// Publishes the status topics every `every`, each only when it changed.
 pub(crate) async fn run(shared: Arc<Shared>, every: Duration) {
-    let started = Instant::now();
+    let started = crate::time::now();
     let mut last: Vec<String> = Vec::new();
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);

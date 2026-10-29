@@ -6,7 +6,7 @@ use std::task::{Context, Poll};
 
 pub(crate) use zzq_disk::Record;
 
-use super::Completion;
+use super::{Completion, Log};
 
 /// Bytes per segment file, unless a packet needs more.
 const SEGMENT: u64 = 64 << 20;
@@ -89,15 +89,16 @@ impl DataDir {
             .disk
             .open(self.path.join(name), |r| replay(r).map_err(Into::into))
             .map_err(to_io)?;
-        Ok(Log(journal))
+        Ok(Log::Disk(Box::new(DiskLog(journal))))
     }
 }
 
 /// A journal: records appended in order and written in groups.
+/// A journal on disk.
 #[derive(Debug)]
-pub(crate) struct Log(zzq_disk::Journal);
+pub(crate) struct DiskLog(zzq_disk::Journal);
 
-impl Log {
+impl DiskLog {
     /// Appends a record whose body is `parts` joined, and returns its
     /// number.
     pub(crate) fn append(&mut self, kind: u8, parts: &[&[u8]]) -> io::Result<u64> {

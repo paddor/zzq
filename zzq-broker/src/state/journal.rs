@@ -138,7 +138,11 @@ pub(crate) fn unsub(b: &mut Vec<u8>, client_id: &str, filter: &str) {
 
 /// The body of an [`IMAGE`] record for `s`.
 pub(crate) fn image(b: &mut Vec<u8>, s: &Session, clock: Clock) {
-    b.push(u8::from(s.conn.is_some()));
+    image_of(b, s, s.conn.is_some(), clock);
+}
+
+fn image_of(b: &mut Vec<u8>, s: &Session, connected: bool, clock: Clock) {
+    b.push(u8::from(connected));
     put_session(b, s, clock);
     put_u64(b, s.flow.last_seq);
     put_count(b, s.inflight().len() + s.queue().len());
@@ -189,11 +193,12 @@ pub(crate) fn inbound(b: &mut Vec<u8>, client_id: &str, pkid: u16) {
     put_u16(b, pkid);
 }
 
-/// The body of an [`IMAGE`] record for a session as a journal left it.
-pub(crate) fn image_state(b: &mut Vec<u8>, st: SessionState, clock: Clock) {
+/// The body of an [`IMAGE`] record for a session as a journal left it,
+/// with a connection or without.
+pub(crate) fn image_state(b: &mut Vec<u8>, st: SessionState, connected: bool, clock: Clock) {
     let (mut s, will) = Session::restore(st, crate::budget::LaneTotal::default(), 1);
     s.delayed_will = will.map(|(due, msg)| crate::session::DelayedWill { timer: 0, due, msg });
-    image(b, &s, clock);
+    image_of(b, &s, connected, clock);
 }
 
 /// A message, for the wills of tests and seeds.
@@ -218,7 +223,7 @@ pub(crate) fn framed(records: &[Vec<u8>]) -> Vec<u8> {
 /// A record of each kind for a session `c`, kind byte first.
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use crate::budget::LaneTotal;
     use crate::session::{DelayedWill, Will};
@@ -244,10 +249,10 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     add(UNSUB, &|b| unsub(b, "c", "a/+"));
     add(IMAGE, &|b| image(b, &s, clock));
     s.will = None;
-    s.expires_at = Some(Instant::now() + Duration::from_secs(60));
+    s.expires_at = Some(crate::time::now() + Duration::from_secs(60));
     s.delayed_will = Some(DelayedWill {
         timer: 1,
-        due: Instant::now() + Duration::from_secs(5),
+        due: crate::time::now() + Duration::from_secs(5),
         msg: will_msg(),
     });
     add(DOWN, &|b| down(b, &s, clock));
@@ -280,7 +285,7 @@ pub(crate) fn replay_records(data: &[u8]) -> Result<usize, &'static str> {
         sessions.apply(*kind, body, clock, |_| true)?;
         rest = r;
     }
-    Ok(sessions.finish(std::time::Instant::now()).len())
+    Ok(sessions.finish(crate::time::now()).len())
 }
 
 #[cfg(test)]

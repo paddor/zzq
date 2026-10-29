@@ -15,6 +15,11 @@ Notable changes to zzq. The format follows
   dump. A seeded simulation drives three nodes through drops, delays,
   splits, crashes and restarts.
 
+### Changed
+
+- `zzq-broker` reads time from Tokio's clock, so a paused Tokio runtime
+  drives keep alive, session expiry, will delays and sweeps.
+
 ## [0.4.0] - 2026-10-29
 
 ### Added

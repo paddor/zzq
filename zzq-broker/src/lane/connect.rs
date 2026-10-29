@@ -225,7 +225,7 @@ impl Lane {
         let will = s.will.take().filter(|_| send_will);
         let expiry = s.expiry;
         if expiry != 0 && expiry != u32::MAX {
-            s.expires_at = Some(Instant::now() + Duration::from_secs(u64::from(expiry)));
+            s.expires_at = Some(crate::time::now() + Duration::from_secs(u64::from(expiry)));
         }
         self.release_waiters(key);
         if expiry == 0 {
@@ -270,7 +270,7 @@ impl Lane {
             return;
         };
         self.ids.will += 1;
-        let (timer, due) = (self.ids.will, Instant::now() + delay);
+        let (timer, due) = (self.ids.will, crate::time::now() + delay);
         if let Some(old) = s.delayed_will.replace(DelayedWill { timer, due, msg }) {
             self.wills.remove(&(old.due, old.timer));
         }

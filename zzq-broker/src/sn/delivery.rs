@@ -27,7 +27,7 @@ impl Client {
     /// publishes, PUBREL and REGISTER are kept for retransmission.
     pub(super) async fn deliver(&mut self, datagram: Vec<u8>) {
         if let Some(key) = retry_key(&datagram) {
-            let next = Instant::now() + self.shared.opts.sn.retry;
+            let next = crate::time::now() + self.shared.opts.sn.retry;
             self.retry.unacked.insert(
                 key,
                 Retry {
@@ -66,7 +66,7 @@ impl Client {
     pub(super) fn fall_asleep(&mut self, seconds: u16) {
         let max = self.shared.opts.sn.max_keep_alive.max(1);
         let duration = Duration::from_secs(u64::from(seconds.clamp(1, max)));
-        let now = Instant::now();
+        let now = crate::time::now();
         self.sleep.until = Some((now + duration.mul_f32(1.5), duration));
         self.sleep.pinged = Some(now);
     }
@@ -82,7 +82,7 @@ impl Client {
         }
         self.send(&sn::Packet::PingResp).await;
         if let Some((deadline, duration)) = &mut self.sleep.until {
-            *deadline = Instant::now() + duration.mul_f32(1.5);
+            *deadline = crate::time::now() + duration.mul_f32(1.5);
         }
         true
     }
@@ -97,7 +97,7 @@ impl Client {
     /// Retransmissions, and keep alive on behalf of a sleeping client.
     /// Returns false when the client is gone.
     pub(super) async fn on_tick(&mut self, pipe: &mut DuplexStream) -> bool {
-        let now = Instant::now();
+        let now = crate::time::now();
         if let Some((deadline, _)) = self.sleep.until {
             if now > deadline {
                 return false;

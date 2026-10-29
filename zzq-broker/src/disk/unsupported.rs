@@ -4,7 +4,7 @@ use std::io;
 use std::path::Path;
 use std::task::{Context, Poll};
 
-use super::Completion;
+use super::{Completion, Log};
 
 /// A journal record.
 #[derive(Debug)]
@@ -42,11 +42,11 @@ impl DataDir {
     }
 }
 
-/// No journal.
+/// No journal on disk.
 #[derive(Debug)]
-pub(crate) enum Log {}
+pub(crate) enum DiskLog {}
 
-impl Log {
+impl DiskLog {
     pub(crate) fn append(&mut self, _kind: u8, _parts: &[&[u8]]) -> io::Result<u64> {
         match *self {}
     }

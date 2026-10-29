@@ -5,24 +5,21 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
 use zzq_proto::QoS;
 use zzq_proto::topic::validate_name;
-use zzq_tokio::transport::Listener;
 use zzq_tokio::{Context, Endpoint};
 
-use crate::conn::ConnDriver;
-use crate::disk::{self, DataDir};
+use crate::disk::DataDir;
 use crate::durable::{Cursor, JournalId};
 use crate::lane::{Control, Lane, LaneLog, LaneRef, LaneStats, Phase, Remote};
 use crate::mailbox::{self, Mailbox};
 use crate::msg::Msg;
 use crate::options::BrokerOptions;
-use crate::retain::{Retained, STRIPES};
-use crate::state::SessionState;
+use crate::retain::Retained;
 use crate::{Error, Result};
 
 /// Batches in flight to one lane before senders wait.
@@ -35,8 +32,17 @@ const SWEEP: Duration = Duration::from_millis(1000 / crate::lane::SWEEP_PARTS as
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
+mod listen;
+mod open;
+
+pub(crate) use listen::{admit, listen};
+pub(crate) use open::Opened;
+use open::{blocking, check, open_data, start};
+
 thread_local! {
-    static LANES: RefCell<HashMap<u64, LaneRef>> = RefCell::new(HashMap::new());
+    /// Lane state by broker and lane: one thread runs several lanes of a
+    /// context made with `Context::local`.
+    static LANES: RefCell<HashMap<(u64, u16), LaneRef>> = RefCell::new(HashMap::new());
 }
 
 /// Sends batches for other lanes collected on `lane`. Waits while a target
@@ -89,9 +95,10 @@ async fn ship_waiting(lane: &LaneRef) {
     }
 }
 
-/// The lane state of broker `id` on the current lane thread.
-pub(crate) fn lane_ref(id: u64) -> Option<LaneRef> {
-    LANES.with(|l| l.borrow().get(&id).cloned())
+/// The state of lane `lane` of broker `id`, on that lane's thread.
+pub(crate) fn lane_ref(id: u64, lane: usize) -> Option<LaneRef> {
+    let lane = u16::try_from(lane).ok()?;
+    LANES.with(|l| l.borrow().get(&(id, lane)).cloned())
 }
 
 #[derive(Debug)]
@@ -119,6 +126,8 @@ pub(crate) struct Shared {
     pairs: Box<[Cursor]>,
     /// The disk threads of `opts.data_dir`, after the journals they serve.
     data: Option<DataDir>,
+    /// With `opts.cluster`: the groups the journals hand to the replica.
+    cluster: Option<Arc<crate::cluster::Groups>>,
     pub(crate) lanes: Box<[LaneTx]>,
     /// Connected clients on all lanes, for `max_connections`.
     pub(crate) connections: AtomicUsize,
@@ -137,9 +146,21 @@ impl Shared {
         }
     }
 
-    /// Whether the broker has a data directory.
+    /// Whether the broker journals its state: to a data directory, or to
+    /// the cluster.
     pub(crate) const fn journals(&self) -> bool {
-        self.data.is_some()
+        self.data.is_some() || self.cluster.is_some()
+    }
+
+    /// Whether the broker is a node of a cluster.
+    pub(crate) const fn clustered(&self) -> bool {
+        self.cluster.is_some()
+    }
+
+    /// The groups the cluster journals hand to the replica. Only called
+    /// with a cluster.
+    pub(crate) fn cluster_groups(&self) -> Arc<crate::cluster::Groups> {
+        self.cluster.clone().unwrap_or_default()
     }
 
     /// Bytes the state may take: `max_state_bytes`, and no more than the
@@ -196,9 +217,13 @@ impl Shared {
 
     /// Stops `task` with the broker, or now if the broker stopped already,
     /// as a bind cancelled before its listener was up may find it.
-    fn own_task(&self, task: AbortHandle) {
+    pub(crate) fn own_task(&self, task: AbortHandle) {
         match &mut *self.tasks.lock().unwrap_or_else(PoisonError::into_inner) {
-            Some(tasks) => tasks.push(task),
+            Some(tasks) => {
+                // Listeners come and go with a cluster's leadership.
+                tasks.retain(|t| !t.is_finished());
+                tasks.push(task);
+            }
             None => task.abort(),
         }
     }
@@ -324,6 +349,7 @@ impl Broker {
         let Opened {
             retained,
             data,
+            cluster,
             lane_logs,
             sessions,
         } = open_data(&opts, n).await?;
@@ -336,6 +362,7 @@ impl Broker {
             lane_logs,
             pairs: (0..n * n).map(|_| Cursor::default()).collect(),
             data,
+            cluster,
             lanes: lanes.into_boxed_slice(),
             connections: AtomicUsize::new(0),
             tasks: Mutex::new(Some(Vec::new())),
@@ -350,23 +377,16 @@ impl Broker {
                 .call(move || install(i as u16, s, ctl_rx, data_rx))
                 .await?;
         }
-        if shared.data.is_some() {
-            complete_writes(&shared).await?;
-            crate::dump::restore(&shared, sessions).await?;
-        }
-        if let Some(path) = &shared.opts.state_file {
-            crate::dump::load(&shared, path).await?;
-        }
-        if let Some(every) = shared.opts.sys_interval {
-            let s = shared.clone();
-            ctx.lane(0)
-                .call(move || {
-                    let task = tokio::task::spawn_local(crate::sys::run(s.clone(), every));
-                    s.own_task(task.abort_handle());
-                })
-                .await?;
-        }
+        start(&shared, sessions).await?;
         Ok(broker)
+    }
+
+    /// The broker's node of a cluster, as its replica last saw it. Engine
+    /// API for the simulator.
+    #[doc(hidden)]
+    pub fn cluster_status(&self) -> Option<zzq_cluster::node::NodeStatus> {
+        let groups = self.shared.cluster.as_ref()?;
+        *groups.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The ID that tells this broker's lane state apart on a lane thread.
@@ -387,30 +407,16 @@ impl Broker {
     ///
     /// [`Error::Transport`] if the URI is invalid or binding fails, for
     /// example because the address is in use.
+    ///
+    /// A node of a cluster listens only while it leads: it binds `uri`
+    /// then, and closes its listeners and connections when it no longer
+    /// does. It returns `uri` as given.
     pub async fn bind(&self, uri: &str) -> Result<Endpoint> {
         let endpoint = uri.parse::<Endpoint>()?;
-        let (tx, rx) = oneshot::channel();
-        let shared = self.shared.clone();
-        let lane = self.shared.ctx.next_lane().clone();
-        lane.spawn(move || async move {
-            if matches!(endpoint, Endpoint::Udp { .. }) {
-                bind_udp(shared, endpoint, tx).await;
-                return;
-            }
-            let listener =
-                match Listener::bind(&shared.ctx, &endpoint, &shared.opts.transport).await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        let _ = tx.send(Err(e));
-                        return;
-                    }
-                };
-            let bound = listener.endpoint();
-            let task = tokio::task::spawn_local(accept_loop(shared.clone(), listener));
-            shared.own_task(task.abort_handle());
-            let _ = tx.send(Ok(bound));
-        })?;
-        Ok(rx.await.map_err(|_| Error::Closed)??)
+        if self.shared.cluster.is_some() {
+            return crate::cluster::bind(&self.shared, endpoint).await;
+        }
+        Ok(listen(&self.shared, endpoint).await?.0)
     }
 
     /// Publishes a message as the broker itself. Messages to one topic
@@ -557,106 +563,6 @@ pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
     Ok(total)
 }
 
-/// What the data directory holds, or empty stores without one.
-struct Opened {
-    retained: Retained,
-    data: Option<DataDir>,
-    lane_logs: Box<[LaneLog]>,
-    /// The sessions of each lane.
-    sessions: Vec<Vec<SessionState>>,
-}
-
-/// Opens the journals in `opts.data_dir`, if it is set, for `n` lanes,
-/// with what they hold.
-async fn open_data(opts: &BrokerOptions, n: usize) -> Result<Opened> {
-    let Some(path) = opts.data_dir.clone() else {
-        return Ok(Opened {
-            retained: Retained::new(opts.max_retained),
-            data: None,
-            lane_logs: (0..n).map(|i| LaneLog::new(i, None)).collect(),
-            sessions: Vec::new(),
-        });
-    };
-    let (max_packet, max, levels) = (
-        opts.max_packet_size,
-        opts.max_retained,
-        opts.max_topic_levels,
-    );
-    // Replaying the journals reads files.
-    blocking(move || {
-        let data = DataDir::open(&path, max_packet)?;
-        let retained = Retained::open(&data, max, levels)?;
-        let (logs, sessions) = disk::open_lanes(&data, n)?
-            .into_iter()
-            .enumerate()
-            .map(|(i, (log, sessions))| (LaneLog::new(i, Some(log)), sessions))
-            .unzip::<_, _, Vec<_>, _>();
-        Ok(Opened {
-            retained,
-            data: Some(data),
-            lane_logs: logs.into(),
-            sessions,
-        })
-    })
-    .await?
-    .map_err(Error::DataDir)
-}
-
-/// Starts the task per retained stripe that takes its finished writes,
-/// spread over the lanes.
-async fn complete_writes(shared: &Arc<Shared>) -> Result<()> {
-    for i in 0..STRIPES {
-        let s = shared.clone();
-        shared
-            .ctx
-            .lane(i % shared.lanes.len())
-            .call(move || {
-                let task = tokio::task::spawn_local({
-                    let s = s.clone();
-                    async move { s.retained.complete(i).await }
-                });
-                s.own_task(task.abort_handle());
-            })
-            .await?;
-    }
-    Ok(())
-}
-
-/// Runs `f` on a thread of its own, for file work too long for a lane,
-/// with or without a Tokio runtime around the caller.
-async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Result<T> {
-    let (tx, rx) = oneshot::channel();
-    std::thread::Builder::new()
-        .name("zzq-files".to_owned())
-        .spawn(move || {
-            let _ = tx.send(f());
-        })
-        .map_err(Error::DataDir)?;
-    rx.await.map_err(|_| Error::Closed)
-}
-
-/// Refuses options the broker cannot work with.
-fn check(o: &BrokerOptions) -> Result<()> {
-    if o.sys_interval.is_some_and(|d| d.is_zero()) {
-        return Err(Error::InvalidOption("sys_interval"));
-    }
-    if o.sn.retry.is_zero() {
-        return Err(Error::InvalidOption("sn.retry"));
-    }
-    if o.sn.max_keep_alive == 0 {
-        return Err(Error::InvalidOption("sn.max_keep_alive"));
-    }
-    // A data directory keeps the sessions.
-    if o.data_dir.is_some() && o.state_file.is_some() {
-        return Err(Error::InvalidOption("state_file"));
-    }
-    // A v5 client must not get a Receive Maximum of 0.
-    if o.receive_maximum == 0 {
-        return Err(Error::InvalidOption("receive_maximum"));
-    }
-    Ok(())
-}
-
 /// Routes a message from the broker itself. Messages to one topic go
 /// through one lane, so they keep their order.
 pub(crate) fn publish(shared: &Shared, msg: Msg) -> Result<()> {
@@ -691,8 +597,8 @@ fn install(
 ) {
     let broker = shared.id;
     let lane: LaneRef = Rc::new(RefCell::new(Lane::new(id, shared.clone())));
-    LANES.with(|l| l.borrow_mut().insert(broker, lane.clone()));
-    if shared.data.is_some() {
+    LANES.with(|l| l.borrow_mut().insert((broker, id), lane.clone()));
+    if shared.journals() {
         let task = tokio::task::spawn_local(crate::lane::complete(lane.clone()));
         shared.own_task(task.abort_handle());
     }
@@ -709,7 +615,7 @@ fn install(
                     tokio::task::yield_now().await;
                 }
                 if last {
-                    LANES.with(|lanes| lanes.borrow_mut().remove(&broker));
+                    LANES.with(|lanes| lanes.borrow_mut().remove(&(broker, id)));
                     // Ends the data loop, which would otherwise keep the
                     // lane alive through the senders in `Shared`.
                     shared.lanes[usize::from(id)].data.close();
@@ -751,51 +657,12 @@ fn install(
                 if l.phase == Phase::ShutDown {
                     break;
                 }
-                l.sweep(Instant::now());
+                l.sweep(crate::time::now());
                 l.flush();
             }
             ship(&lane).await;
         }
     });
-}
-
-async fn accept_loop(shared: Arc<Shared>, mut listener: Listener) {
-    loop {
-        let stream = match listener.accept().await {
-            Ok(s) => s,
-            Err(zzq_tokio::Error::Closed) => return,
-            Err(_) => {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            }
-        };
-        tokio::task::spawn_local(admit(shared.clone(), stream));
-    }
-}
-
-/// Binds `udp://` and runs the MQTT-SN gateway on the current lane.
-async fn bind_udp(
-    shared: Arc<Shared>,
-    endpoint: Endpoint,
-    tx: oneshot::Sender<zzq_tokio::Result<Endpoint>>,
-) {
-    let socket = match zzq_tokio::transport::udp::bind(&endpoint).await {
-        Ok(s) => s,
-        Err(e) => {
-            let _ = tx.send(Err(e));
-            return;
-        }
-    };
-    let bound = match (&endpoint, socket.local_addr()) {
-        (Endpoint::Udp { host, .. }, Ok(a)) => Endpoint::Udp {
-            host: host.clone(),
-            port: a.port(),
-        },
-        _ => endpoint.clone(),
-    };
-    let task = tokio::task::spawn_local(crate::sn::gateway(shared.clone(), socket));
-    shared.own_task(task.abort_handle());
-    let _ = tx.send(Ok(bound));
 }
 
 /// The lane that owns sessions of `client_id`. Every connection of a client
@@ -805,41 +672,4 @@ pub fn lane_for(client_id: &str, lanes: usize) -> usize {
     use std::hash::{BuildHasher, BuildHasherDefault};
     let hash = BuildHasherDefault::<rustc_hash::FxHasher>::default().hash_one(client_id.as_bytes());
     (hash % lanes.max(1) as u64) as usize
-}
-
-/// Reads CONNECT on the accepting lane, then moves the connection to the
-/// lane that owns its client ID.
-pub(crate) async fn admit(shared: Arc<Shared>, stream: zzq_tokio::transport::Stream) {
-    let max = shared.opts.max_packet_size;
-    let mut buf = bytes::BytesMut::new();
-    // Stops at a whole CONNECT, a decode error, or a first byte that is not
-    // CONNECT, which the connection refuses without its body.
-    let done = |b: &[u8]| {
-        b.first().is_some_and(|&x| x >> 4 != 1)
-            || !matches!(zzq_proto::decode(b, zzq_proto::Version::V5, max), Ok(None))
-    };
-    let read =
-        tokio::time::timeout(shared.opts.connect_timeout, stream.prefetch(&mut buf, done)).await;
-    let Ok(Ok(stream)) = read else {
-        return;
-    };
-    let peer_cert = stream.peer_cert();
-    let lanes = shared.ctx.lanes();
-    let lane = match zzq_proto::decode(&buf, zzq_proto::Version::V5, max) {
-        Ok(Some((zzq_proto::Packet::Connect(c), _))) if !c.client_id.is_empty() => {
-            shared.ctx.lane(lane_for(c.client_id, lanes))
-        }
-        _ => shared.ctx.next_lane(),
-    };
-    let id = shared.id;
-    let _ = lane.spawn(move || async move {
-        if let Some(lane) = lane_ref(id) {
-            let driver = ConnDriver {
-                lane,
-                initial: buf,
-                peer_cert,
-            };
-            let _ = stream.drive(driver).await;
-        }
-    });
 }

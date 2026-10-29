@@ -1,12 +1,14 @@
 //! Sessions rebuilt from the records of a lane journal.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 use zzq_proto::topic::validate_filter;
 use zzq_proto::{QoS, SubscriptionOptions, Version};
 
+use crate::disk::Append;
 use crate::index::SubIds;
 use crate::msg::Msg;
 use crate::session::{Queued, Will};
@@ -30,7 +32,7 @@ pub(crate) struct Sessions {
     msg: Option<Msg>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Replayed {
     /// Without subscriptions, inbound packet IDs or deliveries.
     st: SessionState,
@@ -43,7 +45,7 @@ struct Replayed {
     connected: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Item {
     queued: Queued,
     /// The packet ID it went out under, if that matters.
@@ -118,6 +120,26 @@ impl Sessions {
             out.push(r.finish(now));
         }
         out
+    }
+
+    /// Appends records that rebuild these sessions as they stand, with
+    /// their delivery numbers and connections, then the message for the
+    /// deliveries that may follow.
+    pub(crate) fn image(&self, out: &mut impl Append, clock: Clock) -> io::Result<()> {
+        let mut buf = Vec::new();
+        out.append(CLEAR, &[])?;
+        for r in self.by_client.values() {
+            buf.clear();
+            super::image_state(&mut buf, r.clone().into_state(), r.connected, clock);
+            out.append(IMAGE, &[&buf])?;
+        }
+        out.append(CLEARED, &[])?;
+        if let Some(m) = &self.msg {
+            buf.clear();
+            crate::state::msg_head(&mut buf, m, clock);
+            out.append(MSG, &[&buf, m.payload()])?;
+        }
+        Ok(())
     }
 }
 
@@ -235,6 +257,16 @@ impl Replayed {
 
     /// The session; still connected, it lost its connection `now`.
     fn finish(self, now: Instant) -> SessionState {
+        let connected = self.connected;
+        let mut st = self.into_state();
+        if connected {
+            lost(&mut st, now);
+        }
+        st
+    }
+
+    /// The session as it stands, its deliveries in order.
+    fn into_state(self) -> SessionState {
         let mut st = self.st;
         st.subs = self
             .subs
@@ -259,9 +291,6 @@ impl Replayed {
         }
         st.seqs.extend(queue_seqs);
         st.last_seq = self.last_seq;
-        if self.connected {
-            lost(&mut st, now);
-        }
         st
     }
 }

@@ -1,0 +1,356 @@
+//! The replica task: one per broker, on a lane. It owns the node, turns
+//! the journals' groups into ops while it leads and their commits into
+//! written records, and keeps a follower's state until the node leads.
+
+use std::collections::VecDeque;
+use std::sync::Arc;
+use std::time::Duration;
+
+use bytes::Bytes;
+use rustc_hash::FxHashMap;
+use tokio::sync::mpsc;
+use zzq_cluster::OpNumber;
+use zzq_cluster::node::{Event, Node, Outgoing, ProposeError, Role};
+
+use super::app::Accumulators;
+use super::image::{self, Cut};
+use super::log::{Commits, Group, Journal};
+use crate::broker::Shared;
+
+/// Polls of the node without a deadline wait at most this long.
+const IDLE: Duration = Duration::from_millis(50);
+
+/// An op this leader proposed and the records it carries.
+#[derive(Debug)]
+struct Proposed {
+    op: OpNumber,
+    journal: Journal,
+    first: u64,
+    last: u64,
+}
+
+/// Where the broker's state lives.
+#[derive(Debug)]
+enum App {
+    /// Rebuilt from replicated ops; no lane serves it.
+    Follower(Accumulators),
+    /// In the lanes, which serve clients.
+    Leader,
+}
+
+pub(crate) struct Replica {
+    shared: Arc<Shared>,
+    node: Node,
+    outbound: mpsc::Sender<Outgoing>,
+    inbound: mpsc::Receiver<[Bytes; 3]>,
+    /// Groups not proposed yet: the pipeline was full.
+    held: VecDeque<Group>,
+    /// Ops proposed and not committed yet, oldest first.
+    proposed: VecDeque<Proposed>,
+    /// The last record of each journal taken from its groups, so a group
+    /// knows its first.
+    taken: FxHashMap<Journal, u64>,
+    app: App,
+    /// The image a leader cut, until its groups are proposed.
+    cut: Option<Cut>,
+    origin: tokio::time::Instant,
+}
+
+impl std::fmt::Debug for Replica {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Replica")
+            .field("role", &self.node.role())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Replica {
+    pub(crate) fn new(
+        shared: Arc<Shared>,
+        node: Node,
+        outbound: mpsc::Sender<Outgoing>,
+        inbound: mpsc::Receiver<[Bytes; 3]>,
+    ) -> Replica {
+        let lanes = shared.lanes.len();
+        let levels = shared.opts.max_topic_levels;
+        Replica {
+            shared,
+            node,
+            outbound,
+            inbound,
+            held: VecDeque::new(),
+            proposed: VecDeque::new(),
+            taken: FxHashMap::default(),
+            app: App::Follower(Accumulators::new(lanes, levels)),
+            cut: None,
+            origin: tokio::time::Instant::now(),
+        }
+    }
+
+    fn now(&self) -> Duration {
+        self.origin.elapsed()
+    }
+
+    /// Runs until the broker stops: input, node, output, events.
+    pub(crate) async fn run(mut self) {
+        let groups = self.shared.cluster_groups();
+        loop {
+            let now = self.now();
+            let wait = self
+                .node
+                .next_deadline()
+                .map_or(IDLE, |d| d.saturating_sub(now))
+                .min(IDLE);
+            tokio::select! {
+                biased;
+                frames = self.inbound.recv() => match frames {
+                    Some(frames) => {
+                        let _ = self.node.receive(&frames, self.now());
+                    }
+                    None => return,
+                },
+                () = groups.ready.ready() => self.held.extend(groups.take()),
+                () = tokio::time::sleep(wait) => {}
+            }
+            let now = self.now();
+            if self.node.poll(now).is_err() {
+                // The core faulted: this node serves nothing until restart.
+                self.fail_proposed();
+            }
+            self.propose(now);
+            while let Some(out) = self.node.next_outgoing() {
+                // A full link drops; the node sends again.
+                let _ = self.outbound.try_send(out);
+            }
+            while let Some(event) = self.node.next_event() {
+                self.event(event).await;
+            }
+            self.offer_cut();
+            *groups
+                .status
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(self.node.status());
+        }
+    }
+
+    /// Proposes the held groups while leading, as far as the pipeline
+    /// takes them. Not leading, they fail.
+    fn propose(&mut self, now: Duration) {
+        while let Some(g) = self.held.front() {
+            match self.node.propose(g.body.clone(), now) {
+                Ok(op) => {
+                    let Some(g) = self.held.pop_front() else {
+                        break;
+                    };
+                    let (first, last) = self.span(&g);
+                    if let Some(cut) = &mut self.cut {
+                        cut.proposed(g.journal, last, op.op);
+                    }
+                    self.proposed.push_back(Proposed {
+                        op: op.op,
+                        journal: g.journal,
+                        first,
+                        last,
+                    });
+                }
+                Err(ProposeError::Full) => break,
+                // Not leading: these records never commit here.
+                Err(_) => {
+                    self.fail_held();
+                    break;
+                }
+            }
+        }
+    }
+
+    fn fail_held(&mut self) {
+        for g in std::mem::take(&mut self.held) {
+            let (first, last) = self.span(&g);
+            if let Some(c) = commits(&self.shared, g.journal) {
+                c.fail(first, last);
+            }
+        }
+    }
+
+    /// The records of `g`: after the last its journal handed over.
+    fn span(&mut self, g: &Group) -> (u64, u64) {
+        let taken = self.taken.entry(g.journal).or_insert(0);
+        let first = (*taken + 1).min(g.last);
+        *taken = g.last.max(*taken);
+        (first, g.last)
+    }
+
+    /// Fails every op proposed that did not commit: the leadership went.
+    fn fail_proposed(&mut self) {
+        for p in std::mem::take(&mut self.proposed) {
+            if let Some(c) = commits(&self.shared, p.journal) {
+                c.fail(p.first, p.last);
+            }
+        }
+    }
+
+    async fn event(&mut self, event: Event) {
+        match event {
+            Event::Committed(through) => {
+                while self.proposed.front().is_some_and(|p| p.op <= through) {
+                    if let Some(p) = self.proposed.pop_front()
+                        && let Some(c) = commits(&self.shared, p.journal)
+                    {
+                        c.commit(p.last);
+                    }
+                }
+            }
+            Event::Apply { op, body } => {
+                if let App::Follower(acc) = &mut self.app
+                    && acc.apply(op.op, &body).is_ok()
+                {
+                    let _ = self.node.applied(op.op);
+                }
+            }
+            Event::CutImage => self.cut_image().await,
+            Event::Image { bytes, .. } => self.install(&bytes),
+            Event::Role(Role::Leader) => self.promote().await,
+            Event::Role(_) => self.demote().await,
+            Event::Reset => self.app = App::Follower(self.empty()),
+            _ => {}
+        }
+    }
+
+    fn empty(&self) -> Accumulators {
+        Accumulators::new(self.shared.lanes.len(), self.shared.opts.max_topic_levels)
+    }
+
+    /// A follower's state becomes the image's. One that does not fit is
+    /// dropped, and the state comes again.
+    fn install(&mut self, bytes: &Bytes) {
+        let (lanes, levels) = (self.shared.lanes.len(), self.shared.opts.max_topic_levels);
+        let acc = image::decode(bytes).and_then(|p| Accumulators::from_image(lanes, levels, &p));
+        let Ok(acc) = acc else {
+            self.app = App::Follower(self.empty());
+            self.node.reset_application();
+            return;
+        };
+        self.app = App::Follower(acc);
+    }
+
+    /// Cuts an image to offer: a follower its state at once; a leader asks
+    /// each lane for its part, cuts the stripes here, and offers once the
+    /// groups they sealed are proposed.
+    async fn cut_image(&mut self) {
+        let App::Follower(acc) = &self.app else {
+            self.cut = self.cut_lanes().await;
+            return;
+        };
+        let applied = self.node.status().applied;
+        let parts = acc.image(applied);
+        let _ = self
+            .node
+            .offer_image(applied, applied, image::encode(&parts));
+    }
+
+    async fn cut_lanes(&self) -> Option<Cut> {
+        let mut asked = Vec::new();
+        for lane in &self.shared.lanes {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            lane.control.push(crate::lane::Control::CutImage(tx)).ok()?;
+            asked.push(rx);
+        }
+        let mut cut = Cut::default();
+        for (j, rx) in asked.into_iter().enumerate() {
+            let (last, body) = rx.await.ok()?;
+            cut.add(Journal::Lane(u16::try_from(j).ok()?), last, body);
+        }
+        let retained = &self.shared.retained;
+        for s in 0..retained.stripes() {
+            let (last, body) = retained.cut_image(s)?;
+            cut.add(Journal::Retained(u8::try_from(s).ok()?), last, body);
+        }
+        Some(cut)
+    }
+
+    /// Offers the leader's image once its groups are proposed.
+    fn offer_cut(&mut self) {
+        let Some(cut) = &self.cut else {
+            return;
+        };
+        let taken = &self.taken;
+        let tip = self.node.status().log_last;
+        if let Some((predecessor, position, bytes)) =
+            cut.finish(|j| taken.get(&j).copied().unwrap_or(0), tip)
+        {
+            self.cut = None;
+            let _ = self.node.offer_image(predecessor, position, bytes);
+        }
+    }
+
+    /// Hands the follower's state to the lanes, which serve it from now.
+    async fn promote(&mut self) {
+        let App::Follower(acc) = std::mem::replace(&mut self.app, App::Leader) else {
+            return;
+        };
+        let (sessions, retained) = acc.finish();
+        retained.install(&self.shared.retained);
+        let _ = crate::dump::restore(&self.shared, sessions).await;
+        super::open_listeners(&self.shared).await;
+    }
+
+    /// The node no longer leads: what it proposed and did not commit
+    /// fails, and the lanes drop their state, which may hold such changes.
+    /// The committed state comes back as a follower's, from the ops again
+    /// or an image.
+    async fn demote(&mut self) {
+        if !matches!(self.app, App::Leader) {
+            return;
+        }
+        self.fail_proposed();
+        super::close_listeners(&self.shared);
+        let mut done = Vec::new();
+        for lane in &self.shared.lanes {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if lane.control.push(crate::lane::Control::Reset(tx)).is_ok() {
+                done.push(rx);
+            }
+        }
+        for rx in done {
+            let _ = rx.await;
+        }
+        self.shared.retained.reset();
+        // What the lanes handed over before they dropped their state goes
+        // with it, and the numbers of what they discarded are passed.
+        self.held.extend(self.shared.cluster_groups().take());
+        self.fail_held();
+        for j in journals(&self.shared) {
+            if let Some(n) = appended(&self.shared, j) {
+                let taken = self.taken.entry(j).or_insert(0);
+                *taken = n.max(*taken);
+            }
+        }
+        self.cut = None;
+        self.node.reset_application();
+        self.app = App::Follower(self.empty());
+    }
+}
+
+/// Every journal of the broker.
+fn journals(shared: &Shared) -> impl Iterator<Item = Journal> {
+    let lanes = (0..shared.lanes.len()).filter_map(|j| u16::try_from(j).ok().map(Journal::Lane));
+    let stripes =
+        (0..shared.retained.stripes()).filter_map(|s| u8::try_from(s).ok().map(Journal::Retained));
+    lanes.chain(stripes)
+}
+
+/// The number of the last record `journal` appended.
+fn appended(shared: &Shared, journal: Journal) -> Option<u64> {
+    match journal {
+        Journal::Lane(i) => shared.lane_logs.get(usize::from(i))?.cluster_appended(),
+        Journal::Retained(s) => shared.retained.cluster_appended(usize::from(s)),
+    }
+}
+
+/// The commits of `journal`, through the broker's journals.
+pub(crate) fn commits(shared: &Shared, journal: Journal) -> Option<Arc<Commits>> {
+    match journal {
+        Journal::Lane(i) => shared.lane_logs.get(usize::from(i))?.commits(),
+        Journal::Retained(s) => shared.retained.commits(usize::from(s)),
+    }
+}

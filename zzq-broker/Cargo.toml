@@ -24,6 +24,7 @@ fuzzing = []
 [dependencies]
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-tokio = { workspace = true, default-features = false }
+zzq-cluster = { path = "../zzq-cluster" }
 bytes = { workspace = true, features = ["std"] }
 bytestring.workspace = true
 rustc-hash.workspace = true
@@ -44,4 +45,4 @@ rcgen = "0.14"
 zzq-client = { path = "../zzq-client" }
 zzq-proto = { workspace = true, features = ["std"] }
 
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

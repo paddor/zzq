@@ -163,7 +163,7 @@ impl Lane {
     /// lane and their delayed wills timed.
     pub(super) fn restore(&mut self, states: Vec<SessionState>, sync: &Arc<SyncAck>) {
         let lanes = self.shared.lanes.len();
-        let now = Instant::now();
+        let now = crate::time::now();
         // Sessions come from the journal, or from a state file without one.
         let journaled = self.journals();
         for st in states {
@@ -188,6 +188,22 @@ impl Lane {
             }
         }
         self.stats.subscriptions = self.index.len() as u64;
+    }
+
+    /// Starts over empty, without journaling: the node no longer leads,
+    /// and what the lane holds may not have committed. Connections close;
+    /// their clients go to the new leader.
+    pub(crate) fn reset(&mut self) {
+        let keys: Vec<Key> = self.sessions.keys().collect();
+        for key in keys {
+            if let Some(s) = self.sessions.get_mut(key)
+                && let Some(c) = s.conn.take()
+            {
+                Self::kick(&c, s.version, reason::USE_ANOTHER_SERVER);
+            }
+        }
+        self.shared.lane_logs[usize::from(self.id)].discard();
+        *self = Lane::new(self.id, self.shared.clone());
     }
 
     pub(crate) fn shutdown(&mut self) {

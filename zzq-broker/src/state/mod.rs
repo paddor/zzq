@@ -28,7 +28,7 @@
 //! a session could not have.
 
 use std::io::{self, Write};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use xxhash_rust::xxh3::xxh3_64;
 use zzq_proto::{SubscriptionOptions, Version};
@@ -59,12 +59,9 @@ pub(crate) struct Clock {
 
 impl Clock {
     pub(crate) fn now() -> Clock {
-        let wall = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
         Clock {
-            now: Instant::now(),
-            wall_ms: millis(wall),
+            now: crate::time::now(),
+            wall_ms: millis(crate::time::unix_now()),
         }
     }
 
@@ -106,7 +103,7 @@ pub(crate) type Sub = (Box<str>, SubscriptionOptions, u32);
 pub(crate) type Sent = (u16, Queued, bool);
 
 /// A session as an image holds it, before a lane restores it.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SessionState {
     pub(crate) client_id: Box<str>,
     pub(crate) username: Option<Box<str>>,

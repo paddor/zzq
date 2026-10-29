@@ -12,7 +12,8 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::Poll;
 use std::time::Instant;
 
-use crate::disk::{self, Completion, DataDir, Log, Record};
+use crate::cluster::{GroupWriter, Journal};
+use crate::disk::{self, Append, Completion, DataDir, Log, Record};
 use crate::durable::{Cursor, JournalId, Journaled, RETRY, Wait};
 use crate::msg::{Msg, expired, too_deep};
 use crate::state::{self, Clock};
@@ -88,6 +89,67 @@ fn stripe_of(topic: &str) -> usize {
 }
 
 impl Retained {
+    /// A store whose stripes journal to the cluster: `log` makes the
+    /// journal of each.
+    pub(crate) fn clustered(max: usize, mut log: impl FnMut(usize) -> Log) -> Retained {
+        let r = Retained::new(max);
+        for (i, stripe) in r.stripes.iter().enumerate() {
+            stripe.lock().log = Some(log(i));
+        }
+        r
+    }
+
+    /// Drops every message, without journaling, and what the stripes'
+    /// cluster journals hold back: the node no longer leads.
+    pub(crate) fn reset(&self) {
+        for stripe in &self.stripes {
+            let mut st = stripe.lock();
+            let n = st.tree.len();
+            st.tree = Tree::default();
+            st.stale = false;
+            if let Some(log) = st.log.as_mut() {
+                log.discard();
+            }
+            drop(st);
+            self.len.fetch_sub(n, Ordering::Relaxed);
+        }
+    }
+
+    /// The number of the last record stripe `i`'s cluster journal appended.
+    pub(crate) fn cluster_appended(&self, i: usize) -> Option<u64> {
+        self.stripes.get(i)?.lock().log.as_ref()?.cluster_appended()
+    }
+
+    /// Stripes, each with its own journal.
+    pub(crate) const fn stripes(&self) -> usize {
+        self.stripes.len()
+    }
+
+    /// A cluster leader's part of an image for stripe `i`: its records so
+    /// far go to the replica, and its messages after them become a group
+    /// body. Returns the number of the last record the part holds.
+    pub(crate) fn cut_image(&self, i: usize) -> Option<(u64, bytes::Bytes)> {
+        let mut st = self.stripes.get(i)?.lock();
+        let State {
+            tree, log, head, ..
+        } = &mut *st;
+        let last = match log.as_mut() {
+            Some(Log::Cluster(c)) => {
+                c.flush();
+                c.appended()
+            }
+            _ => 0,
+        };
+        let mut part = GroupWriter::new(Journal::Retained(u8::try_from(i).ok()?));
+        let _ = put_messages(&mut part, tree, head, Clock::now());
+        Some((last, part.finish()))
+    }
+
+    /// The commits of stripe `i`'s cluster journal.
+    pub(crate) fn commits(&self, i: usize) -> Option<std::sync::Arc<crate::cluster::Commits>> {
+        self.stripes.get(i)?.lock().log.as_ref()?.commits()
+    }
+
     /// A store in memory only.
     pub(crate) fn new(max: usize) -> Retained {
         Retained {
@@ -275,11 +337,18 @@ impl Retained {
     pub(crate) async fn complete(&self, i: usize) {
         let stripe = &self.stripes[i];
         loop {
-            let done = std::future::poll_fn(|cx| match stripe.lock().log.as_mut() {
-                Some(log) => log.poll_complete(cx),
-                None => Poll::Ready(Completion::Closed),
-            })
-            .await;
+            let commits = stripe.lock().log.as_ref().and_then(Log::commits);
+            let clustered = commits.is_some();
+            let done = match commits {
+                Some(c) => c.next().await,
+                None => {
+                    std::future::poll_fn(|cx| match stripe.lock().log.as_mut() {
+                        Some(log) => log.poll_complete(cx),
+                        None => Poll::Ready(Completion::Closed),
+                    })
+                    .await
+                }
+            };
             match done {
                 Completion::Written(n) => {
                     stripe.cursor.advance(n);
@@ -291,6 +360,9 @@ impl Retained {
                         self.write_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+                // A cluster journal fails with the leadership, and the
+                // stripes drop their state: nothing to write again.
+                Completion::Failed(first, last) if clustered => stripe.cursor.fail(first, last),
                 Completion::Failed(first, last) => {
                     self.write_errors.fetch_add(1, Ordering::Relaxed);
                     let mut st = stripe.lock();
@@ -413,14 +485,7 @@ impl State {
         let Some(log) = log else {
             return Err(io::ErrorKind::NotConnected.into());
         };
-        let clock = Clock::now();
-        log.append(CLEAR, &[])?;
-        for m in tree.messages() {
-            head.clear();
-            state::msg_head(head, &m, clock);
-            log.append(KEPT, &[head, m.payload()])?;
-        }
-        let n = log.append(CLEARED, &[])?;
+        let n = put_messages(log, tree, head, Clock::now())?;
         log.flush()?;
         self.stale = false;
         Ok((n, log.backlog()))
@@ -460,6 +525,76 @@ impl State {
     }
 }
 
+/// The retained messages a follower rebuilds from the stripe records the
+/// leader replicates, until it leads and they go into its store.
+#[derive(Debug)]
+pub(crate) struct Accumulator {
+    trees: Vec<Tree>,
+    snapshots: Vec<Option<Tree>>,
+    max_levels: usize,
+}
+
+impl Accumulator {
+    pub(crate) fn new(max_levels: usize) -> Accumulator {
+        Accumulator {
+            trees: (0..STRIPES).map(|_| Tree::default()).collect(),
+            snapshots: (0..STRIPES).map(|_| None).collect(),
+            max_levels,
+        }
+    }
+
+    /// Applies a record of stripe `stripe`.
+    pub(crate) fn apply(
+        &mut self,
+        stripe: usize,
+        kind: u8,
+        body: &[u8],
+    ) -> Result<(), &'static str> {
+        let (Some(tree), Some(snapshot)) =
+            (self.trees.get_mut(stripe), self.snapshots.get_mut(stripe))
+        else {
+            return Err("unknown retained stripe");
+        };
+        Replay::new(self.max_levels).apply(tree, snapshot, stripe, Record { kind, body })
+    }
+
+    /// Appends a snapshot of stripe `stripe` to `out`.
+    pub(crate) fn image(&self, stripe: usize, out: &mut impl Append) -> io::Result<u64> {
+        let tree = self.trees.get(stripe).ok_or(io::ErrorKind::NotFound)?;
+        put_messages(out, tree, &mut Vec::new(), Clock::now())
+    }
+
+    /// Hands the trees to `retained`, in place of its own.
+    pub(crate) fn install(self, retained: &Retained) {
+        for (stripe, tree) in retained.stripes.iter().zip(self.trees) {
+            let mut st = stripe.lock();
+            let old = st.tree.len();
+            let new = tree.len();
+            st.tree = tree;
+            drop(st);
+            retained.len.fetch_add(new, Ordering::Relaxed);
+            retained.len.fetch_sub(old, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Appends a snapshot of the messages of `tree` to `out`. Returns the
+/// number of its last record.
+fn put_messages(
+    out: &mut impl Append,
+    tree: &Tree,
+    head: &mut Vec<u8>,
+    clock: Clock,
+) -> io::Result<u64> {
+    out.append(CLEAR, &[])?;
+    for m in tree.messages() {
+        head.clear();
+        state::msg_head(head, &m, clock);
+        out.append(KEPT, &[head, m.payload()])?;
+    }
+    out.append(CLEARED, &[])
+}
+
 /// Applies journal records to the trees of their stripes.
 #[derive(Debug, Clone, Copy)]
 struct Replay {
@@ -473,7 +608,7 @@ impl Replay {
     fn new(max_levels: usize) -> Replay {
         Replay {
             clock: Clock::now(),
-            now: Instant::now(),
+            now: crate::time::now(),
             max_levels,
         }
     }
@@ -553,7 +688,7 @@ pub(crate) fn replay_one(data: &[u8]) -> Result<usize, &'static str> {
 #[cfg(any(test, feature = "fuzzing"))]
 pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     let mut m = Msg::new("a/b", b"v", &[1, 1], zzq_proto::QoS::AtLeastOnce, true);
-    m.expires_at = Some(Instant::now() + std::time::Duration::from_secs(3600));
+    m.expires_at = Some(crate::time::now() + std::time::Duration::from_secs(3600));
     let mut set = vec![SET];
     state::msg_head(&mut set, &m, Clock::now());
     set.extend_from_slice(m.payload());
