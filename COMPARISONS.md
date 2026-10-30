@@ -4,10 +4,9 @@ How the brokers in [BENCHMARKS.md](BENCHMARKS.md) compare:
 
 - **Under load:** what they do with messages they cannot deliver, where
   the memory goes, and which defaults decide a benchmark. Measured on
-  one machine with tuned configs: zzq, HiveMQ CE, TBMQ and NATS on
-  2026-10-28 and 29, the rest on 2026-10-26.
+  one machine with tuned configs.
 - **With storage on:** the same load with each broker's most durable
-  setting, measured on 2026-10-28 and 29.
+  setting.
 - **What a crash or a failed node loses:** from each release's source,
   docs and issues. Failover is also measured, for four clusters.
 
@@ -17,8 +16,8 @@ Source links point to the release that ran.
 
 | Broker | Fan-in loss, QoS 0 / 1 / 2 | Peak RSS | Stalls a publisher | Fixed load fails at |
 | --- | --- | --- | --- | --- |
-| zzq, 1 IO lane | 0 / 0 / 0% | 119 MiB | no | 60K / 80K / - |
-| zzq, 2 IO lanes | 0.2 / 0 / 0% | 216 MiB | no | - / - / - |
+| zzq, 1 IO lane | 0 / 0 / 0% | 129 MiB | no | 60K / - / - |
+| zzq, 2 IO lanes | 0 / 0 / 0% | 168 MiB | no | - / - / - |
 | rmqtt | 0 / 59 / 76% | 3.6 GiB | no | - / 40K / - |
 | EMQX | 99.7 / 75 / 61% | 1.6 GiB | no | 40K / 40K / 200K |
 | Mosquitto | 0 / 12 / 0% | 57 MiB | yes | 40K / 40K / 150K |
@@ -124,8 +123,8 @@ sessions. Rates are deliveries per second in the 5 s window.
 
 | Broker | PUBACK after a synced write | Time to PUBACK, p50 | One QoS 1 pair, 16 B / 4 KiB | 16 QoS 1 pairs, 16 B | QoS 1 fan-in, 16 B | Fan-in lost, QoS 1 / 2 |
 | --- | --- | --- | --- | --- | --- | --- |
-| zzq, 1 IO lane | yes | 0.78 ms | 86K / 14K | 260K | 203K | 0 / 0% |
-| zzq, 2 IO lanes | yes | 0.83 ms | 62K / 20K | 228K | 352K | 0 / 0% |
+| zzq, 1 IO lane | yes | 0.79 ms | 46K / 23K | 203K | 287K | 0 / 0% |
+| zzq, 2 IO lanes | yes | 0.80 ms | 84K / 22K | 242K | 301K | 0 / 0% |
 | rmqtt | no | 45 µs | 28K / 18K | 13K | 30K | 5.6 / 24.7% |
 | EMQX | no | 177 µs | 15K / 11K | 21K | 18K | 0 / 0% |
 | Mosquitto | no | 47 µs | 31K / 23K | 28K | 20K | 0 / 0% |
@@ -151,8 +150,11 @@ sessions. Rates are deliveries per second in the 5 s window.
   QoS 1 fan-in, with the publishers acked. NATS at QoS 2 ran 0-282 msg/s
   from run to run and stalled for seconds; its 47% had not arrived 2 s
   after the last delivery, and a rerun of that cell lost nothing.
-- **zzq pays at 4 KiB.** One pair on one lane runs 14K msg/s, below
-  Mosquitto (23K) and rmqtt (18K), which do not wait for the disk.
+- **zzq pays at 4 KiB.** One pair runs 14K-23K msg/s from run to run,
+  no faster than Mosquitto (23K) and rmqtt (18K), which do not wait for
+  the disk.
+- **zzq moves with the disk.** Its rates swing up to 2x between runs: one
+  QoS 1 pair at 16 B on one lane ran 46K-88K msg/s in three runs.
 
 ## Durability
 
@@ -224,10 +226,10 @@ come back 2 s after.
 
 | Broker | Stop | Target/s | Acked | Lost | Duplicates | Reordered | Gap |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| zzq | KILL | 1K | 19.3K | 0 | 16 | 0 | 662 ms |
-| zzq | KILL, away | 1K | 19.3K | 0 | 0 | 0 | 665 ms |
-| zzq | KILL | 10K | 182K | 0 | 12 | 0 | 675 ms |
-| zzq | TERM | 1K | 19.3K | 0 | 0 | 0 | 661 ms |
+| zzq | KILL | 1K | 19.3K | 0 | 16 | 0 | 679 ms |
+| zzq | KILL, away | 1K | 19.3K | 0 | 0 | 0 | 662 ms |
+| zzq | KILL | 10K | 189K | 0 | 16 | 0 | 671 ms |
+| zzq | TERM | 1K | 19.3K | 0 | 0 | 0 | 667 ms |
 | VerneMQ | KILL | 1K | 8.0K | 3 | 0 | 0 | 12 s |
 | VerneMQ | KILL, away | 1K | 8.0K | 2.0K | 0 | 0 | 12 s |
 | VerneMQ | KILL | 10K | 36.7K | 36.3K | 0 | 0 | 12 s |
@@ -276,12 +278,14 @@ to the release that ran.
     messages queued, the publishers that feed it get their acks held
     until it is down to half. Publishers slow to the subscriber's pace.
   - QoS 0: past `max_out_bytes` waiting for one connection, QoS 0
-    messages to it are dropped and counted: 0.2% of QoS 0 fan-in at
-    4 KiB on 2 lanes.
-  - One lane is one CPU. At fixed load it fails point to point at 60K/s
-    and, in the latest run, fan-in at 80K/s (103 ms median, at 100% CPU);
-    earlier runs of fan-in at 80K/s passed with 7-76 ms. Two lanes pass
-    every step.
+    messages to it are dropped and counted. No throughput cell got there.
+  - A lane that falls behind another takes 8 MiB at a time, for all its
+    subscribers together. QoS 0 fan-out at 16 B on 2 lanes peaks at 31 MiB
+    of RSS with 13 of 16 subscribers on the other lane, and at 143 MiB
+    with 156 of 256.
+  - One lane is one CPU. At fixed load it fails point to point at 60K/s.
+    Fan-in at 80K/s passes at 100% CPU with a 14 ms median, though it
+    failed one earlier run at 103 ms. Two lanes pass every step.
   - An offline session queues up to `max_queued` messages and
     `max_queued_bytes`; past that the oldest are dropped and counted.
     `max_state_bytes` bounds all sessions, queues and retained messages.
@@ -303,7 +307,7 @@ to the release that ran.
     once the leader and one follower hold it in RAM.
   - Only the leader listens, so a load balancer's TCP health check finds
     it.
-  - Measured: 0.66 s without a PUBACK after the leader was killed or
+  - Measured: 0.66-0.68 s without a PUBACK after the leader was killed or
     stopped, and nothing acked lost. The gap is the 500 ms the followers
     wait for the leader, the election and the clients' reconnect; a stop
     is no faster than a kill.

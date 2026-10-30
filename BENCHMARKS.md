@@ -14,9 +14,9 @@ them.
   and its CPU and memory include theirs.
 - Before each run, the runner waits for 90% idle CPU and no compiler
   processes. A run that overlaps a compiler is repeated.
-- Each cell is one run. The charts show the newest run per cell: zzq,
-  HiveMQ CE, TBMQ, NATS and every run with storage on from 2026-10-28
-  and 29, the rest from 2026-10-26.
+- Each cell is one run. The charts show the newest run per cell: zzq from
+  2026-10-30, HiveMQ CE, TBMQ, NATS and the other runs with storage on from
+  2026-10-28 and 29, the rest from 2026-10-26.
 - Rivals run tuned configs: in-flight windows of about 1000, queues of about
   100K, no rate limits, and Nagle off where they have the knob. Several
   defaults drop messages or pace subscribers, which would measure the
@@ -62,7 +62,8 @@ this load, and why some configs differ from the tuned ones.
 - QoS 1 and 2 publishers keep up to 100 messages in flight. QoS 0 has no flow
   control, so it shows how a broker handles a subscriber that falls behind.
 - Round trip: one message in flight between two connections. The dot is
-  p99, the whiskers p50 and p99.9, on a log axis.
+  p99, the whiskers p50 and p99.9, on a linear axis up to 300 µs. A value
+  past that is cut, with the value in a label.
 - The CPU rows under each panel are the broker's CPU percent over the run,
   out of 400.
 

@@ -23,6 +23,10 @@ pub(crate) const WIDTH: u32 = 1440;
 /// Room for the title and hardware line above the first row.
 pub(crate) const TOP: u32 = 56;
 pub(crate) const PANEL_H: u32 = 260;
+/// Height of a round-trip panel on a linear axis.
+const LINEAR_RTT_H: u32 = 520;
+/// Top of a linear round-trip axis in microseconds, the same in each panel.
+const LINEAR_RTT_TOP: f64 = 300.0;
 pub(crate) const ROW_GAP: u32 = 50;
 const LEFT_LABELS: u32 = 62;
 const RIGHT_LABELS: u32 = 56;
@@ -68,7 +72,16 @@ pub(crate) enum RowData {
     /// msg/s per cell.
     Throughput(BTreeMap<Key, f64>),
     /// Round trip per cell.
-    Rtt(BTreeMap<Key, Latency>),
+    Rtt(BTreeMap<Key, Latency>, RttAxis),
+}
+
+/// The y axis of a round-trip row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RttAxis {
+    /// For brokers orders of magnitude apart.
+    Log,
+    /// For true distances between brokers, in a taller panel.
+    Linear,
 }
 
 impl RowData {
@@ -76,14 +89,14 @@ impl RowData {
     pub(crate) const fn qos_levels(&self) -> u8 {
         match self {
             RowData::Throughput(_) => 3,
-            RowData::Rtt(_) => 2,
+            RowData::Rtt(..) => 2,
         }
     }
 
     pub(crate) fn has(&self, key: &Key) -> bool {
         match self {
             RowData::Throughput(m) => m.contains_key(key),
-            RowData::Rtt(m) => m.contains_key(key),
+            RowData::Rtt(m, _) => m.contains_key(key),
         }
     }
 }
@@ -93,6 +106,16 @@ pub(crate) struct Row {
     pub(crate) data: RowData,
     /// CPU percent per cell.
     pub(crate) cpu: BTreeMap<Key, f64>,
+}
+
+impl Row {
+    /// Height of this row's panels, without CPU lines.
+    const fn height(&self) -> u32 {
+        match self.data {
+            RowData::Rtt(_, RttAxis::Linear) => LINEAR_RTT_H,
+            _ => PANEL_H,
+        }
+    }
 }
 
 /// Where a chart shows CPU.
@@ -182,8 +205,9 @@ impl Ranged for SizeAxis {
 pub(crate) fn draw(chart: &Chart<'_>) -> Result {
     let n_rows = u32::try_from(chart.rows.len())?;
     let legend_h = legend_height(chart.impls.len(), chart.notes.len());
-    let panel_h = PANEL_H + chart.cpu_h();
-    let body_h = TOP + n_rows * panel_h + n_rows.saturating_sub(1) * ROW_GAP;
+    let cpu_h = chart.cpu_h();
+    let rows_h: u32 = chart.rows.iter().map(|r| r.height() + cpu_h).sum();
+    let body_h = TOP + rows_h + n_rows.saturating_sub(1) * ROW_GAP;
     let height = body_h + legend_h;
     if let Some(dir) = chart.out.parent() {
         std::fs::create_dir_all(dir)?;
@@ -192,20 +216,22 @@ pub(crate) fn draw(chart: &Chart<'_>) -> Result {
     let root = SVGBackend::new(&chart.out, (WIDTH, height)).into_drawing_area();
     root.fill(&BACKGROUND)?;
     let mut titles = Vec::new();
-    for (i, row) in (0..).zip(&chart.rows) {
-        let y = TOP + i * (panel_h + ROW_GAP);
+    let mut y = TOP;
+    for row in &chart.rows {
+        let panel_h = row.height() + cpu_h;
         titles.push((y - 6, row.title));
         let area = root.clone().shrink((0, y), (WIDTH, panel_h));
         let panels = area.split_evenly((1, chart.qos.len()));
         for (qos, panel) in chart.qos.clone().zip(&panels) {
             match &row.data {
                 RowData::Throughput(msgs) => throughput_panel(panel, chart, row, msgs, qos)?,
-                RowData::Rtt(lat) if qos < row.data.qos_levels() => {
-                    rtt_panel(panel, chart, row, lat, qos)?;
+                RowData::Rtt(lat, axis) if qos < row.data.qos_levels() => {
+                    rtt_panel(panel, chart, row, lat, (*axis, qos))?;
                 }
-                RowData::Rtt(_) => not_measured(panel, qos)?,
+                RowData::Rtt(..) => not_measured(panel, qos)?,
             }
         }
+        y += panel_h + ROW_GAP;
     }
     let legend_area = root.clone().shrink((0, body_h), (WIDTH, legend_h));
     let cpu = (chart.cpu == CpuShow::Legend).then(|| median_cpu(chart));
@@ -349,31 +375,48 @@ fn configure_mesh(
 }
 
 /// One round-trip panel for one QoS level: p99 lines with whiskers from
-/// p50 to p99.9, on a log axis, so brokers milliseconds apart both show.
-/// The axis fits the p50s and p99 lines; a whisker past the top ends in a
-/// marker and a label with its p99.9.
+/// p50 to p99.9. A log axis fits the p50s and p99 lines. A linear axis ends
+/// at [`LINEAR_RTT_TOP`], so panels compare. A whisker past the top ends in
+/// a marker and a label with its p99.9.
 fn rtt_panel(
     area: &Area<'_>,
     chart: &Chart<'_>,
     row: &Row,
     lat: &BTreeMap<Key, Latency>,
-    qos: u8,
+    (axis, qos): (RttAxis, u8),
 ) -> Result {
     let sizes = chart.sizes;
-    let (low, peak) = lat
-        .iter()
-        .filter(|((_, q, _), _)| *q == qos)
-        .fold((f64::MAX, 0.0), |(low, peak), (_, l)| {
-            (low.min(l.p50), f64::max(peak, l.p99))
-        });
-    let axis = log_axis(low, peak * 1.6);
-    let top = axis.end;
-
-    let mut cc = panel(area, &format!("QoS {qos}"), false, chart.cpu_h())
-        .build_cartesian_2d(SizeAxis::new(sizes.len()), axis.log_scale())?;
+    let mut builder = panel(area, &format!("QoS {qos}"), false, chart.cpu_h());
+    let x_label = |v: &f64| size_label(sizes, *v);
+    let y_label = |v: &f64| fmt_us(*v);
+    if axis == RttAxis::Log {
+        let (low, peak) = lat
+            .iter()
+            .filter(|((_, q, _), _)| *q == qos)
+            .fold((f64::MAX, 0.0), |(low, peak), (_, l)| {
+                (low.min(l.p50), f64::max(peak, l.p99))
+            });
+        let axis = log_axis(low, peak * 1.6);
+        let top = axis.end;
+        let mut cc = builder.build_cartesian_2d(SizeAxis::new(sizes.len()), axis.log_scale())?;
+        cc.configure_mesh()
+            .x_label_formatter(&x_label)
+            .y_label_formatter(&y_label)
+            .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
+            .x_label_style(("sans-serif", 10).into_font().color(&TEXT))
+            .light_line_style(TRANSPARENT)
+            .bold_line_style(GRID)
+            .axis_style(AXIS)
+            .draw()?;
+        cpu_lines(area, &cc, chart, row, qos)?;
+        return rtt_lines(&mut cc, chart, lat, qos, top);
+    }
+    let (top, ticks) = nice_axis(LINEAR_RTT_TOP, 2 * N_TICKS);
+    let mut cc = builder.build_cartesian_2d(SizeAxis::new(sizes.len()), 0.0..top)?;
     cc.configure_mesh()
-        .x_label_formatter(&|v| size_label(sizes, *v))
-        .y_label_formatter(&|v| fmt_us(*v))
+        .x_label_formatter(&x_label)
+        .y_labels(ticks + 1)
+        .y_label_formatter(&y_label)
         .y_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .x_label_style(("sans-serif", 10).into_font().color(&TEXT))
         .light_line_style(TRANSPARENT)
@@ -381,27 +424,58 @@ fn rtt_panel(
         .axis_style(AXIS)
         .draw()?;
     cpu_lines(area, &cc, chart, row, qos)?;
+    rtt_lines(&mut cc, chart, lat, qos, top)
+}
 
-    // Each label gets its own line, so labels at nearby sizes cannot meet.
-    let mut labels = 0;
+/// The whiskers and p99 lines of a round-trip panel, the first impl on top.
+/// An impl with every p99 past `top` gets a label instead. A line with only
+/// some past it stops at `top`, with a label there.
+fn rtt_lines<C: CoordTranslate<From = (f64, f64)>>(
+    cc: &mut ChartContext<'_, SVGBackend<'_>, C>,
+    chart: &Chart<'_>,
+    lat: &BTreeMap<Key, Latency>,
+    qos: u8,
+    top: f64,
+) -> Result {
+    let sizes = chart.sizes;
+    // The next free label line at each size. Labels fit between two sizes.
+    let mut lines = vec![0; sizes.len()];
     for imp in chart.impls.iter().rev() {
-        for (i, &size) in sizes.iter().enumerate() {
-            let Some(l) = lat.get(&(imp.key, qos, size)) else {
-                continue;
-            };
-            whisker(&mut cc, i as f64, l, top, imp.color)?;
+        let cells: Vec<(usize, &Latency)> = (0..)
+            .zip(sizes)
+            .filter_map(|(i, &size)| Some((i, lat.get(&(imp.key, qos, size))?)))
+            .collect();
+        let (low, peak) = cells.iter().fold((f64::MAX, 0.0), |(low, peak), (_, l)| {
+            (low.min(l.p99), f64::max(peak, l.p99))
+        });
+        if low > top {
+            let text = format!("{} p99: {}-{}", imp.label, fmt_us(low), fmt_us(peak));
+            top_label(cc, (0.0, top), text, imp.color, &mut lines[0])?;
+            continue;
+        }
+        for &(i, l) in &cells {
+            whisker(cc, i as f64, l, top, imp.color)?;
             if l.p999 > top {
-                let right = i + 1 < sizes.len();
-                clip_label(&mut cc, (i as f64, top), l.p999, imp.color, (right, labels))?;
-                labels += 1;
+                let at = (i as f64, top);
+                let marker = TriangleMarker::new(at, 4, imp.color.filled());
+                cc.draw_series(std::iter::once(marker))?;
+                if l.p99 > top {
+                    let text = format!("p99: {}", fmt_us(l.p99));
+                    top_label(cc, at, text, imp.color, &mut lines[i])?;
+                }
+                let text = format!("p99.9: {}", fmt_us(l.p999));
+                top_label(cc, at, text, imp.color, &mut lines[i])?;
             }
         }
-        let pts = points(sizes, |size| lat.get(&(imp.key, qos, size)).map(|l| l.p99));
+        let pts = points(sizes, |size| {
+            lat.get(&(imp.key, qos, size)).map(|l| l.p99.min(top))
+        });
         cc.draw_series(LineSeries::new(
             pts.iter().copied(),
             imp.color.stroke_width(2),
         ))?;
-        cc.draw_series(pts.iter().map(|&p| Circle::new(p, 2, imp.color.filled())))?;
+        let dots = pts.iter().filter(|p| p.1 < top);
+        cc.draw_series(dots.map(|&p| Circle::new(p, 2, imp.color.filled())))?;
     }
     Ok(())
 }
@@ -476,33 +550,22 @@ pub(crate) fn whisker<C: CoordTranslate<From = (f64, f64)>>(
     Ok(())
 }
 
-/// Marks a whisker cut at `at` and labels its p99.9, right of the point
-/// unless `right` is false, in label row `row`.
-pub(crate) fn clip_label<C: CoordTranslate<From = (f64, f64)>>(
+/// `text` right of `at`, on label line `line`, which it then takes.
+fn top_label<C: CoordTranslate<From = (f64, f64)>>(
     cc: &mut ChartContext<'_, SVGBackend<'_>, C>,
     at: (f64, f64),
-    p999: f64,
+    text: String,
     color: RGBColor,
-    (right, row): (bool, i32),
+    line: &mut i32,
 ) -> Result {
-    cc.draw_series(std::iter::once(TriangleMarker::new(at, 4, color.filled())))?;
-    let (dx, h) = if right {
-        (8, HPos::Left)
-    } else {
-        (-8, HPos::Right)
-    };
     let style = ("sans-serif", 10)
         .into_font()
         .color(&color)
-        .pos(Pos::new(h, VPos::Top));
+        .pos(Pos::new(HPos::Left, VPos::Top));
     cc.draw_series(std::iter::once(
-        EmptyElement::at(at)
-            + Text::new(
-                format!("p99.9: {}", fmt_us(p999)),
-                (dx, 2 + 12 * row),
-                style,
-            ),
+        EmptyElement::at(at) + Text::new(text, (8, 2 + 12 * *line), style),
     ))?;
+    *line += 1;
     Ok(())
 }
 
@@ -646,7 +709,12 @@ pub(crate) fn fmt_us(v: f64) -> String {
     if v >= 1e6 {
         format!("{:.0} s", v / 1e6)
     } else if v >= 1e3 {
-        format!("{:.0} ms", v / 1e3)
+        let n = v / 1e3;
+        if (n - n.round()).abs() < 0.05 {
+            format!("{n:.0} ms")
+        } else {
+            format!("{n:.1} ms")
+        }
     } else {
         format!("{v:.0} \u{03bc}s")
     }
@@ -763,6 +831,7 @@ mod tests {
         assert_eq!(log_axis(0.0, 0.0), 1.0..2.0);
         assert_eq!(fmt_us(250.0), "250 \u{03bc}s");
         assert_eq!(fmt_us(20_000.0), "20 ms");
+        assert_eq!(fmt_us(1_500.0), "1.5 ms");
         assert_eq!(fmt_msgs(2.5e6), "2.5M/s");
         assert_eq!(fmt_gbs(0.004), "4.0 MB/s");
         assert_eq!(fmt_gbs(4.4), "4.4 GB/s");

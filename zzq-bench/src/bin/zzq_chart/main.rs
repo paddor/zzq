@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use data::{BrokerRow, ClientRow, FixedRow};
-use draw::{Chart, CpuShow, Impl, Key, Latency, Result, Row, RowData};
+use draw::{Chart, CpuShow, Impl, Key, Latency, Result, Row, RowData, RttAxis};
 use fixed::{FixedChart, Scenario, Step};
 use plotters::style::RGBColor;
 
@@ -234,6 +234,7 @@ fn brokers() -> Result {
         rows: broker_rows(
             &rows,
             "round trip, 1 message in flight: p99, whiskers p50 to p99.9",
+            RttAxis::Linear,
         ),
         cpu: CpuShow::BelowAxis,
         cpu_of: "broker",
@@ -263,6 +264,7 @@ fn durable() -> Result {
         rows: broker_rows(
             &rows,
             "time to PUBACK, 1 QoS 1 message in flight: p99, whiskers p50 to p99.9",
+            RttAxis::Log,
         ),
         cpu: CpuShow::BelowAxis,
         cpu_of: "broker",
@@ -306,8 +308,12 @@ fn newest_brokers(impls: &'static [Impl]) -> BTreeMap<BrokerCell, BrokerRow> {
     )
 }
 
-/// The throughput rows, then the round-trip row titled `rtt`.
-fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>, rtt_title: &'static str) -> Vec<Row> {
+/// The throughput rows, then the round-trip row titled `rtt_title`.
+fn broker_rows(
+    rows: &BTreeMap<BrokerCell, BrokerRow>,
+    rtt_title: &'static str,
+    rtt_axis: RttAxis,
+) -> Vec<Row> {
     let mut tput: Vec<BTreeMap<Key, f64>> = vec![BTreeMap::new(); BROKER_ROWS.len()];
     let mut cpu: Vec<BTreeMap<Key, f64>> = vec![BTreeMap::new(); BROKER_ROWS.len() + 1];
     let mut rtt = BTreeMap::new();
@@ -345,7 +351,7 @@ fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>, rtt_title: &'static str) 
         .collect();
     chart_rows.push(Row {
         title: rtt_title,
-        data: RowData::Rtt(rtt),
+        data: RowData::Rtt(rtt, rtt_axis),
         cpu: cpu.next().unwrap_or_default(),
     });
     chart_rows
