@@ -7,6 +7,10 @@ Notable changes to zzq. The format follows
 
 ### Added
 
+- Twenty-four nextest soak jobs for transports, storage, MQTT-SN,
+  connection churn, backpressure, crash recovery, and cluster failover,
+  with resource monitoring and per-run artifacts (`scripts/soak.sh`).
+
 - `zzq-cluster`: Viewstamped Replication for three nodes, its cores
   copied from Ozzy. `node::Node` replicates opaque ops through RAM on the
   leader and one follower, elects a new leader when one goes, rebuilds a

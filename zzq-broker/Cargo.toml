@@ -22,6 +22,12 @@ quic = ["tls", "zzq-tokio/quic"]
 cluster = ["dep:omq-tokio"]
 # Entry points for the fuzz targets in `fuzz/afl`.
 fuzzing = []
+# Long-running, ignored integration tests, driven by scripts/soak.sh.
+soak = []
+
+[[test]]
+name = "zzq_soak"
+required-features = ["soak", "tls", "quic", "cluster"]
 
 [dependencies]
 zzq-proto = { workspace = true, features = ["std"] }
@@ -44,6 +50,7 @@ zzq-disk = { workspace = true, features = ["testing"] }
 
 [dev-dependencies]
 rcgen = "0.14"
+serde_json.workspace = true
 # Path only, so publishing drops it and the two crates publish in any order.
 zzq-client = { path = "../zzq-client" }
 zzq-proto = { workspace = true, features = ["std"] }

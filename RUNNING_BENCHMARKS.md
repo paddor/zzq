@@ -110,3 +110,30 @@ others are builds under `ZZQ_RIVALS`:
 `zzq_perf_verify` measures zzq alone and compares throughput, latency and
 memory with the thresholds in `.perf_hw` (ignored). Without that file it runs
 a smaller smoke gate.
+
+## Soaks
+
+`scripts/soak.sh 60` smoke-tests 24 ignored tests with nextest, using
+six concurrent workers. `scripts/soak.sh 600` runs each for ten
+minutes. Extra arguments are nextest filters, for example `cluster_crash`.
+The `soak` Cargo feature enables the `zzq_soak` test target; ordinary tests
+skip it. Its executable has the `zzq_` prefix for process monitors.
+`ZZQ_SOAK_PROFILE` chooses a different nextest profile when separate
+concurrent invocations need independent JUnit reports.
+
+The jobs cover seven MQTT transports with storage off/on, MQTT-SN,
+session churn, backpressure, disk crash recovery, and three-process
+cluster crashes, partitions, quorum loss, and clean restarts. Cluster
+clients use both direct endpoint discovery and reconnect through a TCP
+proxy. Replication faults affect only test-owned proxies and processes.
+
+Artifacts go in `/mnt/ssd2/tmp/zzq-soak`: nextest output and JUnit,
+the source patch, broker logs, and one-second memory, descriptor, thread,
+CPU, I/O, and progress samples. Allocated disk space is sampled every
+30 seconds. `scripts/soak_summary.sh RUN_DIRECTORY` writes a JSON
+summary of test results and resource peaks. `ZZQ_SOAK_ROOT` and
+`ZZQ_SOAK_MOUNT` change the storage location and required mount;
+`ZZQ_SOAK_SEED` selects the payload seed. Progress deadlines, bounded
+delivery checks, and resource ceilings fail a job. Resource growth is
+checked after warmup; a short smoke cannot establish memory stability.
+Nextest stops a job still running at 1.5 times its time plus 5 minutes.

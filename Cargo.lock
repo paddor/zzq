@@ -1515,6 +1515,7 @@ dependencies = [
  "omq-tokio",
  "rcgen",
  "rustc-hash",
+ "serde_json",
  "thiserror",
  "tokio",
  "xxhash-rust",
