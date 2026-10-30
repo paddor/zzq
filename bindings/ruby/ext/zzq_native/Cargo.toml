@@ -12,8 +12,8 @@ name = "zzq_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-zzq-broker = "0.4"
-zzq-client = "0.4"
+zzq-broker = "0.5"
+zzq-client = "0.5"
 bytes = "1.12"
 libc = "0.2"
 rb-sys = "0.9"
