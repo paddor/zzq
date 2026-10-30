@@ -3,6 +3,17 @@
 #[path = "../tests/support/mod.rs"]
 pub(crate) mod support;
 
+#[cfg(target_os = "linux")]
+#[path = "tests/crash_cut.rs"]
+mod crash_cut;
+
+#[cfg(target_os = "linux")]
+#[path = "tests/handoff.rs"]
+mod handoff;
+
+#[path = "tests/leadership_reset.rs"]
+mod leadership_reset;
+
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -277,16 +288,18 @@ async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
 #[tokio::test(flavor = "multi_thread")]
 async fn on_disk_an_ack_waits_for_a_congested_subscriber() {
     for lanes in [1, 2] {
-        acks_wait_for_a_congested_subscriber_on_disk(lanes).await;
+        for qos in [QoS::AtLeastOnce, QoS::ExactlyOnce] {
+            acks_wait_for_a_congested_subscriber_on_disk(lanes, qos).await;
+        }
     }
 }
 
-async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize) {
+async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize, qos: QoS) {
     use zzq_proto::{PacketType, SubscriptionOptions, Version};
 
     use support::{Got, Raw};
 
-    let name = format!("congested-{lanes}");
+    let name = format!("congested-{lanes}-{qos:?}");
     let (dir, opts) = on_disk(&name);
     let opts = BrokerOptions {
         max_inflight: 1,
@@ -318,7 +331,7 @@ async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize) {
         assert_eq!(pkids, want, "{lanes} lanes");
     };
     for pkid in 1..=3 {
-        publisher.pub_("t", b"x", QoS::AtLeastOnce, pkid).await;
+        publisher.pub_("t", b"x", qos, pkid).await;
     }
     // The third makes the subscriber congested. Its own lane holds that
     // ack; another lane learns of it after routing the third.
@@ -328,7 +341,7 @@ async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize) {
     )
     .await;
     publisher.quiet(300).await;
-    publisher.pub_("t", b"x", QoS::AtLeastOnce, 4).await;
+    publisher.pub_("t", b"x", qos, 4).await;
     publisher.quiet(300).await;
     for _ in 0..4 {
         let p = sub.publish().await;
@@ -846,7 +859,7 @@ async fn a_failed_subscription_write_disconnects() {
 
 /// Options of a broker on data directory `name`, and CONNECT fields for
 /// a session that outlives its connection.
-fn on_disk(name: &str) -> (std::path::PathBuf, impl Fn() -> BrokerOptions) {
+fn on_disk(name: &str) -> (std::path::PathBuf, impl Fn() -> BrokerOptions + use<>) {
     let dir = std::env::temp_dir().join(format!("zzq-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let opts = {

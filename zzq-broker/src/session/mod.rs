@@ -22,7 +22,7 @@ mod hold;
 mod outbound;
 mod output;
 
-pub(crate) use hold::AckHold;
+pub(crate) use hold::{AckHold, HeldAck};
 
 /// Write buffers above this size are freed once their session goes idle.
 const IDLE_BUFFER: usize = 64 << 10;
@@ -182,6 +182,8 @@ pub(crate) struct QueueLimit {
 
 #[derive(Debug)]
 pub(crate) struct Session {
+    /// Persistent identity of this session, distinct after Clean Start.
+    pub(crate) birth: u64,
     pub(crate) client_id: Box<str>,
     pub(crate) username: Option<Box<str>>,
     pub(crate) version: Version,
@@ -220,6 +222,8 @@ pub(crate) struct Output {
     wrote: bool,
     /// The lane wakes the writer once it finishes the current work.
     pub(crate) dirty: bool,
+    /// QoS 2 packet IDs must survive a restart before their PUBLISH goes out.
+    pub(crate) due: crate::durable::Due,
 }
 
 /// What the session keeps about the messages its client publishes.
@@ -239,6 +243,18 @@ pub(crate) struct Inbound {
     pub(crate) held_acks: u32,
     /// Acks held until journal writes finish.
     pub(crate) hold: Option<Box<AckHold>>,
+    /// Its publishes that went through other lanes' journals.
+    pub(crate) flows: Option<Box<Flows>>,
+}
+
+/// The handoffs of a session's QoS 2 publishes.
+#[derive(Debug, Default)]
+pub(crate) struct Flows {
+    /// The handoff of each packet ID waiting for PUBREL.
+    pub(crate) by_pkid: FxHashMap<u16, u64>,
+    /// The last handoff, unless it reached its destinations: later publishes
+    /// must not pass it.
+    pub(crate) last: u64,
 }
 
 /// QoS 1/2 messages towards the client.
@@ -314,6 +330,7 @@ impl Session {
     pub(crate) fn new(client_id: Box<str>, version: Version, total: LaneTotal) -> Session {
         let charge = Charge::new(total, budget::session(&client_id));
         Session {
+            birth: 0,
             client_id,
             username: None,
             version,
@@ -376,6 +393,7 @@ impl Session {
     /// buffer.
     pub(crate) fn take_out(&mut self) -> Vec<u8> {
         self.out.wrote = true;
+        self.out.due = crate::durable::Due::Now;
         let spare = std::mem::take(&mut self.out.spare);
         std::mem::replace(&mut self.out.buf, spare)
     }
@@ -439,6 +457,7 @@ impl Session {
         lanes: usize,
     ) -> (Session, Option<(Instant, Msg)>) {
         let mut s = Session::new(st.client_id, st.version, total);
+        s.birth = st.birth;
         s.username = st.username;
         s.expiry = st.expiry;
         s.expires_at = st.expires_at;
@@ -612,6 +631,7 @@ mod tests {
     fn restored_session_skips_ids_in_use() {
         let total = LaneTotal::default();
         let st = SessionState {
+            birth: 0,
             client_id: "c".into(),
             username: None,
             version: Version::V5,

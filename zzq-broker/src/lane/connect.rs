@@ -87,11 +87,12 @@ impl Lane {
         let key = self.by_client.get(c.client_id.as_str()).copied();
         let present = key.is_some_and(|k| self.take_over(k, c));
         let key = key.filter(|_| present).unwrap_or_else(|| {
-            let session = Session::new(
+            let mut session = Session::new(
                 c.client_id.as_str().into(),
                 c.version,
                 self.budget.total.clone(),
             );
+            session.birth = self.handoffs.state.next();
             let k = self.sessions.insert(session);
             self.by_client.insert(c.client_id.as_str().into(), k);
             k
@@ -250,15 +251,21 @@ impl Lane {
         let Some(s) = self.sessions.get(key) else {
             return;
         };
-        if s.expiry != 0 {
-            let journaled = self.journal_session(key, rec::SESSION).is_some();
-            if let Some(s) = self.sessions.get_mut(key) {
-                s.journaled = journaled;
-            }
+        let pending_output = s.out.due != crate::durable::Due::Now;
+        let keeps = s.expiry != 0;
+        let appended = if keeps {
+            self.journal_session(key, rec::SESSION)
         } else if s.journaled {
-            self.journal_session(key, rec::END);
-            if let Some(s) = self.sessions.get_mut(key) {
-                s.journaled = false;
+            self.journal_session(key, rec::END)
+        } else {
+            None
+        };
+        if let Some(s) = self.sessions.get_mut(key) {
+            s.journaled = keeps && appended.is_some();
+            // A reconnect may resend a PUBLISH held by the old writer.
+            // This later append also covers a rewrite after failed I/O.
+            if pending_output {
+                s.out.due = crate::durable::Due::Now.then(appended);
             }
         }
     }

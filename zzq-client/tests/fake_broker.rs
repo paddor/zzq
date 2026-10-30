@@ -611,6 +611,96 @@ async fn a_resumed_pubrel_goes_at_once_and_takes_room() {
 }
 
 #[tokio::test]
+async fn a_resumed_pubrel_with_a_forgotten_id_completes_the_publish() {
+    let (listener, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let opts = ClientOptions {
+        clean_start: false,
+        session_expiry: 60,
+        reconnect: Some(Reconnect {
+            min: Duration::from_millis(10),
+            max: Duration::from_millis(50),
+        }),
+        ..ClientOptions::new("forgotten-pubcomp")
+    };
+    let connecting = tokio::spawn(async move { Client::connect(&ctx, &uri, opts).await.unwrap() });
+    let mut first = accept_with(&listener, false, 1).await;
+    let client = connecting.await.unwrap();
+    let handle = client.handle();
+    let acked = handle
+        .enqueue("t", "value", QoS::ExactlyOnce, false)
+        .await
+        .unwrap();
+    let (_, packet) = first.packet().await;
+    let Packet::Publish(publish) = decode(&packet, Version::V5, usize::MAX).unwrap().unwrap().0
+    else {
+        panic!("expected PUBLISH");
+    };
+    let id = publish.pkid;
+    first.ack(PacketType::PubRec, id).await;
+    assert_eq!(first.packet().await.0 >> 4, 6);
+    // The broker completed PUBREL, but its PUBCOMP was lost with the link.
+    drop(first);
+    let mut second = accept_with(&listener, true, 1).await;
+    assert_eq!(second.packet().await.0 >> 4, 6, "resent PUBREL");
+    let mut out = Vec::new();
+    let mut ack = AckFields::new(PacketType::PubComp, id);
+    ack.reason = zzq_proto::reason::PACKET_IDENTIFIER_NOT_FOUND;
+    encode::ack(&ack, Version::V5, &mut out);
+    second.s.write_all(&out).await.unwrap();
+    assert!(
+        timeout(WAIT, acked).await.unwrap().is_ok(),
+        "recovery PUBCOMP is a completion"
+    );
+    let next = handle
+        .enqueue("t", "next", QoS::AtLeastOnce, false)
+        .await
+        .unwrap();
+    let (_, packet) = second.packet().await;
+    let Packet::Publish(publish) = decode(&packet, Version::V5, usize::MAX).unwrap().unwrap().0
+    else {
+        panic!("expected PUBLISH after quota was released");
+    };
+    second.ack(PacketType::PubAck, publish.pkid).await;
+    assert!(timeout(WAIT, next).await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn a_forgotten_id_on_the_connection_of_the_first_pubrel_fails_the_publish() {
+    let (listener, uri) = listen().await;
+    let ctx = zzq_client::Context::new().unwrap();
+    let connecting = tokio::spawn(async move {
+        Client::connect(&ctx, &uri, ClientOptions::new("live-pubcomp"))
+            .await
+            .unwrap()
+    });
+    let mut broker = accept_with(&listener, false, 1).await;
+    let client = connecting.await.unwrap();
+    let acked = client
+        .handle()
+        .enqueue("t", "value", QoS::ExactlyOnce, false)
+        .await
+        .unwrap();
+    let (_, packet) = broker.packet().await;
+    let Packet::Publish(publish) = decode(&packet, Version::V5, usize::MAX).unwrap().unwrap().0
+    else {
+        panic!("expected PUBLISH");
+    };
+    let id = publish.pkid;
+    broker.ack(PacketType::PubRec, id).await;
+    assert_eq!(broker.packet().await.0 >> 4, 6);
+    let mut out = Vec::new();
+    let mut ack = AckFields::new(PacketType::PubComp, id);
+    ack.reason = zzq_proto::reason::PACKET_IDENTIFIER_NOT_FOUND;
+    encode::ack(&ack, Version::V5, &mut out);
+    broker.s.write_all(&out).await.unwrap();
+    assert!(
+        timeout(WAIT, acked).await.unwrap().is_err(),
+        "nothing was resent: the broker lost the flow"
+    );
+}
+
+#[tokio::test]
 async fn packets_left_unread_by_a_lost_connection_do_not_reach_the_next() {
     let (l, uri) = listen().await;
     let ctx = zzq_client::Context::new().unwrap();

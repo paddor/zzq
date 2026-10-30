@@ -29,7 +29,8 @@ use crate::lane::{Control, Dump, SyncAck};
 use crate::msg::Msg;
 use crate::msg::too_deep;
 use crate::session::Session;
-use crate::state::{Clock, ImageReader, ImageWriter, Record, SessionState};
+use crate::state::handoff::LaneState;
+use crate::state::{Clock, ImageReader, ImageWriter, Record};
 use crate::{Error, Result};
 
 /// Image bytes per frame, or a little more, as a frame ends on a record.
@@ -183,11 +184,11 @@ pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
     };
     let records = decode(file)?;
     let n = shared.lanes.len();
-    let mut sessions: Vec<Vec<SessionState>> = (0..n).map(|_| Vec::new()).collect();
+    let mut sessions: Vec<LaneState> = (0..n).map(|_| LaneState::default()).collect();
     let max = shared.opts.max_topic_levels;
     for r in records {
         match r {
-            Record::Session(st) => sessions[lane_for(&st.client_id, n)].push(*st),
+            Record::Session(st) => sessions[lane_for(&st.client_id, n)].sessions.push(*st),
             // Deeper than clients may use now: the store walks topics a
             // level at a time.
             Record::Retained(m) if !too_deep(m.topic(), max) => {
@@ -203,14 +204,14 @@ pub(crate) async fn load(shared: &Shared, path: &Path) -> Result<()> {
 
 /// Hands each lane its sessions, and waits until every lane has their
 /// subscriptions.
-pub(crate) async fn restore(shared: &Shared, sessions: Vec<Vec<SessionState>>) -> Result<()> {
+pub(crate) async fn restore(shared: &Shared, sessions: Vec<LaneState>) -> Result<()> {
     // Filters deeper than clients may use now are left out: the index walks
     // them a level at a time.
     let max = shared.opts.max_topic_levels;
     let subscribed = Arc::new(SyncAck::default());
     let mut restored = Vec::with_capacity(sessions.len());
     for (lane, mut states) in shared.lanes.iter().zip(sessions) {
-        for st in &mut states {
+        for st in &mut states.sessions {
             st.subs.retain(|(filter, _, _)| !too_deep(filter, max));
         }
         let (tx, rx) = oneshot::channel();
@@ -221,6 +222,16 @@ pub(crate) async fn restore(shared: &Shared, sessions: Vec<Vec<SessionState>>) -
         rx.await.map_err(|_| Error::Closed)?;
     }
     subscribed.wait().await;
+    Ok(())
+}
+
+/// Starts recovered handoffs after any forced-epoch rewrite is queued.
+pub(crate) async fn resume(shared: &Shared) -> Result<()> {
+    for lane in &shared.lanes {
+        let (tx, rx) = oneshot::channel();
+        push(lane, Control::ResumeHandoffs(tx))?;
+        rx.await.map_err(|_| Error::Closed)?;
+    }
     Ok(())
 }
 

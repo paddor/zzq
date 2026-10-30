@@ -89,6 +89,7 @@ impl Conn<'_> {
     /// `resend`.
     fn resend_unacked(&mut self, order: Vec<u16>) {
         self.s.requests.resend.clear();
+        self.s.requests.resent_rel.clear();
         let released = self
             .s
             .requests
@@ -119,6 +120,9 @@ impl Conn<'_> {
     fn resend_one(&mut self, pkid: u16) {
         if let Some((_, packet)) = self.s.requests.unacked.get(&pkid) {
             let dup = if is(packet, 3) { 0x08 } else { 0 };
+            if is(packet, 6) {
+                self.s.requests.resent_rel.insert(pkid);
+            }
             self.out.push(|b| {
                 let at = b.len();
                 b.extend_from_slice(packet);

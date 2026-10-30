@@ -122,7 +122,8 @@ pub(crate) struct Shared {
     /// The session journal of each lane.
     pub(crate) lane_logs: Box<[LaneLog]>,
     /// For lane `to`, how far its journal holds the deliveries lane `from`
-    /// sent it, at `to * lanes + from`.
+    /// sent it, at `to * lanes + from`, and after those the same for the
+    /// handoffs it sent.
     pairs: Box<[Cursor]>,
     /// The disk threads of `opts.data_dir`, after the journals they serve.
     data: Option<DataDir>,
@@ -143,6 +144,10 @@ impl Shared {
             JournalId::Retained(i) => self.retained.cursor(i),
             JournalId::Lane(i) => &self.lane_logs[i].cursor,
             JournalId::Pair { from, to } => &self.pairs[to * self.lane_logs.len() + from],
+            JournalId::Handoff { from, to } => {
+                let lanes = self.lane_logs.len();
+                &self.pairs[lanes * lanes + to * lanes + from]
+            }
         }
     }
 
@@ -197,7 +202,9 @@ impl Shared {
     pub(crate) fn fail_next_write(&self, j: JournalId) {
         match j {
             JournalId::Retained(i) => self.retained.fail_next_write(i),
-            JournalId::Lane(i) | JournalId::Pair { to: i, .. } => {
+            JournalId::Lane(i)
+            | JournalId::Pair { to: i, .. }
+            | JournalId::Handoff { to: i, .. } => {
                 self.lane_logs[i].fail_next_write();
             }
         }
@@ -209,7 +216,9 @@ impl Shared {
     pub(crate) fn fail_next_segment(&self, j: JournalId) {
         match j {
             JournalId::Retained(i) => self.retained.fail_next_segment(i),
-            JournalId::Lane(i) | JournalId::Pair { to: i, .. } => {
+            JournalId::Lane(i)
+            | JournalId::Pair { to: i, .. }
+            | JournalId::Handoff { to: i, .. } => {
                 self.lane_logs[i].fail_next_segment();
             }
         }
@@ -360,7 +369,7 @@ impl Broker {
             opts,
             retained,
             lane_logs,
-            pairs: (0..n * n).map(|_| Cursor::default()).collect(),
+            pairs: (0..2 * n * n).map(|_| Cursor::default()).collect(),
             data,
             cluster,
             lanes: lanes.into_boxed_slice(),
@@ -597,6 +606,15 @@ impl Drop for Broker {
     }
 }
 
+/// The tasks of a lane that journals: one takes its journal's completions,
+/// one sends its handoffs on after their writes.
+fn install_journal_tasks(lane: &LaneRef, shared: &Shared) {
+    let task = tokio::task::spawn_local(crate::lane::complete(lane.clone()));
+    shared.own_task(task.abort_handle());
+    let task = tokio::task::spawn_local(crate::lane::prepare_handoffs(lane.clone()));
+    shared.own_task(task.abort_handle());
+}
+
 fn install(
     id: u16,
     shared: Arc<Shared>,
@@ -607,8 +625,7 @@ fn install(
     let lane: LaneRef = Rc::new(RefCell::new(Lane::new(id, shared.clone())));
     LANES.with(|l| l.borrow_mut().insert((broker, id), lane.clone()));
     if shared.journals() {
-        let task = tokio::task::spawn_local(crate::lane::complete(lane.clone()));
-        shared.own_task(task.abort_handle());
+        install_journal_tasks(&lane, &shared);
     }
 
     let l = lane.clone();

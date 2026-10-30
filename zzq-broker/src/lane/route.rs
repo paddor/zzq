@@ -13,11 +13,19 @@ use crate::msg::{Arena, Block, Msg, Publication};
 use crate::session::{Kept, KeptMsg, Outcome, QueueLimit, Queued, Session, SharedMsg};
 use crate::slab::Key;
 
+use super::handoff::Arriving;
 use super::{Control, Hit, Lane, Ticket};
 
 /// A delivery for a session on another lane.
 #[derive(Debug)]
 pub(crate) enum Remote {
+    Handoff {
+        pending: std::sync::Arc<crate::state::handoff::Pending>,
+        seq: u64,
+        from: u16,
+        epoch: u64,
+        sequence: u64,
+    },
     /// PUBLISH packets for the target lane to route to its own sessions,
     /// as offset and length into one shared buffer.
     Forward {
@@ -25,6 +33,8 @@ pub(crate) enum Remote {
         first: (u32, u32),
         more: Vec<(u32, u32)>,
         origin: Origin,
+        /// Absolute number of the last delivery in this entry.
+        last: u64,
     },
     /// A delivery to one session, chosen for a shared subscription. With
     /// `pins`, the message slices the publisher's read buffer.
@@ -34,6 +44,8 @@ pub(crate) enum Remote {
         pins: bool,
         /// The lane that sent it.
         sender: u16,
+        epoch: u64,
+        sequence: u64,
     },
     /// The last batch the sending lane ships before a state dump.
     Drained(Ticket),
@@ -44,6 +56,7 @@ pub(crate) enum Remote {
 pub(crate) struct Origin {
     /// The lane that sent them.
     sender: u16,
+    epoch: u64,
     version: Version,
     /// The publisher, for No Local.
     from: Option<SubRef>,
@@ -151,6 +164,12 @@ impl Lane {
         {
             return matches.clone();
         }
+        self.look_up_matches(key, topic, generation)
+    }
+
+    /// Matches for a publish from `key` to a topic it did not publish to
+    /// last, which its session remembers for the next.
+    fn look_up_matches(&mut self, key: Key, topic: &str, generation: u64) -> Rc<Matches> {
         let (matches, cached) = self.index.lookup(topic);
         if cached && let Some(session) = self.sessions.get_mut(key) {
             // Reuse the topic buffer: a publisher changing topics should not
@@ -222,6 +241,7 @@ impl Lane {
                 let pins = p.pins && p.chunk.is_some_and(|c| msg.pins(c));
                 let lane = usize::from(e.sub.lane);
                 let qos = p.qos.min(e.opts.qos);
+                let sequence = self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
                 self.out.remote[lane].push(Remote::Deliver {
                     key: e.sub.key,
                     pins,
@@ -232,8 +252,9 @@ impl Lane {
                         sub_id: e.sub_id,
                     },
                     sender: self.id,
+                    epoch: self.epoch,
+                    sequence,
                 });
-                self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
             }
         }
         if remote_lanes != 0 {
@@ -254,20 +275,17 @@ impl Lane {
         let (chunk, at, version, pins) = forward_packet(p, hot, &mut self.out.fwd);
         let origin = Origin {
             sender: self.id,
+            epoch: self.epoch,
             version,
             from: from.map(|k| self.sub_ref(k)),
             pins,
         };
         let to = |lane: usize| remote_lanes & (1 << (lane & 63)) != 0;
-        for (lane, batch) in self.out.remote.iter_mut().enumerate() {
-            if to(lane) && lane != usize::from(self.id) {
-                push_forward(batch, &chunk, at, origin);
-            }
-        }
         for lane in 0..self.out.remote.len() {
             if to(lane) && lane != usize::from(self.id) {
                 let wait = wait_lanes & (1 << (lane & 63)) != 0;
-                self.count_sent(lane, wait && p.qos != QoS::AtMostOnce);
+                let sequence = self.count_sent(lane, wait && p.qos != QoS::AtMostOnce);
+                push_forward(&mut self.out.remote[lane], &chunk, at, origin, sequence);
             }
         }
     }
@@ -276,12 +294,14 @@ impl Lane {
     /// session there gets it at QoS 1/2: the publisher's ack waits for
     /// that lane to journal it.
     #[inline]
-    fn count_sent(&mut self, lane: usize, wait: bool) {
-        if let Some(w) = self.pairs.sent(self.id, lane)
-            && wait
-        {
+    fn count_sent(&mut self, lane: usize, wait: bool) -> u64 {
+        let Some(w) = self.pairs.sent(self.id, lane) else {
+            return 0;
+        };
+        if wait {
             self.needs.wait(w);
         }
+        w.n
     }
 
     /// Routes a publish forwarded by another lane to this lane's sessions.
@@ -442,19 +462,41 @@ impl Lane {
     }
 
     /// Delivers a message routed on another lane.
+    #[expect(clippy::too_many_lines, reason = "one arm per delivery message")]
     pub(crate) fn deliver_remote(&mut self, r: Remote) {
         match r {
+            Remote::Handoff {
+                pending,
+                seq,
+                from,
+                epoch,
+                sequence,
+            } => {
+                if epoch != self.epoch {
+                    return;
+                }
+                self.take_handoff(Arriving {
+                    pending,
+                    seq,
+                    from,
+                    sequence,
+                });
+            }
             Remote::Forward {
                 chunk,
                 first,
                 more,
                 origin,
+                last,
             } => {
+                if origin.epoch != self.epoch {
+                    return;
+                }
                 self.route_forwarded(&chunk, first, origin);
                 for &at in &more {
                     self.route_forwarded(&chunk, at, origin);
                 }
-                self.got_from(origin.sender, 1 + more.len() as u64);
+                self.got_from(origin.sender, last);
             }
             // After what came before it in the batch.
             Remote::Drained(ticket) => drop(ticket),
@@ -463,7 +505,12 @@ impl Lane {
                 item,
                 pins,
                 sender,
+                epoch,
+                sequence,
             } => {
+                if epoch != self.epoch {
+                    return;
+                }
                 let p = Publication {
                     pins,
                     ..Publication::of(&item.msg)
@@ -483,7 +530,7 @@ impl Lane {
                         self.stats.dropped.session_ended += 1;
                     }
                 }
-                self.got_from(sender, 1);
+                self.got_from(sender, sequence);
             }
         }
     }
@@ -569,11 +616,18 @@ fn keep(
 
 /// Appends a forwarded packet, sharing the last batch entry when it uses
 /// the same buffer.
-fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: Origin) {
+fn push_forward(
+    batch: &mut Vec<Remote>,
+    chunk: &Bytes,
+    at: (u32, u32),
+    origin: Origin,
+    sequence: u64,
+) {
     if let Some(Remote::Forward {
         chunk: c,
         more,
         origin: o,
+        last,
         ..
     }) = batch.last_mut()
         && c.as_ptr() == chunk.as_ptr()
@@ -581,6 +635,7 @@ fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: 
         && *o == origin
     {
         more.push(at);
+        *last = sequence;
         return;
     }
     // Packets of one read are mostly alike, so size the rest from this one;
@@ -591,6 +646,7 @@ fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: 
         first: at,
         more: Vec::with_capacity(more),
         origin,
+        last: sequence,
     });
 }
 
@@ -634,6 +690,8 @@ mod tests {
                         sub_id: SubIds::default(),
                     },
                     sender: 0,
+                    epoch: 0,
+                    sequence: 0,
                 });
             }
             (l.stats.dropped.offline, l.stats.dropped.session_ended)

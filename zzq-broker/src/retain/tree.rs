@@ -13,6 +13,7 @@ use crate::msg::{Msg, expired};
 /// the branches it can match.
 #[derive(Debug, Default)]
 pub(super) struct Tree {
+    pub(super) receipts: Vec<Receipt>,
     root: Node,
     len: usize,
     /// Bytes counted against `max_state_bytes`: messages, also released
@@ -24,6 +25,12 @@ pub(super) struct Tree {
     /// When messages with a Message Expiry Interval run out, soonest first.
     /// One entry per stored topic with a deadline.
     expiring: BTreeSet<(Instant, Box<str>)>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Receipt {
+    pub(super) sequence: u64,
+    pub(super) written: Option<crate::durable::Journaled>,
 }
 
 #[derive(Debug, Default)]
@@ -107,7 +114,7 @@ impl Tree {
 
     /// Bytes counted against `max_state_bytes`.
     pub(super) const fn bytes(&self) -> usize {
-        self.bytes
+        self.bytes + self.receipts.capacity() * std::mem::size_of::<Receipt>()
     }
 
     /// Drops messages whose Message Expiry Interval ran out, and released

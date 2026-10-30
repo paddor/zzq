@@ -68,6 +68,7 @@ impl Replica {
         if std::mem::take(&mut self.rewrite) {
             self.rewrite_journals().await;
         }
+        let _ = crate::dump::resume(&self.shared).await;
         crate::cluster::open_listeners(&self.shared).await;
     }
 

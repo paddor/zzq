@@ -204,7 +204,7 @@ fn forced(
 /// differ in it would replay the same ops into different states, so
 /// they do not link.
 fn fingerprint(lanes: usize, max_levels: usize) -> u64 {
-    let mut b = b"zzq-broker cluster state 1".to_vec();
+    let mut b = b"zzq-broker cluster state 2".to_vec();
     for n in [lanes, crate::retain::STRIPES, max_levels] {
         b.extend_from_slice(&(n as u64).to_be_bytes());
     }

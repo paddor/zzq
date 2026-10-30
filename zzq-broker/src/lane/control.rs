@@ -10,7 +10,6 @@ use zzq_tokio::signal::StateSignal;
 use crate::dump::Part;
 use crate::index::{Entry, SubRef};
 use crate::msg::Msg;
-use crate::state::SessionState;
 
 use super::{Lane, LaneStats};
 
@@ -90,7 +89,12 @@ pub(crate) enum Control {
     Dump(Box<Dump>),
     /// Add sessions from a state file, then answer. Their subscriptions
     /// count down the ack on the other lanes.
-    Restore(Vec<SessionState>, Arc<SyncAck>, oneshot::Sender<()>),
+    Restore(
+        crate::state::handoff::LaneState,
+        Arc<SyncAck>,
+        oneshot::Sender<()>,
+    ),
+    ResumeHandoffs(oneshot::Sender<()>),
     /// Drop every session and connection without journaling, then answer.
     Reset(oneshot::Sender<()>),
     /// Answer with the lane's part of a cluster image.
@@ -118,6 +122,14 @@ impl Lane {
     /// Handles a control message.
     #[expect(clippy::too_many_lines, reason = "one arm per control message")]
     pub(crate) fn control(&mut self, c: Control) {
+        let epoch = match &c {
+            Control::SubAdd { entry, .. } => Some(entry.sub.epoch),
+            Control::SubRemove(_, sub, _) | Control::Congested(sub, _) => Some(sub.epoch),
+            _ => None,
+        };
+        if epoch.is_some_and(|epoch| epoch != self.epoch) {
+            return;
+        }
         match c {
             Control::SubAdd {
                 filter,
@@ -170,6 +182,10 @@ impl Lane {
             }
             Control::Restore(states, sync, done) => {
                 self.restore(states, &sync);
+                let _ = done.send(());
+            }
+            Control::ResumeHandoffs(done) => {
+                self.resume_handoffs();
                 let _ = done.send(());
             }
             Control::Reset(done) => {

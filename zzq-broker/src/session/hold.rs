@@ -18,8 +18,9 @@ pub(crate) struct AckHold {
     pub(crate) failed: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct HeldAck {
+    pub(crate) handoff: Option<std::sync::Arc<crate::state::handoff::Pending>>,
     pub(crate) kind: PacketType,
     pub(crate) pkid: u16,
     pub(crate) reason: u8,
@@ -29,6 +30,8 @@ pub(crate) struct HeldAck {
     /// A congested subscriber the publish went to: once on disk, the ack
     /// waits for it to drain too.
     pub(crate) congested: Option<SubRef>,
+    /// Its publish reached the lane's state whatever became of the write.
+    pub(crate) applied: bool,
 }
 
 impl AckHold {
@@ -51,22 +54,26 @@ impl AckHold {
     /// then while `congested`, a subscriber it went to, is congested.
     pub(crate) fn push_publish(&mut self, kind: PacketType, pkid: u16, congested: Option<SubRef>) {
         self.acks.push(HeldAck {
+            handoff: None,
             kind,
             pkid,
             reason: 0,
             durable: true,
             congested,
+            applied: false,
         });
     }
 
     /// Holds an ack behind the others.
     pub(crate) fn push_now(&mut self, kind: PacketType, pkid: u16, reason: u8) {
         self.acks.push(HeldAck {
+            handoff: None,
             kind,
             pkid,
             reason,
             durable: false,
             congested: None,
+            applied: false,
         });
     }
 

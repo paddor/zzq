@@ -37,6 +37,7 @@ use crate::msg::Msg;
 use crate::session::{Queued, Session, Will};
 
 mod codec;
+pub(crate) mod handoff;
 pub(crate) mod journal;
 
 use codec::{Decoder, put_msg, put_session};
@@ -106,6 +107,7 @@ pub(crate) type Sent = (u16, Queued, bool);
 #[derive(Debug, Clone)]
 pub(crate) struct SessionState {
     pub(crate) client_id: Box<str>,
+    pub(crate) birth: u64,
     pub(crate) username: Option<Box<str>>,
     pub(crate) version: Version,
     pub(crate) expiry: u32,
@@ -342,6 +344,7 @@ mod tests {
         let mut expiring = item(5, QoS::ExactlyOnce);
         expiring.msg.expires_at = clock.now.checked_sub(Duration::from_secs(1));
         SessionState {
+            birth: 0,
             client_id: "dev-1".into(),
             username: Some("user".into()),
             version: Version::V5,

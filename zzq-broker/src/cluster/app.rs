@@ -7,8 +7,9 @@ use zzq_cluster::OpNumber;
 
 use crate::broker::lane_for;
 use crate::retain::{self, STRIPES};
+use crate::state::Clock;
+use crate::state::handoff::LaneState;
 use crate::state::journal::Sessions;
-use crate::state::{Clock, SessionState};
 
 use super::GroupWriter;
 use super::image::Part;
@@ -27,7 +28,7 @@ pub(crate) struct Accumulators {
 impl Accumulators {
     pub(crate) fn new(lanes: usize, max_levels: usize) -> Accumulators {
         Accumulators {
-            lanes: (0..lanes).map(|_| Sessions::default()).collect(),
+            lanes: (0..lanes).map(|_| Sessions::new(lanes)).collect(),
             retained: retain::Accumulator::new(max_levels),
             cuts: FxHashMap::default(),
         }
@@ -122,9 +123,9 @@ impl Accumulators {
 
     /// The sessions of each lane, those still connected at the old leader
     /// taken as lost now, and the retained messages.
-    pub(crate) fn finish(self) -> (Vec<Vec<SessionState>>, retain::Accumulator) {
+    pub(crate) fn finish(self) -> (Vec<LaneState>, retain::Accumulator) {
         let now = crate::time::now();
-        let sessions = self.lanes.into_iter().map(|s| s.finish(now)).collect();
+        let sessions = self.lanes.into_iter().map(|s| s.into_lane(now)).collect();
         (sessions, self.retained)
     }
 }

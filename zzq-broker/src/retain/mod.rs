@@ -18,6 +18,7 @@ use crate::durable::{Cursor, JournalId, Journaled, RETRY, Wait};
 use crate::msg::{Msg, expired, too_deep};
 use crate::state::{self, Clock};
 
+mod handoff;
 mod tree;
 
 use tree::Tree;
@@ -38,6 +39,8 @@ const CLEAR: u8 = 3;
 const KEPT: u8 = 4;
 /// Ends a snapshot, which takes the place of the messages before it.
 const CLEARED: u8 = 5;
+const ONCE: u8 = 6;
+const RECEIPTS: u8 = 7;
 
 /// Retained messages of every stripe.
 #[derive(Debug)]
@@ -603,6 +606,11 @@ fn put_messages(
         state::msg_head(head, &m, clock);
         out.append(KEPT, &[head, m.payload()])?;
     }
+    head.clear();
+    for receipt in &tree.receipts {
+        head.extend_from_slice(&receipt.sequence.to_be_bytes());
+    }
+    out.append(RECEIPTS, &[head])?;
     out.append(CLEARED, &[])
 }
 
@@ -634,6 +642,10 @@ impl Replay {
         r: Record<'_>,
     ) -> Result<(), &'static str> {
         match r.kind {
+            RECEIPTS => {
+                let into = snapshot.as_mut().unwrap_or(tree);
+                handoff::read_receipts(into, r.body)?;
+            }
             CLEAR if r.body.is_empty() => *snapshot = Some(Tree::default()),
             CLEARED if r.body.is_empty() => {
                 if let Some(s) = snapshot.take() {
@@ -655,6 +667,7 @@ impl Replay {
             // Any other record after an unfinished snapshot: the snapshot
             // was cut off, and the stripe went on without it.
             _ if snapshot.take().is_some() => return self.apply(tree, snapshot, stripe, r),
+            ONCE => return handoff::replay(self, tree, stripe, r.body),
             SET => {
                 let m = state::decode_msg(r.body, self.clock)?;
                 if stripe_of(m.topic()) != stripe {
@@ -690,7 +703,12 @@ pub(crate) fn replay_one(data: &[u8]) -> Result<usize, &'static str> {
     };
     let mut tree = Tree::default();
     let replay = Replay::new(usize::MAX);
-    let stripe = state::decode_msg(body, replay.clock).map_or(0, |m| stripe_of(m.topic()));
+    let message = if kind == ONCE {
+        body.get(11..).unwrap_or_default()
+    } else {
+        body
+    };
+    let stripe = state::decode_msg(message, replay.clock).map_or(0, |m| stripe_of(m.topic()));
     replay.apply(&mut tree, &mut None, stripe, Record { kind, body })?;
     Ok(tree.len())
 }
@@ -705,12 +723,20 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     set.extend_from_slice(m.payload());
     let mut kept = set.clone();
     kept[0] = KEPT;
+    let mut once = vec![ONCE, 0, 0];
+    once.extend_from_slice(&1u64.to_be_bytes());
+    once.push(1);
+    once.extend_from_slice(&set[1..]);
+    let mut receipts = vec![RECEIPTS];
+    receipts.extend_from_slice(&1u64.to_be_bytes());
     vec![
         set,
         [&[REMOVE][..], b"a/b"].concat(),
         vec![CLEAR],
         kept,
         vec![CLEARED],
+        once,
+        receipts,
     ]
 }
 

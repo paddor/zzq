@@ -20,6 +20,7 @@ use crate::slab::{Key, Slab};
 mod backpressure;
 mod connect;
 mod control;
+mod handoff;
 mod hold;
 mod journal;
 mod maintenance;
@@ -30,6 +31,7 @@ mod subscribe;
 
 use backpressure::Hit;
 pub(crate) use control::{Control, Dump, SyncAck, Ticket};
+pub(crate) use handoff::prepare as prepare_handoffs;
 pub(crate) use journal::{LaneLog, complete};
 pub(crate) use route::Remote;
 pub(crate) use subscribe::Held;
@@ -85,6 +87,8 @@ pub(crate) struct Attached {
 #[derive(Debug)]
 pub(crate) struct Lane {
     pub(crate) id: u16,
+    /// Changes with every leadership reset, fencing work from older state.
+    epoch: u64,
     pub(crate) shared: Arc<Shared>,
     pub(crate) sessions: Slab<Session>,
     by_client: FxHashMap<Box<str>, Key>,
@@ -108,6 +112,7 @@ pub(crate) struct Lane {
     /// The journal writes the publish being handled needs.
     needs: hold::Needs,
     pairs: pairs::Pairs,
+    handoffs: handoff::Routing,
 }
 
 /// Whether a lane serves connections.
@@ -127,7 +132,8 @@ pub(crate) struct Outbox {
     /// Batches by target lane.
     remote: Box<[Vec<Remote>]>,
     /// One task ships at a time, in arrival order, so batches for a lane
-    /// leave in the order they were collected, also while it is full.
+    /// leave in the order they were collected, also while it is full. It is
+    /// held for room in a mailbox only, never for a journal write.
     pub(crate) shipping: Rc<tokio::sync::Mutex<()>>,
     /// Copies of QoS 1/2 publishes for congested sessions on other lanes.
     fwd: Arena,
@@ -166,8 +172,10 @@ impl Lane {
         let lanes = shared.lanes.len();
         let shared_journals = shared.journals();
         let total = LaneTotal::default();
+        let handoffs = handoff::Routing::new(total.clone());
         Lane {
             id,
+            epoch: 0,
             shared,
             sessions: Slab::default(),
             by_client: FxHashMap::default(),
@@ -190,6 +198,7 @@ impl Lane {
             journal_unflushed: false,
             needs: hold::Needs::default(),
             pairs: pairs::Pairs::new(lanes, shared_journals),
+            handoffs,
         }
     }
 
@@ -199,7 +208,11 @@ impl Lane {
     }
 
     const fn sub_ref(&self, key: Key) -> SubRef {
-        SubRef { lane: self.id, key }
+        SubRef {
+            lane: self.id,
+            epoch: self.epoch,
+            key,
+        }
     }
 
     #[inline]

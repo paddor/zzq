@@ -8,9 +8,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use rustc_hash::FxHashMap;
-use zzq_proto::SubscriptionOptions;
 use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::trie::TopicTrie;
+use zzq_proto::{QoS, SubscriptionOptions};
 
 use crate::slab::Key;
 
@@ -26,6 +26,7 @@ const SEEN: usize = 1 << 12;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct SubRef {
     pub(crate) lane: u16,
+    pub(crate) epoch: u64,
     pub(crate) key: Key,
 }
 
@@ -67,6 +68,8 @@ impl SubIds {
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
     pub(crate) sub: SubRef,
+    pub(crate) client: Arc<str>,
+    pub(crate) birth: u64,
     pub(crate) opts: SubscriptionOptions,
     /// v5 Subscription Identifiers.
     pub(crate) sub_id: SubIds,
@@ -132,6 +135,21 @@ pub(crate) struct Matches {
     /// At most one entry per session.
     pub(crate) direct: Vec<Entry>,
     pub(crate) groups: Vec<Group>,
+}
+
+impl Matches {
+    /// Every subscription, all members of a group.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = &Entry> {
+        let members = self.groups.iter().flat_map(|g| g.members.iter());
+        self.direct.iter().chain(members)
+    }
+
+    /// Whether each of them is on lane `lane`, with a session that keeps
+    /// what it gets at QoS 1 or 2 in the journal.
+    pub(crate) fn kept_on(&self, lane: u16) -> bool {
+        self.entries()
+            .all(|e| e.sub.lane == lane && e.journaled && e.opts.qos != QoS::AtMostOnce)
+    }
 }
 
 #[derive(Debug)]
@@ -317,11 +335,11 @@ fn inner_filter(filter: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zzq_proto::QoS;
 
     fn sub(n: u32) -> SubRef {
         SubRef {
             lane: 0,
+            epoch: 0,
             key: Key {
                 slot: n,
                 generation: 0,
@@ -332,6 +350,8 @@ mod tests {
     fn entry(n: u32, qos: QoS, share: Option<&str>) -> Entry {
         Entry {
             sub: sub(n),
+            client: Arc::from(format!("client-{n}")),
+            birth: 0,
             opts: SubscriptionOptions::from(qos),
             sub_id: SubIds::default(),
             share: share.map(|f| {

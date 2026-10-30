@@ -79,6 +79,8 @@ impl Lane {
         let s = self.sessions.get(key);
         Entry {
             sub: self.sub_ref(key),
+            client: s.map(|s| Arc::from(&*s.client_id)).unwrap_or_default(),
+            birth: s.map_or(0, |s| s.birth),
             opts,
             sub_id: SubIds::one(sub_id),
             share: is_shared(filter).then(|| {

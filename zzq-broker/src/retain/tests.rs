@@ -154,6 +154,81 @@ fn a_store_in_memory_journals_nothing() {
     assert_eq!(r.set(&msg("a"), false), None);
 }
 
+#[tokio::test]
+async fn a_recovered_handoff_cannot_replace_a_newer_retained_value() {
+    let Some((path, data)) = data_dir("handoff") else {
+        return;
+    };
+    let old = Msg::new("handoff/t", b"old", &[], QoS::ExactlyOnce, true);
+    let new = Msg::new("handoff/t", b"new", &[], QoS::AtLeastOnce, true);
+    {
+        let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
+        assert!(matches!(
+            r.set_once(0, 1, &old, false),
+            Some(Journaled::At { .. })
+        ));
+        r.set(&new, false);
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !r.snapshot(true) {
+                tick.tick().await;
+            }
+        })
+        .await
+        .unwrap();
+        r.close();
+    }
+    let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
+    assert_eq!(r.set_once(0, 1, &old, false), None);
+    assert_eq!(r.matching("handoff/t")[0].payload(), b"new");
+    r.set_once(0, 2, &clear("handoff/t"), false);
+    r.set(&new, false);
+    r.close();
+    drop(r);
+    let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
+    assert_eq!(r.set_once(0, 2, &clear("handoff/t"), false), None);
+    assert_eq!(r.matching("handoff/t")[0].payload(), b"new");
+    drop(r);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn a_refused_retained_handoff_stays_refused_after_restart() {
+    let Some((path, data)) = data_dir("handoff-full") else {
+        return;
+    };
+    let m = msg("handoff/full");
+    {
+        let r = Retained::open(&data, 0, usize::MAX).unwrap();
+        assert!(matches!(
+            r.set_once(3, 9, &m, false),
+            Some(Journaled::At { .. })
+        ));
+        assert_eq!(r.len(), 0);
+        r.close();
+    }
+    let r = Retained::open(&data, 10, usize::MAX).unwrap();
+    assert_eq!(r.set_once(3, 9, &m, false), None);
+    assert_eq!(r.len(), 0);
+    r.set_once(3, 10, &m, false);
+    assert_eq!(r.len(), 1);
+    r.close();
+    assert_eq!(r.set_once(3, 11, &m, false), Some(Journaled::Failed));
+    drop(r);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn malformed_retained_handoffs_are_refused() {
+    let r = Replay::new(usize::MAX);
+    let mut tree = Tree::default();
+    for body in [&[][..], &[0; 11], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 9]] {
+        assert!(handoff::replay(r, &mut tree, 0, body).is_err());
+    }
+    assert!(handoff::read_receipts(&mut tree, &[0]).is_err());
+    assert!(handoff::read_receipts(&mut tree, &vec![0; (usize::from(u16::MAX) + 2) * 8]).is_err());
+}
+
 /// A data directory for the test `name`, or `None` where the temp
 /// directory takes no `O_DIRECT`.
 fn data_dir(name: &str) -> Option<(PathBuf, DataDir)> {

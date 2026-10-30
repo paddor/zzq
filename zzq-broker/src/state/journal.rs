@@ -5,6 +5,7 @@
 //! ```text
 //! session   = client_id:str username:opt(str) version:u8 expiry:u32
 //!             will:opt(delay:u32 msg)
+//!             birth:u64
 //! down      = client_id:str expiry:u32 expires:time
 //!             delayed_will:opt(due:time msg)
 //! end       = client_id:str
@@ -12,7 +13,7 @@
 //! unsub     = client_id:str filter:str
 //! will_sent = client_id:str
 //! clear     = (empty)
-//! image     = connected:u8 session last_seq:u64 count:u32 seq:u64*
+//! image     = connected:u8 session last_seq:u64 count:u32 seq:u64* birth:u64
 //! cleared   = (empty)
 //! msg       = msg
 //! queued    = client_id:str seq:u64 qos:u8 retain:u8 sub_ids:u32[4]
@@ -20,6 +21,14 @@
 //! sent      = client_id:str seq:u64 pkid:u16
 //! released  = client_id:str seq:u64
 //! inbound   = client_id:str pkid:u16
+//! handoff   = seq:u64 publisher:str birth:u64 pkid:u16 msg targets
+//! handoff_kept = handoff
+//! handed    = seq:u64
+//! routing   = serial:u64 count:u32 received:u64*
+//! received  = source:u16 seq:u64
+//! transaction = (kind:u8 length:u32 body)*
+//! part      = first:u8 bytes
+//! part_end  = kind:u8 bytes
 //! ```
 //!
 //! `session` comes with each connection, `down` when it ends. A session
@@ -29,9 +38,19 @@
 //! numbers of the inflight deliveries, then the queued ones. A snapshot
 //! is `clear`, an `image` per session, then `cleared`: it counts only
 //! once `cleared` is there.
+//! Handoffs keep the original routing decision until every destination
+//! commits it. A destination's receipt and its queue changes occupy one
+//! transaction record. Snapshots include unfinished handoffs, as
+//! `handoff_kept`, and receipts: any record but those of a snapshot cuts
+//! off one that did not end, also a `handoff`.
+//! A record too long for one goes as `part`s and a `part_end`, which name
+//! its kind. It counts only once `part_end` is there.
+
+use std::io;
 
 use zzq_proto::{QoS, SubscriptionOptions, Version};
 
+use crate::disk::Append;
 use crate::index::SubIds;
 use crate::msg::Publication;
 use crate::session::Session;
@@ -73,6 +92,43 @@ pub(crate) const INBOUND: u8 = 14;
 pub(crate) const INBOUND_DONE: u8 = 15;
 /// Ends a snapshot, which takes the place of the sessions before it.
 pub(crate) const CLEARED: u8 = 16;
+/// A QoS 2 routing decision, including the inbound ID and all destinations.
+pub(crate) const HANDOFF: u8 = 17;
+/// Every destination committed this handoff.
+pub(crate) const HANDED: u8 = 18;
+/// Persistent lane counters, inside a snapshot.
+pub(crate) const ROUTING: u8 = 19;
+/// A destination's receipt, in the same transaction as its deliveries.
+pub(crate) const RECEIVED: u8 = 20;
+/// An atomic group of nested lane records.
+pub(crate) const TRANSACTION: u8 = 21;
+/// An unfinished handoff, inside a snapshot.
+pub(crate) const HANDOFF_KEPT: u8 = 22;
+/// The start or next piece of a record too long for one.
+pub(crate) const PART: u8 = 23;
+/// The last piece of such a record, which makes it count.
+pub(crate) const PART_END: u8 = 24;
+
+/// Bytes of a record beyond which it goes in parts: a journal segment takes
+/// a packet and little more, and a cluster op a group.
+const PART_BYTES: usize = 1 << 19;
+
+/// Appends a record of `kind` whose body is `parts`, in pieces if it is
+/// long. Returns the number of the last.
+pub(crate) fn append_record(out: &mut impl Append, kind: u8, parts: &[&[u8]]) -> io::Result<u64> {
+    if parts.iter().map(|p| p.len()).sum::<usize>() <= PART_BYTES {
+        return out.append(kind, parts);
+    }
+    let mut pieces = parts.iter().flat_map(|p| p.chunks(PART_BYTES));
+    let mut piece = pieces.next().unwrap_or_default();
+    let mut first = 1;
+    for next in pieces {
+        out.append(PART, &[&[first], piece])?;
+        first = 0;
+        piece = next;
+    }
+    out.append(PART_END, &[&[kind], piece])
+}
 
 /// The body of a [`SESSION`] record for `s`.
 pub(crate) fn session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
@@ -94,6 +150,7 @@ pub(crate) fn session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
         }
         None => b.push(0),
     }
+    put_u64(b, s.birth);
 }
 
 /// The body of a [`DOWN`] record for `s`.
@@ -152,6 +209,7 @@ fn image_of(b: &mut Vec<u8>, s: &Session, connected: bool, clock: Clock) {
     for k in s.queue() {
         put_u64(b, k.seq);
     }
+    put_u64(b, s.birth);
 }
 
 /// The head of a [`MSG`] record for `p`. Its payload follows as it is.
@@ -192,6 +250,26 @@ pub(crate) fn inbound(b: &mut Vec<u8>, client_id: &str, pkid: u16) {
     put_bytes(b, client_id.as_bytes());
     put_u16(b, pkid);
 }
+
+/// Writes the handoff part of a lane snapshot, before CLEARED.
+pub(crate) fn handoffs(
+    out: &mut impl Append,
+    h: &super::handoff::Handoffs,
+    buf: &mut Vec<u8>,
+    clock: Clock,
+) -> io::Result<()> {
+    buf.clear();
+    super::handoff::put_meta(buf, h);
+    out.append(ROUTING, &[buf])?;
+    for p in h.pending.values() {
+        buf.clear();
+        super::handoff::put_pending(buf, p, clock);
+        append_record(out, HANDOFF_KEPT, &[buf])?;
+    }
+    Ok(())
+}
+
+pub(crate) use super::handoff::put_pending;
 
 /// The body of an [`IMAGE`] record for a session as a journal left it,
 /// with a connection or without.
@@ -268,7 +346,68 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     add(INBOUND, &|b| inbound(b, "c", 3));
     add(INBOUND_DONE, &|b| inbound(b, "c", 3));
     add(CLEARED, &|_| {});
+    out.extend(handoff_seeds(clock));
     out
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+fn handoff_seeds(clock: Clock) -> Vec<Vec<u8>> {
+    use crate::msg::Msg;
+
+    use super::handoff::{Handoffs, Pending, Target};
+
+    let p = Pending {
+        seq: 9,
+        ready: false.into(),
+        congested: std::sync::OnceLock::new(),
+        publisher: "c".into(),
+        birth: 0,
+        pkid: 3,
+        msg: Msg::new("a/b", b"once", &[], QoS::ExactlyOnce, true),
+        targets: vec![Target {
+            lane: 0,
+            client: "c".into(),
+            birth: 0,
+            qos: QoS::ExactlyOnce,
+            retain: false,
+            sub_id: SubIds::one(7),
+        }],
+    };
+    let mut pending = vec![HANDOFF];
+    put_pending(&mut pending, &p, clock);
+    let mut kept = vec![HANDOFF_KEPT];
+    put_pending(&mut kept, &p, clock);
+    let mut part = vec![PART, 1];
+    part.extend_from_slice(&pending[1..3]);
+    let mut part_end = vec![PART_END, HANDOFF];
+    part_end.extend_from_slice(&pending[3..]);
+    let mut handed = vec![HANDED];
+    put_u64(&mut handed, 9);
+    let mut routing = vec![ROUTING];
+    super::handoff::put_meta(
+        &mut routing,
+        &Handoffs {
+            serial: 9,
+            received: vec![8],
+            ..Handoffs::default()
+        },
+    );
+    let mut received = vec![RECEIVED];
+    put_u16(&mut received, 0);
+    put_u64(&mut received, 9);
+    let mut transaction = vec![TRANSACTION, RECEIVED];
+    put_u32(&mut transaction, 10);
+    transaction.extend_from_slice(&received[1..]);
+    vec![
+        pending,
+        handed,
+        routing,
+        received,
+        transaction,
+        kept,
+        part,
+        part_end,
+    ]
 }
 
 /// Replays `data` as records of one lane journal: each a kind byte, a

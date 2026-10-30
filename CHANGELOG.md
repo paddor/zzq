@@ -37,6 +37,64 @@ Notable changes to zzq. The format follows
 
 - `zzq-broker` reads time from Tokio's clock, so a paused Tokio runtime
   drives keep alive, session expiry, will delays and sweeps.
+- A durable QoS 2 publish whose subscribers are all on its lane, with sessions
+  in the journal, is one record and one write to its PUBREC: the packet ID and
+  the deliveries, so that a crash leaves both or neither.
+- A durable QoS 2 publish to other lanes gets PUBREC once its routing decision
+  is written, which is all a crash needs to finish it. PUBCOMP waits for the
+  destinations, so the two journals write side by side, and what a publisher
+  leaves on its way stays bounded by its in-flight window. Later publishes of
+  the client wait for it to arrive.
+- A journal that cannot take a handoff yet gets it later, in order, instead of
+  failing a publish whose publisher already has PUBREC. A written handoff that
+  a destination failed on stays until the next start.
+- The record that a handoff finished goes out with the next write, and a
+  handoff no longer writes a receipt on a lane that delivers none of it.
+- Durable QoS 2 fan-in and fan-out across 2 lanes run about 25-40% below 0.4.0.
+  Each message now also writes its routing decision and the subscriber's packet
+  ID, which crash recovery needs.
+
+### Fixed
+
+- Durable QoS 2 routing survives a crash between the source and destination
+  journal writes. Recovery replays the saved routing decision once, including
+  retained updates, and subscriber output waits for its packet ID to be durable.
+  A refused publish durably releases its packet ID before sending PUBREC.
+- Leadership changes preserve connection generations and delivery cursors,
+  release the old connection count, and discard stale subscription controls
+  and forwarded messages.
+- The client completes a QoS 2 publish when a resent PUBREL gets PUBCOMP
+  Packet Identifier not found, as allowed when the original PUBCOMP was
+  lost during reconnect or failover. For a PUBREL sent once, that reason
+  fails the publish.
+- A journal write that waits, for a stalled disk or a suspended cluster
+  leader, stops only the QoS 2 publish behind it. Before, every connection
+  on the lane waited for it, and a leader could hang for good while dropping
+  its state.
+- A publish that reuses the packet ID of a finished QoS 2 flow is routed.
+  Before, it could get PUBREC while the broker dropped it, when older handoffs
+  on a slow lane kept the old flow from being forgotten.
+- A failed QoS 2 publish from a v3.1.1 client counts as new when it comes
+  again, instead of getting PUBREC for a message the broker does not have.
+- A retained QoS 2 publish reaches the store before its subscribers are
+  matched, so a SUBSCRIBE at that moment no longer misses it, and it can no
+  longer replace a newer value of the same read. QoS 0 and 1 publishes wait
+  for a QoS 2 publish before them in the same read.
+- A full state budget no longer refuses QoS 2 publishes, in line with
+  `max_state_bytes`: as for QoS 1, only what would wait in a queue is dropped.
+- Handoffs and session images longer than a journal segment or cluster op go
+  in parts, instead of failing every write of the lane from then on.
+- A handoff written after a snapshot that never ended is no longer lost at
+  recovery.
+- A session resumed without expiry no longer loses its new connection to the
+  failed journal write of the old one.
+- A retried QoS 2 publish waits for the journal write of the first attempt,
+  instead of getting PUBREC for a record a crash could still take.
+- A failed journal write of a QoS 2 publish on one lane closes the connection,
+  and the client's retry finds the message once. Before, a v5 publisher could
+  be told it failed about a message its subscribers still got.
+- A delivery inside a record of many parts waits for the last part, not the
+  first.
 
 ## [0.4.0] - 2026-10-29
 

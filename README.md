@@ -69,6 +69,10 @@ directory (`zzq_broker --data-dir`, Linux only) and it also keeps retained
 messages and persistent sessions on disk. An ack then goes out only once
 its message is written, so a crash loses nothing that was acked. When the
 disk runs low, the broker stops keeping new messages instead of failing.
+QoS 2 routing decisions are journaled before delivery. Recovery completes
+unfinished decisions, and destination receipts prevent duplicate delivery
+when only some journals committed before a crash. Snapshots keep these
+decisions and receipts, including across cluster leadership changes.
 
 ## Clustering
 

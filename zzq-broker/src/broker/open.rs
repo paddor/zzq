@@ -10,17 +10,18 @@ use crate::disk::{self, DataDir};
 use crate::lane::LaneLog;
 use crate::options::BrokerOptions;
 use crate::retain::{Retained, STRIPES};
-use crate::state::SessionState;
+use crate::state::handoff::LaneState;
 use crate::{Error, Result};
 
 /// Brings the installed lanes up: their journals' completions, the state
 /// from the data directory, the cluster node, the state file and `$SYS`.
-pub(super) async fn start(shared: &Arc<Shared>, sessions: Vec<Vec<SessionState>>) -> Result<()> {
+pub(super) async fn start(shared: &Arc<Shared>, sessions: Vec<LaneState>) -> Result<()> {
     if shared.journals() {
         complete_writes(shared).await?;
     }
     if shared.data.is_some() {
         crate::dump::restore(shared, sessions).await?;
+        crate::dump::resume(shared).await?;
     }
     if let Some(cluster) = &shared.opts.cluster {
         crate::cluster::start(shared, cluster).await?;
@@ -54,7 +55,7 @@ pub(crate) struct Opened {
     pub(crate) cluster: Option<Arc<crate::cluster::Groups>>,
     pub(crate) lane_logs: Box<[LaneLog]>,
     /// The sessions of each lane.
-    pub(crate) sessions: Vec<Vec<SessionState>>,
+    pub(crate) sessions: Vec<LaneState>,
 }
 
 /// Opens the journals in `opts.data_dir`, if it is set, for `n` lanes,
@@ -81,7 +82,7 @@ pub(super) async fn open_data(opts: &BrokerOptions, n: usize) -> Result<Opened> 
     blocking(move || {
         let data = DataDir::open(&path, max_packet)?;
         let retained = Retained::open(&data, max, levels)?;
-        let (logs, sessions) = disk::open_lanes(&data, n)?
+        let (logs, sessions) = disk::open_lanes(&data, n, &retained)?
             .into_iter()
             .enumerate()
             .map(|(i, (log, sessions))| (LaneLog::new(i, Some(log)), sessions))

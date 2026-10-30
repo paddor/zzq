@@ -6,7 +6,7 @@ use std::io;
 use std::pin::pin;
 use std::task::{Poll, ready};
 
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use zzq_proto::packet::fixed_header;
 use zzq_proto::{DecodeError, reason};
@@ -135,46 +135,85 @@ pub(super) async fn read_loop<R: AsyncRead + Unpin>(
             }
             continue;
         }
-        let chunk = input.buf.split_to(complete).freeze();
-        let result = {
-            let mut l = lane.borrow_mut();
-            let result = l.handle_chunk(key, &chunk);
-            l.flush();
-            result
-        };
-        drop(chunk);
-        conn.held.set(true);
-        let mut waited = crate::broker::ship(lane).await;
-        // Let other connections on this lane run, such as subscribers whose
-        // acks free up their window.
-        tokio::task::yield_now().await;
-        let held = lane.borrow_mut().take_held(conn.id);
-        waited |= !held.is_empty();
-        for h in held {
-            if let Some(sync) = &h.sync {
-                sync.wait().await;
+        let mut chunk = input.buf.split_to(complete).freeze();
+        let mut at = 0;
+        while at < chunk.len() {
+            let result = {
+                let mut l = lane.borrow_mut();
+                let result = l.handle_chunk(key, &chunk, at);
+                l.flush();
+                result
+            };
+            match result {
+                // A publish waits for the QoS 2 publish before it.
+                Ok(next) if next < chunk.len() => at = next,
+                // Lets go of the read block for the waits.
+                _ => chunk = Bytes::new(),
             }
-            if let Err(close) = written(lane, conn, h.due).await {
+            if let Err(close) = settle(lane, key, conn).await {
                 return close;
             }
-            lane.borrow_mut().release(&h);
-        }
-        match disk_acks(lane, key, conn).await {
-            Ok(w) => waited |= w,
-            Err(close) => return close,
-        }
-        conn.held.set(false);
-        // Keep alive counts from the end of a wait the broker made.
-        if waited {
-            conn.last_rx.set(crate::time::now());
-        }
-        if let Err(close) = result {
-            return close;
-        }
-        if conn.is_closed() {
-            return Close::Kicked;
+            if let Err(close) = result {
+                return close;
+            }
+            if conn.is_closed() {
+                return Close::Kicked;
+            }
+            if at < chunk.len()
+                && let Err(close) = behind_handoff(lane, key, conn).await
+            {
+                return close;
+            }
         }
     }
+}
+
+/// Waits until the session's last QoS 2 publish reached its destinations, for
+/// a publish that must not pass it.
+async fn behind_handoff(lane: &LaneRef, key: Key, conn: &ConnShared) -> Result<(), Close> {
+    let (shared, waits) = {
+        let l = lane.borrow();
+        (l.shared.clone(), l.handoff_waits(key))
+    };
+    conn.held.set(true);
+    for w in waits {
+        // Cancel-safe as in `read_more`; a lost wait leaves the record to
+        // its cursor.
+        tokio::select! {
+            biased;
+            () = conn.stop.notified() => return Err(Close::Kicked),
+            _ = shared.cursor(w.journal).wait(w.n) => {}
+        }
+    }
+    conn.held.set(false);
+    conn.last_rx.set(crate::time::now());
+    Ok(())
+}
+
+/// Ships what the connection's last packets routed, then waits for what
+/// their replies and acks need.
+async fn settle(lane: &LaneRef, key: Key, conn: &ConnShared) -> Result<(), Close> {
+    conn.held.set(true);
+    let mut waited = crate::broker::ship(lane).await;
+    // Let other connections on this lane run, such as subscribers whose
+    // acks free up their window.
+    tokio::task::yield_now().await;
+    let held = lane.borrow_mut().take_held(conn.id);
+    waited |= !held.is_empty();
+    for h in held {
+        if let Some(sync) = &h.sync {
+            sync.wait().await;
+        }
+        written(lane, conn, h.due).await?;
+        lane.borrow_mut().release(&h);
+    }
+    waited |= disk_acks(lane, key, conn).await?;
+    conn.held.set(false);
+    // Keep alive counts from the end of a wait the broker made.
+    if waited {
+        conn.last_rx.set(crate::time::now());
+    }
+    Ok(())
 }
 
 /// Waits for the journal write `due`. A failed one closes the connection:

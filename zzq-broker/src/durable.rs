@@ -22,6 +22,10 @@ pub(crate) enum JournalId {
     Lane(usize),
     /// Of lane `to`, for the deliveries lane `from` sent it.
     Pair { from: usize, to: usize },
+    /// Of lane `to`, for the handoffs lane `from` sent it. They leave once
+    /// their records are written, so they have their own count: a delivery
+    /// routed after one may arrive first.
+    Handoff { from: usize, to: usize },
 }
 
 /// A journal record an ack waits for: its journal and its number there.
@@ -42,9 +46,10 @@ pub(crate) enum Journaled {
 }
 
 /// What an ack waits for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Due {
     /// Nothing.
+    #[default]
     Now,
     /// This record.
     After(Wait),
