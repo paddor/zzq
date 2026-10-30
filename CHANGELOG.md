@@ -36,6 +36,10 @@ Notable changes to zzq. The format follows
   without PUBACKs and what the subscribers lost, got twice or out of
   order. zzq, VerneMQ, TBMQ and NATS clusters.
 - NATS 2.15 among the rivals of `zzq_suite`, over MQTT 3.1.1.
+- `zzq_perf_verify` gates the journal paths, in the sections
+  `broker_1io_durable` and `broker_2io_durable`, and QoS 2 and fan-in without
+  a journal. `fanout16_behind_rss_kib` gates the peak memory of a lane that
+  falls behind.
 
 ### Changed
 

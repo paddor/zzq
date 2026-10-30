@@ -225,13 +225,26 @@ fn topic(i: usize) -> String {
 ///
 /// If `/proc/<pid>/status` cannot be read or lacks `VmRSS`.
 pub fn rss(pid: u32) -> io::Result<u64> {
-    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))?;
-    status
+    status_bytes(pid, "VmRSS:")
+}
+
+/// The most resident memory of process `pid` so far, in bytes.
+///
+/// # Errors
+///
+/// If `/proc/<pid>/status` cannot be read or lacks `VmHWM`.
+pub fn peak_rss(pid: u32) -> io::Result<u64> {
+    status_bytes(pid, "VmHWM:")
+}
+
+fn status_bytes(pid: u32, key: &str) -> io::Result<u64> {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))?
         .lines()
-        .find_map(|l| l.strip_prefix("VmRSS:"))
-        .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        .map(|kib| kib << 10)
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "no VmRSS"))
+        .find_map(|l| l.strip_prefix(key))
+        .and_then(|v| v.trim().strip_suffix("kB"))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|kb| kb << 10)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, format!("no {key}")))
 }
 
 /// The broker's estimate, from `$SYS/broker/state/bytes`.

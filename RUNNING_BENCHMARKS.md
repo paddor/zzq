@@ -111,6 +111,18 @@ others are builds under `ZZQ_RIVALS`:
 memory with the thresholds in `.perf_hw` (ignored). Without that file it runs
 a smaller smoke gate.
 
+The sections `broker_1io_durable` and `broker_2io_durable` gate the journal
+paths: each case gets a fresh broker and data directory under `TMPDIR`, with
+subscribers that keep their sessions. Set `TMPDIR` to the disk the thresholds
+were measured on, and check it is mounted. A durable case that misses its
+threshold gets 3 tries: a VM's disk swings 2-3x between runs. A section missing
+from `.perf_hw` is skipped, as is a case without a threshold.
+
+`fanout16_behind_rss_kib` in `broker_2io` gates peak memory under load: a QoS 0
+fan-out with most subscribers on the lane after the publisher's, which falls
+behind. Which lanes clients land on depends on their IDs, so `zzq_brokerbench`
+takes `lanes=2 local=N` to fix how many subscribers share the publisher's lane.
+
 ## Soaks
 
 `scripts/soak.sh 60` smoke-tests 24 ignored tests with nextest, using
