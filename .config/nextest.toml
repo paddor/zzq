@@ -1,0 +1,12 @@
+[profile.soak]
+test-threads = 6
+retries = 0
+fail-fast = true
+slow-timeout = { period = "30s", terminate-after = 30, grace-period = "10s" }
+status-level = "pass"
+failure-output = "immediate-final"
+
+[profile.soak.junit]
+path = "soak.xml"
+store-success-output = true
+store-failure-output = true

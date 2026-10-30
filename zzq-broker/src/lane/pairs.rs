@@ -2,9 +2,11 @@
 //! for the acks of publishers on that lane.
 //!
 //! Each lane counts the deliveries it sends to every other lane, and the
-//! receiver counts them as it takes them, in the same order. Once the
+//! receiver uses their absolute sequence numbers. Once the
 //! receiver's journal holds every record it made for deliveries up to a
-//! count, it moves the cursor of the pair to that count.
+//! count, it moves the cursor of the pair to that count. Handoffs count
+//! apart from deliveries: each lane has a slot for both, handoffs after all
+//! the deliveries.
 
 use std::collections::VecDeque;
 
@@ -17,15 +19,14 @@ use super::Lane;
 pub(crate) struct Pairs {
     /// Counting is on: the broker has a data directory.
     on: bool,
-    /// Deliveries sent to each lane.
+    lanes: usize,
+    /// Sent to each slot.
     sent: Box<[u64]>,
-    /// Deliveries got from each lane.
-    got: Box<[u64]>,
     /// The count each pair cursor reached.
     done: Box<[u64]>,
-    /// Per sending lane: a count got and the last record of this lane's
+    /// Per sending slot: a count got and the last record of this lane's
     /// journal it needs, oldest first.
-    pending: Box<[VecDeque<(u64, u64)>]>,
+    pending: Box<[VecDeque<(u64, u64, bool)>]>,
     /// The last record appended to this lane's journal.
     pub(super) appended: u64,
     /// Records the journal wrote, or failed to.
@@ -39,10 +40,10 @@ impl Pairs {
         }
         Pairs {
             on,
-            sent: vec![0; lanes].into(),
-            got: vec![0; lanes].into(),
-            done: vec![0; lanes].into(),
-            pending: (0..lanes).map(|_| VecDeque::new()).collect(),
+            lanes,
+            sent: vec![0; 2 * lanes].into(),
+            done: vec![0; 2 * lanes].into(),
+            pending: (0..2 * lanes).map(|_| VecDeque::new()).collect(),
             appended: 0,
             written: 0,
         }
@@ -61,6 +62,28 @@ impl Pairs {
             n: *n,
         })
     }
+
+    /// Counts a handoff lane `from` sends to lane `to`. Returns the record
+    /// a publisher's ack waits for there, if counting is on.
+    pub(super) fn sent_handoff(&mut self, from: u16, to: usize) -> Option<Wait> {
+        let n = self.sent.get_mut(self.lanes + to)?;
+        *n += 1;
+        Some(Wait {
+            journal: JournalId::Handoff {
+                from: usize::from(from),
+                to,
+            },
+            n: *n,
+        })
+    }
+
+    /// Old waits lost their connections. Keep sequence numbers monotonic:
+    /// shared cursors and journal completions outlive a lane's state.
+    pub(super) fn reset(&mut self) {
+        for queue in &mut self.pending {
+            queue.clear();
+        }
+    }
 }
 
 impl Lane {
@@ -69,33 +92,51 @@ impl Lane {
         self.pairs.on
     }
 
-    /// The cursor of the pair from lane `from` to this one.
-    fn pair(&self, from: usize) -> &Cursor {
-        self.shared.cursor(JournalId::Pair {
-            from,
-            to: usize::from(self.id),
+    /// The cursor of `slot`, towards this lane.
+    fn pair(&self, slot: usize) -> &Cursor {
+        let to = usize::from(self.id);
+        let lanes = self.pairs.lanes;
+        self.shared.cursor(if slot < lanes {
+            JournalId::Pair { from: slot, to }
+        } else {
+            JournalId::Handoff {
+                from: slot - lanes,
+                to,
+            }
         })
     }
 
-    /// Counts `n` deliveries got from lane `from`, whose records are
-    /// appended by now.
-    pub(super) fn got_from(&mut self, from: u16, n: u64) {
-        let from = usize::from(from);
+    /// Records through delivery `count` from lane `from` are appended.
+    /// Gaps are allowed: a reset can discard batches not shipped yet.
+    pub(super) fn got_from(&mut self, from: u16, count: u64) {
+        self.received_from(usize::from(from), count, false);
+    }
+
+    /// Records through handoff `count` from lane `from` are appended, or
+    /// that handoff was refused, unless `written`.
+    pub(super) fn got_handoff_from(&mut self, from: u16, count: u64, written: bool) {
+        self.received_from(self.pairs.lanes + usize::from(from), count, !written);
+    }
+
+    fn received_from(&mut self, slot: usize, count: u64, failed: bool) {
         let p = &mut self.pairs;
-        if !p.on || from >= p.got.len() {
+        if !p.on || slot >= p.pending.len() {
             return;
         }
-        p.got[from] += n;
-        let count = p.got[from];
         let needs = p.appended;
-        let queue = &mut p.pending[from];
+        let queue = &mut p.pending[slot];
         if queue.is_empty() && needs <= p.written {
-            p.done[from] = count;
-            self.pair(from).advance(count);
-        } else if let Some(last) = queue.back_mut().filter(|l| l.1 == needs) {
+            let first = p.done[slot] + 1;
+            p.done[slot] = count;
+            if failed {
+                self.pair(slot).fail(first, count);
+            } else {
+                self.pair(slot).advance(count);
+            }
+        } else if let Some(last) = queue.back_mut().filter(|l| l.1 == needs && l.2 == failed) {
             last.0 = count;
         } else {
-            queue.push_back((count, needs));
+            queue.push_back((count, needs, failed));
         }
     }
 
@@ -107,12 +148,12 @@ impl Lane {
         }
         self.pairs.written = self.pairs.written.max(last);
         for from in 0..self.pairs.pending.len() {
-            while let Some(&(count, needs)) = self.pairs.pending[from].front()
+            while let Some(&(count, needs, refused)) = self.pairs.pending[from].front()
                 && needs <= last
             {
                 self.pairs.pending[from].pop_front();
                 let cursor = self.pair(from);
-                if failed && needs >= first {
+                if refused || (failed && needs >= first) {
                     cursor.fail(self.pairs.done[from] + 1, count);
                 } else {
                     cursor.advance(count);

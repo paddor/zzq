@@ -2,7 +2,6 @@
 //! behind it and packet IDs.
 
 use std::mem::size_of;
-use std::time::Instant;
 
 use zzq_proto::{PacketType, QoS};
 
@@ -187,7 +186,9 @@ impl Session {
                 break;
             };
             let expires_at = h.msg.expires_at;
-            if expires_at.is_some() && expired(expires_at, *now.get_or_insert_with(Instant::now)) {
+            if expires_at.is_some()
+                && expired(expires_at, *now.get_or_insert_with(crate::time::now))
+            {
                 self.flow.counts.expired += 1;
                 self.charge.sub(budget::held(&h));
                 self.progress(h.seq, Progress::Done(h.seq));

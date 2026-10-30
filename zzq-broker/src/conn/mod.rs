@@ -55,7 +55,7 @@ impl ConnShared {
             stop: Notify::new(),
             closed: Cell::new(false),
             farewell: RefCell::new(Vec::new()),
-            last_rx: Cell::new(Instant::now()),
+            last_rx: Cell::new(crate::time::now()),
             held: Cell::new(false),
             keep_alive: Cell::new(keep_alive),
             connacked: Cell::new(false),

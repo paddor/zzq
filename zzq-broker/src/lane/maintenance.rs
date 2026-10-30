@@ -14,7 +14,7 @@ use crate::conn::ConnShared;
 use crate::dump::Part;
 use crate::session::Session;
 use crate::slab::Key;
-use crate::state::SessionState;
+use crate::state::handoff::LaneState;
 
 use super::{Close, Lane, Phase, Remote, SWEEP_PARTS, SyncAck, Ticket};
 
@@ -22,6 +22,8 @@ impl Lane {
     /// Keep alive timeouts and session expiry, for the next of
     /// [`SWEEP_PARTS`] parts of the sessions.
     pub(crate) fn sweep(&mut self, now: Instant) {
+        self.retry_handoffs();
+        self.reap_handoffs();
         self.check_state();
         // A state dump keeps sessions and delayed wills with their due
         // times.
@@ -161,12 +163,13 @@ impl Lane {
 
     /// Adds sessions from a state file, with their subscriptions on every
     /// lane and their delayed wills timed.
-    pub(super) fn restore(&mut self, states: Vec<SessionState>, sync: &Arc<SyncAck>) {
+    pub(super) fn restore(&mut self, states: LaneState, sync: &Arc<SyncAck>) {
+        self.restore_handoffs(states.handoffs);
         let lanes = self.shared.lanes.len();
-        let now = Instant::now();
+        let now = crate::time::now();
         // Sessions come from the journal, or from a state file without one.
         let journaled = self.journals();
-        for st in states {
+        for st in states.sessions {
             let Entry::Vacant(slot) = self.by_client.entry(st.client_id.clone()) else {
                 continue;
             };
@@ -188,6 +191,47 @@ impl Lane {
             }
         }
         self.stats.subscriptions = self.index.len() as u64;
+    }
+
+    /// Starts over empty, without journaling: the node no longer leads,
+    /// and what the lane holds may not have committed. Connections close;
+    /// their clients go to the new leader.
+    pub(crate) fn reset(&mut self) {
+        let keys: Vec<Key> = self.sessions.keys().collect();
+        let mut sessions = std::mem::take(&mut self.sessions);
+        let mut disconnected = 0;
+        for key in keys {
+            if let Some(mut s) = sessions.remove(key)
+                && let Some(c) = s.conn.take()
+            {
+                Self::kick(&c, s.version, reason::USE_ANOTHER_SERVER);
+                disconnected += 1;
+            }
+        }
+        // Reset owns these connections now; their eventual detach sees stale
+        // keys. Relaxed: this is only the admission limit's counter.
+        self.shared
+            .connections
+            .fetch_sub(disconnected, Ordering::Relaxed);
+        // Old connection tasks and cross-lane controls may outlive this state.
+        // Keep their keys and connection IDs distinct from every new one.
+        sessions.trim();
+        let ids = std::mem::take(&mut self.ids);
+        let epoch = self.epoch + 1;
+        let mut pairs = std::mem::take(&mut self.pairs);
+        pairs.reset();
+        // A sender blocked on a full mailbox may still own this lock, and
+        // the handoff task sleeps on this signal.
+        let shipping = self.out.shipping.clone();
+        let wake = self.handoffs.wake.clone();
+        self.shared.lane_logs[usize::from(self.id)].discard();
+        *self = Lane::new(self.id, self.shared.clone());
+        self.sessions = sessions;
+        self.ids = ids;
+        self.epoch = epoch;
+        self.pairs = pairs;
+        self.out.shipping = shipping;
+        self.handoffs.wake = wake;
     }
 
     pub(crate) fn shutdown(&mut self) {

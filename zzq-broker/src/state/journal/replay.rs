@@ -1,36 +1,44 @@
 //! Sessions rebuilt from the records of a lane journal.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 use zzq_proto::topic::validate_filter;
 use zzq_proto::{QoS, SubscriptionOptions, Version};
 
+use crate::disk::Append;
 use crate::index::SubIds;
 use crate::msg::Msg;
 use crate::session::{Queued, Will};
 use crate::state::codec::Decoder;
+use crate::state::handoff::{self, Handoffs, LaneState};
 use crate::state::{Clock, SessionState};
 
 use super::{
-    CLEAR, CLEARED, DONE, DOWN, END, IMAGE, INBOUND, INBOUND_DONE, MSG, QUEUED, RELEASED, SENT,
-    SESSION, SUB, UNSUB, WILL_SENT,
+    CLEAR, CLEARED, DONE, DOWN, END, HANDED, HANDOFF, HANDOFF_KEPT, IMAGE, INBOUND, INBOUND_DONE,
+    MSG, PART, PART_BYTES, PART_END, QUEUED, RECEIVED, RELEASED, ROUTING, SENT, SESSION, SUB,
+    TRANSACTION, UNSUB, WILL_SENT,
 };
 
 /// The sessions a lane journal leaves, record by record.
 #[derive(Debug, Default)]
 pub(crate) struct Sessions {
+    lanes: usize,
     by_client: FxHashMap<Box<str>, Replayed>,
     /// The sessions of a snapshot still being read: they take the place
     /// of `by_client` at its end, and are dropped if it never comes.
-    snapshot: Option<FxHashMap<Box<str>, Replayed>>,
+    snapshot: Option<(FxHashMap<Box<str>, Replayed>, Handoffs)>,
+    handoffs: Handoffs,
     /// The message of the last [`MSG`] record, which [`QUEUED`] records
     /// after it deliver.
     msg: Option<Msg>,
+    /// The [`PART`] records of a record that has not ended.
+    pub(super) parts: Vec<u8>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Replayed {
     /// Without subscriptions, inbound packet IDs or deliveries.
     st: SessionState,
@@ -43,7 +51,7 @@ struct Replayed {
     connected: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Item {
     queued: Queued,
     /// The packet ID it went out under, if that matters.
@@ -52,6 +60,12 @@ struct Item {
 }
 
 impl Sessions {
+    pub(crate) fn new(lanes: usize) -> Sessions {
+        Sessions {
+            lanes,
+            ..Sessions::default()
+        }
+    }
     /// Applies a record. `owned` tells whether a client ID belongs to the
     /// journal's lane.
     pub(crate) fn apply(
@@ -61,12 +75,100 @@ impl Sessions {
         clock: Clock,
         owned: impl Fn(&str) -> bool,
     ) -> Result<(), &'static str> {
+        match kind {
+            PART => {
+                let (&first, piece) = body.split_first().ok_or("empty record part")?;
+                if first != 0 {
+                    self.parts.clear();
+                }
+                self.parts.extend_from_slice(piece);
+                Ok(())
+            }
+            PART_END => {
+                let (&kind, piece) = body.split_first().ok_or("empty record end")?;
+                let mut whole = std::mem::take(&mut self.parts);
+                whole.extend_from_slice(piece);
+                self.apply_whole(kind, &whole, clock, &owned)
+            }
+            _ => {
+                // What a failed write left of a long record.
+                self.parts.clear();
+                self.apply_whole(kind, body, clock, &owned)
+            }
+        }
+    }
+
+    fn apply_whole(
+        &mut self,
+        kind: u8,
+        body: &[u8],
+        clock: Clock,
+        owned: &dyn Fn(&str) -> bool,
+    ) -> Result<(), &'static str> {
+        if kind != TRANSACTION {
+            return self.apply_one(kind, body, clock, owned);
+        }
+        let mut d = Decoder(body);
+        while !d.0.is_empty() {
+            let kind = d.u8()?;
+            if matches!(
+                kind,
+                TRANSACTION
+                    | CLEAR
+                    | CLEARED
+                    | IMAGE
+                    | ROUTING
+                    | HANDOFF
+                    | HANDOFF_KEPT
+                    | HANDED
+                    | PART
+                    | PART_END
+            ) {
+                return Err("invalid transaction record");
+            }
+            let len = d.u32()? as usize;
+            self.apply_one(kind, d.take(len)?, clock, owned)?;
+        }
+        Ok(())
+    }
+
+    /// Decodes a [`HANDOFF`] or [`HANDOFF_KEPT`] body, and checks it belongs
+    /// in the journal of this lane.
+    fn pending(
+        &self,
+        d: &mut Decoder<'_>,
+        clock: Clock,
+        owned: &dyn Fn(&str) -> bool,
+    ) -> Result<handoff::Pending, &'static str> {
+        let p = handoff::read_pending(d, clock)?;
+        if self.lanes != 0
+            && p.targets
+                .iter()
+                .any(|t| crate::broker::lane_for(&t.client, self.lanes) != usize::from(t.lane))
+        {
+            return Err("handoff destination belongs to another lane");
+        }
+        if !owned(&p.publisher) {
+            return Err("handoff in the journal of another lane");
+        }
+        Ok(p)
+    }
+
+    #[expect(clippy::too_many_lines, reason = "one arm per journal record")]
+    fn apply_one(
+        &mut self,
+        kind: u8,
+        body: &[u8],
+        clock: Clock,
+        owned: &dyn Fn(&str) -> bool,
+    ) -> Result<(), &'static str> {
         let mut d = Decoder(body);
         match kind {
-            CLEAR => self.snapshot = Some(FxHashMap::default()),
+            CLEAR => self.snapshot = Some((FxHashMap::default(), Handoffs::default())),
             CLEARED => {
-                if let Some(snapshot) = self.snapshot.take() {
+                if let Some((snapshot, handoffs)) = self.snapshot.take() {
                     self.by_client = snapshot;
+                    self.handoffs = handoffs;
                 }
             }
             IMAGE => {
@@ -74,16 +176,58 @@ impl Sessions {
                 if !owned(&r.st.client_id) {
                     return Err("session in the journal of another lane");
                 }
-                let into = self.snapshot.as_mut().unwrap_or(&mut self.by_client);
+                let (into, h) = self
+                    .snapshot
+                    .as_mut()
+                    .map(|s| (&mut s.0, &mut s.1))
+                    .unwrap_or((&mut self.by_client, &mut self.handoffs));
+                h.serial = h.serial.max(r.st.birth);
                 into.insert(r.st.client_id.clone(), r);
+            }
+            ROUTING => {
+                let h = self
+                    .snapshot
+                    .as_mut()
+                    .map(|s| &mut s.1)
+                    .unwrap_or(&mut self.handoffs);
+                handoff::read_meta(&mut d, h)?;
+            }
+            HANDOFF_KEPT => {
+                let p = self.pending(&mut d, clock, owned)?;
+                let h = self
+                    .snapshot
+                    .as_mut()
+                    .map(|s| &mut s.1)
+                    .unwrap_or(&mut self.handoffs);
+                h.serial = h.serial.max(p.seq);
+                h.pending.insert(p.seq, std::sync::Arc::new(p));
             }
             // Any other record after an unfinished snapshot: the snapshot
             // was cut off, and the lane went on without it.
-            _ if self.snapshot.take().is_some() => return self.apply(kind, body, clock, owned),
+            _ if self.snapshot.take().is_some() => return self.apply_one(kind, body, clock, owned),
+            HANDOFF => {
+                let p = self.pending(&mut d, clock, owned)?;
+                if let Some(r) = self
+                    .by_client
+                    .get_mut(&p.publisher)
+                    .filter(|r| r.st.birth == p.birth)
+                {
+                    r.awaiting_rel.insert(p.pkid);
+                }
+                self.handoffs.serial = self.handoffs.serial.max(p.seq);
+                self.handoffs.pending.insert(p.seq, std::sync::Arc::new(p));
+            }
+            HANDED => {
+                self.handoffs.pending.remove(&d.u64()?);
+            }
+            RECEIVED => {
+                self.handoffs.receive(d.u16()?, d.u64()?);
+            }
             MSG => self.msg = Some(d.msg(clock)?),
             SESSION => {
                 let client_id = d.str()?;
                 let st = session_head(&mut d, client_id, clock)?;
+                self.handoffs.serial = self.handoffs.serial.max(st.birth);
                 if !owned(client_id) {
                     return Err("session in the journal of another lane");
                 }
@@ -112,12 +256,45 @@ impl Sessions {
 
     /// The sessions, those still connected taken as lost `now`: their
     /// expiry starts and their will is due after its delay.
+    #[cfg(any(test, feature = "fuzzing"))]
     pub(crate) fn finish(self, now: Instant) -> Vec<SessionState> {
+        self.into_lane(now).sessions
+    }
+
+    pub(crate) fn into_lane(self, now: Instant) -> LaneState {
         let mut out = Vec::with_capacity(self.by_client.len());
         for r in self.by_client.into_values() {
             out.push(r.finish(now));
         }
-        out
+        LaneState {
+            sessions: out,
+            handoffs: self.handoffs,
+        }
+    }
+
+    /// Appends records that rebuild these sessions as they stand, with
+    /// their delivery numbers and connections, then the message for the
+    /// deliveries that may follow.
+    pub(crate) fn image(&self, out: &mut impl Append, clock: Clock) -> io::Result<()> {
+        let mut buf = Vec::new();
+        out.append(CLEAR, &[])?;
+        for r in self.by_client.values() {
+            buf.clear();
+            super::image_state(&mut buf, r.clone().into_state(), r.connected, clock);
+            super::append_record(out, IMAGE, &[&buf])?;
+        }
+        super::handoffs(out, &self.handoffs, &mut buf, clock)?;
+        out.append(CLEARED, &[])?;
+        if let Some(m) = &self.msg {
+            buf.clear();
+            crate::state::msg_head(&mut buf, m, clock);
+            super::append_record(out, MSG, &[&buf, m.payload()])?;
+        }
+        // The rest of a long record may come in the ops after the image.
+        for (i, piece) in self.parts.chunks(PART_BYTES).enumerate() {
+            out.append(PART, &[&[u8::from(i == 0)], piece])?;
+        }
+        Ok(())
     }
 }
 
@@ -235,6 +412,16 @@ impl Replayed {
 
     /// The session; still connected, it lost its connection `now`.
     fn finish(self, now: Instant) -> SessionState {
+        let connected = self.connected;
+        let mut st = self.into_state();
+        if connected {
+            lost(&mut st, now);
+        }
+        st
+    }
+
+    /// The session as it stands, its deliveries in order.
+    fn into_state(self) -> SessionState {
         let mut st = self.st;
         st.subs = self
             .subs
@@ -259,9 +446,6 @@ impl Replayed {
         }
         st.seqs.extend(queue_seqs);
         st.last_seq = self.last_seq;
-        if self.connected {
-            lost(&mut st, now);
-        }
         st
     }
 }
@@ -291,6 +475,10 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
             released: false,
         };
         items.insert(d.u64()?, item);
+    }
+    st.birth = if d.0.is_empty() { 0 } else { d.u64()? };
+    if st.birth == u64::MAX {
+        return Err("invalid session birth");
     }
     let subs = std::mem::take(&mut st.subs)
         .into_iter()
@@ -351,7 +539,12 @@ fn session_head(
     } else {
         None
     };
+    let birth = if d.0.is_empty() { 0 } else { d.u64()? };
+    if birth == u64::MAX {
+        return Err("invalid session birth");
+    }
     Ok(SessionState {
+        birth,
         client_id: client_id.into(),
         username,
         version,

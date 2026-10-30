@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use data::{BrokerRow, ClientRow, FixedRow};
-use draw::{Chart, CpuShow, Impl, Key, Latency, Result, Row, RowData};
+use draw::{Chart, CpuShow, Impl, Key, Latency, Result, Row, RowData, RttAxis};
 use fixed::{FixedChart, Scenario, Step};
 use plotters::style::RGBColor;
 
@@ -39,6 +39,7 @@ const BROWN: RGBColor = RGBColor(180, 83, 9);
 const INDIGO: RGBColor = RGBColor(99, 102, 241);
 const TAN: RGBColor = RGBColor(187, 170, 153);
 const MAGENTA: RGBColor = RGBColor(255, 17, 255);
+const OLIVE: RGBColor = RGBColor(154, 160, 30);
 
 const fn rival(
     key: &'static str,
@@ -90,6 +91,7 @@ const BROKERS: &[Impl] = &[
         "CPUs 0-3, with Kafka, Valkey, PostgreSQL",
         MAGENTA,
     ),
+    rival("nats", "NATS", "CPUs 0-3, MQTT 3.1.1", OLIVE),
 ];
 
 const fn stored(
@@ -136,6 +138,7 @@ const DURABLE: &[Impl] = &[
     stored("saguin", "Sag\u{fc}in", "SQLite", INDIGO),
     stored("hivemq", "HiveMQ CE", "file persistence", TAN),
     stored("tbmq", "TBMQ", "Kafka, Valkey, PostgreSQL", MAGENTA),
+    stored("nats", "NATS", "JetStream, every write synced", OLIVE),
 ];
 
 /// Broker throughput rows: scenario, publishers, subscribers, title.
@@ -231,6 +234,7 @@ fn brokers() -> Result {
         rows: broker_rows(
             &rows,
             "round trip, 1 message in flight: p99, whiskers p50 to p99.9",
+            RttAxis::Linear,
         ),
         cpu: CpuShow::BelowAxis,
         cpu_of: "broker",
@@ -241,8 +245,8 @@ fn brokers() -> Result {
              has no flow control, so it can trail QoS 1 at large sizes.",
             "Where brokers drop messages, close subscribers or stall under this load: \
              COMPARISONS.md.",
-            "zzq on 2 IO lanes: the single pair and the round trip cross lanes. rumqttd speaks \
-             MQTT 3.1.1, the rest 5.0. Round trips at QoS 0 and 1 only.",
+            "zzq on 2 IO lanes: the single pair and the round trip cross lanes. rumqttd and NATS \
+             speak MQTT 3.1.1, the rest 5.0. Round trips at QoS 0 and 1 only.",
         ],
     };
     write(&chart)
@@ -260,6 +264,7 @@ fn durable() -> Result {
         rows: broker_rows(
             &rows,
             "time to PUBACK, 1 QoS 1 message in flight: p99, whiskers p50 to p99.9",
+            RttAxis::Log,
         ),
         cpu: CpuShow::BelowAxis,
         cpu_of: "broker",
@@ -303,8 +308,12 @@ fn newest_brokers(impls: &'static [Impl]) -> BTreeMap<BrokerCell, BrokerRow> {
     )
 }
 
-/// The throughput rows, then the round-trip row titled `rtt`.
-fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>, rtt_title: &'static str) -> Vec<Row> {
+/// The throughput rows, then the round-trip row titled `rtt_title`.
+fn broker_rows(
+    rows: &BTreeMap<BrokerCell, BrokerRow>,
+    rtt_title: &'static str,
+    rtt_axis: RttAxis,
+) -> Vec<Row> {
     let mut tput: Vec<BTreeMap<Key, f64>> = vec![BTreeMap::new(); BROKER_ROWS.len()];
     let mut cpu: Vec<BTreeMap<Key, f64>> = vec![BTreeMap::new(); BROKER_ROWS.len() + 1];
     let mut rtt = BTreeMap::new();
@@ -342,7 +351,7 @@ fn broker_rows(rows: &BTreeMap<BrokerCell, BrokerRow>, rtt_title: &'static str) 
         .collect();
     chart_rows.push(Row {
         title: rtt_title,
-        data: RowData::Rtt(rtt),
+        data: RowData::Rtt(rtt, rtt_axis),
         cpu: cpu.next().unwrap_or_default(),
     });
     chart_rows
@@ -455,8 +464,8 @@ fn fixed_load() -> Result {
 }
 
 const FIXED_NOTES: &[&str] = &[
-    "QoS 1, 16 B, MQTT 5 (rumqttd 3.1.1). Each publisher sends on a fixed schedule; the offered \
-     rate counts deliveries. Steps run 2 s, then measure 8 s, on the same connections.",
+    "QoS 1, 16 B, MQTT 5 (rumqttd and NATS 3.1.1). Each publisher sends on a fixed schedule; the \
+     offered rate counts deliveries. Steps run 2 s, then measure 8 s, on the same connections.",
     "Latency runs from the send to delivery, or from when it was due if the broker held it back. \
      Seconds with host CPU steal are left out. Broker on CPUs 0-3, load generator on CPUs 4-5.",
     "A step fails under 95% delivered, on a closed connection, or at a median over 100 ms; a \
@@ -465,6 +474,8 @@ const FIXED_NOTES: &[&str] = &[
      Fan-out latency includes the generator reading each burst of 1000 deliveries.",
     "Tuned configs, except where they run out of memory at 20K connections: NanoMQ's queue \
      (2048), FluxMQ's send queue (1000), VerneMQ's socket buffers (128 KiB). See COMPARISONS.md.",
+    "NATS has no shared subscriptions: it takes the fan-in filter as a plain one, which matches no \
+     topic.",
 ];
 
 /// One scenario's steps per impl and offered rate.

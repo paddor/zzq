@@ -104,21 +104,21 @@ fn a_message_counts_until_no_session_holds_it() {
     r.set(&msg("a"), false);
     assert_eq!(r.bytes(), one + held.size());
     drop(held);
-    r.sweep(Instant::now());
+    r.sweep(crate::time::now());
     assert_eq!(r.bytes(), one);
     let held = r.matching("a").pop().unwrap();
     r.set(&clear("a"), false);
-    r.sweep(Instant::now());
+    r.sweep(crate::time::now());
     assert_eq!(r.bytes(), held.size());
     drop(held);
-    r.sweep(Instant::now());
+    r.sweep(crate::time::now());
     assert_eq!(r.bytes(), 0);
 }
 
 #[test]
 fn sweep_drops_expired_but_not_replaced() {
     let r = Retained::new(usize::MAX);
-    let now = Instant::now();
+    let now = crate::time::now();
     let soon = |topic: &str| {
         let mut m = msg(topic);
         m.expires_at = Some(now);
@@ -137,7 +137,7 @@ fn sweep_drops_expired_but_not_replaced() {
 #[test]
 fn republished_topic_keeps_one_expiry_entry() {
     let mut tree = Tree::default();
-    let now = Instant::now();
+    let now = crate::time::now();
     for i in 0..100 {
         let mut m = msg("status");
         m.expires_at = Some(now + Duration::from_secs(60 + i));
@@ -152,6 +152,81 @@ fn republished_topic_keeps_one_expiry_entry() {
 fn a_store_in_memory_journals_nothing() {
     let r = Retained::new(usize::MAX);
     assert_eq!(r.set(&msg("a"), false), None);
+}
+
+#[tokio::test]
+async fn a_recovered_handoff_cannot_replace_a_newer_retained_value() {
+    let Some((path, data)) = data_dir("handoff") else {
+        return;
+    };
+    let old = Msg::new("handoff/t", b"old", &[], QoS::ExactlyOnce, true);
+    let new = Msg::new("handoff/t", b"new", &[], QoS::AtLeastOnce, true);
+    {
+        let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
+        assert!(matches!(
+            r.set_once(0, 1, &old, false),
+            Some(Journaled::At { .. })
+        ));
+        r.set(&new, false);
+        let mut tick = tokio::time::interval(Duration::from_millis(5));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !r.snapshot(true) {
+                tick.tick().await;
+            }
+        })
+        .await
+        .unwrap();
+        r.close();
+    }
+    let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
+    assert_eq!(r.set_once(0, 1, &old, false), None);
+    assert_eq!(r.matching("handoff/t")[0].payload(), b"new");
+    r.set_once(0, 2, &clear("handoff/t"), false);
+    r.set(&new, false);
+    r.close();
+    drop(r);
+    let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
+    assert_eq!(r.set_once(0, 2, &clear("handoff/t"), false), None);
+    assert_eq!(r.matching("handoff/t")[0].payload(), b"new");
+    drop(r);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn a_refused_retained_handoff_stays_refused_after_restart() {
+    let Some((path, data)) = data_dir("handoff-full") else {
+        return;
+    };
+    let m = msg("handoff/full");
+    {
+        let r = Retained::open(&data, 0, usize::MAX).unwrap();
+        assert!(matches!(
+            r.set_once(3, 9, &m, false),
+            Some(Journaled::At { .. })
+        ));
+        assert_eq!(r.len(), 0);
+        r.close();
+    }
+    let r = Retained::open(&data, 10, usize::MAX).unwrap();
+    assert_eq!(r.set_once(3, 9, &m, false), None);
+    assert_eq!(r.len(), 0);
+    r.set_once(3, 10, &m, false);
+    assert_eq!(r.len(), 1);
+    r.close();
+    assert_eq!(r.set_once(3, 11, &m, false), Some(Journaled::Failed));
+    drop(r);
+    std::fs::remove_dir_all(path).unwrap();
+}
+
+#[test]
+fn malformed_retained_handoffs_are_refused() {
+    let r = Replay::new(usize::MAX);
+    let mut tree = Tree::default();
+    for body in [&[][..], &[0; 11], &[0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 9]] {
+        assert!(handoff::replay(r, &mut tree, 0, body).is_err());
+    }
+    assert!(handoff::read_receipts(&mut tree, &[0]).is_err());
+    assert!(handoff::read_receipts(&mut tree, &vec![0; (usize::from(u16::MAX) + 2) * 8]).is_err());
 }
 
 /// A data directory for the test `name`, or `None` where the temp
@@ -184,9 +259,9 @@ fn journals_hold_what_the_store_held() {
         return;
     };
     let mut expiring = Msg::new("e/1", b"soon", &[1, 1], QoS::AtLeastOnce, true);
-    expiring.expires_at = Some(Instant::now() + Duration::from_secs(600));
+    expiring.expires_at = Some(crate::time::now() + Duration::from_secs(600));
     let mut gone = msg("e/2");
-    gone.expires_at = Some(Instant::now() + Duration::from_millis(1));
+    gone.expires_at = Some(crate::time::now() + Duration::from_millis(1));
     let got = written(
         &data,
         &[
@@ -210,7 +285,7 @@ fn journals_hold_what_the_store_held() {
         (m.payload(), m.props(), m.qos),
         (&b"soon"[..], &[1, 1][..], QoS::AtLeastOnce)
     );
-    let left = m.expires_at.unwrap() - Instant::now();
+    let left = m.expires_at.unwrap() - crate::time::now();
     assert!(left > Duration::from_secs(300), "{left:?}");
     drop(r);
     // Topics deeper than allowed now stay out.
@@ -259,12 +334,9 @@ fn a_snapshot_takes_the_place_of_the_records_before_it() {
         r.set(&msg(&format!("s/{}", i % 10)), false);
     }
     r.set(&clear("s/3"), false);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let deadline = crate::time::now() + Duration::from_secs(10);
     while !r.snapshot(true) {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "no segment for the snapshot"
-        );
+        assert!(crate::time::now() < deadline, "no segment for the snapshot");
         std::thread::sleep(Duration::from_millis(5));
     }
     r.set(&msg("s/after"), false);

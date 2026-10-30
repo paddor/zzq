@@ -28,6 +28,8 @@ zzq_suite fixed zzq 2      # fixed load, zzq with 2 IO lanes
 zzq_suite fixed nanomq fixed
 zzq_suite durable zzq 1    # storage on, zzq with 1 IO lane and a data dir
 zzq_suite durable emqx     # a rival with its most durable storage
+zzq_suite failover zzq     # a cluster of three, its leader killed under load
+zzq_suite failover vernemq netsplit
 zzq_suite all              # every suite, one log each
 zzq_chart                  # redraw doc/charts from the cache
 ```
@@ -57,6 +59,22 @@ that containers wrote are removed with `podman unshare`. XMQ and rmqtt
 keep messages in a Redis container that syncs every write. FluxMQ 1.0.0
 refuses persistent sessions on one node, so it has no durable run.
 
+## Failover
+
+`failover` starts a fresh cluster of three for each cell, node `i` on CPU
+`i` with MQTT on port 1883 + `i`, and runs `zzq_failover` on the load
+CPUs. It kills or stops the node the publishers use mid-run and records
+the gap without PUBACKs, and what the subscribers lost, got twice or out
+of order, into `failover.jsonl`. zzq nodes keep state files in
+`$TMPDIR/zzq-suite/failover`. VerneMQ runs as three copies of its release
+in `$TMPDIR/zzq-suite/failover-vernemq`, joined to node 0, with the
+`cluster` config (its netsplit defaults) or `netsplit` (it serves during
+one). TBMQ runs as three containers beside one PostgreSQL, Kafka and
+Valkey, with 2 GiB heaps; node 0 installs the database. NATS runs as
+three processes routed to each other, with the MQTT streams on all three
+(`nats-cluster.conf`) and their stores in
+`$TMPDIR/zzq-suite/failover-nats`.
+
 ## Rivals
 
 Broker configs are in `zzq-bench/harness/conf`, one per broker and config
@@ -71,13 +89,16 @@ others are builds under `ZZQ_RIVALS`:
 | `flashmq/bin/flashmq` | FlashMQ 1.27.3 |
 | `fluxmq/bin/fluxmq` | FluxMQ 1.0.0 |
 | `saguin/bin/saguin` | Sagüin 0.1.0-rc.1 |
+| `nats/bin/nats-server` | NATS 2.15.2, the `linux-amd64` release binary |
 | `vernemq-src/_build/default/rel/vernemq` | VerneMQ 2.2.1 built from source, with its generated `etc/vernemq.conf` copied to `etc/vernemq.conf.orig` |
 | `emqtt-bench/lib` | emqtt 1.14.6 and its dependencies, from an emqtt-bench release |
 
 - VerneMQ is built from source: its official images and packages come
   under an EULA that forbids competitive analysis.
-- FluxMQ, HiveMQ CE and TBMQ keep their stores in `$TMPDIR/zzq-suite` in
-  every config, so set `TMPDIR` to a disk.
+- FluxMQ, HiveMQ CE, TBMQ and NATS keep their stores in
+  `$TMPDIR/zzq-suite` in every config, so set `TMPDIR` to a disk. NATS
+  needs JetStream for MQTT, and speaks MQTT 3.1.1 only, so its runs do
+  too.
 - TBMQ runs with PostgreSQL 17, Kafka 4.0 and Valkey 8 containers, all on
   the broker CPUs, and needs ports 5432, 6379, 8083, 8084, 9092 and 9093.
   After start, the suite turns off its basic auth provider over the REST
@@ -89,3 +110,42 @@ others are builds under `ZZQ_RIVALS`:
 `zzq_perf_verify` measures zzq alone and compares throughput, latency and
 memory with the thresholds in `.perf_hw` (ignored). Without that file it runs
 a smaller smoke gate.
+
+The sections `broker_1io_durable` and `broker_2io_durable` gate the journal
+paths: each case gets a fresh broker and data directory under `TMPDIR`, with
+subscribers that keep their sessions. Set `TMPDIR` to the disk the thresholds
+were measured on, and check it is mounted. A durable case that misses its
+threshold gets 3 tries: a VM's disk swings 2-3x between runs. A section missing
+from `.perf_hw` is skipped, as is a case without a threshold.
+
+`fanout16_behind_rss_kib` in `broker_2io` gates peak memory under load: a QoS 0
+fan-out with most subscribers on the lane after the publisher's, which falls
+behind. Which lanes clients land on depends on their IDs, so `zzq_brokerbench`
+takes `lanes=2 local=N` to fix how many subscribers share the publisher's lane.
+
+## Soaks
+
+`scripts/soak.sh 60` smoke-tests 24 ignored tests with nextest, using
+six concurrent workers. `scripts/soak.sh 600` runs each for ten
+minutes. Extra arguments are nextest filters, for example `cluster_crash`.
+The `soak` Cargo feature enables the `zzq_soak` test target; ordinary tests
+skip it. Its executable has the `zzq_` prefix for process monitors.
+`ZZQ_SOAK_PROFILE` chooses a different nextest profile when separate
+concurrent invocations need independent JUnit reports.
+
+The jobs cover seven MQTT transports with storage off/on, MQTT-SN,
+session churn, backpressure, disk crash recovery, and three-process
+cluster crashes, partitions, quorum loss, and clean restarts. Cluster
+clients use both direct endpoint discovery and reconnect through a TCP
+proxy. Replication faults affect only test-owned proxies and processes.
+
+Artifacts go in `/mnt/ssd2/tmp/zzq-soak`: nextest output and JUnit,
+the source patch, broker logs, and one-second memory, descriptor, thread,
+CPU, I/O, and progress samples. Allocated disk space is sampled every
+30 seconds. `scripts/soak_summary.sh RUN_DIRECTORY` writes a JSON
+summary of test results and resource peaks. `ZZQ_SOAK_ROOT` and
+`ZZQ_SOAK_MOUNT` change the storage location and required mount;
+`ZZQ_SOAK_SEED` selects the payload seed. Progress deadlines, bounded
+delivery checks, and resource ceilings fail a job. Resource growth is
+checked after warmup; a short smoke cannot establish memory stability.
+Nextest stops a job still running at 1.5 times its time plus 5 minutes.

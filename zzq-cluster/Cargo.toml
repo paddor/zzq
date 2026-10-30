@@ -1,0 +1,20 @@
+[package]
+name = "zzq-cluster"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+readme = "README.md"
+description = "Viewstamped Replication for zzq clusters (engine crate of zzq-broker)."
+keywords = ["mqtt", "replication", "consensus", "vsr"]
+categories = ["network-programming"]
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+xxhash-rust.workspace = true

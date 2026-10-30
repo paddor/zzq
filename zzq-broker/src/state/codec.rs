@@ -282,6 +282,7 @@ impl<'a> Decoder<'a> {
             queue.push(self.item(clock)?);
         }
         Ok(SessionState {
+            birth: 0,
             client_id: client_id.into(),
             username,
             version,

@@ -16,25 +16,39 @@ use super::route::Owned;
 use super::{Close, Lane};
 
 impl Lane {
-    /// Handles every packet in `chunk`, which holds only whole packets.
-    pub(crate) fn handle_chunk(&mut self, key: Key, chunk: &Bytes) -> Result<(), Close> {
+    /// Handles the packets of `chunk` from `at`; it holds only whole
+    /// packets. Returns where it stopped: the end, or a publish that would
+    /// pass a QoS 2 publish before it, whose delivery waits for journals.
+    /// Its turn comes once that publish reached its destinations.
+    pub(crate) fn handle_chunk(
+        &mut self,
+        key: Key,
+        chunk: &Bytes,
+        at: usize,
+    ) -> Result<usize, Close> {
         let Some(s) = self.sessions.get(key) else {
             return Err(Close::Kicked);
         };
         let version = s.version;
         let max = self.shared.opts.max_packet_size;
-        let mut buf: &[u8] = chunk;
+        self.handoffs.in_read = self.handoff_ahead(key);
+        let mut buf: &[u8] = &chunk[at..];
         while !buf.is_empty() {
             let (packet, n) = match decode(buf, version, max) {
                 Ok(Some(p)) => p,
                 Ok(None) => return Err(Close::Protocol(reason::MALFORMED_PACKET)),
                 Err(e) => return Err(Close::Protocol(e.reason_code())),
             };
+            if self.handoffs.in_read
+                && matches!(&packet, Packet::Publish(p) if p.qos != QoS::ExactlyOnce)
+            {
+                return Ok(chunk.len() - buf.len());
+            }
             let raw = &buf[..n];
             buf = &buf[n..];
             self.handle_packet(key, packet, raw, chunk)?;
         }
-        Ok(())
+        Ok(chunk.len())
     }
 
     #[expect(
@@ -117,11 +131,15 @@ impl Lane {
             return;
         };
         let removed = s.inbound.awaiting_rel.remove(&a.pkid);
-        // Not before the journal has it: a restart would take a new
-        // PUBLISH with this ID as a repeat.
-        if removed && let Some(j) = self.journal_inbound(key, a.pkid, true) {
-            self.hold_ack(key, PacketType::PubComp, a.pkid, j);
-            return;
+        if removed {
+            let handoff = self.take_flow(key, a.pkid);
+            // Not before the journal has it: a restart would take a new
+            // PUBLISH with this ID as a repeat.
+            let j = self.journal_inbound(key, a.pkid, true);
+            if j.is_some() || handoff.is_some() {
+                self.hold_pubcomp(key, a.pkid, j, handoff);
+                return;
+            }
         }
         let Some(s) = self.sessions.get_mut(key) else {
             return;
@@ -144,6 +162,12 @@ impl Lane {
         chunk: &Bytes,
     ) -> Result<(), Close> {
         let opts_alias_max = self.shared.opts.topic_alias_maximum;
+        // The QoS here: a call per publish would be most of a QoS 0 publish's
+        // way through this function.
+        let exactly_once = p.qos == QoS::ExactlyOnce;
+        if exactly_once && self.retry_handoff(key, p) {
+            return Ok(());
+        }
         let receive_max = usize::from(self.shared.opts.receive_maximum);
         self.needs.clear();
         let s = self.sessions.get_mut(key).ok_or(Close::Kicked)?;
@@ -181,11 +205,6 @@ impl Lane {
             return Ok(());
         }
         let version = s.version;
-        // A repeat of a QoS 2 ID after a restart is no new message.
-        if p.qos == QoS::ExactlyOnce && s.journaled {
-            let j = self.journal_inbound(key, p.pkid, false);
-            self.needs.note(j);
-        }
         let packet = filtered_props.is_none().then_some((raw, version));
         let publication = Publication {
             topic,
@@ -199,12 +218,15 @@ impl Lane {
             pins: true,
             expires_at: None,
         };
-        self.route_publish(key, &publication);
+        if !exactly_once || !self.route_handoff(key, p.pkid, &publication) {
+            self.route_publish(key, &publication);
+        }
         self.ack_or_hold(key, p)
     }
 
     /// Stores a retained publication and routes it, noting the journal
     /// writes its ack needs.
+    #[inline]
     fn route_publish(&mut self, key: Key, publication: &Publication<'_>) {
         let mut owned = Owned::default();
         if publication.retain {

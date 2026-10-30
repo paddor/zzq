@@ -34,6 +34,7 @@
 
 mod broker;
 mod budget;
+mod cluster;
 mod conn;
 mod disk;
 mod dump;
@@ -54,15 +55,21 @@ mod state;
 mod sys;
 #[cfg(test)]
 mod tests;
+mod time;
 
 // The shared test support names the crate.
 #[cfg(test)]
 extern crate self as zzq_broker;
 
 pub use broker::{Broker, Dropped, Stats, lane_for};
+#[doc(hidden)]
+#[cfg(feature = "cluster")]
+pub use cluster::omq_links;
 pub use options::{
     AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo, SnOptions,
 };
+#[doc(hidden)]
+pub use options::{ClusterLinks, ClusterOptions, ClusterStart};
 pub use zzq_proto::{QoS, ReasonCode};
 pub use zzq_tokio::transport::TransportOptions;
 #[cfg(feature = "tls")]
@@ -91,6 +98,9 @@ pub enum Error {
     /// [`BrokerOptions::state_file`] could not be read or written.
     #[error("state file failed")]
     State(#[source] std::io::Error),
+    /// The links to the other nodes of a cluster could not be set up.
+    #[error("cluster links failed")]
+    ClusterLinks(#[source] std::io::Error),
     /// A [`BrokerOptions`] field has a value the broker cannot work with.
     #[error("invalid option: {0}")]
     InvalidOption(&'static str),

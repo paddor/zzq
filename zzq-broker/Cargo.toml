@@ -15,15 +15,25 @@ categories = ["network-programming", "asynchronous"]
 workspace = true
 
 [features]
-default = ["tls", "quic"]
+default = ["tls", "quic", "cluster"]
 tls = ["zzq-tokio/tls"]
 quic = ["tls", "zzq-tokio/quic"]
+# Links between the nodes of a cluster over OMQ.
+cluster = ["dep:omq-tokio"]
 # Entry points for the fuzz targets in `fuzz/afl`.
 fuzzing = []
+# Long-running, ignored integration tests, driven by scripts/soak.sh.
+soak = []
+
+[[test]]
+name = "zzq_soak"
+required-features = ["soak", "tls", "quic", "cluster"]
 
 [dependencies]
 zzq-proto = { workspace = true, features = ["std"] }
 zzq-tokio = { workspace = true, default-features = false }
+zzq-cluster.workspace = true
+omq-tokio = { workspace = true, optional = true }
 bytes = { workspace = true, features = ["std"] }
 bytestring.workspace = true
 rustc-hash.workspace = true
@@ -40,8 +50,9 @@ zzq-disk = { workspace = true, features = ["testing"] }
 
 [dev-dependencies]
 rcgen = "0.14"
+serde_json.workspace = true
 # Path only, so publishing drops it and the two crates publish in any order.
 zzq-client = { path = "../zzq-client" }
 zzq-proto = { workspace = true, features = ["std"] }
 
-tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }

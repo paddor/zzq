@@ -141,6 +141,8 @@ struct Requests {
     pending: FxHashMap<u16, Pending>,
     /// Encoded requests not yet acked, by packet ID, with their send order.
     unacked: FxHashMap<u16, (u64, Vec<u8>)>,
+    /// Packet IDs of the PUBREL packets this connection sent again.
+    resent_rel: FxHashSet<u16>,
     sent: u64,
     next_pkid: u16,
     /// QoS 1/2 publishes beyond the broker's Receive Maximum.
@@ -201,6 +203,7 @@ impl Session {
             requests: Requests {
                 pending: FxHashMap::default(),
                 unacked: FxHashMap::default(),
+                resent_rel: FxHashSet::default(),
                 sent: 0,
                 next_pkid: 0,
                 waiting: VecDeque::new(),

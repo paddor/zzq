@@ -1,7 +1,7 @@
 [workspace]
-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-broker", "zzq-client", "zzq-bench"]
+members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-cluster", "zzq-broker", "zzq-client", "zzq-bench"]
 exclude = ["fuzz", "bindings", "zzq-bench/harness"]
-default-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-broker", "zzq-client"]
+default-members = ["zzq-proto", "zzq-tokio", "zzq-disk", "zzq-cluster", "zzq-broker", "zzq-client"]
 resolver = "2"
 
 [workspace.package]
@@ -38,10 +38,12 @@ missing_const_for_fn = "warn"
 zzq-proto = { path = "zzq-proto", version = "0.4.0", default-features = false }
 zzq-tokio = { path = "zzq-tokio", version = "0.4.0", default-features = false }
 zzq-disk = { path = "zzq-disk", version = "0.4.0" }
+zzq-cluster = { path = "zzq-cluster", version = "0.4.0" }
 zzq-broker = { path = "zzq-broker", version = "0.4.0" }
 zzq-client = { path = "zzq-client", version = "0.4.0" }
 bytes = { version = "1.12", default-features = false }
 bytestring = "1.4"
+omq-tokio = { version = "0.33", default-features = false }
 plotters = { version = "0.3.7", default-features = false, features = ["svg_backend", "line_series"] }
 rustc-hash = "2.1"
 serde = { version = "1.0", features = ["derive"] }

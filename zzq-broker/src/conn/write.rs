@@ -5,6 +5,7 @@ use std::rc::Rc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use super::ConnShared;
+use crate::durable::Due;
 use crate::lane::LaneRef;
 use crate::slab::Key;
 
@@ -17,6 +18,9 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
     loop {
         conn.wake.notified().await;
         loop {
+            if !output_ready(&lane, key, &conn).await {
+                break;
+            }
             let buf = {
                 let mut l = lane.borrow_mut();
                 let max_out = l.shared.opts.max_out_bytes;
@@ -60,6 +64,42 @@ pub(super) async fn writer<W: AsyncWrite + Unpin>(
             }
             let _ = w.shutdown().await;
             return;
+        }
+    }
+}
+
+/// Rechecks after every wait: more packets may have joined the output.
+async fn output_ready(lane: &LaneRef, key: Key, conn: &ConnShared) -> bool {
+    loop {
+        let due = {
+            let l = lane.borrow();
+            let Some(s) = l.sessions.get(key).filter(|s| s.has_conn(conn.id)) else {
+                return false;
+            };
+            s.out.due
+        };
+        let written = match due {
+            Due::Now => return true,
+            Due::Failed => false,
+            Due::After(w) => {
+                let shared = lane.borrow().shared.clone();
+                match shared.cursor(w.journal).check(w.n) {
+                    Some(true) => return true,
+                    Some(false) => false,
+                    None => {
+                        // Cancel-safe: the cursor owns the write. The wake may
+                        // also be new output, whose later barrier is checked next.
+                        tokio::select! {
+                            ok = shared.cursor(w.journal).wait(w.n) => ok,
+                            () = conn.wake.notified() => !conn.is_closed(),
+                        }
+                    }
+                }
+            }
+        };
+        if !written {
+            conn.close(Vec::new());
+            return false;
         }
     }
 }

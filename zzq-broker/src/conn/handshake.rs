@@ -2,7 +2,6 @@
 
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -137,7 +136,7 @@ where
     // from the end of a wait the broker made, as in the read loop.
     conn.held.set(true);
     if crate::broker::ship(lane).await {
-        conn.last_rx.set(Instant::now());
+        conn.last_rx.set(crate::time::now());
     }
     conn.held.set(false);
     let writer = tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));

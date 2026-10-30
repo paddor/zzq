@@ -4,15 +4,19 @@
 //! Without that file, this command runs a smaller smoke gate. The broker and
 //! the load run in separate pinned child processes. State memory cases each
 //! get a fresh broker child, as memory freed earlier hides what state costs.
+//! Durable sections run each case on a fresh broker and data directory under
+//! `TMPDIR`, which must be on the disk to measure, with subscribers that keep
+//! their sessions.
 //!
 //! Env: `ZZQ_PERF_MEASURE_MS` (default 3000), `ZZQ_PERF_WARMUP_MS` (1000).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use zzq_bench::child;
-use zzq_bench::load::{self, Load, Scenario, Until};
+use zzq_bench::load::{self, Keep, Load, Scenario, Until};
 use zzq_bench::ram::{self, Probe};
 use zzq_bench::wire;
 
@@ -45,6 +49,11 @@ enum Kind {
     },
     /// Broker RSS per piece of state, bytes.
     StateMemory(State),
+    /// Peak broker RSS on a fresh broker, KiB, under a QoS 0 fan-out with
+    /// most subscribers on the lane after the publisher's, which falls behind.
+    BehindMemory {
+        subs: usize,
+    },
 }
 
 /// State added to a fresh broker.
@@ -92,6 +101,18 @@ const fn fanout(qos: u8, size: usize, subs: usize) -> Kind {
         size,
         pubs: 1,
         subs,
+        cross: false,
+        topics: 1,
+    }
+}
+
+const fn fanin(qos: u8, size: usize, pubs: usize) -> Kind {
+    Kind::Throughput {
+        scenario: Scenario::Fanin,
+        qos,
+        size,
+        pubs,
+        subs: 1,
         cross: false,
         topics: 1,
     }
@@ -165,6 +186,30 @@ const ONE_LANE: &[Case] = &[
         kind: fanout(1, 16, 16),
     },
     Case {
+        key: "fanout16_qos2_16b_msgs_s",
+        kind: fanout(2, 16, 16),
+    },
+    Case {
+        key: "pairs16_qos0_16b_msgs_s",
+        kind: pairs(0, 16, 16),
+    },
+    Case {
+        key: "pairs16_qos2_16b_msgs_s",
+        kind: pairs(2, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos0_16b_msgs_s",
+        kind: fanin(0, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos1_16b_msgs_s",
+        kind: fanin(1, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos2_16b_msgs_s",
+        kind: fanin(2, 16, 16),
+    },
+    Case {
         key: "rtt_qos0_16b_p50_us",
         kind: Kind::LatencyP50 { qos: 0, size: 16 },
     },
@@ -175,6 +220,10 @@ const ONE_LANE: &[Case] = &[
 ];
 
 const TWO_LANES: &[Case] = &[
+    Case {
+        key: "fanout16_behind_rss_kib",
+        kind: Kind::BehindMemory { subs: 16 },
+    },
     Case {
         key: "pairs2_qos0_16b_msgs_s",
         kind: pairs(0, 16, 2),
@@ -192,8 +241,99 @@ const TWO_LANES: &[Case] = &[
         kind: cross(1, 16, 2),
     },
     Case {
+        key: "pairs2_qos2_16b_msgs_s",
+        kind: pairs(2, 16, 2),
+    },
+    Case {
+        key: "cross2_qos2_16b_msgs_s",
+        kind: cross(2, 16, 2),
+    },
+    Case {
         key: "fanout16_qos0_16b_msgs_s",
         kind: fanout(0, 16, 16),
+    },
+    Case {
+        key: "fanout16_qos2_16b_msgs_s",
+        kind: fanout(2, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos2_16b_msgs_s",
+        kind: fanin(2, 16, 16),
+    },
+];
+
+/// The journal paths, each case on a fresh broker and data directory.
+const ONE_LANE_DURABLE: &[Case] = &[
+    Case {
+        key: "qos1_16b_msgs_s",
+        kind: pairs(1, 16, 1),
+    },
+    Case {
+        key: "qos2_16b_msgs_s",
+        kind: pairs(2, 16, 1),
+    },
+    Case {
+        key: "qos1_4k_msgs_s",
+        kind: pairs(1, 4096, 1),
+    },
+    Case {
+        key: "qos2_4k_msgs_s",
+        kind: pairs(2, 4096, 1),
+    },
+    Case {
+        key: "pairs16_qos1_16b_msgs_s",
+        kind: pairs(1, 16, 16),
+    },
+    Case {
+        key: "pairs16_qos2_16b_msgs_s",
+        kind: pairs(2, 16, 16),
+    },
+    Case {
+        key: "fanout16_qos1_16b_msgs_s",
+        kind: fanout(1, 16, 16),
+    },
+    Case {
+        key: "fanout16_qos2_16b_msgs_s",
+        kind: fanout(2, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos1_16b_msgs_s",
+        kind: fanin(1, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos2_16b_msgs_s",
+        kind: fanin(2, 16, 16),
+    },
+    Case {
+        key: "ack_qos1_16b_p50_us",
+        kind: Kind::LatencyP50 { qos: 1, size: 16 },
+    },
+];
+
+const TWO_LANES_DURABLE: &[Case] = &[
+    Case {
+        key: "cross2_qos1_16b_msgs_s",
+        kind: cross(1, 16, 2),
+    },
+    Case {
+        key: "cross2_qos2_16b_msgs_s",
+        kind: cross(2, 16, 2),
+    },
+    Case {
+        key: "pairs16_qos1_16b_msgs_s",
+        kind: pairs(1, 16, 16),
+    },
+    Case {
+        key: "pairs16_qos2_16b_msgs_s",
+        kind: pairs(2, 16, 16),
+    },
+    Case {
+        key: "fanout16_qos2_16b_msgs_s",
+        kind: fanout(2, 16, 16),
+    },
+    Case {
+        key: "fanin16_qos2_16b_msgs_s",
+        kind: fanin(2, 16, 16),
     },
 ];
 
@@ -214,6 +354,8 @@ struct Section {
     lanes: usize,
     /// Lanes poll without sleeping.
     busy: bool,
+    /// The broker has a data directory, and subscribers keep their sessions.
+    durable: bool,
     cases: &'static [Case],
 }
 
@@ -222,26 +364,56 @@ const SECTIONS: &[Section] = &[
         name: "broker_1io",
         lanes: 1,
         busy: false,
+        durable: false,
         cases: ONE_LANE,
     },
     Section {
         name: "broker_2io",
         lanes: 2,
         busy: false,
+        durable: false,
         cases: TWO_LANES,
     },
     Section {
         name: "broker_1io_busy",
         lanes: 1,
         busy: true,
+        durable: false,
         cases: BUSY,
+    },
+    Section {
+        name: "broker_1io_durable",
+        lanes: 1,
+        busy: false,
+        durable: true,
+        cases: ONE_LANE_DURABLE,
+    },
+    Section {
+        name: "broker_2io_durable",
+        lanes: 2,
+        busy: false,
+        durable: true,
+        cases: TWO_LANES_DURABLE,
     },
 ];
 
+/// Tries of a durable case that misses its threshold. A VM's disk swings 2-3x
+/// between runs, and a real regression misses on every try.
+const DURABLE_TRIES: usize = 3;
+
 /// Thresholds used without `.perf_hw`.
-fn smoke(key: &str) -> f64 {
-    if key.ends_with("_us") {
+fn smoke(key: &str, durable: bool) -> f64 {
+    if durable {
+        // Whatever the disk.
+        if key.ends_with("_us") {
+            100_000.0
+        } else {
+            100.0
+        }
+    } else if key.ends_with("_us") {
         1000.0
+    } else if key.ends_with("_rss_kib") {
+        512.0 * 1024.0
     } else if key.ends_with("_kib") {
         64.0
     } else if key.ends_with("_bytes") {
@@ -256,7 +428,8 @@ fn main() -> ExitCode {
     match args.get(1).map(String::as_str) {
         Some("--broker-child") => {
             let lanes = args.get(2).and_then(|n| n.parse().ok()).unwrap_or(1);
-            return broker_child(lanes, args.get(3).is_some_and(|b| b == "busy"));
+            let busy = args.get(3).is_some_and(|b| b == "busy");
+            return broker_child(lanes, busy, args.get(4).map(PathBuf::from));
         }
         Some("--load-child") => return load_child(&args[2..]),
         _ => {}
@@ -292,22 +465,71 @@ fn main() -> ExitCode {
     }
 }
 
+/// Runs `measure` up to `tries` times, until a result `passes`. Returns the
+/// last result and how many it took.
+fn until_passes<T>(
+    tries: usize,
+    mut measure: impl FnMut() -> T,
+    passes: impl Fn(&T) -> bool,
+) -> (T, usize) {
+    let mut result = measure();
+    let mut took = 1;
+    while took < tries && !passes(&result) {
+        result = measure();
+        took += 1;
+    }
+    (result, took)
+}
+
+/// Whether a smaller value of the case `key` is better.
+fn lower_better(key: &str) -> bool {
+    ["_us", "_kib", "_bytes"]
+        .iter()
+        .any(|unit| key.ends_with(unit))
+}
+
+/// Whether a result meets `limit`, from a run that closed no connection.
+fn meets(line: &Result<String, String>, case: &Case, limit: f64) -> bool {
+    let Ok(line) = line else {
+        return false;
+    };
+    let clean = !line.contains("closed=") || line.contains("closed=0");
+    clean
+        && result_value(line, case.kind).is_some_and(|value| {
+            if lower_better(case.key) {
+                value <= limit
+            } else {
+                value >= limit
+            }
+        })
+}
+
 fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io::Result<usize> {
-    let (section, lanes, cases) = (sec.name, sec.lanes, sec.cases);
-    let cpus = std::thread::available_parallelism().map_or(6, usize::from);
-    let broker_cpus = format!("0-{}", lanes - 1);
-    let load_cpus = format!("{lanes}-{}", cpus - 1);
-    let (mut broker, addr) = spawn_broker(&broker_cpus, lanes, sec.busy)?;
+    let (section, cases) = (sec.name, sec.cases);
+    let (broker_cpus, load_cpus) = sec.cpus();
+    // A durable case starts its own, on a new data directory.
+    let mut shared = if sec.durable {
+        None
+    } else {
+        Some(spawn_broker(&broker_cpus, sec, None)?)
+    };
     let mut failed = 0;
     for case in cases {
-        let Some(limit) = limits.map_or(Some(smoke(case.key)), |l| l.get(case.key).copied()) else {
+        let threshold = |l: &HashMap<String, f64>| l.get(case.key).copied();
+        let Some(limit) = limits.map_or(Some(smoke(case.key, sec.durable)), threshold) else {
             continue;
         };
-        let line = match case.kind {
-            Kind::IdleMemory { conns } => idle_memory(&addr, conns, broker.id()),
-            Kind::StateMemory(state) => state_memory(&broker_cpus, sec, state),
-            kind => run_load(&load_cpus, &addr, lanes, kind),
+        let tries = if sec.durable { DURABLE_TRIES } else { 1 };
+        let measure = || match (&shared, case.kind) {
+            (Some((broker, addr)), Kind::IdleMemory { conns }) => {
+                idle_memory(addr, conns, broker.id())
+            }
+            (_, Kind::StateMemory(state)) => state_memory(&broker_cpus, sec, state),
+            (_, Kind::BehindMemory { subs }) => behind_memory(&broker_cpus, &load_cpus, sec, subs),
+            (Some((_, addr)), kind) => run_load(&load_cpus, addr, sec, kind),
+            (None, kind) => durable_load(&broker_cpus, &load_cpus, sec, kind),
         };
+        let (line, took) = until_passes(tries, measure, |l| meets(l, case, limit));
         let Some(value) = line.as_ref().ok().and_then(|l| result_value(l, case.kind)) else {
             println!(
                 "[{section}] {}: no result ({})",
@@ -317,33 +539,65 @@ fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io:
             failed += 1;
             continue;
         };
-        let lower_better = ["_us", "_kib", "_bytes"]
-            .iter()
-            .any(|unit| case.key.ends_with(unit));
-        let ok = if lower_better {
-            value <= limit
+        let verdict = if meets(&line, case, limit) {
+            "PASS"
         } else {
-            value >= limit
-        };
-        let clean = line
-            .as_ref()
-            .is_ok_and(|l| !l.contains("closed=") || l.contains("closed=0"));
-        let verdict = if ok && clean { "PASS" } else { "FAIL" };
-        if verdict == "FAIL" {
             failed += 1;
-        }
-        let bound = if lower_better { "max" } else { "min" };
+            "FAIL"
+        };
+        let bound = if lower_better(case.key) { "max" } else { "min" };
         println!(
-            "[{section}] {} = {} ({bound} {}) {verdict}  {}",
+            "[{section}] {} = {} ({bound} {}) {verdict}  tries={took} {}",
             case.key,
             human(value),
             human(limit),
             line.unwrap_or_default()
         );
     }
-    let _ = broker.kill();
-    let _ = broker.wait();
+    if let Some((broker, _)) = &mut shared {
+        let _ = broker.kill();
+        let _ = broker.wait();
+    }
     Ok(failed)
+}
+
+impl Section {
+    /// The CPUs of the broker and of the load. A broker with a data directory
+    /// has its disk threads beside its lanes, as in `zzq_suite`.
+    fn cpus(&self) -> (String, String) {
+        let cpus = std::thread::available_parallelism().map_or(6, usize::from);
+        let broker = if self.durable {
+            cpus.saturating_sub(2).max(self.lanes)
+        } else {
+            self.lanes
+        };
+        (
+            format!("0-{}", broker - 1),
+            format!("{broker}-{}", cpus - 1),
+        )
+    }
+}
+
+/// Runs `kind` on a broker of its own with an empty data directory, as what a
+/// journal holds changes how fast it goes.
+fn durable_load(
+    broker_cpus: &str,
+    load_cpus: &str,
+    sec: &Section,
+    kind: Kind,
+) -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!("zzq-perf-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let spawned = spawn_broker(broker_cpus, sec, Some(&dir)).map_err(|e| e.to_string());
+    let line = spawned.and_then(|(mut broker, addr)| {
+        let line = run_load(load_cpus, &addr, sec, kind);
+        let _ = broker.kill();
+        let _ = broker.wait();
+        line
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+    line
 }
 
 fn human(v: f64) -> String {
@@ -372,17 +626,23 @@ fn pinned(cpus: &str) -> Command {
     }
 }
 
-fn spawn_broker(cpus: &str, lanes: usize, busy: bool) -> std::io::Result<(Child, String)> {
+fn spawn_broker(cpus: &str, sec: &Section, dir: Option<&Path>) -> std::io::Result<(Child, String)> {
     let mut cmd = pinned(cpus);
     cmd.arg("--broker-child")
-        .arg(lanes.to_string())
-        .arg(if busy { "busy" } else { "idle" });
+        .arg(sec.lanes.to_string())
+        .arg(if sec.busy { "busy" } else { "idle" });
+    if let Some(dir) = dir {
+        cmd.arg(dir);
+    }
     child::spawn(cmd)
 }
 
-fn run_load(cpus: &str, addr: &str, lanes: usize, kind: Kind) -> Result<String, String> {
+fn run_load(cpus: &str, addr: &str, sec: &Section, kind: Kind) -> Result<String, String> {
     let mut c = pinned(cpus);
-    c.arg("--load-child").arg(addr).arg(lanes.to_string());
+    c.arg("--load-child")
+        .arg(addr)
+        .arg(sec.lanes.to_string())
+        .arg(if sec.durable { "keep" } else { "ram" });
     match kind {
         Kind::Throughput {
             scenario,
@@ -410,6 +670,9 @@ fn run_load(cpus: &str, addr: &str, lanes: usize, kind: Kind) -> Result<String, 
         }
         Kind::LatencyP50 { qos, size } => {
             c.args(["rtt", &qos.to_string(), &size.to_string(), "0", "0", "1"]);
+        }
+        Kind::BehindMemory { subs } => {
+            c.args(["behind", "0", "16", "1", &subs.to_string(), "1"]);
         }
         Kind::IdleMemory { .. } | Kind::StateMemory(_) => {
             return Err("measured in process".to_owned());
@@ -453,7 +716,7 @@ fn idle_memory(addr: &str, conns: usize, broker: u32) -> Result<String, String> 
 /// Adds state to a fresh broker child and reports how much its RSS grew
 /// per item.
 fn state_memory(cpus: &str, sec: &Section, state: State) -> Result<String, String> {
-    let (mut broker, addr) = spawn_broker(cpus, sec.lanes, sec.busy).map_err(|e| e.to_string())?;
+    let (mut broker, addr) = spawn_broker(cpus, sec, None).map_err(|e| e.to_string())?;
     let grown = Probe::new(&addr, broker.id(), true, None).and_then(|mut probe| match state {
         State::Session => probe.sessions(SESSIONS),
         State::Queued => probe.sessions(SESSIONS).and_then(|_| probe.queued(10, 100)),
@@ -471,12 +734,30 @@ fn state_memory(cpus: &str, sec: &Section, state: State) -> Result<String, Strin
     ))
 }
 
+/// Runs the fan-out of [`Kind::BehindMemory`] on a fresh broker child and
+/// reports the broker's peak RSS.
+fn behind_memory(
+    broker_cpus: &str,
+    load_cpus: &str,
+    sec: &Section,
+    subs: usize,
+) -> Result<String, String> {
+    let (mut broker, addr) = spawn_broker(broker_cpus, sec, None).map_err(|e| e.to_string())?;
+    let line = run_load(load_cpus, &addr, sec, Kind::BehindMemory { subs });
+    let peak = ram::peak_rss(broker.id());
+    let _ = broker.kill();
+    let _ = broker.wait();
+    let (line, peak) = (line?, peak.map_err(|e| e.to_string())?);
+    Ok(format!("{line} peak_rss_kib={}", peak >> 10))
+}
+
 fn result_value(line: &str, kind: Kind) -> Option<f64> {
     let key = match kind {
         Kind::Throughput { .. } => "delivered=",
         Kind::LatencyP50 { .. } => "p50=",
         Kind::IdleMemory { .. } => "kib_per_conn=",
         Kind::StateMemory(_) => "bytes_each=",
+        Kind::BehindMemory { .. } => "peak_rss_kib=",
     };
     line.split_whitespace()
         .find_map(|w| w.strip_prefix(key))
@@ -493,9 +774,10 @@ fn env_ms(name: &str, default: u64) -> Duration {
 }
 
 fn load_child(args: &[String]) -> ExitCode {
-    let [addr, lanes, scenario, qos, size, pubs, subs, topics] = args else {
+    let [addr, lanes, keep, scenario, qos, size, pubs, subs, topics] = args else {
         return ExitCode::FAILURE;
     };
+    let keep = keep == "keep";
     let num = |s: &str| s.parse::<usize>().unwrap_or(0);
     let cfg = Load {
         addr: addr.clone(),
@@ -507,30 +789,27 @@ fn load_child(args: &[String]) -> ExitCode {
         topics: num(topics).max(1),
         warmup: env_ms("ZZQ_PERF_WARMUP_MS", 1000),
         measure: env_ms("ZZQ_PERF_MEASURE_MS", 3000),
+        keep: Keep {
+            sessions: keep,
+            ..Keep::default()
+        },
         ..Load::default()
     };
     let cross = scenario == "cross";
-    let scenario = match scenario.as_str() {
-        "rtt" => {
-            return match load::latency(&cfg, 20_000, Until::Delivered) {
-                Ok(l) => {
-                    println!(
-                        "p50={:.1} p99={:.1} p999={:.1} lost={}",
-                        l.p50, l.p99, l.p999, l.lost
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(e) => {
-                    eprintln!("{e}");
-                    ExitCode::FAILURE
-                }
-            };
-        }
-        "fanout" => Scenario::Fanout,
+    let scenario_name = scenario.as_str();
+    let scenario = match scenario_name {
+        "rtt" => return latency_child(&cfg, keep),
+        "fanout" | "behind" => Scenario::Fanout,
         "fanin" => Scenario::Fanin,
         _ => Scenario::Pairs,
     };
-    let cfg = Load { cross, ..cfg };
+    // A fifth of the subscribers share the publisher's lane.
+    let local = (scenario_name == "behind").then_some(cfg.subs / 5);
+    let cfg = Load {
+        cross,
+        local,
+        ..cfg
+    };
     match load::throughput(scenario, &cfg) {
         Ok(t) => {
             println!(
@@ -546,14 +825,36 @@ fn load_child(args: &[String]) -> ExitCode {
     }
 }
 
-fn broker_child(lanes: usize, busy: bool) -> ExitCode {
+/// Prints round trips. With `keep`, what a journal costs: the wait for the ack.
+fn latency_child(cfg: &Load, keep: bool) -> ExitCode {
+    let until = if keep { Until::Acked } else { Until::Delivered };
+    match load::latency(cfg, 20_000, until) {
+        Ok(l) => {
+            println!(
+                "p50={:.1} p99={:.1} p999={:.1} lost={}",
+                l.p50, l.p99, l.p999, l.lost
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn broker_child(lanes: usize, busy: bool, data_dir: Option<PathBuf>) -> ExitCode {
     let cfg = zzq_broker::Config {
         io_threads: lanes,
         name: "zzq-perf".to_owned(),
         busy_poll: busy,
         ..zzq_broker::Config::default()
     };
-    child::serve(&cfg, zzq_broker::BrokerOptions::default())
+    let opts = zzq_broker::BrokerOptions {
+        data_dir,
+        ..zzq_broker::BrokerOptions::default()
+    };
+    child::serve(&cfg, opts)
 }
 
 fn parse_ini(text: &str) -> HashMap<String, HashMap<String, f64>> {
@@ -575,4 +876,100 @@ fn parse_ini(text: &str) -> HashMap<String, HashMap<String, f64>> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_key_means_one_case_in_its_section() {
+        for sec in SECTIONS {
+            let mut keys: Vec<_> = sec.cases.iter().map(|c| c.key).collect();
+            keys.sort_unstable();
+            let all = keys.len();
+            keys.dedup();
+            assert_eq!(keys.len(), all, "{}", sec.name);
+        }
+    }
+
+    #[test]
+    fn the_durable_sections_gate_qos2() {
+        let durable: Vec<_> = SECTIONS.iter().filter(|s| s.durable).collect();
+        assert_eq!(durable.len(), 2);
+        for sec in durable {
+            assert!(sec.name.ends_with("_durable"));
+            assert!(
+                sec.cases
+                    .iter()
+                    .any(|c| matches!(c.kind, Kind::Throughput { qos: 2, .. }))
+            );
+        }
+    }
+
+    #[test]
+    fn a_durable_case_gets_a_smoke_threshold_any_disk_meets() {
+        assert_eq!(smoke("qos2_16b_msgs_s", true), 100.0);
+        assert_eq!(smoke("ack_qos1_16b_p50_us", true), 100_000.0);
+        assert_eq!(smoke("qos2_16b_msgs_s", false), 100_000.0);
+    }
+
+    #[test]
+    fn a_memory_case_under_load_gets_room_for_its_buffers_in_the_smoke_gate() {
+        assert_eq!(smoke("fanout16_behind_rss_kib", false), 512.0 * 1024.0);
+        assert_eq!(smoke("idle_conn_kib", false), 64.0);
+        let line = "delivered=1 peak_rss_kib=37000";
+        let kind = Kind::BehindMemory { subs: 16 };
+        assert_eq!(result_value(line, kind), Some(37000.0));
+    }
+
+    #[test]
+    fn a_case_stops_at_the_first_try_that_passes() {
+        let mut values = [1, 2, 3].into_iter();
+        let found = until_passes(3, || values.next().unwrap(), |v| *v >= 2);
+        assert_eq!(found, (2, 2));
+    }
+
+    #[test]
+    fn a_case_that_always_misses_runs_out_of_tries() {
+        let mut runs = 0;
+        let measure = || {
+            runs += 1;
+            runs
+        };
+        assert_eq!(until_passes(3, measure, |_| false), (3, 3));
+        let mut runs = 0;
+        let measure = || {
+            runs += 1;
+            runs
+        };
+        assert_eq!(until_passes(1, measure, |_| false), (1, 1));
+    }
+
+    #[test]
+    fn a_result_meets_its_limit_on_the_side_of_its_unit_on_a_clean_run() {
+        let rate = Case {
+            key: "qos2_16b_msgs_s",
+            kind: pairs(2, 16, 1),
+        };
+        let meets_rate = |line: &str| meets(&Ok(line.into()), &rate, 100.0);
+        assert!(meets_rate("delivered=100 closed=0"));
+        assert!(!meets_rate("delivered=99 closed=0"));
+        assert!(!meets_rate("delivered=100 closed=1"));
+        assert!(!meets(&Err("broker died".into()), &rate, 100.0));
+        let latency = Case {
+            key: "ack_qos1_16b_p50_us",
+            kind: Kind::LatencyP50 { qos: 1, size: 16 },
+        };
+        assert!(meets(&Ok("p50=100".into()), &latency, 100.0));
+        assert!(!meets(&Ok("p50=101".into()), &latency, 100.0));
+    }
+
+    #[test]
+    fn a_threshold_file_has_sections_of_numbers() {
+        let ini = parse_ini("# note\n[a]\nx = 1.5\ny=not\n\n[b]\nz=2\n");
+        assert_eq!(ini["a"].get("x"), Some(&1.5));
+        assert_eq!(ini["a"].get("y"), None);
+        assert_eq!(ini["b"].get("z"), Some(&2.0));
+    }
 }

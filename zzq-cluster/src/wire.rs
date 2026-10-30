@@ -1,0 +1,471 @@
+//! Bounded native replica messages. No I/O or implicit consensus authority.
+//!
+//! The transport supplies an independently authenticated voter/session binding.
+//! Scope decoding checks the immutable configuration; the production cores still
+//! decide whether the message's view, history, role, and evidence are admissible.
+
+#![cfg_attr(not(test), warn(clippy::arithmetic_side_effects))]
+
+mod admission;
+mod election;
+pub use admission::ReceiveFence;
+mod flow;
+pub use flow::flow_state_route;
+mod compact;
+pub use compact::{COMPACT_STATE_BYTES, CompactState};
+mod prepare;
+mod publication;
+pub use publication::{
+    PUBLICATION_BYTES, PUBLICATION_TOPIC_BYTES, decode_publication, encode_publication,
+    publication_topic,
+};
+mod checkpoint;
+mod error;
+mod recovery;
+pub use checkpoint::{
+    CheckpointMessage, CheckpointRequest, HistoryFence, HistoryRetired, encode_checkpoint,
+    encode_history_retired,
+};
+mod fields;
+mod transfer;
+
+pub use error::WireError;
+pub use flow::{FlowMessage, FlowProbe, FlowState, encode_flow_probe, encode_flow_state};
+pub use prepare::{
+    Operation, Operations, Prepare, PrepareBatch, PrepareEncoding, PrepareMetadata,
+    VerifiedOperation, encode_flow_prepare, encode_flow_prepare_metadata, encode_prepare,
+    encode_prepare_metadata, encode_prepare_unbound,
+};
+pub use recovery::{
+    RecoveryMessage, RecoveryRequest, RecoveryState, encode_recovery, encode_recovery_state,
+};
+pub use transfer::{FetchOps, OpsBatch, encode_fetch, encode_ops};
+
+use crate::layout::{Reader, Writer};
+use crate::{Envelope, EnvelopeLimits, Opcode};
+use crate::{LinkSessionId, NodeId};
+use fields::{ReadFields, WriteFields, validate_election_view, validate_prefix, validate_scope};
+
+use crate::flow::{FlowError, ReceiveEpoch};
+use crate::{
+    Commit, Configuration, DoViewChange, Prefix, PrepareOk, Scope, StartView, StartViewChange,
+};
+
+const COMMON_BYTES: usize = 80;
+
+/// Authenticated peer and established session supplied by the transport adapter.
+///
+/// Construction checks membership and nonzero IDs, not cryptographic identity.
+/// Never construct this binding from untrusted packet fields or routing IDs alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerBinding {
+    configuration: Configuration,
+    peer: NodeId,
+    session: LinkSessionId,
+    receive_epoch: Option<ReceiveEpoch>,
+}
+
+impl PeerBinding {
+    /// Bind one independently authenticated configured voter to its live session.
+    ///
+    /// # Errors
+    ///
+    /// [`WireError`] when the message is malformed or does not fit the limits.
+    pub fn new(
+        configuration: Configuration,
+        peer: NodeId,
+        session: LinkSessionId,
+    ) -> Result<Self, WireError> {
+        configuration.voter_index(peer)?;
+        if session.as_bytes() == &[0; 16] {
+            return Err(WireError::Peer);
+        }
+        Ok(Self {
+            configuration,
+            peer,
+            session,
+            receive_epoch: None,
+        })
+    }
+
+    /// Require epoch-bound normal payloads bound to this locally issued receive epoch.
+    ///
+    /// Set only from the receiver's own current flow state, never incoming fields.
+    /// Rejects legacy PREPARE and stale `PREPARE_FLOW` before decoding/hashing bodies.
+    /// Control and installation-history messages retain their independent rules.
+    #[must_use]
+    pub const fn with_receive_epoch(mut self, epoch: ReceiveEpoch) -> Self {
+        self.receive_epoch = Some(epoch);
+        self
+    }
+}
+
+/// Local sender, established link session, and bounds of one encoded packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EncodeContext {
+    /// Configured local voter, written as envelope sender and embedded voter.
+    pub sender: NodeId,
+    /// Established session of the destination link.
+    pub session: LinkSessionId,
+    /// Frame and operation bounds of the encoded packet.
+    pub limits: WireLimits,
+}
+
+/// Directional receive and command work bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WireLimits {
+    /// Maximum actual metadata and payload frame sizes.
+    pub envelope: EnvelopeLimits,
+    /// Maximum canonical operations in a prepare/history response, independent of records.
+    pub max_operations: usize,
+}
+
+impl WireLimits {
+    /// Conservative shared prepare/history profile. Round the largest fixed
+    /// metadata span up to 16 bytes, preserving room for control exchanges.
+    pub fn for_transfer(max_operations: usize, max_body_bytes: usize) -> Option<Self> {
+        let fixed = transfer::FETCH_BYTES
+            .max(transfer::OPS_FIXED_BYTES)
+            .max(prepare::BATCH_BYTES + 16)
+            .next_multiple_of(16);
+        Some(Self {
+            envelope: EnvelopeLimits {
+                max_metadata_bytes: max_operations
+                    .checked_mul(prepare::DESCRIPTOR_BYTES)?
+                    .checked_add(fixed)?,
+                max_payload_bytes: max_body_bytes,
+            },
+            max_operations,
+        })
+    }
+
+    /// Bound a routed native message, including its 16-byte destination identity.
+    pub fn message_bytes(self) -> Option<usize> {
+        self.envelope
+            .max_metadata_bytes
+            .checked_add(self.envelope.max_payload_bytes)?
+            .checked_add(crate::ENVELOPE_BYTES + 16)
+    }
+}
+
+impl Default for WireLimits {
+    fn default() -> Self {
+        Self {
+            envelope: EnvelopeLimits::default(),
+            max_operations: 64,
+        }
+    }
+}
+
+/// Fixed-size replica control metadata. Receipt alone has no authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+    /// Cumulative durable backup evidence plus its current session fence.
+    PrepareOk {
+        /// Matching contiguous prefix after successful disk synchronization.
+        ack: PrepareOk,
+    },
+    /// Primary's cumulative commit announcement or idle heartbeat.
+    Commit(Commit),
+    /// Volatile suspicion about this current view, not a durable promise or vote.
+    ExitView(Scope),
+    /// First election phase, emitted after the sender's durable view promise.
+    StartViewChange(StartViewChange),
+    /// Frozen full-WAL descriptor for the candidate's second-phase quorum.
+    DoViewChange(DoViewChange),
+    /// Primary's durably installed selected lineage, not a backup installation.
+    StartView(StartView),
+}
+
+impl Control {
+    /// Claimed prefix for routing/replay hints. This does not validate its evidence.
+    pub const fn acknowledged(self) -> Option<Prefix> {
+        match self {
+            Self::PrepareOk { ack, .. } => Some(ack.durable),
+            _ => None,
+        }
+    }
+
+    /// Exact group, immutable configuration digest, and active/proposed view.
+    pub const fn scope(self) -> Scope {
+        match self {
+            Self::PrepareOk { ack, .. } => ack.scope,
+            Self::Commit(message) => message.scope,
+            Self::ExitView(scope) => scope,
+            Self::StartViewChange(message) => message.scope,
+            Self::DoViewChange(message) => message.scope,
+            Self::StartView(message) => message.scope,
+        }
+    }
+
+    const fn opcode(self) -> Opcode {
+        match self {
+            Self::PrepareOk { .. } => Opcode::PrepareOk,
+            Self::Commit(_) => Opcode::Commit,
+            Self::ExitView(_) => Opcode::ExitView,
+            Self::StartViewChange(_) => Opcode::StartViewChange,
+            Self::DoViewChange(_) => Opcode::DoViewChange,
+            Self::StartView(_) => Opcode::StartView,
+        }
+    }
+}
+
+/// Decoded replica command, still subject to role/history checks in the core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicaMessage<'a> {
+    /// Receiver-fenced hint to enter nonvoting recovery, never new authority.
+    HistoryRetired(HistoryRetired),
+    /// Checkpoint state bytes for a separately authorized nonvoting recovery.
+    Checkpoint(CheckpointMessage<'a>),
+    /// Fresh lost-state evidence, neither receipt credit nor a normal/election vote.
+    Recovery(RecoveryMessage),
+    /// Receipt/credit exchange or epoch-bound data; never durable quorum evidence.
+    Flow(FlowMessage<'a>),
+    /// Fixed-size quorum/control evidence from the bound sender.
+    Control(Control),
+    /// Hash-validated canonical bytes, still requiring application validation.
+    Prepare(PrepareBatch<'a>),
+    /// Correlated bounded request for an independently pinned source lineage.
+    FetchOps(FetchOps),
+    /// Hash-validated response bytes, not a normal prepare or commit announcement.
+    Ops(OpsBatch<'a>),
+}
+
+/// Envelope and valid prefix length in the caller's reusable metadata buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControlEncoding {
+    /// First frame, with exact lengths for this encoding.
+    pub header: [u8; 64],
+    /// Second frame length; the third frame must be present and empty.
+    pub metadata_bytes: usize,
+}
+
+/// Encode control metadata into caller-owned storage without allocating.
+///
+/// Invalid fields or insufficient capacity leave the output unchanged. Callers
+/// may send only messages actually authorized by the current consensus role.
+///
+/// # Errors
+///
+/// [`WireError`] when the message is malformed or does not fit the limits.
+pub fn encode_control(
+    sender: NodeId,
+    session: LinkSessionId,
+    message: Control,
+    output: &mut [u8],
+) -> Result<ControlEncoding, WireError> {
+    let scope = message.scope();
+    validate_scope(scope)?;
+    let metadata_bytes = match message {
+        Control::PrepareOk { ack, .. } => {
+            validate_prefix(ack.durable)?;
+            COMMON_BYTES + 40
+        }
+        Control::Commit(message) => {
+            validate_prefix(message.committed)?;
+            COMMON_BYTES + 40
+        }
+        Control::StartViewChange(message) => {
+            validate_election_view(message.scope)?;
+            COMMON_BYTES
+        }
+        Control::ExitView(_) => COMMON_BYTES,
+        Control::DoViewChange(message) => {
+            election::validate_report(message)?;
+            COMMON_BYTES + 16 + 8 + 40 + 40
+        }
+        Control::StartView(message) => {
+            election::validate_start(message)?;
+            COMMON_BYTES + 16 + 40 + 40
+        }
+    };
+    if output.len() < metadata_bytes {
+        return Err(WireError::Capacity);
+    }
+    let header = Envelope {
+        opcode: message.opcode(),
+        response: false,
+        request_id: None,
+        sender,
+        session: Some(session),
+    }
+    .encode_header(metadata_bytes, 0, EnvelopeLimits::default())?;
+    let mut writer = Writer::with_len(output, metadata_bytes)?;
+    writer.scope(scope, sender)?;
+    match message {
+        Control::PrepareOk { ack } => writer.prefix(ack.durable)?,
+        Control::Commit(message) => writer.prefix(message.committed)?,
+        Control::StartViewChange(_) | Control::ExitView(_) => {}
+        Control::DoViewChange(message) => election::write_report(&mut writer, message)?,
+        Control::StartView(message) => election::write_start(&mut writer, message)?,
+    }
+    Ok(ControlEncoding {
+        header,
+        metadata_bytes,
+    })
+}
+
+/// Read only the fixed group/configuration prefix of an implemented PEER
+/// command. This does not authenticate the sender or validate membership, view,
+/// operation hashes, or payloads. Dispatch uses it to select an actor, which must
+/// still call `decode` with an independently established `PeerBinding`.
+///
+/// # Errors
+///
+/// [`WireError`] when the message is malformed or does not fit the limits.
+pub fn route(packet: crate::Packet<'_>, limits: EnvelopeLimits) -> Result<Scope, WireError> {
+    packet
+        .envelope
+        .validate_frames(packet.metadata.len(), packet.payload.len(), limits)?;
+    if !matches!(
+        packet.envelope.opcode,
+        Opcode::ReplicaOpen
+            | Opcode::ReplicaState
+            | Opcode::Prepare
+            | Opcode::PrepareFlow
+            | Opcode::PreparePub
+            | Opcode::PrepareOk
+            | Opcode::Commit
+            | Opcode::ExitView
+            | Opcode::StartViewChange
+            | Opcode::DoViewChange
+            | Opcode::StartView
+            | Opcode::Recovery
+            | Opcode::RecoveryState
+            | Opcode::FetchOps
+            | Opcode::Ops
+            | Opcode::HistoryRetired
+            | Opcode::SnapshotBegin
+            | Opcode::SnapshotChunk
+    ) {
+        return Err(WireError::UnsupportedCommand);
+    }
+    if !matches!(
+        packet.envelope.opcode,
+        Opcode::Prepare
+            | Opcode::PrepareFlow
+            | Opcode::PreparePub
+            | Opcode::Ops
+            | Opcode::SnapshotChunk
+    ) && !packet.payload.is_empty()
+    {
+        return Err(WireError::Payload);
+    }
+    Reader::new(packet.metadata).routing_scope(packet.envelope.sender)
+}
+
+/// Decode a bounded packet and reject mismatched voter/session/configuration.
+///
+/// This does not validate a claim against local disk state or count a quorum.
+/// Old views remain recognizable so the consensus core can apply its fencing rules.
+///
+/// # Errors
+///
+/// [`WireError`] when the message is malformed or does not fit the limits.
+pub fn decode<'a>(
+    frames: &[&'a [u8]],
+    binding: PeerBinding,
+    limits: WireLimits,
+) -> Result<ReplicaMessage<'a>, WireError> {
+    let packet = crate::decode_packet(frames, limits.envelope)?;
+    if packet.envelope.sender != binding.peer || packet.envelope.session != Some(binding.session) {
+        return Err(WireError::Peer);
+    }
+    let mut reader = Reader::new(packet.metadata);
+    let incoming = Incoming {
+        scope: reader.scope(binding)?,
+        envelope: packet.envelope,
+        reader,
+        payload: packet.payload,
+    };
+    match packet.envelope.opcode {
+        Opcode::HistoryRetired => {
+            checkpoint::decode_retired(incoming).map(ReplicaMessage::HistoryRetired)
+        }
+        Opcode::SnapshotBegin | Opcode::SnapshotChunk => {
+            checkpoint::decode(incoming, binding, limits).map(ReplicaMessage::Checkpoint)
+        }
+        Opcode::Recovery => recovery::decode_request(incoming)
+            .map(|request| ReplicaMessage::Recovery(RecoveryMessage::Request(request))),
+        Opcode::RecoveryState => recovery::decode_state(incoming, binding)
+            .map(|state| ReplicaMessage::Recovery(RecoveryMessage::State(state))),
+        Opcode::ReplicaOpen => flow::decode_probe(incoming)
+            .map(|probe| ReplicaMessage::Flow(FlowMessage::Probe(probe))),
+        Opcode::ReplicaState => flow::decode_state(incoming)
+            .map(|state| ReplicaMessage::Flow(FlowMessage::State(state))),
+        Opcode::FetchOps => transfer::decode_fetch(incoming, binding).map(ReplicaMessage::FetchOps),
+        Opcode::Ops => transfer::decode_ops(incoming, limits).map(ReplicaMessage::Ops),
+        _ => decode_uncorrelated(incoming, binding, limits),
+    }
+}
+
+/// Fields after the authenticated scope, borrowing the packet frames.
+struct Incoming<'a> {
+    scope: Scope,
+    envelope: Envelope,
+    reader: Reader<'a>,
+    payload: &'a [u8],
+}
+
+/// Decode normal data and control, which carry no request correlation.
+fn decode_uncorrelated(
+    Incoming {
+        scope,
+        envelope,
+        mut reader,
+        payload,
+    }: Incoming<'_>,
+    binding: PeerBinding,
+    limits: WireLimits,
+) -> Result<ReplicaMessage<'_>, WireError> {
+    if envelope.response || envelope.request_id.is_some() {
+        return Err(WireError::Correlation);
+    }
+    match envelope.opcode {
+        Opcode::PrepareFlow => {
+            let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.array()?))?;
+            if binding.receive_epoch != Some(epoch) {
+                return Err(FlowError::Channel.into());
+            }
+            prepare::decode_prepare(scope, reader, payload, limits)
+                .map(|batch| ReplicaMessage::Flow(FlowMessage::Prepare { epoch, batch }))
+        }
+        Opcode::Prepare => {
+            if binding.receive_epoch.is_some() {
+                return Err(FlowError::Channel.into());
+            }
+            prepare::decode_prepare(scope, reader, payload, limits).map(ReplicaMessage::Prepare)
+        }
+        _ if !payload.is_empty() => Err(WireError::Payload),
+        opcode => decode_control(scope, opcode, reader).map(ReplicaMessage::Control),
+    }
+}
+
+fn decode_control(
+    scope: Scope,
+    opcode: Opcode,
+    mut reader: Reader<'_>,
+) -> Result<Control, WireError> {
+    let message = match opcode {
+        Opcode::PrepareOk => Control::PrepareOk {
+            ack: PrepareOk {
+                scope,
+                durable: reader.prefix()?,
+            },
+        },
+        Opcode::Commit => Control::Commit(Commit {
+            scope,
+            committed: reader.prefix()?,
+        }),
+        Opcode::StartViewChange => {
+            validate_election_view(scope)?;
+            Control::StartViewChange(StartViewChange { scope })
+        }
+        Opcode::ExitView => Control::ExitView(scope),
+        Opcode::DoViewChange => Control::DoViewChange(election::read_report(scope, &mut reader)?),
+        Opcode::StartView => Control::StartView(election::read_start(scope, &mut reader)?),
+        _ => return Err(WireError::UnsupportedCommand),
+    };
+    reader.finish()?;
+    Ok(message)
+}

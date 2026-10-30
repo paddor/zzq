@@ -265,7 +265,7 @@ pub(crate) fn expiry(props: &[u8]) -> Option<Instant> {
     }
     let p = zzq_proto::Properties::try_from(props).ok()?;
     let seconds = p.get_int(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL)?;
-    Some(Instant::now() + Duration::from_secs(u64::from(seconds)))
+    Some(crate::time::now() + Duration::from_secs(u64::from(seconds)))
 }
 
 /// Whether a message with this deadline has expired.

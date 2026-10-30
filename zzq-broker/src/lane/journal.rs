@@ -6,19 +6,24 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
 use zzq_proto::{QoS, SubscriptionOptions};
 
-use crate::disk::{self, Completion, Log};
+use crate::cluster::{GroupWriter, Journal};
+use crate::disk::{self, Append, Completion, Log};
 use crate::durable::{Cursor, JournalId, Journaled, RETRY, Wait};
 use crate::index::SubIds;
 use crate::msg::Publication;
 use crate::session::{Progress, Session};
 use crate::slab::{Key, Slab};
 use crate::state::Clock;
+use crate::state::handoff::Handoffs;
 use crate::state::journal::{self as rec, CLEAR, CLEARED, IMAGE};
 
 use super::route::Owned;
 use super::{Lane, LaneRef};
+
+mod handoff;
 
 /// A lane's journal. Only its lane writes it; it sits in `Shared` so the
 /// broker handle can close it.
@@ -30,6 +35,11 @@ pub(crate) struct LaneLog {
     pub(crate) cursor: Cursor,
     /// Writes that failed.
     pub(crate) write_errors: AtomicU64,
+    #[cfg(test)]
+    pub(crate) paused: std::sync::atomic::AtomicBool,
+    /// Transactions cannot start, as when a rewrite of the journal fails.
+    #[cfg(test)]
+    pub(crate) refuse_transactions: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -47,6 +57,9 @@ struct LogState {
     /// The segment the last snapshot started in, and its last record:
     /// once that is written, the segments before go.
     trim: Option<(u64, u64)>,
+    last: u64,
+    transaction: Vec<u8>,
+    in_transaction: bool,
 }
 
 impl LaneLog {
@@ -65,6 +78,11 @@ impl LaneLog {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The commits of its cluster journal.
+    pub(crate) fn commits(&self) -> Option<std::sync::Arc<crate::cluster::Commits>> {
+        self.lock().log.as_ref().and_then(Log::commits)
+    }
+
     /// Whether the lane journals its sessions.
     pub(crate) fn is_open(&self) -> bool {
         self.lock().log.is_some()
@@ -78,6 +96,10 @@ impl LaneLog {
 
     /// Sends what was appended, unless a write is in flight.
     fn flush(&self) {
+        #[cfg(test)]
+        if self.paused.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(log) = self.lock().log.as_mut()
             && log.flush().is_err()
         {
@@ -92,6 +114,15 @@ impl LaneLog {
         }
     }
 
+    /// The next completion of its writes, or of a cluster journal's commits.
+    async fn next_completion(&self) -> Completion {
+        let commits = self.lock().log.as_ref().and_then(Log::commits);
+        match commits {
+            Some(c) => c.next().await,
+            None => std::future::poll_fn(|cx| self.poll_complete(cx)).await,
+        }
+    }
+
     /// Writes everything appended, blocking, then closes the journal,
     /// which lets go of its directory. Later changes fail.
     pub(crate) fn close(&self) {
@@ -100,6 +131,20 @@ impl LaneLog {
             && log.sync().is_err()
         {
             self.write_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// The number of the last record a cluster journal appended.
+    pub(crate) fn cluster_appended(&self) -> Option<u64> {
+        self.lock().log.as_ref()?.cluster_appended()
+    }
+
+    /// Drops the records a cluster journal did not hand over yet.
+    pub(crate) fn discard(&self) {
+        let mut st = self.lock();
+        st.stale = false;
+        if let Some(log) = st.log.as_mut() {
+            log.discard();
         }
     }
 
@@ -112,17 +157,17 @@ impl LaneLog {
     /// `None` without a journal.
     fn append(
         &self,
-        sessions: &Slab<Session>,
+        state: (&Slab<Session>, &Handoffs),
         kind: u8,
         encode: impl FnOnce(&mut Vec<u8>, Clock),
     ) -> Option<Journaled> {
-        self.append_with(sessions, kind, encode, &[])
+        self.append_with(state, kind, encode, &[])
     }
 
     /// [`LaneLog::append`] with `tail` after what `encode` writes.
     fn append_with(
         &self,
-        sessions: &Slab<Session>,
+        state: (&Slab<Session>, &Handoffs),
         kind: u8,
         encode: impl FnOnce(&mut Vec<u8>, Clock),
         tail: &[u8],
@@ -132,7 +177,7 @@ impl LaneLog {
             return Some(Journaled::Failed);
         }
         st.log.as_ref()?;
-        if let Ok(n) = st.append(kind, sessions, encode, tail) {
+        if let Ok(n) = st.append(kind, state, encode, tail) {
             return Some(Journaled::At {
                 wait: Wait {
                     journal: JournalId::Lane(self.lane),
@@ -182,35 +227,38 @@ impl LogState {
     fn append(
         &mut self,
         kind: u8,
-        sessions: &Slab<Session>,
+        state: (&Slab<Session>, &Handoffs),
         encode: impl FnOnce(&mut Vec<u8>, Clock),
         tail: &[u8],
     ) -> io::Result<u64> {
         if self.stale {
-            self.write_all(sessions)?;
+            self.write_all(state)?;
         }
         let LogState { log, buf, .. } = self;
         let log = log.as_mut().ok_or(io::ErrorKind::NotConnected)?;
         buf.clear();
         encode(buf, Clock::now());
-        log.append(kind, &[buf, tail])
+        if self.in_transaction {
+            let len =
+                u32::try_from(buf.len() + tail.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
+            self.transaction.push(kind);
+            self.transaction.extend_from_slice(&len.to_be_bytes());
+            self.transaction.extend_from_slice(buf);
+            self.transaction.extend_from_slice(tail);
+            return Ok(self.last + 1);
+        }
+        let n = rec::append_record(log, kind, &[buf, tail])?;
+        self.last = n;
+        Ok(n)
     }
 
     /// Journals a snapshot of every session the journal holds, so it
     /// holds what the lane holds. Returns the number of its last record.
-    fn write_all(&mut self, sessions: &Slab<Session>) -> io::Result<u64> {
+    fn write_all(&mut self, state: (&Slab<Session>, &Handoffs)) -> io::Result<u64> {
         let LogState { log, buf, .. } = self;
         let log = log.as_mut().ok_or(io::ErrorKind::NotConnected)?;
-        let clock = Clock::now();
-        log.append(CLEAR, &[])?;
-        for key in sessions.keys() {
-            if let Some(s) = sessions.get(key).filter(|s| s.journaled) {
-                buf.clear();
-                rec::image(buf, s, clock);
-                log.append(IMAGE, &[buf])?;
-            }
-        }
-        let n = log.append(CLEARED, &[])?;
+        let n = put_sessions(log, state, buf, Clock::now())?;
+        self.last = n;
         self.stale = false;
         Ok(n)
     }
@@ -219,7 +267,12 @@ impl LogState {
     /// past what it holds live, or with `force`, unless one waits for its
     /// trim: the segments before go once it is written. False if it waits
     /// for that segment.
-    fn snapshot(&mut self, sessions: &Slab<Session>, live: u64, force: bool) -> io::Result<bool> {
+    fn snapshot(
+        &mut self,
+        state: (&Slab<Session>, &Handoffs),
+        live: u64,
+        force: bool,
+    ) -> io::Result<bool> {
         let Some(log) = self.log.as_mut().filter(|_| self.trim.is_none()) else {
             return Ok(true);
         };
@@ -230,7 +283,7 @@ impl LogState {
         let Some(segment) = log.roll()? else {
             return Ok(false);
         };
-        let last = self.write_all(sessions)?;
+        let last = self.write_all(state)?;
         if let Some(log) = self.log.as_mut() {
             self.snapshot_at = log.written_bytes();
             log.flush()?;
@@ -266,11 +319,15 @@ impl Lane {
     pub(super) fn journal_session(&mut self, key: Key, kind: u8) -> Option<Journaled> {
         let id = usize::from(self.id);
         let s = self.sessions.get(key)?;
-        let j = self.shared.lane_logs[id].append(&self.sessions, kind, |b, clock| match kind {
-            rec::SESSION => rec::session(b, s, clock),
-            rec::DOWN => rec::down(b, s, clock),
-            _ => rec::client(b, &s.client_id),
-        });
+        let j = self.shared.lane_logs[id].append(
+            (&self.sessions, &self.handoffs.state),
+            kind,
+            |b, clock| match kind {
+                rec::SESSION => rec::session(b, s, clock),
+                rec::DOWN => rec::down(b, s, clock),
+                _ => rec::client(b, &s.client_id),
+            },
+        );
         self.appended(j);
         j
     }
@@ -278,9 +335,13 @@ impl Lane {
     /// Journals the end of `s`, which left the lane's sessions.
     pub(super) fn journal_end(&mut self, s: &Session) {
         let id = usize::from(self.id);
-        let j = self.shared.lane_logs[id].append(&self.sessions, rec::END, |b, _| {
-            rec::client(b, &s.client_id);
-        });
+        let j = self.shared.lane_logs[id].append(
+            (&self.sessions, &self.handoffs.state),
+            rec::END,
+            |b, _| {
+                rec::client(b, &s.client_id);
+            },
+        );
         self.appended(j);
     }
 
@@ -296,12 +357,18 @@ impl Lane {
         let s = self.sessions.get(key).filter(|s| s.journaled)?;
         let log = &self.shared.lane_logs[id];
         let j = match opts {
-            Some((o, sub_id)) => log.append(&self.sessions, rec::SUB, |b, _| {
-                rec::sub(b, &s.client_id, filter, o, sub_id);
-            }),
-            None => log.append(&self.sessions, rec::UNSUB, |b, _| {
-                rec::unsub(b, &s.client_id, filter);
-            }),
+            Some((o, sub_id)) => {
+                log.append((&self.sessions, &self.handoffs.state), rec::SUB, |b, _| {
+                    rec::sub(b, &s.client_id, filter, o, sub_id);
+                })
+            }
+            None => log.append(
+                (&self.sessions, &self.handoffs.state),
+                rec::UNSUB,
+                |b, _| {
+                    rec::unsub(b, &s.client_id, filter);
+                },
+            ),
         };
         self.appended(j);
         j
@@ -327,7 +394,7 @@ impl Lane {
         if !owned.journaled {
             owned.journaled = true;
             let j = log.append_with(
-                &self.sessions,
+                (&self.sessions, &self.handoffs.state),
                 rec::MSG,
                 |b, c| rec::msg_head(b, p, c),
                 p.payload,
@@ -339,9 +406,13 @@ impl Lane {
         let Some(s) = self.sessions.get(key) else {
             return 0;
         };
-        let j = log.append(&self.sessions, rec::QUEUED, |b, _| {
-            rec::queued(b, &s.client_id, seq, g);
-        });
+        let j = log.append(
+            (&self.sessions, &self.handoffs.state),
+            rec::QUEUED,
+            |b, _| {
+                rec::queued(b, &s.client_id, seq, g);
+            },
+        );
         self.needs.note(j);
         self.appended(j);
         seq
@@ -362,6 +433,7 @@ impl Lane {
         let mut progress = std::mem::take(&mut s.flow.progress);
         let log = &self.shared.lane_logs[id];
         let mut released = Vec::new();
+        let mut sent = crate::durable::Due::Now;
         let mut last = None;
         if let Some(s) = self.sessions.get(key) {
             let cid = &s.client_id;
@@ -371,15 +443,22 @@ impl Lane {
                     Progress::Sent(seq, _) => (rec::SENT, seq),
                     Progress::Released(seq) => (rec::RELEASED, seq),
                 };
-                let j = log.append(&self.sessions, kind, |b, _| match *p {
-                    Progress::Sent(_, pkid) => rec::sent(b, cid, seq, pkid),
-                    _ => rec::delivery(b, cid, seq),
-                });
+                let j = log.append(
+                    (&self.sessions, &self.handoffs.state),
+                    kind,
+                    |b, _| match *p {
+                        Progress::Sent(_, pkid) => rec::sent(b, cid, seq, pkid),
+                        _ => rec::delivery(b, cid, seq),
+                    },
+                );
                 if kind != rec::DONE {
                     last = Some(j);
                 }
                 if kind == rec::RELEASED {
                     released.extend(j);
+                }
+                if kind == rec::SENT {
+                    sent = sent.then(j);
                 }
             }
         }
@@ -389,6 +468,9 @@ impl Lane {
         progress.clear();
         if let Some(s) = self.sessions.get_mut(key) {
             s.flow.progress = progress;
+            if sent != crate::durable::Due::Now && s.out.due != crate::durable::Due::Failed {
+                s.out.due = sent;
+            }
             if let Some(h) = s.inbound.hold.as_mut() {
                 for j in released {
                     h.note(j);
@@ -407,9 +489,13 @@ impl Lane {
         } else {
             rec::INBOUND
         };
-        let j = self.shared.lane_logs[id].append(&self.sessions, kind, |b, _| {
-            rec::inbound(b, &s.client_id, pkid);
-        });
+        let j = self.shared.lane_logs[id].append(
+            (&self.sessions, &self.handoffs.state),
+            kind,
+            |b, _| {
+                rec::inbound(b, &s.client_id, pkid);
+            },
+        );
         self.appended(j);
         j
     }
@@ -445,24 +531,69 @@ impl Lane {
         let log = &self.shared.lane_logs[usize::from(self.id)];
         let live = self.budget.total.get() as u64;
         log.lock()
-            .snapshot(&self.sessions, live, force)
+            .snapshot((&self.sessions, &self.handoffs.state), live, force)
             .unwrap_or_else(|_| {
                 log.write_errors.fetch_add(1, Ordering::Relaxed);
                 true
             })
     }
 
-    /// Writes every journaled session again after a failed write.
-    fn rewrite_journal(&mut self) {
+    /// A cluster leader's part of an image: the records so far go to the
+    /// replica, and the lane's sessions after them become a group body.
+    /// Returns the number of the last record the part holds.
+    pub(crate) fn cut_image(&mut self) -> (u64, Bytes) {
+        let log = &self.shared.lane_logs[usize::from(self.id)];
+        let mut st = log.lock();
+        let st = &mut *st;
+        let last = match st.log.as_mut() {
+            Some(Log::Cluster(c)) => {
+                c.flush();
+                c.appended()
+            }
+            _ => 0,
+        };
+        let mut part = GroupWriter::new(Journal::Lane(self.id));
+        let _ = put_sessions(
+            &mut part,
+            (&self.sessions, &self.handoffs.state),
+            &mut st.buf,
+            Clock::now(),
+        );
+        (last, part.finish())
+    }
+
+    /// Writes every journaled session again: after a failed write, or as
+    /// the start of a forced cluster epoch's history.
+    pub(super) fn rewrite_journal(&mut self) {
         let log = &self.shared.lane_logs[usize::from(self.id)];
         let mut st = log.lock();
         st.stale = true;
-        let written = st.write_all(&self.sessions);
+        let written = st.write_all((&self.sessions, &self.handoffs.state));
         let flushed = st.log.as_mut().map_or(Ok(()), Log::flush);
         if written.is_err() || flushed.is_err() {
             log.write_errors.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// Appends a snapshot of the journaled sessions to `out`. Returns the
+/// number of its last record.
+fn put_sessions(
+    out: &mut impl Append,
+    state: (&Slab<Session>, &Handoffs),
+    buf: &mut Vec<u8>,
+    clock: Clock,
+) -> io::Result<u64> {
+    out.append(CLEAR, &[])?;
+    for key in state.0.keys() {
+        if let Some(s) = state.0.get(key).filter(|s| s.journaled) {
+            buf.clear();
+            rec::image(buf, s, clock);
+            rec::append_record(out, IMAGE, &[buf])?;
+        }
+    }
+    rec::handoffs(out, state.1, buf, clock)?;
+    out.append(CLEARED, &[])
 }
 
 /// Moves the cursor of `lane`'s journal as its writes finish, until the
@@ -474,7 +605,7 @@ pub(crate) async fn complete(lane: LaneRef) {
     };
     let log = &shared.lane_logs[id];
     loop {
-        match std::future::poll_fn(|cx| log.poll_complete(cx)).await {
+        match log.next_completion().await {
             Completion::Written(n) => {
                 log.cursor.advance(n);
                 if log.lock().written(n).is_err() {
@@ -486,9 +617,13 @@ pub(crate) async fn complete(lane: LaneRef) {
                 l.snapshot_journal(false);
             }
             Completion::Failed(first, last) => {
-                log.write_errors.fetch_add(1, Ordering::Relaxed);
                 let mut l = lane.borrow_mut();
-                l.rewrite_journal();
+                // A cluster journal fails with the leadership, and the lane
+                // drops its state: nothing to write again.
+                if !shared.clustered() {
+                    log.write_errors.fetch_add(1, Ordering::Relaxed);
+                    l.rewrite_journal();
+                }
                 log.cursor.fail(first, last);
                 l.pairs_written(first, last, true);
             }

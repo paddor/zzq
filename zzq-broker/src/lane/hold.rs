@@ -5,7 +5,7 @@ use zzq_proto::packet::Publish;
 use zzq_proto::{PacketType, QoS, reason};
 
 use crate::durable::{Journaled, Wait};
-use crate::session::AckHold;
+use crate::session::{AckHold, HeldAck};
 use crate::slab::Key;
 
 use super::{Close, Lane};
@@ -13,18 +13,26 @@ use super::{Close, Lane};
 /// The journal writes the publish being handled needs before its ack.
 #[derive(Debug, Default)]
 pub(crate) struct Needs {
+    pub(super) handoff: Option<std::sync::Arc<crate::state::handoff::Pending>>,
     waits: Vec<Wait>,
     failed: bool,
     /// Records waiting for the disk passed their cap.
     crowded: bool,
+    /// The publish reached the lane's state whatever becomes of the write.
+    pub(super) applied: bool,
 }
 
 impl Needs {
+    pub(super) fn waits(&self) -> Vec<Wait> {
+        self.waits.clone()
+    }
     /// Starts over for the next publish.
     pub(super) fn clear(&mut self) {
+        self.handoff = None;
         self.waits.clear();
         self.failed = false;
         self.crowded = false;
+        self.applied = false;
     }
 
     /// Adds what became of one change.
@@ -58,7 +66,7 @@ impl Lane {
     /// has no ack: its connection waits only while records pile up for
     /// the disk.
     pub(super) fn hold_publish(&mut self, key: Key, p: &Publish<'_>) {
-        let needs = std::mem::take(&mut self.needs);
+        let mut needs = std::mem::take(&mut self.needs);
         let kind = match p.qos {
             QoS::AtMostOnce => {
                 if needs.crowded
@@ -82,16 +90,39 @@ impl Lane {
             }
             h.failed |= needs.failed;
             h.push_publish(kind, p.pkid, congested);
+            if let Some(ack) = h.acks.last_mut() {
+                ack.handoff = needs.handoff.take();
+                ack.applied = needs.applied;
+            }
         }
         self.needs = needs;
     }
 
-    /// Holds ack `kind` for `pkid` of session `key` until the write of `j`
-    /// is done.
-    pub(super) fn hold_ack(&mut self, key: Key, kind: PacketType, pkid: u16, j: Journaled) {
+    /// Holds the PUBCOMP for `pkid` until the write of `j` is done, and until
+    /// the destinations of its publish, if that went through `handoff`, have
+    /// it: that frees the publisher's slot, which bounds what is on its way.
+    pub(super) fn hold_pubcomp(
+        &mut self,
+        key: Key,
+        pkid: u16,
+        j: Option<Journaled>,
+        handoff: Option<std::sync::Arc<crate::state::handoff::Pending>>,
+    ) {
+        let waits = handoff
+            .as_ref()
+            .and_then(|p| self.handoff_waits_of(p.seq))
+            .unwrap_or_default();
         if let Some(h) = self.hold(key) {
-            h.note(j);
-            h.push_durable(kind, pkid);
+            if let Some(j) = j {
+                h.note(j);
+            }
+            for w in waits {
+                h.wait(w);
+            }
+            h.push_durable(PacketType::PubComp, pkid);
+            if let Some(ack) = h.acks.last_mut() {
+                ack.handoff = handoff;
+            }
         }
     }
 
@@ -128,29 +159,62 @@ impl Lane {
         let ok = written && !hold.failed;
         let mut result = Ok(());
         for a in &hold.acks {
-            if ok || !a.durable {
-                let hit = a.congested.map(|sub| self.hit_of(sub));
-                if let Err(close) = self.ack_after(key, hit, (a.kind, a.pkid, a.reason)) {
-                    result = Err(close);
-                    break;
-                }
-                continue;
+            if !ok && a.durable {
+                let refused = self.refuse_ack(key, a, result.is_ok());
+                result = result.and(refused);
+            } else if result.is_ok() {
+                let sub = a
+                    .congested
+                    .or_else(|| a.handoff.as_ref()?.congested.get().copied());
+                let hit = sub.map(|sub| self.hit_of(sub));
+                result = self.ack_after(key, hit, (a.kind, a.pkid, a.reason));
             }
-            let Some(s) = self.sessions.get_mut(key) else {
-                break;
-            };
-            if !s.version.is_v5() || !matches!(a.kind, PacketType::PubAck | PacketType::PubRec) {
-                result = Err(Close::Protocol(reason::UNSPECIFIED_ERROR));
-                break;
-            }
-            // A PUBREC with an error ends the QoS 2 flow.
-            if a.kind == PacketType::PubRec {
-                s.inbound.awaiting_rel.remove(&a.pkid);
-            }
-            s.ack(a.kind, a.pkid, reason::UNSPECIFIED_ERROR);
         }
         self.mark(key);
+        for p in hold.acks.iter().filter_map(|a| a.handoff.as_ref()) {
+            self.reap_handoff(p.seq);
+        }
         self.flush();
         result
+    }
+
+    /// Held ack `a` answers for a change that did not reach a journal. With
+    /// `tell`, a v5 publisher gets Unspecified error. Whoever cannot be told
+    /// so gets an error, for the connection to close. A publish in the
+    /// lane's state stays, as the journal gets all of that state again: the
+    /// connection closes, and the client's retry finds it.
+    fn refuse_ack(&mut self, key: Key, a: &HeldAck, tell: bool) -> Result<(), Close> {
+        if a.applied {
+            return Err(Close::Protocol(reason::UNSPECIFIED_ERROR));
+        }
+        let Some(s) = self.sessions.get_mut(key) else {
+            return Ok(());
+        };
+        let can_tell =
+            s.version.is_v5() && matches!(a.kind, PacketType::PubAck | PacketType::PubRec);
+        // The QoS 2 flow ends here, also for a client that learns of it by
+        // the close: its PUBLISH is a new one when it comes again.
+        if a.kind == PacketType::PubRec {
+            s.inbound.awaiting_rel.remove(&a.pkid);
+            if let Some(flows) = s.inbound.flows.as_mut() {
+                flows.by_pkid.remove(&a.pkid);
+            }
+        }
+        if can_tell && tell {
+            s.ack(a.kind, a.pkid, reason::UNSPECIFIED_ERROR);
+        }
+        if a.kind == PacketType::PubRec {
+            let j = self.journal_inbound(key, a.pkid, true);
+            if let Some(s) = self.sessions.get_mut(key) {
+                // The sender may reuse this ID as soon as it sees the
+                // rejection, including after the broker restarts.
+                s.out.due = s.out.due.then(j);
+            }
+        }
+        if can_tell {
+            Ok(())
+        } else {
+            Err(Close::Protocol(reason::UNSPECIFIED_ERROR))
+        }
     }
 }

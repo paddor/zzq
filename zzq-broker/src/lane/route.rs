@@ -13,11 +13,29 @@ use crate::msg::{Arena, Block, Msg, Publication};
 use crate::session::{Kept, KeptMsg, Outcome, QueueLimit, Queued, Session, SharedMsg};
 use crate::slab::Key;
 
-use super::{Control, Hit, Lane, Ticket};
+use super::handoff::Arriving;
+use super::{Control, Hit, Lane, LaneRef, Phase, Ticket};
+
+/// What a run may add to the write buffers of a lane's subscribers, all of
+/// them together, before its connections run. A lane that falls behind holds
+/// about twice this, as a buffer has a spare, however many subscribers it has.
+/// Only one read per subscriber comes on top, as a forward is not split. Much
+/// less would starve forwarded data next to local publishers, which bring a
+/// read each per round.
+const DATA_RUN_BYTES: usize = 8 << 20;
+/// What an item weighs on top of its bytes, so that tiny ones end a run too.
+const DATA_ITEM: usize = 64;
 
 /// A delivery for a session on another lane.
 #[derive(Debug)]
 pub(crate) enum Remote {
+    Handoff {
+        pending: std::sync::Arc<crate::state::handoff::Pending>,
+        seq: u64,
+        from: u16,
+        epoch: u64,
+        sequence: u64,
+    },
     /// PUBLISH packets for the target lane to route to its own sessions,
     /// as offset and length into one shared buffer.
     Forward {
@@ -25,6 +43,8 @@ pub(crate) enum Remote {
         first: (u32, u32),
         more: Vec<(u32, u32)>,
         origin: Origin,
+        /// Absolute number of the last delivery in this entry.
+        last: u64,
     },
     /// A delivery to one session, chosen for a shared subscription. With
     /// `pins`, the message slices the publisher's read buffer.
@@ -34,9 +54,55 @@ pub(crate) enum Remote {
         pins: bool,
         /// The lane that sent it.
         sender: u16,
+        epoch: u64,
+        sequence: u64,
     },
     /// The last batch the sending lane ships before a state dump.
     Drained(Ticket),
+}
+
+impl Remote {
+    /// What it adds to a run even if nobody takes it.
+    fn weight(&self) -> usize {
+        DATA_ITEM
+            + match self {
+                Remote::Handoff { pending, .. } => pending.msg.size(),
+                // Packets of one read, in order: the bytes they span.
+                Remote::Forward { first, more, .. } => {
+                    let last = more.last().unwrap_or(first);
+                    last.0.saturating_add(last.1).saturating_sub(first.0) as usize
+                }
+                Remote::Deliver { item, .. } => item.msg.size(),
+                Remote::Drained(_) => 0,
+            }
+    }
+}
+
+/// Delivers batches from other lanes in runs of [`DATA_RUN_BYTES`], letting
+/// the lane's connections run after each. False once the lane shut down.
+pub(crate) async fn deliver_batches(lane: &LaneRef, batches: &mut Vec<Vec<Remote>>) -> bool {
+    let mut items = batches.drain(..).flatten();
+    loop {
+        let full = {
+            let mut l = lane.borrow_mut();
+            if l.phase == Phase::ShutDown {
+                return false;
+            }
+            let mut weight = 0;
+            for r in items.by_ref() {
+                weight += l.deliver_remote(r);
+                if weight >= DATA_RUN_BYTES {
+                    break;
+                }
+            }
+            l.flush();
+            weight >= DATA_RUN_BYTES
+        };
+        tokio::task::yield_now().await;
+        if !full {
+            return true;
+        }
+    }
 }
 
 /// How forwarded packets were sent.
@@ -44,6 +110,7 @@ pub(crate) enum Remote {
 pub(crate) struct Origin {
     /// The lane that sent them.
     sender: u16,
+    epoch: u64,
     version: Version,
     /// The publisher, for No Local.
     from: Option<SubRef>,
@@ -151,6 +218,12 @@ impl Lane {
         {
             return matches.clone();
         }
+        self.look_up_matches(key, topic, generation)
+    }
+
+    /// Matches for a publish from `key` to a topic it did not publish to
+    /// last, which its session remembers for the next.
+    fn look_up_matches(&mut self, key: Key, topic: &str, generation: u64) -> Rc<Matches> {
         let (matches, cached) = self.index.lookup(topic);
         if cached && let Some(session) = self.sessions.get_mut(key) {
             // Reuse the topic buffer: a publisher changing topics should not
@@ -222,6 +295,7 @@ impl Lane {
                 let pins = p.pins && p.chunk.is_some_and(|c| msg.pins(c));
                 let lane = usize::from(e.sub.lane);
                 let qos = p.qos.min(e.opts.qos);
+                let sequence = self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
                 self.out.remote[lane].push(Remote::Deliver {
                     key: e.sub.key,
                     pins,
@@ -232,8 +306,9 @@ impl Lane {
                         sub_id: e.sub_id,
                     },
                     sender: self.id,
+                    epoch: self.epoch,
+                    sequence,
                 });
-                self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
             }
         }
         if remote_lanes != 0 {
@@ -254,20 +329,17 @@ impl Lane {
         let (chunk, at, version, pins) = forward_packet(p, hot, &mut self.out.fwd);
         let origin = Origin {
             sender: self.id,
+            epoch: self.epoch,
             version,
             from: from.map(|k| self.sub_ref(k)),
             pins,
         };
         let to = |lane: usize| remote_lanes & (1 << (lane & 63)) != 0;
-        for (lane, batch) in self.out.remote.iter_mut().enumerate() {
-            if to(lane) && lane != usize::from(self.id) {
-                push_forward(batch, &chunk, at, origin);
-            }
-        }
         for lane in 0..self.out.remote.len() {
             if to(lane) && lane != usize::from(self.id) {
                 let wait = wait_lanes & (1 << (lane & 63)) != 0;
-                self.count_sent(lane, wait && p.qos != QoS::AtMostOnce);
+                let sequence = self.count_sent(lane, wait && p.qos != QoS::AtMostOnce);
+                push_forward(&mut self.out.remote[lane], &chunk, at, origin, sequence);
             }
         }
     }
@@ -276,16 +348,19 @@ impl Lane {
     /// session there gets it at QoS 1/2: the publisher's ack waits for
     /// that lane to journal it.
     #[inline]
-    fn count_sent(&mut self, lane: usize, wait: bool) {
-        if let Some(w) = self.pairs.sent(self.id, lane)
-            && wait
-        {
+    fn count_sent(&mut self, lane: usize, wait: bool) -> u64 {
+        let Some(w) = self.pairs.sent(self.id, lane) else {
+            return 0;
+        };
+        if wait {
             self.needs.wait(w);
         }
+        w.n
     }
 
-    /// Routes a publish forwarded by another lane to this lane's sessions.
-    fn route_forwarded(&mut self, chunk: &Bytes, at: (u32, u32), origin: Origin) {
+    /// Routes one packet forwarded by another lane to this lane's sessions.
+    /// Returns the bytes that adds to their output.
+    fn route_forwarded(&mut self, chunk: &Bytes, at: (u32, u32), origin: Origin) -> usize {
         let Origin {
             version,
             from,
@@ -293,10 +368,10 @@ impl Lane {
             ..
         } = origin;
         let Some(packet) = chunk.get(at.0 as usize..(at.0 + at.1) as usize) else {
-            return;
+            return 0;
         };
         let Ok(Some((Packet::Publish(p), n))) = decode(packet, version, usize::MAX) else {
-            return;
+            return 0;
         };
         let publication = Publication {
             topic: p.topic,
@@ -314,13 +389,16 @@ impl Lane {
         let (m, _) = self.index.lookup(p.topic);
         let mut owned = Owned::default();
         let n = m.direct.len();
+        let mut delivered = 0;
         for (i, e) in m.direct.iter().enumerate() {
             if e.sub.lane == self.id
                 && let Some(g) = Self::grant(from, e, &publication, i + 1 == n)
             {
                 self.deliver(e.sub.key, &publication, &mut owned, g);
+                delivered += 1;
             }
         }
+        packet.len() * delivered
     }
 
     /// What `e` gets of `p`, unless No Local skips its own publish.
@@ -441,20 +519,45 @@ impl Lane {
         }
     }
 
-    /// Delivers a message routed on another lane.
-    pub(crate) fn deliver_remote(&mut self, r: Remote) {
+    /// Delivers a message routed on another lane. Returns what it weighs in a
+    /// run: the bytes it added to output, or those it brought if more.
+    #[expect(clippy::too_many_lines, reason = "one arm per delivery message")]
+    pub(crate) fn deliver_remote(&mut self, r: Remote) -> usize {
+        let weight = r.weight();
+        let mut added = 0;
         match r {
+            Remote::Handoff {
+                pending,
+                seq,
+                from,
+                epoch,
+                sequence,
+            } => {
+                if epoch != self.epoch {
+                    return weight;
+                }
+                self.take_handoff(Arriving {
+                    pending,
+                    seq,
+                    from,
+                    sequence,
+                });
+            }
             Remote::Forward {
                 chunk,
                 first,
                 more,
                 origin,
+                last,
             } => {
-                self.route_forwarded(&chunk, first, origin);
-                for &at in &more {
-                    self.route_forwarded(&chunk, at, origin);
+                if origin.epoch != self.epoch {
+                    return weight;
                 }
-                self.got_from(origin.sender, 1 + more.len() as u64);
+                added += self.route_forwarded(&chunk, first, origin);
+                for &at in &more {
+                    added += self.route_forwarded(&chunk, at, origin);
+                }
+                self.got_from(origin.sender, last);
             }
             // After what came before it in the batch.
             Remote::Drained(ticket) => drop(ticket),
@@ -463,7 +566,12 @@ impl Lane {
                 item,
                 pins,
                 sender,
+                epoch,
+                sequence,
             } => {
+                if epoch != self.epoch {
+                    return weight;
+                }
                 let p = Publication {
                     pins,
                     ..Publication::of(&item.msg)
@@ -483,9 +591,10 @@ impl Lane {
                         self.stats.dropped.session_ended += 1;
                     }
                 }
-                self.got_from(sender, 1);
+                self.got_from(sender, sequence);
             }
         }
+        weight.max(added)
     }
 }
 
@@ -569,11 +678,18 @@ fn keep(
 
 /// Appends a forwarded packet, sharing the last batch entry when it uses
 /// the same buffer.
-fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: Origin) {
+fn push_forward(
+    batch: &mut Vec<Remote>,
+    chunk: &Bytes,
+    at: (u32, u32),
+    origin: Origin,
+    sequence: u64,
+) {
     if let Some(Remote::Forward {
         chunk: c,
         more,
         origin: o,
+        last,
         ..
     }) = batch.last_mut()
         && c.as_ptr() == chunk.as_ptr()
@@ -581,6 +697,7 @@ fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: 
         && *o == origin
     {
         more.push(at);
+        *last = sequence;
         return;
     }
     // Packets of one read are mostly alike, so size the rest from this one;
@@ -591,6 +708,7 @@ fn push_forward(batch: &mut Vec<Remote>, chunk: &Bytes, at: (u32, u32), origin: 
         first: at,
         more: Vec::with_capacity(more),
         origin,
+        last: sequence,
     });
 }
 
@@ -599,18 +717,146 @@ mod tests {
     use std::rc::Rc;
 
     use bytes::Bytes;
+    use zzq_client::{Client, ClientOptions};
     use zzq_proto::{QoS, Version};
 
     use super::super::Remote;
-    use super::{Grant, Owned, keep};
-    use crate::BrokerOptions;
+    use super::{
+        DATA_ITEM, DATA_RUN_BYTES, Grant, Origin, Owned, deliver_batches, forward_packet, keep,
+    };
     use crate::budget::LaneTotal;
     use crate::index::SubIds;
-    use crate::msg::{Msg, Publication};
+    use crate::msg::{Arena, Msg, Publication};
     use crate::session::{KeptMsg, Queued, Session, SharedMsg};
     use crate::slab::Key;
     use crate::tests::on_lane;
     use crate::tests::support::setup;
+    use crate::{BrokerOptions, Context};
+
+    /// Deliveries of `size` payload bytes to a session that is gone.
+    fn to_nobody(n: usize, size: usize) -> Vec<Remote> {
+        let payload = vec![0; size];
+        let key = Key {
+            slot: 1000,
+            generation: 0,
+        };
+        (0..n)
+            .map(|_| Remote::Deliver {
+                key,
+                pins: false,
+                item: Queued {
+                    msg: Msg::new("t", &payload, &[], QoS::AtLeastOnce, false),
+                    qos: QoS::AtLeastOnce,
+                    retain: false,
+                    sub_id: SubIds::default(),
+                },
+                sender: 0,
+                epoch: 0,
+                sequence: 0,
+            })
+            .collect()
+    }
+
+    /// How many of `batch` lane 0 delivered when another of its tasks got to
+    /// run, and how many once it is through.
+    async fn delivered_before_others_run(batch: Vec<Remote>) -> (u64, u64) {
+        let (ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
+        let id = broker.shared().id;
+        let (first_tx, first) = tokio::sync::oneshot::channel();
+        let (all_tx, all) = tokio::sync::oneshot::channel();
+        ctx.lane(0)
+            .spawn(move || async move {
+                let lane = crate::broker::lane_ref(id, 0).unwrap();
+                let l = lane.clone();
+                tokio::task::spawn_local(async move {
+                    let _ = first_tx.send(l.borrow().stats.dropped.session_ended);
+                });
+                assert!(deliver_batches(&lane, &mut vec![batch]).await);
+                let _ = all_tx.send(lane.borrow().stats.dropped.session_ended);
+            })
+            .unwrap();
+        (first.await.unwrap(), all.await.unwrap())
+    }
+
+    /// A subscriber's buffer takes one run at a time, not all that is queued.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lane_lets_its_tasks_run_after_a_run_of_forwarded_bytes() {
+        let batch = to_nobody(8, DATA_RUN_BYTES / 4);
+        assert_eq!(delivered_before_others_run(batch).await, (4, 8));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tiny_deliveries_end_a_run_too() {
+        let total = 2 * DATA_RUN_BYTES / DATA_ITEM;
+        let (first, all) = delivered_before_others_run(to_nobody(total, 1)).await;
+        assert!(
+            first > 0 && first <= (DATA_RUN_BYTES / DATA_ITEM) as u64,
+            "{first}"
+        );
+        assert_eq!(all, total as u64);
+    }
+
+    #[test]
+    fn a_forward_weighs_the_bytes_its_packets_span() {
+        let origin = Origin {
+            sender: 0,
+            epoch: 0,
+            version: Version::V5,
+            from: None,
+            pins: true,
+        };
+        let forward = |more: Vec<(u32, u32)>| Remote::Forward {
+            chunk: Bytes::from_static(&[0; 100]),
+            first: (10, 20),
+            more,
+            origin,
+            last: 0,
+        };
+        assert_eq!(forward(vec![]).weight(), DATA_ITEM + 20);
+        assert_eq!(forward(vec![(30, 5), (50, 30)]).weight(), DATA_ITEM + 70);
+    }
+
+    /// A forward counts what it adds for each subscriber, or what it brings
+    /// if nobody takes it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivered_forward_weighs_its_packet_per_subscriber() {
+        let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
+        let clients = Context::new().unwrap();
+        let mut subs = Vec::new();
+        for id in ["a", "b", "c"] {
+            let sub = Client::connect(&clients, &uri, ClientOptions::new(id))
+                .await
+                .unwrap();
+            sub.subscribe("t", QoS::AtMostOnce).await.unwrap();
+            subs.push(sub);
+        }
+        let weigh = |topic: &'static str| {
+            on_lane(&ctx, &broker, 0, move |l| {
+                let msg = Msg::new(topic, &[0; 100], &[], QoS::AtMostOnce, false);
+                let p = Publication::of(&msg);
+                let (chunk, at, version, pins) = forward_packet(&p, false, &mut Arena::default());
+                let origin = Origin {
+                    sender: 0,
+                    epoch: 0,
+                    version,
+                    from: None,
+                    pins,
+                };
+                let weight = l.deliver_remote(Remote::Forward {
+                    chunk,
+                    first: at,
+                    more: Vec::new(),
+                    origin,
+                    last: 0,
+                });
+                (weight, at.1 as usize)
+            })
+        };
+        let (weight, packet) = weigh("t").await;
+        assert_eq!(weight, 3 * packet);
+        let (weight, packet) = weigh("nobody").await;
+        assert_eq!(weight, DATA_ITEM + packet);
+    }
 
     /// A share group member on another lane whose session ended before
     /// the message arrived: the message is counted as dropped.
@@ -634,6 +880,8 @@ mod tests {
                         sub_id: SubIds::default(),
                     },
                     sender: 0,
+                    epoch: 0,
+                    sequence: 0,
                 });
             }
             (l.stats.dropped.offline, l.stats.dropped.session_ended)

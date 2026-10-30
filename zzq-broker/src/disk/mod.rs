@@ -4,17 +4,166 @@
 use std::fs;
 use std::io;
 use std::path::Path;
-use std::time::Instant;
 
 use crate::broker::lane_for;
+use crate::state::Clock;
+use crate::state::handoff::LaneState;
 use crate::state::journal::{self as rec, IMAGE, Sessions};
-use crate::state::{Clock, SessionState};
 
 #[cfg_attr(target_os = "linux", path = "linux.rs")]
 #[cfg_attr(not(target_os = "linux"), path = "unsupported.rs")]
 mod imp;
 
-pub(crate) use imp::{DataDir, Log, Record};
+use imp::DiskLog;
+pub(crate) use imp::{DataDir, Record};
+
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use crate::cluster::{ClusterLog, Commits};
+
+/// Where a snapshot's records go: a journal, or a cluster image.
+pub(crate) trait Append {
+    /// Appends a record of `kind` whose body is `parts`. Returns its
+    /// number.
+    fn append(&mut self, kind: u8, parts: &[&[u8]]) -> io::Result<u64>;
+}
+
+impl Append for Log {
+    fn append(&mut self, kind: u8, parts: &[&[u8]]) -> io::Result<u64> {
+        Log::append(self, kind, parts)
+    }
+}
+
+/// A journal: on disk, or replicated to the other nodes of a cluster.
+#[derive(Debug)]
+pub(crate) enum Log {
+    Disk(Box<DiskLog>),
+    Cluster(ClusterLog),
+}
+
+impl Log {
+    pub(crate) fn append(&mut self, kind: u8, parts: &[&[u8]]) -> io::Result<u64> {
+        match self {
+            Log::Disk(d) => d.append(kind, parts),
+            Log::Cluster(c) => Ok(c.append(kind, parts)),
+        }
+    }
+
+    pub(crate) fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Log::Disk(d) => d.flush(),
+            Log::Cluster(c) => {
+                c.flush();
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) const fn backlog(&self) -> usize {
+        match self {
+            Log::Disk(d) => d.backlog(),
+            Log::Cluster(c) => c.backlog(),
+        }
+    }
+
+    /// Whether a new segment could not be made; never for a cluster.
+    pub(crate) const fn full(&self) -> bool {
+        match self {
+            Log::Disk(d) => d.full(),
+            Log::Cluster(_) => false,
+        }
+    }
+
+    /// Bytes written: what makes a snapshot due. A cluster journal holds
+    /// no history to trim, so it never takes one.
+    pub(crate) const fn written_bytes(&self) -> u64 {
+        match self {
+            Log::Disk(d) => d.written_bytes(),
+            Log::Cluster(_) => 0,
+        }
+    }
+
+    pub(crate) fn roll(&mut self) -> io::Result<Option<u64>> {
+        match self {
+            Log::Disk(d) => d.roll(),
+            Log::Cluster(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn trim(&mut self, before: u64) -> io::Result<()> {
+        match self {
+            Log::Disk(d) => d.trim(before),
+            Log::Cluster(_) => Ok(()),
+        }
+    }
+
+    /// Writes everything appended and waits for it. A cluster journal
+    /// hands it to the replica and does not wait.
+    pub(crate) fn sync(&mut self) -> io::Result<u64> {
+        match self {
+            Log::Disk(d) => d.sync(),
+            Log::Cluster(c) => {
+                c.flush();
+                Ok(c.appended())
+            }
+        }
+    }
+
+    /// The number of the last record a cluster journal appended.
+    pub(crate) const fn cluster_appended(&self) -> Option<u64> {
+        match self {
+            Log::Disk(_) => None,
+            Log::Cluster(c) => Some(c.appended()),
+        }
+    }
+
+    /// Drops what a cluster journal holds back; nothing for the disk.
+    pub(crate) fn discard(&mut self) {
+        if let Log::Cluster(c) = self {
+            c.discard();
+        }
+    }
+
+    /// The commits of a cluster journal, which its completion task awaits
+    /// instead of polling.
+    pub(crate) fn commits(&self) -> Option<Arc<Commits>> {
+        match self {
+            Log::Disk(_) => None,
+            Log::Cluster(c) => Some(c.commits.clone()),
+        }
+    }
+
+    pub(crate) fn poll_complete(&mut self, cx: &mut Context<'_>) -> Poll<Completion> {
+        match self {
+            Log::Disk(d) => d.poll_complete(cx),
+            // Its completion task awaits `commits`.
+            Log::Cluster(_) => Poll::Pending,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_next_write(&mut self) {
+        if let Log::Disk(d) = self {
+            d.fail_next_write();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn fail_next_segment(&mut self) {
+        if let Log::Disk(d) = self {
+            d.fail_next_segment();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn counts(&self) -> (u64, u64) {
+        match self {
+            Log::Disk(d) => d.counts(),
+            Log::Cluster(c) => (c.appended(), 0),
+        }
+    }
+}
 
 /// Journal bytes written since the last snapshot beyond which the next
 /// one comes, once they are also twice what the journal holds live.
@@ -43,7 +192,11 @@ pub(crate) enum Completion {
 /// Opens the session journals of `n` lanes, `lanes-<n>/lane-<j>`, with
 /// the sessions each holds. Sessions in the journals of another lane
 /// count move to the lanes `lane_for` gives them first.
-pub(crate) fn open_lanes(dir: &DataDir, n: usize) -> io::Result<Vec<(Log, Vec<SessionState>)>> {
+pub(crate) fn open_lanes(
+    dir: &DataDir,
+    n: usize,
+    retained: &crate::retain::Retained,
+) -> io::Result<Vec<(Log, LaneState)>> {
     let root = dir.path();
     let want = format!("lanes-{n}");
     let mut others = Vec::new();
@@ -69,7 +222,7 @@ pub(crate) fn open_lanes(dir: &DataDir, n: usize) -> io::Result<Vec<(Log, Vec<Se
     if !root.join(&want).is_dir() {
         match others[..] {
             [] => {}
-            [m] => move_sessions(dir, m, n)?,
+            [m] => move_sessions(dir, m, n, retained)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -88,40 +241,50 @@ pub(crate) fn open_lanes(dir: &DataDir, n: usize) -> io::Result<Vec<(Log, Vec<Se
 }
 
 /// Opens journal `name` of lane `j` of `n`, with the sessions it holds.
-fn read_lane(
-    dir: &DataDir,
-    name: &str,
-    j: usize,
-    n: usize,
-) -> io::Result<(Log, Vec<SessionState>)> {
+fn read_lane(dir: &DataDir, name: &str, j: usize, n: usize) -> io::Result<(Log, LaneState)> {
     let clock = Clock::now();
-    let mut sessions = Sessions::default();
+    let mut sessions = Sessions::new(n);
     let log = dir.journal(name, |r| {
         sessions.apply(r.kind, r.body, clock, |id| lane_for(id, n) == j)
     })?;
-    Ok((log, sessions.finish(Instant::now())))
+    Ok((log, sessions.into_lane(crate::time::now())))
 }
 
 /// Moves the sessions of `m` lane journals to `n`: writes them all to new
 /// journals beside, then swaps the directories.
-fn move_sessions(dir: &DataDir, m: usize, n: usize) -> io::Result<()> {
-    let mut moved: Vec<Vec<SessionState>> = (0..n).map(|_| Vec::new()).collect();
+fn move_sessions(
+    dir: &DataDir,
+    m: usize,
+    n: usize,
+    retained: &crate::retain::Retained,
+) -> io::Result<()> {
+    let mut old = Vec::with_capacity(m);
     for j in 0..m {
-        let (log, sessions) = read_lane(dir, &format!("lanes-{m}/lane-{j}"), j, m)?;
+        let (log, state) = read_lane(dir, &format!("lanes-{m}/lane-{j}"), j, m)?;
         drop(log);
-        for st in sessions {
-            moved[lane_for(&st.client_id, n)].push(st);
+        old.push(state);
+    }
+    crate::state::handoff::materialize(&mut old, retained)?;
+    let serial = old.iter().map(|l| l.handoffs.serial).max().unwrap_or(0);
+    let mut moved: Vec<_> = (0..n).map(|_| LaneState::default()).collect();
+    for lane in &mut moved {
+        lane.handoffs.serial = serial;
+    }
+    for lane in old {
+        for st in lane.sessions {
+            moved[lane_for(&st.client_id, n)].sessions.push(st);
         }
     }
     let clock = Clock::now();
     let mut buf = Vec::new();
     for (j, sessions) in moved.into_iter().enumerate() {
         let mut log = dir.journal(&format!("lanes-{n}.tmp/lane-{j}"), |_| Ok(()))?;
-        for st in sessions {
+        for st in sessions.sessions {
             buf.clear();
-            rec::image_state(&mut buf, st, clock);
-            log.append(IMAGE, &[&buf])?;
+            rec::image_state(&mut buf, st, false, clock);
+            rec::append_record(&mut log, IMAGE, &[&buf])?;
         }
+        rec::handoffs(&mut log, &sessions.handoffs, &mut buf, clock)?;
         log.sync()?;
     }
     let root = dir.path();

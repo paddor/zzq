@@ -51,7 +51,7 @@ flowchart LR
 | Channel | From, to | Bound | Carries |
 | --- | --- | --- | --- |
 | Control mailbox | Lanes and handle to a lane | None | Subscription changes, broker publishes, congestion, stats, shutdown |
-| Data mailbox | Lane to lane | 64 batches; senders wait | Forwarded PUBLISH packets, shared subscription deliveries |
+| Data mailbox | Lane to lane | 8 batches; senders wait | Forwarded PUBLISH packets, shared subscription deliveries |
 | Writer wake | Lane to a connection's writer | One pending wake | Output is ready |
 | Disk queues | Journals to the disk threads, and back | Bounded | Write groups, segment jobs, completions |
 
@@ -61,9 +61,10 @@ flowchart LR
   send, at most one socket read (256 KiB) per connection. A full data
   mailbox makes the sending lane wait, which slows its publishers.
   Nothing is dropped.
-- The lane handles controls in runs of 64, letting its connections run in
-  between. Data batches it handles all at once: up to 64, with no byte
-  cap of their own.
+- The lane handles controls in runs of 64, and forwarded data in runs that
+  add 8 MiB to its subscribers' write buffers, all of them together, letting
+  its connections run in between. So a lane that falls behind stays small
+  however many subscribers it has.
 - A client queues at most one read of subscription changes: its
   connection reads on once every lane applied them.
 
@@ -189,6 +190,45 @@ sequenceDiagram
 - A connection with acks held for the disk reads on once those writes are
   done, so a publisher cannot outrun the journal. QoS 0 publishers wait
   only while records pile up for the disk.
+
+## Clustering
+
+Three nodes run as one broker, replicated with Viewstamped Replication
+(`zzq-cluster`). The journals that would go to a data directory go to
+the cluster instead, in RAM:
+
+- **Ops.** Each flushed group of a lane's or a retained stripe's records
+  becomes one op. A replica task on lane 0 owns the node, proposes the
+  ops and turns their commits into the journals' completions, so a
+  PUBACK waits for one follower to hold its message.
+- **Leader only.** The leader alone binds client listeners. A leader
+  that misses its followers' acks closes them and waits; one that is no
+  longer leads its view drops its lanes' state and rebuilds it
+  from the ops.
+- **Followers.** A follower applies the committed ops with the replay a
+  start from disk uses, into state no lane serves. Becoming leader hands
+  that state to the lanes.
+- **Images.** A node behind the ops the others keep, or without state,
+  gets an image: each journal's state, cut at its own op.
+- **Exit dumps.** A clean stop writes the node's history and an image to
+  the state file; the next start votes with it.
+- **Forced start.** When no two nodes have the state, one node starts a
+  new configuration epoch from the newest state it has and journals it
+  all as its first ops. Nodes without state join that epoch.
+- **Links.** The nodes talk over OMQ, one PEER socket per node, on a
+  thread of its own.
+
+```mermaid
+flowchart LR
+    subgraph leader [leader]
+        LL["lanes"] -->|groups| LR["replica"]
+    end
+    subgraph follower [follower]
+        FR["replica"] -->|ops| FA["replayed state"]
+    end
+    LR <-->|prepares, acks, OMQ| FR
+    LR -->|commits| LL
+```
 
 ## Why it is fast
 

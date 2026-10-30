@@ -167,7 +167,20 @@ impl Conn<'_> {
     fn control(&mut self, packet: Packet<'_>) -> Result<()> {
         let v = self.s.opts.version;
         match packet {
-            Packet::PubAck(a) | Packet::PubComp(a) => self.done(a.pkid, a.reason)?,
+            Packet::PubAck(a) => self.done(a.pkid, a.reason)?,
+            Packet::PubComp(a) => {
+                // A lost PUBCOMP makes us resend PUBREL after the broker has
+                // forgotten its ID. MQTT 5 section 3.7.2.1 says 0x92 is not an
+                // error during recovery: PUBREC already accepted the message.
+                // For a PUBREL sent once, the broker lost the flow.
+                let resent = self.s.requests.resent_rel.remove(&a.pkid);
+                let code = if resent && a.reason == zzq_proto::reason::PACKET_IDENTIFIER_NOT_FOUND {
+                    0
+                } else {
+                    a.reason
+                };
+                self.done(a.pkid, code)?;
+            }
             Packet::PubRec(a) => {
                 if a.reason >= 0x80 {
                     self.done(a.pkid, a.reason)?;
