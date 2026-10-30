@@ -17,8 +17,9 @@
 //! `retain` sets the retain flag on publishes. `persist` gives subscribers
 //! sessions that outlive their connection.
 //!
-//! `lanes` and `cross` place clients on the lanes of a zzq broker. `cpu_pid`
-//! names the broker's processes, comma-separated: their CPU over the
+//! `lanes` and `cross` place clients on the lanes of a zzq broker, and
+//! `local` says how many fan-out subscribers share the publisher's lane.
+//! `cpu_pid` names the broker's processes, comma-separated: their CPU over the
 //! measured window and their memory at the end go on the result line, next
 //! to the load generator's own CPU. Closed connections and a stalled
 //! publisher go to stderr.
@@ -81,6 +82,11 @@ fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
         window: num("window", "100")? as usize,
         lanes: num("lanes", "1")? as usize,
         cross: get("cross", "0") == "1",
+        local: if get("local", "").is_empty() {
+            None
+        } else {
+            Some(num("local", "0")? as usize)
+        },
         topics: num("topics", "1")? as usize,
         keep: Keep {
             retain: get("retain", "0") == "1",

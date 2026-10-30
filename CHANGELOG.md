@@ -57,6 +57,13 @@ Notable changes to zzq. The format follows
 - Durable QoS 2 fan-in and fan-out across 2 lanes run about 25-40% below 0.4.0.
   Each message now also writes its routing decision and the subscriber's packet
   ID, which crash recovery needs.
+- A lane that falls behind another takes its forwarded data in runs that add
+  8 MiB to its subscribers' write buffers, all of them together, from a mailbox
+  of 8 batches instead of 64. It no longer gives each subscriber 16 MiB at once.
+  A QoS 0 fan-out with 13 of 16 subscribers across lanes peaks at 31 MiB instead
+  of 450 MiB, with 38 of 64 at 42 MiB instead of 1.3 GiB, and with 156 of 256 at
+  143 MiB instead of 2.8 GiB, where it also stops losing 32% of its messages.
+  QoS 0 fan-in across lanes runs 2% slower at 16 B and 6% at 4 KiB.
 
 ### Fixed
 

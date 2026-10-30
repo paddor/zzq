@@ -64,6 +64,9 @@ pub struct Load {
     pub lanes: usize,
     /// Pairs: put each publisher on the lane after its subscriber's.
     pub cross: bool,
+    /// Fan-out with `lanes`: this many subscribers share the publisher's
+    /// lane, the rest go on the next one. Without it, they take turns.
+    pub local: Option<usize>,
     /// Topics per publisher, cycled message by message. Above 1,
     /// subscribers use `/#` filters.
     pub topics: usize,
@@ -88,6 +91,7 @@ impl Default for Load {
             window: 100,
             lanes: 1,
             cross: false,
+            local: None,
             topics: 1,
             keep: Keep::default(),
             broker_pids: Vec::new(),
@@ -256,7 +260,8 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<Conns> {
     let pid = shape.pid;
     let mut subs = Vec::new();
     for i in 0..shape.subs {
-        let id = client_id(&format!("zb-{pid}-s{i}"), i, load.lanes);
+        let lane = load.local.map_or(i, |local| usize::from(i >= local));
+        let id = client_id(&format!("zb-{pid}-s{i}"), lane, load.lanes);
         let mut c = Conn::open(&load.addr, id, load.v5, load.keep.sessions)?;
         wire::subscribe(&mut c.s, &mut c.rd, &shape.filter(i), load.qos, load.v5)?;
         c.s.set_read_timeout(Some(Duration::from_millis(100)))?;

@@ -33,7 +33,7 @@ use backpressure::Hit;
 pub(crate) use control::{Control, Dump, SyncAck, Ticket};
 pub(crate) use handoff::prepare as prepare_handoffs;
 pub(crate) use journal::{LaneLog, complete};
-pub(crate) use route::Remote;
+pub(crate) use route::{Remote, deliver_batches};
 pub(crate) use subscribe::Held;
 
 pub(crate) type LaneRef = Rc<RefCell<Lane>>;

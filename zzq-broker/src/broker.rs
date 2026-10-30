@@ -22,8 +22,9 @@ use crate::options::BrokerOptions;
 use crate::retain::Retained;
 use crate::{Error, Result};
 
-/// Batches in flight to one lane before senders wait.
-const DATA_BATCHES: usize = 64;
+/// Batches in flight to one lane before senders wait. Deep enough to keep a
+/// lane busy between its runs, shallow enough not to hold much behind it.
+const DATA_BATCHES: usize = 8;
 /// Controls a lane handles before it lets its connections run.
 const CONTROL_RUN: usize = 64;
 /// Interval of keep alive and session expiry checks, each over a part of
@@ -650,26 +651,13 @@ fn install(
         }
     });
 
-    // A run takes at most `DATA_BATCHES`, each at most one read per
-    // connection of the sending lane, then lets this lane's connections
-    // run. A byte cap on top cost cross-lane QoS 0 fan-in up to 25%.
     let l = lane.clone();
     tokio::task::spawn_local(async move {
         let mut batches = Vec::new();
         while data_rx.recv_all(&mut batches).await {
-            {
-                let mut lane = l.borrow_mut();
-                if lane.phase == Phase::ShutDown {
-                    break;
-                }
-                for batch in batches.drain(..) {
-                    for r in batch {
-                        lane.deliver_remote(r);
-                    }
-                }
-                lane.flush();
+            if !crate::lane::deliver_batches(&l, &mut batches).await {
+                break;
             }
-            tokio::task::yield_now().await;
         }
     });
 

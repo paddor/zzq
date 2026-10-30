@@ -51,7 +51,7 @@ flowchart LR
 | Channel | From, to | Bound | Carries |
 | --- | --- | --- | --- |
 | Control mailbox | Lanes and handle to a lane | None | Subscription changes, broker publishes, congestion, stats, shutdown |
-| Data mailbox | Lane to lane | 64 batches; senders wait | Forwarded PUBLISH packets, shared subscription deliveries |
+| Data mailbox | Lane to lane | 8 batches; senders wait | Forwarded PUBLISH packets, shared subscription deliveries |
 | Writer wake | Lane to a connection's writer | One pending wake | Output is ready |
 | Disk queues | Journals to the disk threads, and back | Bounded | Write groups, segment jobs, completions |
 
@@ -61,9 +61,10 @@ flowchart LR
   send, at most one socket read (256 KiB) per connection. A full data
   mailbox makes the sending lane wait, which slows its publishers.
   Nothing is dropped.
-- The lane handles controls in runs of 64, letting its connections run in
-  between. Data batches it handles all at once: up to 64, with no byte
-  cap of their own.
+- The lane handles controls in runs of 64, and forwarded data in runs that
+  add 8 MiB to its subscribers' write buffers, all of them together, letting
+  its connections run in between. So a lane that falls behind stays small
+  however many subscribers it has.
 - A client queues at most one read of subscription changes: its
   connection reads on once every lane applied them.
 
