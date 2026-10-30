@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## v0.7.0 — 2026-10-31
+
+- Built on the zzq 0.5 crates, with their fixes. With `data_dir:`, a QoS 2
+  publish across lanes survives a crash, and a lane that falls behind another
+  holds far less memory under load.
+
 ## v0.6.0 — 2026-10-29
 
 - Built on the zzq 0.4 crates.
