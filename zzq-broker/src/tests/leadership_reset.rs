@@ -132,6 +132,7 @@ async fn a_reset_pair_waits_for_its_new_delivery_to_be_journaled() {
     drop(go);
     assert_eq!(p.next().await, ack);
     assert_eq!(sub.publish().await.payload, b"after");
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 

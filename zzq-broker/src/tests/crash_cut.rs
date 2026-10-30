@@ -80,6 +80,7 @@ async fn a_qos2_delivery_waits_for_its_packet_id_to_reach_the_journal() {
     sub.quiet(100).await;
     log.paused.store(false, Ordering::Relaxed);
     assert_eq!(sub.publish().await.payload, b"once");
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -124,7 +125,7 @@ async fn missing_destination(name: &str, snapshot: bool, lanes_after: usize) {
         drop(go);
         assert_eq!(p.next().await, ack(PacketType::PubRec));
     }
-    let (_ctx, _broker, uri) = setup(lanes_after, copy_opts()).await;
+    let (_ctx, broker, uri) = setup(lanes_after, copy_opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable(&publisher)).await;
     packet[0] |= 0x08;
@@ -136,6 +137,7 @@ async fn missing_destination(name: &str, snapshot: bool, lanes_after: usize) {
     assert_eq!(message.payload, b"once");
     sub.complete(&message).await;
     sub.quiet(100).await;
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(copy).unwrap();
 }
@@ -181,7 +183,7 @@ async fn a_committed_destination_does_not_repeat_an_unfinished_source_handoff() 
         );
         copy_tree(&dir.join("lanes-2/lane-1"), &copy.join("lanes-2/lane-1"));
     }
-    let (_ctx, _broker, uri) = setup(2, copy_opts()).await;
+    let (_ctx, broker, uri) = setup(2, copy_opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable(&publisher)).await;
     packet[0] |= 0x08;
@@ -190,6 +192,7 @@ async fn a_committed_destination_does_not_repeat_an_unfinished_source_handoff() 
     p.ack(PacketType::PubRel, 5).await;
     assert_eq!(p.next().await, ack(PacketType::PubComp));
     sub.quiet(100).await;
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(copy).unwrap();
 }
@@ -216,7 +219,7 @@ async fn a_pubrec_sent_before_the_destination_has_it_still_delivers_after_a_cras
             copy_tree(&dir, &copy);
             drop(go);
         }
-        let (_ctx, _broker, uri) = setup(lanes_after, copy_opts()).await;
+        let (_ctx, broker, uri) = setup(lanes_after, copy_opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
         let (mut p, _) = Raw::connect_with(&uri, &durable(&publisher)).await;
         p.ack(PacketType::PubRel, 5).await;
@@ -225,6 +228,7 @@ async fn a_pubrec_sent_before_the_destination_has_it_still_delivers_after_a_cras
         assert_eq!(message.payload, b"once");
         sub.complete(&message).await;
         sub.quiet(100).await;
+        broker.shutdown().await.unwrap();
         std::fs::remove_dir_all(dir).unwrap();
         std::fs::remove_dir_all(copy).unwrap();
     }
@@ -246,7 +250,7 @@ async fn a_written_publish_to_its_own_lane_is_not_repeated_after_a_crash() {
         assert_eq!(p.next().await, ack(PacketType::PubRec));
         copy_tree(&dir, &copy);
     }
-    let (_ctx, _broker, uri) = setup(1, copy_opts()).await;
+    let (_ctx, broker, uri) = setup(1, copy_opts()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("local-pub")).await;
     packet[0] |= 0x08;
     p.send(&packet).await;
@@ -258,6 +262,7 @@ async fn a_written_publish_to_its_own_lane_is_not_repeated_after_a_crash() {
     assert_eq!(got.payload, b"once");
     sub.complete(&got).await;
     sub.quiet(100).await;
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(copy).unwrap();
 }
@@ -289,7 +294,7 @@ async fn an_unwritten_publish_to_its_own_lane_is_new_after_a_crash() {
         copy_tree(&dir, &copy);
         log.paused.store(false, Ordering::Relaxed);
     }
-    let (_ctx, _broker, uri) = setup(1, copy_opts()).await;
+    let (_ctx, broker, uri) = setup(1, copy_opts()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("local2-pub")).await;
     packet[0] |= 0x08;
     p.send(&packet).await;
@@ -299,6 +304,7 @@ async fn an_unwritten_publish_to_its_own_lane_is_new_after_a_crash() {
     assert_eq!(got.payload, b"once");
     sub.complete(&got).await;
     sub.quiet(100).await;
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(copy).unwrap();
 }
@@ -332,10 +338,11 @@ async fn a_recovered_handoff_puts_its_retained_message_in_the_store() {
             std::fs::remove_dir_all(entry.path()).unwrap();
         }
     }
-    let (_ctx, _broker, uri) = setup(2, copy_opts()).await;
+    let (_ctx, broker, uri) = setup(2, copy_opts()).await;
     let mut late = Raw::connect(&uri, "store-late", Version::V5, 0).await;
     late.subscribe("store/t", QoS::AtMostOnce.into()).await;
     assert_eq!(late.publish().await.payload, b"once");
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
     std::fs::remove_dir_all(copy).unwrap();
 }
@@ -359,12 +366,13 @@ async fn a_negative_pubrec_releases_the_packet_id_after_restart() {
             }
         );
     }
-    let (_ctx, _broker, uri) = setup(1, opts()).await;
+    let (_ctx, broker, uri) = setup(1, opts()).await;
     let mut sub = Raw::connect(&uri, "nack-sub", Version::V5, 0).await;
     sub.subscribe("new/t", QoS::ExactlyOnce.into()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("nack-publisher")).await;
     p.pub_("new/t", b"new", QoS::ExactlyOnce, 5).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec));
     assert_eq!(sub.publish().await.payload, b"new");
+    broker.shutdown().await.unwrap();
     std::fs::remove_dir_all(dir).unwrap();
 }

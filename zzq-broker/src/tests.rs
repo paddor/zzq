@@ -306,7 +306,7 @@ async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize, qos: QoS) {
         qos_queue_high: 2,
         ..opts()
     };
-    let (_ctx, _broker, uri) = setup(lanes, opts).await;
+    let (_ctx, broker, uri) = setup(lanes, opts).await;
     let (mut sub, code) = Raw::connect_with(&uri, &durable("sub")).await;
     assert_eq!(code, 0);
     sub.subscribe("t", SubscriptionOptions::from(QoS::AtLeastOnce))
@@ -349,6 +349,7 @@ async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize, qos: QoS) {
     }
     acks(&mut publisher, if lanes == 1 { &[3, 4] } else { &[4] }).await;
     publisher.quiet(100).await;
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -804,6 +805,7 @@ async fn a_failed_retained_write_nacks_v5_publishers_and_drops_v3_ones() {
     ok.send(&publish(Version::V5, QoS::AtLeastOnce, 1, true))
         .await;
     assert_eq!(ok.next().await, ack(PacketType::PubAck, 1, 0));
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -854,6 +856,7 @@ async fn a_failed_subscription_write_disconnects() {
             reason: reason::UNSPECIFIED_ERROR
         }
     );
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -929,7 +932,7 @@ async fn a_qos2_publish_repeated_after_a_restart_is_delivered_once() {
         // The PUBREC means the ID is on disk: a repeat is no new message.
         assert_eq!(p.next().await, ack(PacketType::PubRec, 5));
     }
-    let (_ctx, _broker, uri) = setup(1, opts()).await;
+    let (_ctx, broker, uri) = setup(1, opts()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("q2-pub")).await;
     p.send(&publish(true)).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec, 5));
@@ -940,6 +943,7 @@ async fn a_qos2_publish_repeated_after_a_restart_is_delivered_once() {
     assert_eq!(m.payload, b"once");
     sub.complete(&m).await;
     sub.quiet(300).await;
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -967,7 +971,7 @@ async fn a_released_delivery_gets_its_pubrel_after_a_restart() {
         assert_eq!(sub.next().await, rel);
         m.pkid
     };
-    let (_ctx, _broker, uri) = setup(1, opts()).await;
+    let (_ctx, broker, uri) = setup(1, opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable("rel-sub")).await;
     // The client has the message: PUBREL again, not the PUBLISH.
     let rel = Got::Ack {
@@ -978,6 +982,7 @@ async fn a_released_delivery_gets_its_pubrel_after_a_restart() {
     assert_eq!(sub.next().await, rel);
     sub.ack(PacketType::PubComp, pkid).await;
     sub.quiet(300).await;
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1021,6 +1026,7 @@ async fn a_lane_snapshot_replaces_the_segments_before_it() {
     })
     .await;
     assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1085,6 +1091,7 @@ async fn a_lane_journal_without_room_for_a_segment_snapshots_into_its_spare() {
     })
     .await;
     assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1143,6 +1150,7 @@ async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare(
     let got = broker.shared().retained.matching("r/full");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload(), b"second");
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1200,6 +1208,7 @@ async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
     let mut d = Client::connect(&ctx, &uri, durable("d")).await.unwrap();
     assert!(d.connected().session_present);
     assert_eq!(support::next(&mut d).await.payload, "kept");
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1232,7 +1241,7 @@ async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
         assert!(broker.stats().await.unwrap().write_errors >= 1);
     }
     // The lane wrote its sessions again after the failure.
-    let (_ctx, _broker, uri) = setup(2, opts()).await;
+    let (_ctx, broker, uri) = setup(2, opts()).await;
     let (mut sub, got) = Raw::connack_with(&uri, &durable(&sub_id)).await;
     assert!(
         matches!(
@@ -1245,6 +1254,7 @@ async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
         "{got:?}"
     );
     while sub.publish().await.payload != b"kept" {}
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1289,6 +1299,7 @@ async fn a_failed_retained_write_rewrites_the_stripe() {
     let got = broker.shared().retained.matching("r/fail");
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload(), b"second");
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1299,7 +1310,7 @@ async fn a_burst_to_another_lane_is_acked_once_journaled() {
     use support::{Got, Raw};
 
     let (dir, opts) = on_disk("burst");
-    let (_ctx, _broker, uri) = setup(2, opts()).await;
+    let (_ctx, broker, uri) = setup(2, opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable(&id_on("burst-sub", 1, 2))).await;
     sub.subscribe("b/t", SubscriptionOptions::from(QoS::AtLeastOnce))
         .await;
@@ -1320,6 +1331,7 @@ async fn a_burst_to_another_lane_is_acked_once_journaled() {
             }
         );
     }
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1330,7 +1342,7 @@ async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
     use support::{Got, Raw};
 
     let (dir, opts) = on_disk("cross-hold");
-    let (ctx, _broker, uri) = setup(2, opts()).await;
+    let (ctx, broker, uri) = setup(2, opts()).await;
     let qos1 = SubscriptionOptions::from(QoS::AtLeastOnce);
     let mut plain = Raw::connect(&uri, &id_on("plain-sub", 1, 2), Version::V5, 0).await;
     plain.subscribe("plain/t", qos1).await;
@@ -1364,6 +1376,7 @@ async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
     assert_eq!(p.next().await, ack(2));
     assert_eq!(plain.publish().await.payload, b"x");
     assert_eq!(kept.publish().await.payload, b"x");
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1411,6 +1424,7 @@ async fn acked_deliveries_go_out_with_later_writes() {
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1433,6 +1447,7 @@ async fn stored_topics_deeper_than_allowed_are_not_loaded() {
     broker.shutdown().await.unwrap();
     let (_ctx, broker, _uri) = setup(1, opts(128)).await;
     assert_eq!(broker.stats().await.unwrap().retained, 1);
+    broker.shutdown().await.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
 
