@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-bench"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "plotters",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-broker"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "bytestring",
@@ -1529,7 +1529,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-client"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "bytestring",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-cluster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "thiserror",
@@ -1552,7 +1552,7 @@ dependencies = [
 
 [[package]]
 name = "zzq-disk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "fanring",
  "libc",
@@ -1563,14 +1563,14 @@ dependencies = [
 
 [[package]]
 name = "zzq-proto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "thiserror",
 ]
 
 [[package]]
 name = "zzq-tokio"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "quinn",
