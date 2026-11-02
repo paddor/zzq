@@ -42,6 +42,14 @@ pub(crate) struct LaneLog {
     pub(crate) refuse_transactions: std::sync::atomic::AtomicBool,
 }
 
+/// What a snapshot of a lane's journal holds: its sessions and the
+/// handoffs that connect its journal to others.
+#[derive(Debug, Clone, Copy)]
+struct Image<'a> {
+    sessions: &'a Slab<Session>,
+    handoffs: &'a Handoffs,
+}
+
 #[derive(Debug, Default)]
 struct LogState {
     log: Option<Log>,
@@ -157,7 +165,7 @@ impl LaneLog {
     /// `None` without a journal.
     fn append(
         &self,
-        state: (&Slab<Session>, &Handoffs),
+        state: Image<'_>,
         kind: u8,
         encode: impl FnOnce(&mut Vec<u8>, Clock),
     ) -> Option<Journaled> {
@@ -167,7 +175,7 @@ impl LaneLog {
     /// [`LaneLog::append`] with `tail` after what `encode` writes.
     fn append_with(
         &self,
-        state: (&Slab<Session>, &Handoffs),
+        state: Image<'_>,
         kind: u8,
         encode: impl FnOnce(&mut Vec<u8>, Clock),
         tail: &[u8],
@@ -227,7 +235,7 @@ impl LogState {
     fn append(
         &mut self,
         kind: u8,
-        state: (&Slab<Session>, &Handoffs),
+        state: Image<'_>,
         encode: impl FnOnce(&mut Vec<u8>, Clock),
         tail: &[u8],
     ) -> io::Result<u64> {
@@ -254,7 +262,7 @@ impl LogState {
 
     /// Journals a snapshot of every session the journal holds, so it
     /// holds what the lane holds. Returns the number of its last record.
-    fn write_all(&mut self, state: (&Slab<Session>, &Handoffs)) -> io::Result<u64> {
+    fn write_all(&mut self, state: Image<'_>) -> io::Result<u64> {
         let LogState { log, buf, .. } = self;
         let log = log.as_mut().ok_or(io::ErrorKind::NotConnected)?;
         let clock = log.clock();
@@ -268,12 +276,7 @@ impl LogState {
     /// past what it holds live, or with `force`, unless one waits for its
     /// trim: the segments before go once it is written. False if it waits
     /// for that segment.
-    fn snapshot(
-        &mut self,
-        state: (&Slab<Session>, &Handoffs),
-        live: u64,
-        force: bool,
-    ) -> io::Result<bool> {
+    fn snapshot(&mut self, state: Image<'_>, live: u64, force: bool) -> io::Result<bool> {
         let Some(log) = self.log.as_mut().filter(|_| self.trim.is_none()) else {
             return Ok(true);
         };
@@ -309,6 +312,19 @@ impl Lane {
         &self.shared.lane_logs[usize::from(self.id)]
     }
 
+    const fn image(&self) -> Image<'_> {
+        Image {
+            sessions: &self.sessions,
+            handoffs: &self.handoffs.state,
+        }
+    }
+
+    /// Appends record `kind`, whose body `encode` writes, to the lane's
+    /// journal, for [`Lane::appended`] to note. `None` without a journal.
+    fn append_rec(&self, kind: u8, encode: impl FnOnce(&mut Vec<u8>, Clock)) -> Option<Journaled> {
+        self.log().append(self.image(), kind, encode)
+    }
+
     /// Whether the lane journals its sessions.
     pub(super) fn journals(&self) -> bool {
         self.log().is_open()
@@ -318,31 +334,19 @@ impl Lane {
     /// [`rec::DOWN`], or one that names only the client. It goes out when
     /// the lane next flushes. `None` without a journal.
     pub(super) fn journal_session(&mut self, key: Key, kind: u8) -> Option<Journaled> {
-        let id = usize::from(self.id);
         let s = self.sessions.get(key)?;
-        let j = self.shared.lane_logs[id].append(
-            (&self.sessions, &self.handoffs.state),
-            kind,
-            |b, clock| match kind {
-                rec::SESSION => rec::session(b, s, clock),
-                rec::DOWN => rec::down(b, s, clock),
-                _ => rec::client(b, &s.client_id),
-            },
-        );
+        let j = self.append_rec(kind, |b, clock| match kind {
+            rec::SESSION => rec::session(b, s, clock),
+            rec::DOWN => rec::down(b, s, clock),
+            _ => rec::client(b, &s.client_id),
+        });
         self.appended(j);
         j
     }
 
     /// Journals the end of `s`, which left the lane's sessions.
     pub(super) fn journal_end(&mut self, s: &Session) {
-        let id = usize::from(self.id);
-        let j = self.shared.lane_logs[id].append(
-            (&self.sessions, &self.handoffs.state),
-            rec::END,
-            |b, _| {
-                rec::client(b, &s.client_id);
-            },
-        );
+        let j = self.append_rec(rec::END, |b, _| rec::client(b, &s.client_id));
         self.appended(j);
     }
 
@@ -354,22 +358,12 @@ impl Lane {
         filter: &str,
         opts: Option<(SubscriptionOptions, u32)>,
     ) -> Option<Journaled> {
-        let id = usize::from(self.id);
         let s = self.sessions.get(key).filter(|s| s.journaled)?;
-        let log = &self.shared.lane_logs[id];
         let j = match opts {
-            Some((o, sub_id)) => {
-                log.append((&self.sessions, &self.handoffs.state), rec::SUB, |b, _| {
-                    rec::sub(b, &s.client_id, filter, o, sub_id);
-                })
-            }
-            None => log.append(
-                (&self.sessions, &self.handoffs.state),
-                rec::UNSUB,
-                |b, _| {
-                    rec::unsub(b, &s.client_id, filter);
-                },
-            ),
+            Some((o, sub_id)) => self.append_rec(rec::SUB, |b, _| {
+                rec::sub(b, &s.client_id, filter, o, sub_id);
+            }),
+            None => self.append_rec(rec::UNSUB, |b, _| rec::unsub(b, &s.client_id, filter)),
         };
         self.appended(j);
         j
@@ -385,17 +379,15 @@ impl Lane {
         owned: &mut Owned,
         g: (QoS, bool, SubIds),
     ) -> u64 {
-        let id = usize::from(self.id);
         let Some(s) = self.sessions.get_mut(key).filter(|s| s.journaled) else {
             return 0;
         };
         s.flow.last_seq += 1;
         let seq = s.flow.last_seq;
-        let log = &self.shared.lane_logs[id];
         if !owned.journaled {
             owned.journaled = true;
-            let j = log.append_with(
-                (&self.sessions, &self.handoffs.state),
+            let j = self.log().append_with(
+                self.image(),
                 rec::MSG,
                 |b, c| rec::msg_head(b, p, c),
                 p.payload,
@@ -403,17 +395,10 @@ impl Lane {
             self.needs.note(j);
             self.appended(j);
         }
-        let log = &self.shared.lane_logs[id];
         let Some(s) = self.sessions.get(key) else {
             return 0;
         };
-        let j = log.append(
-            (&self.sessions, &self.handoffs.state),
-            rec::QUEUED,
-            |b, _| {
-                rec::queued(b, &s.client_id, seq, g);
-            },
-        );
+        let j = self.append_rec(rec::QUEUED, |b, _| rec::queued(b, &s.client_id, seq, g));
         self.needs.note(j);
         self.appended(j);
         seq
@@ -424,7 +409,6 @@ impl Lane {
     /// No ack waits for a DONE: it goes out with the next write, or with
     /// the next sweep.
     pub(super) fn journal_progress(&mut self, key: Key) {
-        let id = usize::from(self.id);
         let Some(s) = self.sessions.get_mut(key) else {
             return;
         };
@@ -432,7 +416,6 @@ impl Lane {
             return;
         }
         let mut progress = std::mem::take(&mut s.flow.progress);
-        let log = &self.shared.lane_logs[id];
         let mut released = Vec::new();
         let mut sent = crate::durable::Due::Now;
         let mut last = None;
@@ -444,14 +427,10 @@ impl Lane {
                     Progress::Sent(seq, _) => (rec::SENT, seq),
                     Progress::Released(seq) => (rec::RELEASED, seq),
                 };
-                let j = log.append(
-                    (&self.sessions, &self.handoffs.state),
-                    kind,
-                    |b, _| match *p {
-                        Progress::Sent(_, pkid) => rec::sent(b, cid, seq, pkid),
-                        _ => rec::delivery(b, cid, seq),
-                    },
-                );
+                let j = self.append_rec(kind, |b, _| match *p {
+                    Progress::Sent(_, pkid) => rec::sent(b, cid, seq, pkid),
+                    _ => rec::delivery(b, cid, seq),
+                });
                 if kind != rec::DONE {
                     last = Some(j);
                 }
@@ -483,20 +462,13 @@ impl Lane {
     /// Journals inbound QoS 2 packet ID `pkid` of session `key` as waiting
     /// for PUBREL, or with `done`, as released.
     pub(super) fn journal_inbound(&mut self, key: Key, pkid: u16, done: bool) -> Option<Journaled> {
-        let id = usize::from(self.id);
         let s = self.sessions.get(key).filter(|s| s.journaled)?;
         let kind = if done {
             rec::INBOUND_DONE
         } else {
             rec::INBOUND
         };
-        let j = self.shared.lane_logs[id].append(
-            (&self.sessions, &self.handoffs.state),
-            kind,
-            |b, _| {
-                rec::inbound(b, &s.client_id, pkid);
-            },
-        );
+        let j = self.append_rec(kind, |b, _| rec::inbound(b, &s.client_id, pkid));
         self.appended(j);
         j
     }
@@ -529,10 +501,10 @@ impl Lane {
     /// since the last, or with `force`, so the segments before it can go.
     /// False while it waits for a new segment.
     pub(crate) fn snapshot_journal(&mut self, force: bool) -> bool {
-        let log = &self.shared.lane_logs[usize::from(self.id)];
+        let log = self.log();
         let live = self.budget.total.get() as u64;
         log.lock()
-            .snapshot((&self.sessions, &self.handoffs.state), live, force)
+            .snapshot(self.image(), live, force)
             .unwrap_or_else(|_| {
                 log.write_errors.fetch_add(1, Ordering::Relaxed);
                 true
@@ -543,7 +515,7 @@ impl Lane {
     /// replica, and the lane's sessions after them become a group body.
     /// Returns the number of the last record the part holds.
     pub(crate) fn cut_image(&mut self) -> (u64, Bytes) {
-        let log = &self.shared.lane_logs[usize::from(self.id)];
+        let log = self.log();
         let mut st = log.lock();
         let st = &mut *st;
         let (last, clock) = match st.log.as_mut() {
@@ -554,22 +526,17 @@ impl Lane {
             _ => (0, Clock::now()),
         };
         let mut part = GroupWriter::new(Journal::Lane(self.id));
-        let _ = put_sessions(
-            &mut part,
-            (&self.sessions, &self.handoffs.state),
-            &mut st.buf,
-            clock,
-        );
+        let _ = put_sessions(&mut part, self.image(), &mut st.buf, clock);
         (last, part.finish())
     }
 
     /// Writes every journaled session again: after a failed write, or as
     /// the start of a forced cluster epoch's history.
     pub(super) fn rewrite_journal(&mut self) {
-        let log = &self.shared.lane_logs[usize::from(self.id)];
+        let log = self.log();
         let mut st = log.lock();
         st.stale = true;
-        let written = st.write_all((&self.sessions, &self.handoffs.state));
+        let written = st.write_all(self.image());
         let flushed = st.log.as_mut().map_or(Ok(()), Log::flush);
         if written.is_err() || flushed.is_err() {
             log.write_errors.fetch_add(1, Ordering::Relaxed);
@@ -581,19 +548,19 @@ impl Lane {
 /// number of its last record.
 fn put_sessions(
     out: &mut impl Append,
-    state: (&Slab<Session>, &Handoffs),
+    state: Image<'_>,
     buf: &mut Vec<u8>,
     clock: Clock,
 ) -> io::Result<u64> {
     out.append(CLEAR, &[])?;
-    for key in state.0.keys() {
-        if let Some(s) = state.0.get(key).filter(|s| s.journaled) {
+    for key in state.sessions.keys() {
+        if let Some(s) = state.sessions.get(key).filter(|s| s.journaled) {
             buf.clear();
             rec::image(buf, s, clock);
             rec::append_record(out, IMAGE, &[buf])?;
         }
     }
-    rec::handoffs(out, state.1, buf, clock)?;
+    rec::handoffs(out, state.handoffs, buf, clock)?;
     out.append(CLEARED, &[])
 }
 

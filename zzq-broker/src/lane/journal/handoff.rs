@@ -5,13 +5,7 @@ use crate::state::handoff::Pending;
 
 impl Lane {
     pub(in crate::lane) fn journal_handoff(&mut self, p: &Pending) -> Option<Journaled> {
-        let j = self.log().append(
-            (&self.sessions, &self.handoffs.state),
-            rec::HANDOFF,
-            |b, c| {
-                rec::put_pending(b, p, c);
-            },
-        );
+        let j = self.append_rec(rec::HANDOFF, |b, c| rec::put_pending(b, p, c));
         self.appended(j);
         j
     }
@@ -20,13 +14,7 @@ impl Lane {
     /// crash that loses it only sends the handoff again: it goes out with the
     /// next write, or with the next sweep.
     pub(in crate::lane) fn journal_handed(&mut self, seq: u64) {
-        self.log().append(
-            (&self.sessions, &self.handoffs.state),
-            rec::HANDED,
-            |b, _| {
-                b.extend_from_slice(&seq.to_be_bytes());
-            },
-        );
+        self.append_rec(rec::HANDED, |b, _| b.extend_from_slice(&seq.to_be_bytes()));
     }
 
     /// All QUEUED/SENT records and the receipt share one journal record.
@@ -43,11 +31,7 @@ impl Lane {
         if st.closed || st.log.is_none() {
             return false;
         }
-        if st.stale
-            && st
-                .write_all((&self.sessions, &self.handoffs.state))
-                .is_err()
-        {
+        if st.stale && st.write_all(self.image()).is_err() {
             return false;
         }
         st.transaction.clear();
@@ -58,10 +42,9 @@ impl Lane {
     pub(in crate::lane) fn end_handoff(&mut self, from: u16, seq: u64) -> Journaled {
         let log = self.log();
         let mut st = log.lock();
-        let state = (&self.sessions, &self.handoffs.state);
         let appended = st.append(
             rec::RECEIVED,
-            state,
+            self.image(),
             |b, _| {
                 b.extend_from_slice(&from.to_be_bytes());
                 b.extend_from_slice(&seq.to_be_bytes());
