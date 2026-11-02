@@ -22,6 +22,7 @@ use zzq_proto::QoS;
 
 use crate::lane::Lane;
 use crate::{Broker, BrokerOptions, Context};
+use support::sn::SnClient;
 use support::{WAIT, fields, header, setup, stats_until};
 
 /// Polls `f` on lane `i` until it returns `Some`. Fails after [`WAIT`].
@@ -1428,35 +1429,6 @@ async fn a_publisher_held_back_by_the_broker_is_not_kicked_for_keep_alive() {
     assert_eq!(publisher.next().await, support::Got::PingResp);
 }
 
-/// An MQTT-SN client on a fresh socket that sent CONNECT and got CONNACK.
-async fn sn_connect(addr: &str, id: &str, duration: u16) -> tokio::net::UdpSocket {
-    use zzq_proto::sn::{self, Flags, Packet};
-
-    let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    s.connect(addr).await.unwrap();
-    let connect = Packet::Connect {
-        flags: Flags {
-            clean_session: true,
-            ..Flags::default()
-        },
-        duration,
-        client_id: id,
-    };
-    let mut out = Vec::new();
-    sn::encode(&connect, &mut out);
-    s.send(&out).await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(WAIT, s.recv(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        sn::decode(&buf[..n]).unwrap().0,
-        Packet::ConnAck { code: sn::ACCEPTED }
-    );
-    s
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn an_mqtt_sn_client_without_keep_alive_still_times_out() {
     let opts = BrokerOptions {
@@ -1470,31 +1442,13 @@ async fn an_mqtt_sn_client_without_keep_alive_still_times_out() {
     let addr = broker.bind("udp://127.0.0.1:0").await.unwrap().to_string();
     // Anyone can send this over UDP, and a client that never comes back
     // sends nothing that ends it.
-    let _s = sn_connect(addr.trim_start_matches("udp://"), "silent", 0).await;
+    let _s = SnClient::connect(&addr, "silent", 0).await;
     stats_until(&broker, |s| s.connections == 1).await;
     stats_until(&broker, |s| s.connections == 0).await;
 }
 
-/// Sends `p` to the gateway.
-async fn sn_send(s: &tokio::net::UdpSocket, p: &zzq_proto::sn::Packet<'_>) {
-    let mut out = Vec::new();
-    zzq_proto::sn::encode(p, &mut out);
-    s.send(&out).await.unwrap();
-}
-
-/// The next datagram, or `None` within `ms` milliseconds.
-async fn sn_recv(s: &tokio::net::UdpSocket, ms: u64) -> Option<Vec<u8>> {
-    let mut buf = vec![0u8; 2048];
-    let n = tokio::time::timeout(Duration::from_millis(ms), s.recv(&mut buf))
-        .await
-        .ok()?
-        .unwrap();
-    buf.truncate(n);
-    Some(buf)
-}
-
 /// An MQTT-SN client subscribed to `topic` at QoS 0, and the broker.
-async fn sn_subscriber(topic: &str) -> (Context, Broker, tokio::net::UdpSocket) {
+async fn sn_subscriber(topic: &str) -> (Context, Broker, SnClient) {
     use zzq_proto::sn::{Filter, Flags, Packet};
 
     let opts = BrokerOptions {
@@ -1503,14 +1457,17 @@ async fn sn_subscriber(topic: &str) -> (Context, Broker, tokio::net::UdpSocket) 
     };
     let (ctx, broker, _uri) = setup(1, opts).await;
     let addr = broker.bind("udp://127.0.0.1:0").await.unwrap().to_string();
-    let s = sn_connect(addr.trim_start_matches("udp://"), "sn", 30).await;
+    let s = SnClient::connect(&addr, "sn", 30).await;
     let sub = Packet::Subscribe {
         flags: Flags::default(),
         msg_id: 1,
         topic: Filter::Name(topic),
     };
-    sn_send(&s, &sub).await;
-    assert!(sn_recv(&s, 5000).await.is_some(), "no SUBACK");
+    s.send(&sub).await;
+    assert!(
+        s.recv_within(Duration::from_millis(5000)).await.is_some(),
+        "no SUBACK"
+    );
     (ctx, broker, s)
 }
 
@@ -1532,22 +1489,23 @@ async fn a_refused_register_drops_what_waited_for_it() {
     broker
         .publish("plant/valve/1", "a", QoS::AtMostOnce)
         .unwrap();
-    let (topic_id, msg_id) = register_of(&sn_recv(&s, 5000).await.unwrap());
+    let (topic_id, msg_id) =
+        register_of(&s.recv_within(Duration::from_millis(5000)).await.unwrap());
     let refuse = Packet::RegAck {
         topic_id,
         msg_id,
         code: sn::REJECTED_INVALID_TOPIC_ID,
     };
-    sn_send(&s, &refuse).await;
+    s.send(&refuse).await;
     assert!(
-        sn_recv(&s, 300).await.is_none(),
+        s.recv_within(Duration::from_millis(300)).await.is_none(),
         "a publish under a refused topic ID"
     );
     // The next one asks again.
     broker
         .publish("plant/valve/1", "b", QoS::AtMostOnce)
         .unwrap();
-    register_of(&sn_recv(&s, 5000).await.unwrap());
+    register_of(&s.recv_within(Duration::from_millis(5000)).await.unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1560,16 +1518,17 @@ async fn publishes_waiting_for_a_register_are_bounded() {
             .publish("plant/valve/1", i.to_be_bytes(), QoS::AtMostOnce)
             .unwrap();
     }
-    let (topic_id, msg_id) = register_of(&sn_recv(&s, 5000).await.unwrap());
+    let (topic_id, msg_id) =
+        register_of(&s.recv_within(Duration::from_millis(5000)).await.unwrap());
     tokio::time::sleep(Duration::from_millis(200)).await;
     let accept = Packet::RegAck {
         topic_id,
         msg_id,
         code: sn::ACCEPTED,
     };
-    sn_send(&s, &accept).await;
+    s.send(&accept).await;
     let mut got = 0;
-    while sn_recv(&s, 300).await.is_some() {
+    while s.recv_within(Duration::from_millis(300)).await.is_some() {
         got += 1;
     }
     assert!(
@@ -1582,38 +1541,9 @@ async fn publishes_waiting_for_a_register_are_bounded() {
 /// broker connections.
 #[tokio::test(flavor = "multi_thread")]
 async fn mqtt_sn_clients_stop_with_their_gateway() {
-    use tokio::net::UdpSocket;
-    use zzq_proto::sn::{self, Flags, Packet};
-
     let (_ctx, broker, _uri) = setup(1, BrokerOptions::default()).await;
-    let addr = broker
-        .bind("udp://127.0.0.1:0")
-        .await
-        .unwrap()
-        .socket_addr_string()
-        .unwrap();
-    let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    s.connect(&addr).await.unwrap();
-    let connect = Packet::Connect {
-        flags: Flags {
-            clean_session: true,
-            ..Flags::default()
-        },
-        duration: 60,
-        client_id: "sn",
-    };
-    let mut out = Vec::new();
-    sn::encode(&connect, &mut out);
-    s.send(&out).await.unwrap();
-    let mut buf = [0u8; 64];
-    let n = tokio::time::timeout(WAIT, s.recv(&mut buf))
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(
-        sn::decode(&buf[..n]).unwrap().0,
-        Packet::ConnAck { code: sn::ACCEPTED }
-    );
+    let addr = broker.bind("udp://127.0.0.1:0").await.unwrap().to_string();
+    let _s = SnClient::connect(&addr, "sn", 60).await;
     stats_until(&broker, |s| s.connections == 1).await;
     broker.abort_tasks();
     stats_until(&broker, |s| s.connections == 0).await;

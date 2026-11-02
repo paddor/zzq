@@ -6,6 +6,8 @@
     reason = "each test file uses a part; a raw connection fails loudly"
 )]
 
+pub(crate) mod sn;
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 

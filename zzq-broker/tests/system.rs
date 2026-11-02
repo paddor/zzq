@@ -1,11 +1,6 @@
 //! Broker and client end to end.
 
-#![expect(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    reason = "tests fail loudly"
-)]
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests fail loudly")]
 
 mod support;
 
@@ -523,24 +518,8 @@ async fn tls_client_skips_verification_only_when_asked() {
 
 mod mqtt_sn {
     use super::*;
-    use tokio::net::UdpSocket;
+    use crate::support::sn::SnClient;
     use zzq_proto::sn::{self, Filter, Flags, Packet, SnQoS, Topic};
-
-    async fn send(s: &UdpSocket, p: &Packet<'_>) {
-        let mut out = Vec::new();
-        sn::encode(p, &mut out);
-        s.send(&out).await.unwrap();
-    }
-
-    async fn recv(s: &UdpSocket) -> Vec<u8> {
-        let mut buf = vec![0; 2048];
-        let n = timeout(WAIT, s.recv(&mut buf))
-            .await
-            .expect("no datagram")
-            .unwrap();
-        buf.truncate(n);
-        buf
-    }
 
     /// MQTT-SN settings changed by `f`.
     fn sn_with(f: impl FnOnce(&mut SnOptions)) -> SnOptions {
@@ -566,36 +545,29 @@ mod mqtt_sn {
         mqtt.subscribe("sn/#", QoS::AtLeastOnce).await.unwrap();
         mqtt.subscribe("ab", QoS::AtMostOnce).await.unwrap();
 
-        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        s.connect(&addr).await.unwrap();
+        let s = SnClient::open(&addr).await;
         let flags = Flags {
             clean_session: true,
             ..Flags::default()
         };
-        send(
-            &s,
-            &Packet::Connect {
-                flags,
-                duration: 30,
-                client_id: "sn-1",
-            },
-        )
+        s.send(&Packet::Connect {
+            flags,
+            duration: 30,
+            client_id: "sn-1",
+        })
         .await;
         assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::ConnAck { code: sn::ACCEPTED }
         );
 
-        send(
-            &s,
-            &Packet::Register {
-                topic_id: 0,
-                msg_id: 1,
-                topic: "sn/temp",
-            },
-        )
+        s.send(&Packet::Register {
+            topic_id: 0,
+            msg_id: 1,
+            topic: "sn/temp",
+        })
         .await;
-        let reg = recv(&s).await;
+        let reg = s.recv().await;
         let Packet::RegAck {
             topic_id,
             msg_id: 1,
@@ -606,30 +578,24 @@ mod mqtt_sn {
         };
 
         let data = b"21.5";
-        send(
-            &s,
-            &Packet::Publish {
-                flags: qos(SnQoS::AtMostOnce),
-                topic: Topic::Id(topic_id),
-                msg_id: 0,
-                data,
-            },
-        )
+        s.send(&Packet::Publish {
+            flags: qos(SnQoS::AtMostOnce),
+            topic: Topic::Id(topic_id),
+            msg_id: 0,
+            data,
+        })
         .await;
         let m = next(&mut mqtt).await;
         assert_eq!((m.topic.as_str(), &m.payload[..]), ("sn/temp", &data[..]));
 
-        send(
-            &s,
-            &Packet::Publish {
-                flags: qos(SnQoS::AtLeastOnce),
-                topic: Topic::Id(topic_id),
-                msg_id: 2,
-                data: b"22",
-            },
-        )
+        s.send(&Packet::Publish {
+            flags: qos(SnQoS::AtLeastOnce),
+            topic: Topic::Id(topic_id),
+            msg_id: 2,
+            data: b"22",
+        })
         .await;
-        let ack = recv(&s).await;
+        let ack = s.recv().await;
         assert_eq!(
             sn::decode(&ack).unwrap().0,
             Packet::PubAck {
@@ -640,16 +606,13 @@ mod mqtt_sn {
         );
         assert_eq!(next(&mut mqtt).await.payload, "22");
 
-        send(
-            &s,
-            &Packet::Subscribe {
-                flags: qos(SnQoS::AtLeastOnce),
-                msg_id: 3,
-                topic: Filter::Name("cmd/x"),
-            },
-        )
+        s.send(&Packet::Subscribe {
+            flags: qos(SnQoS::AtLeastOnce),
+            msg_id: 3,
+            topic: Filter::Name("cmd/x"),
+        })
         .await;
-        let suback = recv(&s).await;
+        let suback = s.recv().await;
         let Packet::SubAck {
             topic_id: cmd_id,
             msg_id: 3,
@@ -661,7 +624,7 @@ mod mqtt_sn {
         };
         assert_ne!(cmd_id, 0);
         mqtt.publish("cmd/x", "on", QoS::AtLeastOnce).await.unwrap();
-        let publ = recv(&s).await;
+        let publ = s.recv().await;
         let Packet::Publish {
             topic: Topic::Id(id),
             data: b"on",
@@ -672,28 +635,22 @@ mod mqtt_sn {
             panic!("expected PUBLISH");
         };
         assert_eq!((id, flags.qos), (cmd_id, SnQoS::AtLeastOnce));
-        send(
-            &s,
-            &Packet::PubAck {
-                topic_id: id,
-                msg_id,
-                code: sn::ACCEPTED,
-            },
-        )
+        s.send(&Packet::PubAck {
+            topic_id: id,
+            msg_id,
+            code: sn::ACCEPTED,
+        })
         .await;
 
-        send(
-            &s,
-            &Packet::Subscribe {
-                flags: qos(SnQoS::AtMostOnce),
-                msg_id: 4,
-                topic: Filter::Name("w/#"),
-            },
-        )
+        s.send(&Packet::Subscribe {
+            flags: qos(SnQoS::AtMostOnce),
+            msg_id: 4,
+            topic: Filter::Name("w/#"),
+        })
         .await;
-        recv(&s).await;
+        s.recv().await;
         mqtt.publish("w/a", "wild", QoS::AtMostOnce).await.unwrap();
-        let reg = recv(&s).await;
+        let reg = s.recv().await;
         let Packet::Register {
             topic_id: wid,
             msg_id: reg_id,
@@ -702,96 +659,34 @@ mod mqtt_sn {
         else {
             panic!("expected REGISTER");
         };
-        send(
-            &s,
-            &Packet::RegAck {
-                topic_id: wid,
-                msg_id: reg_id,
-                code: sn::ACCEPTED,
-            },
-        )
+        s.send(&Packet::RegAck {
+            topic_id: wid,
+            msg_id: reg_id,
+            code: sn::ACCEPTED,
+        })
         .await;
-        let publ = recv(&s).await;
+        let publ = s.recv().await;
         assert!(
             matches!(sn::decode(&publ).unwrap().0, Packet::Publish { topic: Topic::Id(i), data: b"wild", .. } if i == wid)
         );
 
-        let anon = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        anon.connect(&addr).await.unwrap();
-        send(
-            &anon,
-            &Packet::Publish {
-                flags: qos(SnQoS::NoConnection),
-                topic: Topic::Short(*b"ab"),
-                msg_id: 0,
-                data: b"q-1",
-            },
-        )
+        let anon = SnClient::open(&addr).await;
+        anon.send(&Packet::Publish {
+            flags: qos(SnQoS::NoConnection),
+            topic: Topic::Short(*b"ab"),
+            msg_id: 0,
+            data: b"q-1",
+        })
         .await;
         let m = next(&mut mqtt).await;
         assert_eq!((m.topic.as_str(), &m.payload[..]), ("ab", &b"q-1"[..]));
 
-        send(&s, &Packet::PingReq { client_id: None }).await;
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
-        send(&s, &Packet::Disconnect { duration: None }).await;
+        s.send(&Packet::PingReq { client_id: None }).await;
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::PingResp);
+        s.send(&Packet::Disconnect { duration: None }).await;
         assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::Disconnect { duration: None }
-        );
-    }
-
-    async fn sn_client(addr: &str, id: &str) -> UdpSocket {
-        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        s.connect(addr).await.unwrap();
-        let flags = Flags {
-            clean_session: true,
-            ..Flags::default()
-        };
-        send(
-            &s,
-            &Packet::Connect {
-                flags,
-                duration: 30,
-                client_id: id,
-            },
-        )
-        .await;
-        assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
-            Packet::ConnAck { code: sn::ACCEPTED }
-        );
-        s
-    }
-
-    async fn subscribe(s: &UdpSocket, topic: &str) -> u16 {
-        send(
-            s,
-            &Packet::Subscribe {
-                flags: qos(SnQoS::AtLeastOnce),
-                msg_id: 1,
-                topic: Filter::Name(topic),
-            },
-        )
-        .await;
-        let ack = recv(s).await;
-        let Packet::SubAck {
-            topic_id,
-            code: sn::ACCEPTED,
-            ..
-        } = sn::decode(&ack).unwrap().0
-        else {
-            panic!("expected SUBACK");
-        };
-        topic_id
-    }
-
-    async fn quiet(s: &UdpSocket) {
-        let mut buf = [0u8; 64];
-        assert!(
-            timeout(Duration::from_millis(300), s.recv(&mut buf))
-                .await
-                .is_err(),
-            "unexpected datagram"
         );
     }
 
@@ -804,26 +699,23 @@ mod mqtt_sn {
             .unwrap()
             .socket_addr_string()
             .unwrap();
-        let s = sn_client(&addr, "sleeper").await;
-        let id = subscribe(&s, "sleep/t").await;
-        send(&s, &Packet::Disconnect { duration: Some(60) }).await;
+        let s = SnClient::connect(&addr, "sleeper", 30).await;
+        let id = s.subscribe(1, "sleep/t").await;
+        s.send(&Packet::Disconnect { duration: Some(60) }).await;
         assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::Disconnect { duration: None }
         );
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         publ.publish("sleep/t", "a", QoS::AtLeastOnce)
             .await
             .unwrap();
-        quiet(&s).await;
-        send(
-            &s,
-            &Packet::PingReq {
-                client_id: Some("sleeper"),
-            },
-        )
+        s.quiet().await;
+        s.send(&Packet::PingReq {
+            client_id: Some("sleeper"),
+        })
         .await;
-        let publish = recv(&s).await;
+        let publish = s.recv().await;
         let Packet::Publish {
             topic: Topic::Id(got),
             data: b"a",
@@ -834,17 +726,14 @@ mod mqtt_sn {
             panic!("expected buffered PUBLISH");
         };
         assert_eq!(got, id);
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
-        send(
-            &s,
-            &Packet::PubAck {
-                topic_id: id,
-                msg_id,
-                code: sn::ACCEPTED,
-            },
-        )
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::PingResp);
+        s.send(&Packet::PubAck {
+            topic_id: id,
+            msg_id,
+            code: sn::ACCEPTED,
+        })
         .await;
-        quiet(&s).await;
+        s.quiet().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -860,18 +749,18 @@ mod mqtt_sn {
             .unwrap()
             .socket_addr_string()
             .unwrap();
-        let s = sn_client(&addr, "lossy").await;
-        let id = subscribe(&s, "lossy/t").await;
+        let s = SnClient::connect(&addr, "lossy", 30).await;
+        let id = s.subscribe(1, "lossy/t").await;
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         publ.publish("lossy/t", "x", QoS::AtLeastOnce)
             .await
             .unwrap();
-        let first = recv(&s).await;
+        let first = s.recv().await;
         let Packet::Publish { flags, msg_id, .. } = sn::decode(&first).unwrap().0 else {
             panic!("expected PUBLISH");
         };
         assert!(!flags.dup);
-        let again = recv(&s).await;
+        let again = s.recv().await;
         let Packet::Publish {
             flags,
             msg_id: same,
@@ -882,16 +771,13 @@ mod mqtt_sn {
         };
         assert!(flags.dup);
         assert_eq!(same, msg_id);
-        send(
-            &s,
-            &Packet::PubAck {
-                topic_id: id,
-                msg_id,
-                code: sn::ACCEPTED,
-            },
-        )
+        s.send(&Packet::PubAck {
+            topic_id: id,
+            msg_id,
+            code: sn::ACCEPTED,
+        })
         .await;
-        quiet(&s).await;
+        s.quiet().await;
     }
 
     async fn bind_sn(opts: BrokerOptions) -> (Context, Broker, String, String) {
@@ -908,15 +794,15 @@ mod mqtt_sn {
     #[tokio::test(flavor = "multi_thread")]
     async fn invalid_short_topics_are_refused_and_the_client_stays() {
         let (_ctx, _broker, _uri, addr) = bind_sn(BrokerOptions::default()).await;
-        let s = sn_client(&addr, "short").await;
+        let s = SnClient::connect(&addr, "short", 30).await;
         let publish = Packet::Publish {
             flags: qos(SnQoS::AtLeastOnce),
             topic: Topic::Short(*b"a#"),
             msg_id: 7,
             data: b"x",
         };
-        send(&s, &publish).await;
-        let bytes = recv(&s).await;
+        s.send(&publish).await;
+        let bytes = s.recv().await;
         let ack = sn::decode(&bytes).unwrap().0;
         assert!(
             matches!(ack, Packet::PubAck { msg_id: 7, code, .. } if code == sn::REJECTED_INVALID_TOPIC_ID),
@@ -927,8 +813,8 @@ mod mqtt_sn {
             msg_id: 8,
             topic: Filter::Short(*b"a#"),
         };
-        send(&s, &subscribe).await;
-        let bytes = recv(&s).await;
+        s.send(&subscribe).await;
+        let bytes = s.recv().await;
         let ack = sn::decode(&bytes).unwrap().0;
         assert!(
             matches!(ack, Packet::SubAck { msg_id: 8, code, .. } if code == sn::REJECTED_INVALID_TOPIC_ID),
@@ -939,9 +825,9 @@ mod mqtt_sn {
             msg_id: 9,
             topic: Filter::Short(*b"a#"),
         };
-        send(&s, &unsubscribe).await;
+        s.send(&unsubscribe).await;
         assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::UnsubAck { msg_id: 9 }
         );
         // A valid one goes to the broker and back.
@@ -950,31 +836,14 @@ mod mqtt_sn {
             msg_id: 10,
             topic: Filter::Short(*b"ab"),
         };
-        send(&s, &unsubscribe).await;
+        s.send(&unsubscribe).await;
         assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::UnsubAck { msg_id: 10 }
         );
         // The client's broker connection is still there.
-        send(&s, &Packet::PingReq { client_id: None }).await;
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
-    }
-
-    async fn register(s: &UdpSocket, msg_id: u16, topic: &str) -> (u16, u8) {
-        send(
-            s,
-            &Packet::Register {
-                topic_id: 0,
-                msg_id,
-                topic,
-            },
-        )
-        .await;
-        let ack = recv(s).await;
-        let Packet::RegAck { topic_id, code, .. } = sn::decode(&ack).unwrap().0 else {
-            panic!("expected REGACK");
-        };
-        (topic_id, code)
+        s.send(&Packet::PingReq { client_id: None }).await;
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::PingResp);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -985,22 +854,19 @@ mod mqtt_sn {
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
-        let s = sn_client(&addr, "few").await;
-        let (id1, code) = register(&s, 1, "a/1").await;
+        let s = SnClient::connect(&addr, "few", 30).await;
+        let (id1, code) = s.register(1, "a/1").await;
         assert_eq!(code, sn::ACCEPTED);
-        assert_eq!(register(&s, 2, "a/2").await.1, sn::ACCEPTED);
-        assert_eq!(register(&s, 3, "a/3").await, (0, sn::REJECTED_CONGESTION));
-        send(
-            &s,
-            &Packet::Subscribe {
-                flags: qos(SnQoS::ExactlyOnce),
-                msg_id: 4,
-                topic: Filter::Name("a/#"),
-            },
-        )
+        assert_eq!(s.register(2, "a/2").await.1, sn::ACCEPTED);
+        assert_eq!(s.register(3, "a/3").await, (0, sn::REJECTED_CONGESTION));
+        s.send(&Packet::Subscribe {
+            flags: qos(SnQoS::ExactlyOnce),
+            msg_id: 4,
+            topic: Filter::Name("a/#"),
+        })
         .await;
         assert!(matches!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::SubAck {
                 code: sn::ACCEPTED,
                 ..
@@ -1012,7 +878,7 @@ mod mqtt_sn {
         for topic in ["a/3", "a/1"] {
             publ.publish(topic, topic, QoS::ExactlyOnce).await.unwrap();
         }
-        let got = recv(&s).await;
+        let got = s.recv().await;
         let Packet::Publish {
             topic: Topic::Id(id),
             data: b"a/1",
@@ -1054,23 +920,19 @@ mod mqtt_sn {
         let mut watch = client(&ctx, &uri, "watch", Version::V5).await;
         watch.subscribe("plant/#", QoS::AtMostOnce).await.unwrap();
         watch.subscribe("$SYS/x", QoS::AtMostOnce).await.unwrap();
-        let anon = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        anon.connect(&addr).await.unwrap();
+        let anon = SnClient::open(&addr).await;
         for id in [5, 6, 7] {
             let flags = Flags {
                 qos: SnQoS::NoConnection,
                 retain: true,
                 ..Flags::default()
             };
-            send(
-                &anon,
-                &Packet::Publish {
-                    flags,
-                    topic: Topic::Predefined(id),
-                    msg_id: 0,
-                    data: b"open",
-                },
-            )
+            anon.send(&Packet::Publish {
+                flags,
+                topic: Topic::Predefined(id),
+                msg_id: 0,
+                data: b"open",
+            })
             .await;
         }
         assert_eq!(next(&mut watch).await.topic, "plant/ok");
@@ -1089,22 +951,19 @@ mod mqtt_sn {
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
-        let s = sn_client(&addr, "reg").await;
-        send(
-            &s,
-            &Packet::Subscribe {
-                flags: qos(SnQoS::AtLeastOnce),
-                msg_id: 1,
-                topic: Filter::Name("r/#"),
-            },
-        )
+        let s = SnClient::connect(&addr, "reg", 30).await;
+        s.send(&Packet::Subscribe {
+            flags: qos(SnQoS::AtLeastOnce),
+            msg_id: 1,
+            topic: Filter::Name("r/#"),
+        })
         .await;
-        recv(&s).await;
+        s.recv().await;
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         publ.publish("r/a", "x", QoS::AtLeastOnce).await.unwrap();
         let Packet::Register {
             topic_id, msg_id, ..
-        } = sn::decode(&recv(&s).await).unwrap().0
+        } = sn::decode(&s.recv().await).unwrap().0
         else {
             panic!("expected REGISTER");
         };
@@ -1113,9 +972,9 @@ mod mqtt_sn {
             msg_id,
             code: sn::ACCEPTED,
         };
-        send(&s, &regack).await;
+        s.send(&regack).await;
         for dup in [false, true] {
-            let Packet::Publish { flags, .. } = sn::decode(&recv(&s).await).unwrap().0 else {
+            let Packet::Publish { flags, .. } = sn::decode(&s.recv().await).unwrap().0 else {
                 panic!("expected PUBLISH");
             };
             assert_eq!(flags.dup, dup);
@@ -1129,17 +988,14 @@ mod mqtt_sn {
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
-        let s = sn_client(&addr, "small").await;
-        send(
-            &s,
-            &Packet::Subscribe {
-                flags: qos(SnQoS::AtLeastOnce),
-                msg_id: 1,
-                topic: Filter::Name("big/#"),
-            },
-        )
+        let s = SnClient::connect(&addr, "small", 30).await;
+        s.send(&Packet::Subscribe {
+            flags: qos(SnQoS::AtLeastOnce),
+            msg_id: 1,
+            topic: Filter::Name("big/#"),
+        })
         .await;
-        recv(&s).await;
+        s.recv().await;
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         publ.publish("big/a", vec![b'x'; 70_000], QoS::AtLeastOnce)
             .await
@@ -1150,7 +1006,7 @@ mod mqtt_sn {
             .unwrap();
         let Packet::Register {
             topic_id, msg_id, ..
-        } = sn::decode(&recv(&s).await).unwrap().0
+        } = sn::decode(&s.recv().await).unwrap().0
         else {
             panic!("expected REGISTER");
         };
@@ -1159,8 +1015,8 @@ mod mqtt_sn {
             msg_id,
             code: sn::ACCEPTED,
         };
-        send(&s, &regack).await;
-        let got = recv(&s).await;
+        s.send(&regack).await;
+        let got = s.recv().await;
         assert!(matches!(
             sn::decode(&got).unwrap().0,
             Packet::Publish { data: b"small", .. }
@@ -1174,22 +1030,22 @@ mod mqtt_sn {
             ..BrokerOptions::default()
         };
         let (ctx, _broker, uri, addr) = bind_sn(opts).await;
-        let s = sn_client(&addr, "pre").await;
+        let s = SnClient::connect(&addr, "pre", 30).await;
         for (msg_id, topic) in [(1, Filter::Predefined(9)), (2, Filter::Name("r/#"))] {
             let sub = Packet::Subscribe {
                 flags: qos(SnQoS::AtMostOnce),
                 msg_id,
                 topic,
             };
-            send(&s, &sub).await;
-            recv(&s).await;
+            s.send(&sub).await;
+            s.recv().await;
         }
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         publ.publish("pre/t", "known", QoS::AtMostOnce)
             .await
             .unwrap();
         assert!(matches!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::Publish {
                 topic: Topic::Predefined(9),
                 data: b"known",
@@ -1202,7 +1058,7 @@ mod mqtt_sn {
         }
         let Packet::Register {
             topic_id, msg_id, ..
-        } = sn::decode(&recv(&s).await).unwrap().0
+        } = sn::decode(&s.recv().await).unwrap().0
         else {
             panic!("expected REGISTER");
         };
@@ -1212,9 +1068,9 @@ mod mqtt_sn {
             msg_id,
             code: sn::ACCEPTED,
         };
-        send(&s, &regack).await;
+        s.send(&regack).await;
         for want in [&b"one"[..], b"two"] {
-            let got = recv(&s).await;
+            let got = s.recv().await;
             let Packet::Publish { data, .. } = sn::decode(&got).unwrap().0 else {
                 panic!("expected PUBLISH");
             };
@@ -1227,8 +1083,7 @@ mod mqtt_sn {
         let (ctx, _broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
         let mut watch = client(&ctx, &uri, "watch", Version::V5).await;
         watch.subscribe("sn/will", QoS::AtMostOnce).await.unwrap();
-        let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        s.connect(&addr).await.unwrap();
+        let s = SnClient::open(&addr).await;
         let connect = Packet::Connect {
             flags: Flags {
                 clean_session: true,
@@ -1238,38 +1093,38 @@ mod mqtt_sn {
             duration: 30,
             client_id: "lossy-link",
         };
-        send(&s, &connect).await;
+        s.send(&connect).await;
         // The first WILLTOPICREQ got lost: the client sends CONNECT again.
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillTopicReq);
-        send(&s, &connect).await;
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillTopicReq);
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::WillTopicReq);
+        s.send(&connect).await;
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::WillTopicReq);
         let will_topic = Packet::WillTopic {
             will: Some((Flags::default(), "sn/will")),
         };
-        send(&s, &will_topic).await;
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::WillMsgReq);
-        send(&s, &Packet::WillMsg { message: b"gone" }).await;
+        s.send(&will_topic).await;
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::WillMsgReq);
+        s.send(&Packet::WillMsg { message: b"gone" }).await;
         let connack = Packet::ConnAck { code: sn::ACCEPTED };
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, connack);
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, connack);
         // The CONNACK got lost too.
-        send(&s, &connect).await;
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, connack);
-        send(&s, &Packet::PingReq { client_id: None }).await;
-        assert_eq!(sn::decode(&recv(&s).await).unwrap().0, Packet::PingResp);
+        s.send(&connect).await;
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, connack);
+        s.send(&Packet::PingReq { client_id: None }).await;
+        assert_eq!(sn::decode(&s.recv().await).unwrap().0, Packet::PingResp);
         nothing(&mut watch).await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn publishes_held_for_registers_are_capped_per_client() {
         let (ctx, broker, uri, addr) = bind_sn(BrokerOptions::default()).await;
-        let s = sn_client(&addr, "held").await;
+        let s = SnClient::connect(&addr, "held", 30).await;
         let sub = Packet::Subscribe {
             flags: qos(SnQoS::AtMostOnce),
             msg_id: 1,
             topic: Filter::Name("h/#"),
         };
-        send(&s, &sub).await;
-        recv(&s).await;
+        s.send(&sub).await;
+        s.recv().await;
         // 8 topics with 100 messages each wait for REGACKs.
         let publ = client(&ctx, &uri, "p", Version::V5).await;
         for t in 0..8 {
@@ -1289,7 +1144,7 @@ mod mqtt_sn {
         while registers.len() < 8 {
             if let Packet::Register {
                 topic_id, msg_id, ..
-            } = sn::decode(&recv(&s).await).unwrap().0
+            } = sn::decode(&s.recv().await).unwrap().0
                 && !registers.iter().any(|&(t, _)| t == topic_id)
             {
                 registers.push((topic_id, msg_id));
@@ -1301,12 +1156,11 @@ mod mqtt_sn {
                 msg_id,
                 code: sn::ACCEPTED,
             };
-            send(&s, &regack).await;
+            s.send(&regack).await;
         }
         let mut held = 0;
-        let mut buf = vec![0; 2048];
-        while let Ok(Ok(n)) = timeout(Duration::from_millis(500), s.recv(&mut buf)).await {
-            if matches!(sn::decode(&buf[..n]), Ok((Packet::Publish { .. }, _))) {
+        while let Some(d) = s.recv_within(Duration::from_millis(500)).await {
+            if matches!(sn::decode(&d), Ok((Packet::Publish { .. }, _))) {
                 held += 1;
             }
         }
@@ -1318,10 +1172,9 @@ mod mqtt_sn {
         let mut opts = BrokerOptions::default();
         opts.sn.max_clients = 2;
         let (_ctx, broker, _uri, addr) = bind_sn(opts).await;
-        let first = sn_client(&addr, "one").await;
-        let _second = sn_client(&addr, "two").await;
-        let third = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        third.connect(&addr).await.unwrap();
+        let first = SnClient::connect(&addr, "one", 30).await;
+        let _second = SnClient::connect(&addr, "two", 30).await;
+        let third = SnClient::open(&addr).await;
         let connect = Packet::Connect {
             flags: Flags {
                 clean_session: true,
@@ -1330,23 +1183,23 @@ mod mqtt_sn {
             duration: 30,
             client_id: "three",
         };
-        send(&third, &connect).await;
+        third.send(&connect).await;
         assert_eq!(
-            sn::decode(&recv(&third).await).unwrap().0,
+            sn::decode(&third.recv().await).unwrap().0,
             Packet::ConnAck {
                 code: sn::REJECTED_CONGESTION
             }
         );
-        send(&first, &Packet::Disconnect { duration: None }).await;
-        recv(&first).await;
+        first.send(&Packet::Disconnect { duration: None }).await;
+        first.recv().await;
         let deadline = tokio::time::Instant::now() + WAIT;
         while broker.stats().await.unwrap().connections > 1 {
             assert!(tokio::time::Instant::now() < deadline, "first stays");
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        send(&third, &connect).await;
+        third.send(&connect).await;
         assert_eq!(
-            sn::decode(&recv(&third).await).unwrap().0,
+            sn::decode(&third.recv().await).unwrap().0,
             Packet::ConnAck { code: sn::ACCEPTED }
         );
     }
@@ -1358,16 +1211,13 @@ mod mqtt_sn {
             ..BrokerOptions::default()
         };
         let (_ctx, broker, _uri, addr) = bind_sn(opts).await;
-        let s = sn_client(&addr, "sleepy").await;
-        send(
-            &s,
-            &Packet::Disconnect {
-                duration: Some(u16::MAX),
-            },
-        )
+        let s = SnClient::connect(&addr, "sleepy", 30).await;
+        s.send(&Packet::Disconnect {
+            duration: Some(u16::MAX),
+        })
         .await;
         assert_eq!(
-            sn::decode(&recv(&s).await).unwrap().0,
+            sn::decode(&s.recv().await).unwrap().0,
             Packet::Disconnect { duration: None }
         );
         // Without a ping, the gateway lets go once 1.5 times the cap passed.
