@@ -312,6 +312,13 @@ fn physical_repair_keeps_local_promises_and_never_skips_fenced_restart() {
         recovery.complete_repair(ticket, invalid),
         Err(RecoveryError::StoragePending)
     );
+    // No op follows u64::MAX: a log ending there is not one to restart.
+    let mut end = repaired;
+    end.log.accepted.op = zzq_cluster::OpNumber(u64::MAX);
+    assert_eq!(
+        recovery.complete_repair(ticket, end),
+        Err(RecoveryError::StoragePending)
+    );
     assert_eq!(
         recovery.complete_repair(ticket, repaired).unwrap(),
         repaired
