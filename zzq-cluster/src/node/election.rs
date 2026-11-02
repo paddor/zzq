@@ -2,8 +2,6 @@
 //! and installs it, a backup installs what the primary's `START_VIEW`
 //! names, and the application catches up before either serves.
 
-use std::time::Duration;
-
 use super::history::Fetch;
 use super::log::Log;
 use super::{Event, Node, NodeError, fresh_generation};
@@ -80,9 +78,9 @@ const fn waiting(e: DriverError) -> bool {
 impl Node {
     /// Moves an election on: select and install as primary, install as
     /// backup, or finish an installation once the application caught up.
-    pub(super) fn elect(&mut self, now: Duration) -> Result<(), NodeError> {
+    pub(super) fn elect(&mut self) -> Result<(), NodeError> {
         if let Some(ticket) = self.driver.installation_ticket() {
-            return self.finish_install(&ticket, now);
+            return self.finish_install(&ticket);
         }
         if self.driver.normal().is_some() {
             return Ok(());
@@ -275,7 +273,8 @@ impl Node {
         }
     }
 
-    fn finish_install(&mut self, ticket: &InstallTicket, now: Duration) -> Result<(), NodeError> {
+    fn finish_install(&mut self, ticket: &InstallTicket) -> Result<(), NodeError> {
+        let now = self.now;
         // A later view was asked for while this one installs: give it up,
         // so the next promise can go out.
         if self.driver.scope().view > ticket.scope().view {

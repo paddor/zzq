@@ -191,7 +191,7 @@ impl Node {
     }
 
     /// Offers the cut image once committed, and answers who waited for it.
-    pub(super) fn poll_images(&mut self, now: Duration) {
+    pub(super) fn poll_images(&mut self) {
         if self
             .images
             .cut
@@ -203,13 +203,13 @@ impl Node {
                 self.on_recovery_request(from, request);
             }
         }
-        self.poll_rebuild(now);
+        self.poll_rebuild();
     }
 
-    pub(super) fn on_recovery(&mut self, from: NodeId, message: &RecoveryMessage, now: Duration) {
+    pub(super) fn on_recovery(&mut self, from: NodeId, message: &RecoveryMessage) {
         match message {
             RecoveryMessage::Request(request) => self.on_recovery_request(from, *request),
-            RecoveryMessage::State(state) => self.on_recovery_state(from, state, now),
+            RecoveryMessage::State(state) => self.on_recovery_state(from, state),
         }
     }
 
@@ -298,15 +298,10 @@ impl Node {
     }
 
     /// Serves a chunk of the offered image named in an answer.
-    pub(super) fn on_checkpoint(
-        &mut self,
-        from: NodeId,
-        message: CheckpointMessage<'_>,
-        now: Duration,
-    ) {
+    pub(super) fn on_checkpoint(&mut self, from: NodeId, message: CheckpointMessage<'_>) {
         match message {
             CheckpointMessage::Request(request) => self.serve_chunk(from, request),
-            CheckpointMessage::Chunk { request, bytes } => self.take_chunk(request, bytes, now),
+            CheckpointMessage::Chunk { request, bytes } => self.take_chunk(request, bytes),
         }
     }
 
@@ -377,7 +372,8 @@ impl Node {
 
     /// Asks the primary for its image, then for its chunks, again after
     /// each retransmit interval without an answer.
-    fn poll_rebuild(&mut self, now: Duration) {
+    fn poll_rebuild(&mut self) {
+        let now = self.now;
         let retransmit = self.config.timing.retransmit;
         let view = self.driver.scope().view;
         let primary = self.config.configuration.primary(view);
@@ -412,7 +408,7 @@ impl Node {
         }
     }
 
-    fn on_recovery_state(&mut self, from: NodeId, state: &RecoveryState, now: Duration) {
+    fn on_recovery_state(&mut self, from: NodeId, state: &RecoveryState) {
         if self.recovering.is_some() {
             self.recovery_state(from, state);
             return;
@@ -443,12 +439,12 @@ impl Node {
             source(from, &log),
             anchor,
         ));
-        self.poll_rebuild(now);
+        self.poll_rebuild();
     }
 
-    fn take_chunk(&mut self, request: CheckpointRequest, bytes: &[u8], now: Duration) {
+    fn take_chunk(&mut self, request: CheckpointRequest, bytes: &[u8]) {
         if self.recovering.is_some() {
-            self.recovery_chunk(request, bytes, now);
+            self.recovery_chunk(request, bytes);
             return;
         }
         let Some(t) = self
@@ -462,7 +458,7 @@ impl Node {
         let anchor = t.anchor;
         match t.take(request, bytes) {
             Taken::Ignored => {}
-            Taken::More => self.poll_rebuild(now),
+            Taken::More => self.poll_rebuild(),
             Taken::Corrupt => self.start_rebuild(),
             Taken::Done(bytes) => {
                 self.images.rebuild = None;

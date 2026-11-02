@@ -158,12 +158,7 @@ impl Node {
         }
     }
 
-    pub(super) fn recovery_chunk(
-        &mut self,
-        request: CheckpointRequest,
-        bytes: &[u8],
-        now: Duration,
-    ) {
+    pub(super) fn recovery_chunk(&mut self, request: CheckpointRequest, bytes: &[u8]) {
         let Some(r) = self.recovering.as_mut() else {
             return;
         };
@@ -190,11 +185,12 @@ impl Node {
                 self.install_image(anchor, bytes);
             }
         }
-        self.poll_recovery(now);
+        self.poll_recovery();
     }
 
     /// Asks, transfers and finishes, as far as answers allow.
-    pub(super) fn poll_recovery(&mut self, now: Duration) {
+    pub(super) fn poll_recovery(&mut self) {
+        let now = self.now;
         let retransmit = self.config.timing.retransmit;
         let Some(r) = self.recovering.as_mut() else {
             return;
@@ -228,7 +224,7 @@ impl Node {
             self.begin_recovery();
             return;
         }
-        self.finish_recovery(&ticket, now);
+        self.finish_recovery(&ticket);
     }
 
     /// Checks and keeps the ops fetched so far.
@@ -259,7 +255,8 @@ impl Node {
 
     /// Joins the ticket's view as a backup once the history is whole, the
     /// application caught up and the view's `START_VIEW` is known.
-    fn finish_recovery(&mut self, ticket: &RecoveryTicket, now: Duration) {
+    fn finish_recovery(&mut self, ticket: &RecoveryTicket) {
+        let now = self.now;
         let Some(r) = self.recovering.as_mut() else {
             return;
         };

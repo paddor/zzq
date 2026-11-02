@@ -110,7 +110,8 @@ impl Node {
     }
 
     /// Sends the next fetch request, or the last again once it timed out.
-    pub(super) fn poll_fetch(&mut self, now: Duration) {
+    pub(super) fn poll_fetch(&mut self) {
+        let now = self.now;
         let Some(fetch) = self.fetch.as_mut() else {
             return;
         };
@@ -171,8 +172,8 @@ impl Node {
         &mut self,
         batch: &OpsBatch<'_>,
         payload: &Bytes,
-        now: Duration,
     ) -> Result<(), NodeError> {
+        let now = self.now;
         let Some(fetch) = self.fetch.as_mut() else {
             return Ok(());
         };
@@ -190,7 +191,7 @@ impl Node {
         fetch.unanswered = 0;
         fetch.answered = true;
         self.driver.history_progress(now)?;
-        self.poll_fetch(now);
+        self.poll_fetch();
         Ok(())
     }
 

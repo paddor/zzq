@@ -397,43 +397,42 @@ impl Node {
     /// Why the frames were dropped. Old views and duplicates are not
     /// errors; the caller may count errors and go on.
     pub fn receive(&mut self, frames: &[Bytes; 3], now: Duration) -> Result<(), NodeError> {
+        self.now = self.now.max(now);
         let borrowed = [&frames[0][..], &frames[1][..], &frames[2][..]];
         let packet =
             decode_packet(&borrowed, self.config.wire.envelope).map_err(WireError::from)?;
         if let Some(hello) = link::read_hello(packet)? {
             if hello.digest == self.config.configuration.scope().configuration_digest {
-                return self.on_hello(hello, now);
+                return self.on_hello(hello);
             }
-            return self.other_epoch(hello, now);
+            return self.other_epoch(hello);
         }
         let from = packet.envelope.sender;
         let i = self.peer_index(from).ok_or(NodeError::UnknownNode)?;
         let Some(session) = self.peers[i].session else {
-            self.hello_again(i, now)?;
+            self.hello_again(i)?;
             return Err(NodeError::NoSession);
         };
         if packet.envelope.opcode == Opcode::ClockSample {
             if packet.envelope.session != Some(session) {
-                self.hello_again(i, now)?;
+                self.hello_again(i)?;
                 return Err(WireError::Peer.into());
             }
             self.peers[i].knows_us = true;
-            self.now = self.now.max(now);
-            return self.on_sample(from, packet, now);
+            return self.on_sample(from, packet);
         }
         let binding = self.encoder.binding(from, session)?;
         let message = match crate::wire::decode(&borrowed, binding, self.config.wire) {
             Ok(message) => message,
             Err(WireError::Peer) => {
                 // Another session: one side missed the other's restart.
-                self.hello_again(i, now)?;
+                self.hello_again(i)?;
                 return Err(WireError::Peer.into());
             }
             Err(e) => return Err(e.into()),
         };
         // Only a peer that bound this process sends on the session.
         self.peers[i].knows_us = true;
-        self.now = self.now.max(now);
         match message {
             ReplicaMessage::Control(control) if self.recovering.is_some() => {
                 let start = match control {
@@ -448,14 +447,14 @@ impl Node {
                 crate::wire::Control::ExitView(_)
                 | crate::wire::Control::StartViewChange(_)
                 | crate::wire::Control::DoViewChange(_),
-            ) if self.role != Role::Leader && now < self.lease.follow_until => {}
-            ReplicaMessage::Control(control) => self.on_control(from, control, now)?,
-            ReplicaMessage::Prepare(batch) => self.on_prepare(from, batch, &frames[2], now)?,
+            ) if self.role != Role::Leader && self.now < self.lease.follow_until => {}
+            ReplicaMessage::Control(control) => self.on_control(from, control)?,
+            ReplicaMessage::Prepare(batch) => self.on_prepare(from, batch, &frames[2])?,
             ReplicaMessage::FetchOps(request) => self.serve_fetch(from, request),
-            ReplicaMessage::Ops(batch) => self.on_ops(&batch, &frames[2], now)?,
+            ReplicaMessage::Ops(batch) => self.on_ops(&batch, &frames[2])?,
             ReplicaMessage::HistoryRetired(notice) => self.on_retired(from, notice),
-            ReplicaMessage::Recovery(message) => self.on_recovery(from, &message, now),
-            ReplicaMessage::Checkpoint(message) => self.on_checkpoint(from, message, now),
+            ReplicaMessage::Recovery(message) => self.on_recovery(from, &message),
+            ReplicaMessage::Checkpoint(message) => self.on_checkpoint(from, message),
         }
         self.after_input();
         Ok(())
@@ -470,7 +469,7 @@ impl Node {
     /// nothing until it restarts.
     pub fn poll(&mut self, now: Duration) -> Result<(), NodeError> {
         self.now = self.now.max(now);
-        self.check_isolation(now);
+        self.check_isolation();
         for _ in 0..DRIVER_ACTIONS {
             match self.driver.poll(now)? {
                 None => break,
@@ -490,21 +489,21 @@ impl Node {
                 }
             }
         }
-        self.send_samples(now);
+        self.send_samples();
         if self.recovering.is_some() {
-            self.poll_recovery(now);
+            self.poll_recovery();
             self.emit_commits();
-            self.poll_fetch(now);
-            self.retry_hellos(now)?;
+            self.poll_fetch();
+            self.retry_hellos()?;
             return Ok(());
         }
         self.after_input();
-        self.elect(now)?;
+        self.elect()?;
         self.after_input();
-        self.poll_fetch(now);
-        self.poll_images(now);
-        self.retry_hellos(now)?;
-        self.send_prepares(now);
+        self.poll_fetch();
+        self.poll_images();
+        self.retry_hellos()?;
+        self.send_prepares();
         Ok(())
     }
 
@@ -549,7 +548,8 @@ impl Node {
 
     /// Says HELLO to peer `i` once per retransmit interval: it sent on a
     /// session this process does not know.
-    fn hello_again(&mut self, i: Side, now: Duration) -> Result<(), NodeError> {
+    fn hello_again(&mut self, i: Side) -> Result<(), NodeError> {
+        let now = self.now;
         if now >= self.peers[i].hello_at {
             self.peers[i].hello_at = now + self.config.timing.retransmit;
             self.say_hello(i)?;
@@ -558,7 +558,8 @@ impl Node {
     }
 
     /// Says HELLO again to peers that do not know this process yet.
-    fn retry_hellos(&mut self, now: Duration) -> Result<(), NodeError> {
+    fn retry_hellos(&mut self) -> Result<(), NodeError> {
+        let now = self.now;
         for i in Side::BOTH {
             if !self.peers[i].knows_us && now >= self.peers[i].hello_at {
                 self.peers[i].hello_at = now + self.config.timing.retransmit;
@@ -568,7 +569,8 @@ impl Node {
         Ok(())
     }
 
-    fn on_hello(&mut self, hello: link::Hello, now: Duration) -> Result<(), NodeError> {
+    fn on_hello(&mut self, hello: link::Hello) -> Result<(), NodeError> {
+        let now = self.now;
         let i = self.peer_index(hello.from).ok_or(NodeError::UnknownNode)?;
         if hello.fingerprint != self.config.fingerprint {
             return Err(NodeError::Fingerprint);
