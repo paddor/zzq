@@ -10,7 +10,7 @@ use zzq_proto::{SubscriptionOptions, Version};
 
 use crate::disk::Append;
 use crate::msg::Msg;
-use crate::session::{Queued, Will};
+use crate::session::Queued;
 use crate::state::codec::Decoder;
 use crate::state::handoff::{self, Handoffs, LaneState};
 use crate::state::{Clock, SessionState};
@@ -369,14 +369,7 @@ impl Replayed {
     fn down(&mut self, d: &mut Decoder<'_>, clock: Clock) -> Result<(), &'static str> {
         self.st.expiry = d.u32()?;
         self.st.expires_at = clock.instant(d.u64()?);
-        self.st.delayed_will = if d.flag()? {
-            let due = clock
-                .instant(d.u64()?)
-                .ok_or("delayed will without a time")?;
-            Some((due, d.msg(clock)?))
-        } else {
-            None
-        };
+        self.st.delayed_will = d.delayed_will(clock)?;
         self.st.will = None;
         self.connected = false;
         Ok(())
@@ -464,10 +457,7 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
         };
         items.insert(d.u64()?, item);
     }
-    st.birth = if d.0.is_empty() { 0 } else { d.u64()? };
-    if st.birth == u64::MAX {
-        return Err("invalid session birth");
-    }
+    st.birth = d.birth()?;
     let subs = std::mem::take(&mut st.subs)
         .into_iter()
         .map(|(f, o, id)| (f, (o, id)))
@@ -506,31 +496,11 @@ fn session_head(
     if client_id.is_empty() {
         return Err("empty client ID");
     }
-    let username = if d.flag()? {
-        Some(d.str()?.into())
-    } else {
-        None
-    };
-    let version = match d.u8()? {
-        3 => Version::V31,
-        4 => Version::V311,
-        5 => Version::V5,
-        _ => return Err("invalid protocol level"),
-    };
+    let username = d.opt_str()?.map(Into::into);
+    let version = d.version()?;
     let expiry = d.u32()?;
-    let will = if d.flag()? {
-        let delay = d.u32()?;
-        Some(Will {
-            msg: d.msg(clock)?,
-            delay,
-        })
-    } else {
-        None
-    };
-    let birth = if d.0.is_empty() { 0 } else { d.u64()? };
-    if birth == u64::MAX {
-        return Err("invalid session birth");
-    }
+    let will = d.will(clock)?;
+    let birth = d.birth()?;
     Ok(SessionState {
         birth,
         client_id: client_id.into(),

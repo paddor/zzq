@@ -56,7 +56,8 @@ use crate::msg::Publication;
 use crate::session::Session;
 
 use super::codec::{
-    put_bytes, put_count, put_grant, put_msg, put_session, put_u16, put_u32, put_u64,
+    put_bytes, put_count, put_delayed_will, put_grant, put_opt_str, put_session, put_u16, put_u32,
+    put_u64, put_will,
 };
 use super::{Clock, SessionState};
 
@@ -135,23 +136,10 @@ pub(crate) fn append_record(out: &mut impl Append, kind: u8, parts: &[&[u8]]) ->
 /// The body of a [`SESSION`] record for `s`.
 pub(crate) fn session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
     put_bytes(b, s.client_id.as_bytes());
-    match &s.username {
-        Some(u) => {
-            b.push(1);
-            put_bytes(b, u.as_bytes());
-        }
-        None => b.push(0),
-    }
+    put_opt_str(b, s.username.as_deref());
     b.push(s.version.level());
     put_u32(b, s.expiry);
-    match &s.will {
-        Some(w) => {
-            b.push(1);
-            put_u32(b, w.delay);
-            put_msg(b, &w.msg, clock);
-        }
-        None => b.push(0),
-    }
+    put_will(b, s.will.as_ref(), clock);
     put_u64(b, s.birth);
 }
 
@@ -160,14 +148,7 @@ pub(crate) fn down(b: &mut Vec<u8>, s: &Session, clock: Clock) {
     put_bytes(b, s.client_id.as_bytes());
     put_u32(b, s.expiry);
     put_u64(b, clock.unix_ms(s.expires_at));
-    match &s.delayed_will {
-        Some(w) => {
-            b.push(1);
-            put_u64(b, clock.unix_ms(Some(w.due)));
-            put_msg(b, &w.msg, clock);
-        }
-        None => b.push(0),
-    }
+    put_delayed_will(b, s.delayed_will.as_ref(), clock);
 }
 
 /// The body of an [`END`] or [`WILL_SENT`] record.
@@ -298,6 +279,7 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
 
     use zzq_proto::QoS;
 
+    use super::codec::put_msg;
     use crate::budget::LaneTotal;
     use crate::index::SubIds;
     use crate::session::{DelayedWill, Will};
