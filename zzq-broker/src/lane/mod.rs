@@ -168,6 +168,18 @@ struct Ids {
 }
 
 impl Lane {
+    /// Session `key` while connection `conn_id` is its connection.
+    #[inline]
+    pub(crate) fn session_of(&self, key: Key, conn_id: u64) -> Option<&Session> {
+        self.sessions.get(key).filter(|s| s.has_conn(conn_id))
+    }
+
+    /// [`Lane::session_of`], to change.
+    #[inline]
+    pub(crate) fn session_of_mut(&mut self, key: Key, conn_id: u64) -> Option<&mut Session> {
+        self.sessions.get_mut(key).filter(|s| s.has_conn(conn_id))
+    }
+
     pub(crate) fn new(id: u16, shared: Arc<Shared>) -> Lane {
         let lanes = shared.lanes.len();
         let shared_journals = shared.journals();

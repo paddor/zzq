@@ -5,14 +5,12 @@ use std::sync::atomic::Ordering;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::task::JoinHandle;
 use zzq_proto::packet::{Connect, decode, fixed_header};
 use zzq_proto::property;
 use zzq_proto::{DecodeError, Packet, Version, encode, reason};
 
-use super::ConnShared;
 use super::read::MIN_CHUNK;
-use super::write::writer;
+use super::{Conn, ConnDriver, ConnShared, Started};
 use crate::lane::{LaneRef, Phase};
 use crate::msg::Msg;
 use crate::options::{AuthDecision, Authenticator, ClientInfo, ConnectInfo};
@@ -86,17 +84,17 @@ impl OwnedConnect {
 }
 
 /// Reads CONNECT, attaches the session and starts the writer.
-pub(super) async fn start<R, W>(
-    lane: &LaneRef,
-    mut buf: BytesMut,
-    peer_cert: Option<Vec<u8>>,
-    r: &mut R,
-    w: W,
-) -> Option<(Key, Rc<ConnShared>, Version, BytesMut, JoinHandle<()>)>
+pub(super) async fn start<R, W>(driver: ConnDriver, r: &mut R, w: W) -> Option<Started>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    let ConnDriver {
+        lane,
+        initial: mut buf,
+        peer_cert,
+    } = driver;
+    let lane = &lane;
     let (limit, max, auth) = {
         let l = lane.borrow();
         let o = &l.shared.opts;
@@ -139,8 +137,18 @@ where
         conn.last_rx.set(crate::time::now());
     }
     conn.held.set(false);
-    let writer = tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
-    Some((key, conn, version, buf, writer))
+    let conn = Conn {
+        lane: lane.clone(),
+        key,
+        shared: conn,
+    };
+    let writer = tokio::task::spawn_local(conn.clone().writer(w));
+    Some(Started {
+        conn,
+        version,
+        buf,
+        writer,
+    })
 }
 
 type ConnectError = (Option<Version>, u8);
