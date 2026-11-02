@@ -17,12 +17,14 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use support::{
-    Got, Pub, Raw, WAIT, client, connect_bytes, next, nothing, publish_bytes, setup, stats_until,
+    Got, Pub, Raw, WAIT, client, connect_bytes, fields, header, next, nothing, publish, setup,
+    stats_until,
 };
 use zzq_broker::{
     AuthDecision, Authenticator, Authorizer, BrokerOptions, ClientInfo, ConnectInfo, ReasonCode,
 };
 use zzq_client::{Client, ClientOptions, LastWill};
+use zzq_proto::encode::PublishHeader;
 use zzq_proto::encode::{ConnectFields, WillFields};
 use zzq_proto::property::{
     MAXIMUM_PACKET_SIZE, RECEIVE_MAXIMUM, SESSION_EXPIRY_INTERVAL, WILL_DELAY_INTERVAL,
@@ -36,14 +38,9 @@ const KEEP: Property<'static> = Property::U32(SESSION_EXPIRY_INTERVAL, 60);
 /// CONNECT fields that resume the v5 session `id`.
 const fn resume<'a>(id: &'a str, properties: &'a [Property<'a>]) -> ConnectFields<'a> {
     ConnectFields {
-        version: Version::V5,
         clean_start: false,
-        keep_alive: 0,
         properties,
-        client_id: id,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, id)
     }
 }
 
@@ -237,8 +234,13 @@ async fn inbound_qos2_state_survives_reconnect() {
     let (mut raw, present) = connect(&uri, &resume("pub2", &keep)).await;
     assert!(present);
     // The resent PUBLISH is the same message (4.3.3).
-    let mut dup = publish_bytes(Version::V5, "in2", b"once", QoS::ExactlyOnce, 7, &[]);
-    dup[0] |= 0x08;
+    let dup = publish(
+        &PublishHeader {
+            dup: true,
+            ..header(Version::V5, "in2", QoS::ExactlyOnce, 7)
+        },
+        b"once",
+    );
     raw.send(&dup).await;
     assert_eq!(raw.next().await, ack(PacketType::PubRec, 7));
     raw.ack(PacketType::PubRel, 7).await;
@@ -397,7 +399,10 @@ async fn qos0_publisher_keeps_flowing_past_a_stopped_subscriber() {
         }
     });
     let mut publ = Raw::connect(&uri, "flooder", Version::V5, 0).await;
-    let one = publish_bytes(Version::V5, "flood", &[7; 1024], QoS::AtMostOnce, 0, &[]);
+    let one = publish(
+        &header(Version::V5, "flood", QoS::AtMostOnce, 0),
+        &[7; 1024],
+    );
     let batch = one.repeat(100);
     tokio::time::timeout(Duration::from_secs(10), async {
         for _ in 0..200 {

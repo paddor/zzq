@@ -10,9 +10,10 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use support::{Got, Pub, Raw, WAIT, client, next, nothing, props, setup, stats_until};
+use support::{Got, Pub, Raw, WAIT, client, header, next, nothing, props, setup, stats_until};
 use zzq_broker::{Authorizer, BrokerOptions, ClientInfo};
 use zzq_client::{Client, ClientOptions};
+use zzq_proto::encode::PublishHeader;
 use zzq_proto::encode::{self, ConnectFields, WillFields};
 use zzq_proto::property::{
     CONTENT_TYPE, CORRELATION_DATA, MESSAGE_EXPIRY_INTERVAL, PAYLOAD_FORMAT_INDICATOR,
@@ -23,20 +24,16 @@ use zzq_proto::{PacketType, Properties, Property, QoS, SubscriptionOptions, Vers
 
 const KEEP: Property<'static> = Property::U32(SESSION_EXPIRY_INTERVAL, 60);
 
-const fn fields<'a>(
+/// A v5 CONNECT for `id` with `properties`.
+const fn v5<'a>(
     id: &'a str,
     clean_start: bool,
     properties: &'a [Property<'a>],
 ) -> ConnectFields<'a> {
     ConnectFields {
-        version: Version::V5,
         clean_start,
-        keep_alive: 0,
         properties,
-        client_id: id,
-        will: None,
-        username: None,
-        password: None,
+        ..support::fields(Version::V5, id)
     }
 }
 
@@ -91,7 +88,7 @@ async fn fan_out_gives_each_subscriber_its_own_qos_and_packet_id() {
             topic: "fan/will",
             payload: b"gone",
         }),
-        ..fields("doomed", true, &[])
+        ..v5("doomed", true, &[])
     };
     let (doomed, _) = Raw::connect_with(&uri, &c).await;
     drop(doomed);
@@ -123,8 +120,13 @@ async fn retain_flag_follows_each_subscribers_retain_as_published() {
     // A live retained publish [MQTT-3.3.1-12, -13], at QoS 0 and 1.
     let mut publ = Raw::connect(&uri, "p", Version::V5, 0).await;
     for qos in [QoS::AtMostOnce, QoS::AtLeastOnce] {
-        let mut bytes = support::publish_bytes(Version::V5, "rap", b"r", qos, 1, &[]);
-        bytes[0] |= 0x01;
+        let bytes = support::publish(
+            &PublishHeader {
+                retain: true,
+                ..header(Version::V5, "rap", qos, 1)
+            },
+            b"r",
+        );
         publ.send(&bytes).await;
         for (raw, retain) in [(&mut keeps, true), (&mut clears, false), (&mut old, false)] {
             let p = raw.publish().await;
@@ -187,7 +189,7 @@ async fn publish_properties_reach_subscribers_unchanged() {
     let mut old = Raw::connect(&uri, "old", Version::V311, 0).await;
     old.subscribe("props/#", QoS::ExactlyOnce.into()).await;
     let keep = [KEEP];
-    let (mut offline, _) = Raw::connect_with(&uri, &fields("offline", true, &keep)).await;
+    let (mut offline, _) = Raw::connect_with(&uri, &v5("offline", true, &keep)).await;
     offline.subscribe("props/#", QoS::AtLeastOnce.into()).await;
     drop(offline);
     stats_until(&broker, |s| s.connections == 2).await;
@@ -197,18 +199,20 @@ async fn publish_properties_reach_subscribers_unchanged() {
         (1, QoS::AtLeastOnce),
         (2, QoS::ExactlyOnce),
     ] {
-        publ.pub_props("props/live", b"payload", qos, pkid, &sent)
-            .await;
+        let h = PublishHeader {
+            properties: &sent,
+            ..header(Version::V5, "props/live", qos, pkid)
+        };
+        publ.send(&support::publish(&h, b"payload")).await;
     }
-    let mut retained = support::publish_bytes(
-        Version::V5,
-        "props/kept",
+    let retained = support::publish(
+        &PublishHeader {
+            retain: true,
+            properties: &sent,
+            ..header(Version::V5, "props/kept", QoS::AtMostOnce, 0)
+        },
         b"payload",
-        QoS::AtMostOnce,
-        0,
-        &sent,
     );
-    retained[0] |= 0x01;
     publ.send(&retained).await;
     for _ in 0..4 {
         let p = live.publish().await;
@@ -224,7 +228,7 @@ async fn publish_properties_reach_subscribers_unchanged() {
     let mut late = Raw::connect(&uri, "late", Version::V5, 0).await;
     late.subscribe("props/kept", QoS::AtMostOnce.into()).await;
     assert_eq!(forwarded(&late.publish().await), want, "retained");
-    let (mut offline, _) = Raw::connect_with(&uri, &fields("offline", false, &keep)).await;
+    let (mut offline, _) = Raw::connect_with(&uri, &v5("offline", false, &keep)).await;
     for _ in 0..2 {
         let p = offline.publish().await;
         assert_eq!(forwarded(&p), want, "queued");
@@ -249,7 +253,7 @@ async fn will_properties_reach_subscribers() {
             topic: "wp",
             payload: b"gone",
         }),
-        ..fields("doomed", true, &[])
+        ..v5("doomed", true, &[])
     };
     let (doomed, _) = Raw::connect_with(&uri, &c).await;
     drop(doomed);
@@ -268,17 +272,21 @@ async fn will_properties_reach_subscribers() {
 async fn queued_delivery_carries_the_reduced_message_expiry() {
     let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
     let keep = [KEEP];
-    let (mut raw, _) = Raw::connect_with(&uri, &fields("away", true, &keep)).await;
+    let (mut raw, _) = Raw::connect_with(&uri, &v5("away", true, &keep)).await;
     raw.subscribe("exp", QoS::AtLeastOnce.into()).await;
     drop(raw);
     stats_until(&broker, |s| s.connections == 0).await;
     let mut publ = Raw::connect(&uri, "p", Version::V5, 0).await;
     let ten = props(&[Property::U32(MESSAGE_EXPIRY_INTERVAL, 10)]);
-    publ.pub_props("exp", b"x", QoS::AtLeastOnce, 1, &ten).await;
+    let h = PublishHeader {
+        properties: &ten,
+        ..header(Version::V5, "exp", QoS::AtLeastOnce, 1)
+    };
+    publ.send(&support::publish(&h, b"x")).await;
     publ.next().await;
     tokio::time::sleep(Duration::from_secs(2)).await;
     // [MQTT-3.3.2-6]
-    let (mut raw, _) = Raw::connect_with(&uri, &fields("away", false, &keep)).await;
+    let (mut raw, _) = Raw::connect_with(&uri, &v5("away", false, &keep)).await;
     let p = raw.publish().await;
     let left = p.properties().get_int(MESSAGE_EXPIRY_INTERVAL).unwrap();
     assert!((7..=8).contains(&left), "{left}");
@@ -481,7 +489,7 @@ async fn max_session_expiry_clamps_connect_and_disconnect() {
     let (_ctx, _broker, uri) = setup(1, opts).await;
     let long = [Property::U32(SESSION_EXPIRY_INTERVAL, 100)];
     // CONNACK says what the broker uses (3.2.2.3.2).
-    let (mut raw, connack) = Raw::connack_with(&uri, &fields("clamped", true, &long)).await;
+    let (mut raw, connack) = Raw::connack_with(&uri, &v5("clamped", true, &long)).await;
     let Got::ConnAck { props: p, .. } = connack else {
         panic!("{connack:?}");
     };
@@ -491,7 +499,7 @@ async fn max_session_expiry_clamps_connect_and_disconnect() {
     raw.disconnect(0, &long).await;
     raw.closed().await;
     tokio::time::sleep(Duration::from_millis(2500)).await;
-    let (_raw, connack) = Raw::connack_with(&uri, &fields("clamped", false, &long)).await;
+    let (_raw, connack) = Raw::connack_with(&uri, &v5("clamped", false, &long)).await;
     assert!(matches!(
         connack,
         Got::ConnAck {

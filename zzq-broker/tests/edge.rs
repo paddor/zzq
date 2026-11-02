@@ -6,7 +6,7 @@ mod support;
 
 use std::time::Duration;
 
-use support::{Got, Raw, WAIT, next, nothing, setup};
+use support::{Got, Raw, WAIT, fields, header, next, nothing, setup};
 use tokio::time::timeout;
 use zzq_broker::{Broker, BrokerOptions, Config, Context};
 use zzq_client::{Client, ClientOptions, LastWill};
@@ -30,15 +30,7 @@ async fn oversized_packet_disconnects() {
     };
     let (_ctx, _broker, uri) = setup(1, opts).await;
     let mut raw = Raw::connect(&uri, "big", Version::V5, 0).await;
-    let h = PublishHeader {
-        version: Version::V5,
-        dup: false,
-        qos: QoS::AtMostOnce,
-        retain: false,
-        topic: "t",
-        pkid: 0,
-        properties: &[],
-    };
+    let h = header(Version::V5, "t", QoS::AtMostOnce, 0);
     let mut out = Vec::new();
     encode::publish(&h, &[0; 2000], &mut out);
     raw.send(&out).await;
@@ -55,13 +47,8 @@ async fn qos2_duplicate_is_delivered_once() {
     let mut raw = Raw::connect(&uri, "p", Version::V311, 0).await;
     for dup in [false, true] {
         let h = PublishHeader {
-            version: Version::V311,
             dup,
-            qos: QoS::ExactlyOnce,
-            retain: false,
-            topic: "q2",
-            pkid: 7,
-            properties: &[],
+            ..header(Version::V311, "q2", QoS::ExactlyOnce, 7)
         };
         let mut out = Vec::new();
         encode::publish(&h, b"once", &mut out);
@@ -531,13 +518,8 @@ async fn queued_messages_expire() {
         zzq_proto::property::Property::U32(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL, seconds)
             .encode(&mut props);
         let h = PublishHeader {
-            version: Version::V5,
-            dup: false,
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            topic: "exp",
-            pkid: 1,
             properties: &props,
+            ..header(Version::V5, "exp", QoS::AtLeastOnce, 1)
         };
         let mut out = Vec::new();
         encode::publish(&h, payload, &mut out);
@@ -789,16 +771,7 @@ async fn max_keep_alive_applies_to_silent_clients() {
         ..BrokerOptions::default()
     };
     let (_ctx, _broker, uri) = setup(1, opts).await;
-    let fields = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "forever",
-        will: None,
-        username: None,
-        password: None,
-    };
+    let fields = fields(Version::V5, "forever");
     let (mut raw, connack) = Raw::connack_with(&uri, &fields).await;
     let Got::ConnAck { props, .. } = connack else {
         panic!("expected CONNACK, got {connack:?}");
@@ -832,13 +805,8 @@ async fn deep_topics_are_rejected() {
     let mut raw = Raw::connect(&uri, "deeper", Version::V5, 0).await;
     let topic = deep(30_000);
     let h = PublishHeader {
-        version: Version::V5,
-        dup: false,
-        qos: QoS::AtMostOnce,
         retain: true,
-        topic: &topic,
-        pkid: 0,
-        properties: &[],
+        ..header(Version::V5, &topic, QoS::AtMostOnce, 0)
     };
     let mut out = Vec::new();
     encode::publish(&h, b"x", &mut out);
@@ -1024,11 +992,6 @@ async fn will_expiry_starts_when_the_will_goes_out() {
         1,
     )];
     let c = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "expiring-will",
         will: Some(encode::WillFields {
             qos: QoS::AtLeastOnce,
             retain: true,
@@ -1036,8 +999,7 @@ async fn will_expiry_starts_when_the_will_goes_out() {
             topic: "wills/exp",
             payload: b"bye",
         }),
-        username: None,
-        password: None,
+        ..fields(Version::V5, "expiring-will")
     };
     let (raw, _) = Raw::connect_with(&uri, &c).await;
     // Older than its expiry before it goes out.
@@ -1061,13 +1023,9 @@ async fn retained_qos0_delivery_carries_the_time_left() {
     zzq_proto::property::Property::U32(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL, 10)
         .encode(&mut props);
     let h = PublishHeader {
-        version: Version::V5,
-        dup: false,
-        qos: QoS::AtLeastOnce,
         retain: true,
-        topic: "ttl",
-        pkid: 1,
         properties: &props,
+        ..header(Version::V5, "ttl", QoS::AtLeastOnce, 1)
     };
     let mut out = Vec::new();
     encode::publish(&h, b"x", &mut out);
@@ -1107,13 +1065,8 @@ async fn publisher_subscription_identifier_is_a_protocol_error() {
     zzq_proto::property::Property::VarInt(zzq_proto::property::SUBSCRIPTION_IDENTIFIER, 7)
         .encode(&mut props);
     let h = PublishHeader {
-        version: Version::V5,
-        dup: false,
-        qos: QoS::AtMostOnce,
-        retain: false,
-        topic: "spoof",
-        pkid: 0,
         properties: &props,
+        ..header(Version::V5, "spoof", QoS::AtMostOnce, 0)
     };
     let mut out = Vec::new();
     encode::publish(&h, b"x", &mut out);
@@ -1126,14 +1079,8 @@ async fn publisher_subscription_identifier_is_a_protocol_error() {
 async fn takeover_drops_output_queued_for_the_old_connection() {
     let (ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
     let fields = ConnectFields {
-        version: Version::V311,
         clean_start: false,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "stuck",
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V311, "stuck")
     };
     let (mut old, _) = Raw::connect_with(&uri, &fields).await;
     old.subscribe("flood", QoS::AtMostOnce.into()).await;
@@ -1292,10 +1239,8 @@ async fn inbound_topic_aliases_resolve_and_bad_ones_disconnect() {
     sub.subscribe("ta/#", QoS::AtMostOnce).await.unwrap();
     let mut raw = Raw::connect(&uri, "alias-pub", Version::V5, 0).await;
     let alias = |n| support::props(&[Property::U16(TOPIC_ALIAS, n)]);
-    raw.pub_props("ta/x", b"set", QoS::AtMostOnce, 0, &alias(1))
-        .await;
-    raw.pub_props("", b"used", QoS::AtMostOnce, 0, &alias(1))
-        .await;
+    raw.pub_props("ta/x", b"set", &alias(1)).await;
+    raw.pub_props("", b"used", &alias(1)).await;
     for payload in ["set", "used"] {
         let m = next(&mut sub).await;
         assert_eq!(
@@ -1309,7 +1254,7 @@ async fn inbound_topic_aliases_resolve_and_bad_ones_disconnect() {
     ] {
         let mut raw = Raw::connect(&uri, "alias-bad", Version::V5, 0).await;
         let props = support::props(&[Property::U16(TOPIC_ALIAS, alias)]);
-        raw.pub_props("", b"x", QoS::AtMostOnce, 0, &props).await;
+        raw.pub_props("", b"x", &props).await;
         raw.disconnected(&[code]).await;
     }
 }
@@ -1320,14 +1265,8 @@ async fn messages_over_the_client_maximum_packet_size_are_dropped() {
     let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
     let props = [Property::U32(MAXIMUM_PACKET_SIZE, 64)];
     let fields = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
         properties: &props,
-        client_id: "small",
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, "small")
     };
     let (mut small, _) = Raw::connect_with(&uri, &fields).await;
     small.subscribe("mps/#", QoS::AtMostOnce.into()).await;

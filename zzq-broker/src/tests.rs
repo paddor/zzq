@@ -22,7 +22,7 @@ use zzq_proto::QoS;
 
 use crate::lane::Lane;
 use crate::{Broker, BrokerOptions, Context};
-use support::{WAIT, setup, stats_until};
+use support::{WAIT, fields, header, setup, stats_until};
 
 /// Polls `f` on lane `i` until it returns `Some`. Fails after [`WAIT`].
 async fn lane_until<T: Send + 'static>(
@@ -115,23 +115,13 @@ async fn reconnects_leave_no_will_timers_behind() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lane_that_shut_down_refuses_connections() {
-    use zzq_proto::encode::ConnectFields;
     use zzq_proto::{Version, reason};
 
     let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
     // A connection that reached the lane before it shut down, such as one
     // whose CONNECT comes through a WebSocket, still holds its state.
     on_lane(&ctx, &broker, 0, Lane::shutdown).await;
-    let c = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "late",
-        will: None,
-        username: None,
-        password: None,
-    };
+    let c = fields(Version::V5, "late");
     let (_raw, code) = support::Raw::connect_with(&uri, &c).await;
     assert_eq!(code, reason::SERVER_UNAVAILABLE);
 }
@@ -165,7 +155,7 @@ async fn sessions_do_not_expire_while_the_lane_closes_for_a_dump() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_kicked_connection_that_stopped_reading_lets_go() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use zzq_proto::encode::{self, ConnectFields};
+    use zzq_proto::encode;
     use zzq_proto::{SubscriptionOptions, Version};
 
     let (ctx, broker, uri) = setup(1, BrokerOptions::default()).await;
@@ -178,16 +168,7 @@ async fn a_kicked_connection_that_stopped_reading_lets_go() {
         .await
         .unwrap();
     let mut out = Vec::new();
-    let c = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "stuck",
-        will: None,
-        username: None,
-        password: None,
-    };
+    let c = fields(Version::V5, "stuck");
     encode::connect(&c, &mut out);
     let opts = SubscriptionOptions::from(QoS::AtMostOnce);
     encode::subscribe(Version::V5, 1, &[], &[("flood", opts)], &mut out);
@@ -235,14 +216,9 @@ async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
         .await;
     let props = [Property::U32(SESSION_EXPIRY_INTERVAL, 60)];
     let connect = |clean_start| ConnectFields {
-        version: Version::V5,
         clean_start,
-        keep_alive: 0,
         properties: &props,
-        client_id: "pub",
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, "pub")
     };
     let (mut first, _) = Raw::connect_with(&uri, &connect(true)).await;
     for pkid in 1..=3 {
@@ -260,13 +236,8 @@ async fn a_held_puback_goes_to_the_connection_that_sent_the_publish() {
     first.reset();
     let (mut again, _) = Raw::connect_with(&uri, &connect(false)).await;
     let h = PublishHeader {
-        version: Version::V5,
         dup: true,
-        qos: QoS::AtLeastOnce,
-        retain: false,
-        topic: "t",
-        pkid: 3,
-        properties: &[],
+        ..header(Version::V5, "t", QoS::AtLeastOnce, 3)
     };
     let mut resend = Vec::new();
     encode::publish(&h, b"x", &mut resend);
@@ -460,14 +431,8 @@ async fn a_shared_message_for_an_offline_member_on_another_lane_is_copied() {
     let member = id_on("member", 1, 2);
     let props = [Property::U32(SESSION_EXPIRY_INTERVAL, 60)];
     let c = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
         properties: &props,
-        client_id: &member,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, &member)
     };
     let (mut m, _) = support::Raw::connect_with(&uri, &c).await;
     m.subscribe("$share/g/t", SubscriptionOptions::from(QoS::AtLeastOnce))
@@ -529,14 +494,9 @@ fn keeping_connect(id: &str, clean_start: bool, receive: u16, max_packet: u32) -
         props.push(Property::U32(MAXIMUM_PACKET_SIZE, max_packet));
     }
     let c = ConnectFields {
-        version: Version::V5,
         clean_start,
-        keep_alive: 0,
         properties: &props,
-        client_id: id,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, id)
     };
     let mut out = Vec::new();
     encode::connect(&c, &mut out);
@@ -717,7 +677,6 @@ async fn options_that_cannot_work_are_refused() {
 async fn a_denial_with_a_success_code_still_refuses() {
     use std::sync::Arc;
 
-    use zzq_proto::encode::ConnectFields;
     use zzq_proto::{ReasonCode, Version, reason};
 
     use crate::{AuthDecision, Authenticator, ConnectInfo};
@@ -733,16 +692,7 @@ async fn a_denial_with_a_success_code_still_refuses() {
         ..BrokerOptions::default()
     };
     let (_ctx, _broker, uri) = setup(1, opts).await;
-    let c = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "x",
-        will: None,
-        username: None,
-        password: None,
-    };
+    let c = fields(Version::V5, "x");
     let (_raw, code) = support::Raw::connect_with(&uri, &c).await;
     assert_eq!(code, reason::NOT_AUTHORIZED);
 }
@@ -766,13 +716,8 @@ async fn a_failed_retained_write_nacks_v5_publishers_and_drops_v3_ones() {
     broker.shared().retained.cursor_of("f/1").fail(1, 3);
     let publish = |version, qos, pkid, retain| {
         let h = PublishHeader {
-            version,
-            dup: false,
-            qos,
             retain,
-            topic: "f/1",
-            pkid,
-            properties: &[],
+            ..header(version, "f/1", qos, pkid)
         };
         let mut out = Vec::new();
         encode::publish(&h, b"v", &mut out);
@@ -832,14 +777,9 @@ async fn a_failed_subscription_write_disconnects() {
         60,
     )];
     let connect = ConnectFields {
-        version: Version::V5,
         clean_start: false,
-        keep_alive: 0,
         properties: &expiry,
-        client_id: "failing",
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, "failing")
     };
     let (mut c, code) = Raw::connect_with(&uri, &connect).await;
     assert_eq!(code, 0);
@@ -883,14 +823,9 @@ const EXPIRY: [zzq_proto::Property<'static>; 1] = [zzq_proto::Property::U32(
 
 fn durable(client_id: &str) -> zzq_proto::encode::ConnectFields<'_> {
     zzq_proto::encode::ConnectFields {
-        version: zzq_proto::Version::V5,
         clean_start: false,
-        keep_alive: 0,
         properties: &EXPIRY,
-        client_id,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(zzq_proto::Version::V5, client_id)
     }
 }
 
@@ -904,13 +839,8 @@ async fn a_qos2_publish_repeated_after_a_restart_is_delivered_once() {
     let (dir, opts) = on_disk("qos2-in");
     let publish = |dup| {
         let h = PublishHeader {
-            version: Version::V5,
             dup,
-            qos: QoS::ExactlyOnce,
-            retain: false,
-            topic: "q2/t",
-            pkid: 5,
-            properties: &[],
+            ..header(Version::V5, "q2/t", QoS::ExactlyOnce, 5)
         };
         let mut out = Vec::new();
         encode::publish(&h, b"once", &mut out);
@@ -1115,13 +1045,8 @@ async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare(
         let mut p = Raw::connect(&uri, "full-pub", Version::V5, 0).await;
         let publish = |pkid, payload: &[u8]| {
             let h = zzq_proto::encode::PublishHeader {
-                version: Version::V5,
-                dup: false,
-                qos: QoS::AtLeastOnce,
                 retain: true,
-                topic: "r/full",
-                pkid,
-                properties: &[],
+                ..header(Version::V5, "r/full", QoS::AtLeastOnce, pkid)
             };
             let mut out = Vec::new();
             zzq_proto::encode::publish(&h, payload, &mut out);
@@ -1268,13 +1193,8 @@ async fn a_failed_retained_write_rewrites_the_stripe() {
     let (dir, opts) = on_disk("stripe-fail");
     let publish = |pkid, payload: &[u8]| {
         let h = zzq_proto::encode::PublishHeader {
-            version: Version::V5,
-            dup: false,
-            qos: QoS::AtLeastOnce,
             retain: true,
-            topic: "r/fail",
-            pkid,
-            properties: &[],
+            ..header(Version::V5, "r/fail", QoS::AtLeastOnce, pkid)
         };
         let mut out = Vec::new();
         zzq_proto::encode::publish(&h, payload, &mut out);
@@ -1317,7 +1237,7 @@ async fn a_burst_to_another_lane_is_acked_once_journaled() {
     drop(sub);
     let mut p = Raw::connect(&uri, &id_on("burst-pub", 0, 2), Version::V5, 0).await;
     let burst: Vec<u8> = (1..=200)
-        .flat_map(|i| support::publish_bytes(Version::V5, "b/t", b"x", QoS::AtLeastOnce, i, &[]))
+        .flat_map(|i| support::publish(&header(Version::V5, "b/t", QoS::AtLeastOnce, i), b"x"))
         .collect();
     p.send(&burst).await;
     for i in 1..=200 {

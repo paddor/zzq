@@ -1,10 +1,15 @@
 //! Random traffic from misbehaving clients must not panic the broker or
 //! leave it unusable. `ZZQ_STRESS_SECS` sets the duration (default 3).
 
+#![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests fail loudly")]
+
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
+use support::{fields, header};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -68,7 +73,6 @@ fn connect(r: &mut Rng, out: &mut Vec<u8>) -> Version {
         30,
     )];
     let c = ConnectFields {
-        version,
         clean_start: r.below(2) == 0,
         keep_alive: [0, 1, 30][r.below(3)],
         properties: if version.is_v5() && r.below(2) == 0 {
@@ -76,10 +80,8 @@ fn connect(r: &mut Rng, out: &mut Vec<u8>) -> Version {
         } else {
             &[]
         },
-        client_id: &id,
         will,
-        username: None,
-        password: None,
+        ..fields(version, &id)
     };
     encode::connect(&c, out);
     version
@@ -92,13 +94,14 @@ fn packet(r: &mut Rng, v: Version, out: &mut Vec<u8>) {
         0..=3 => {
             let q = qos(r);
             let h = PublishHeader {
-                version: v,
                 dup: r.below(4) == 0,
-                qos: q,
                 retain: r.below(4) == 0,
-                topic: r.pick::<&str>(TOPICS),
-                pkid: if q == QoS::AtMostOnce { 0 } else { pkid },
-                properties: &[],
+                ..header(
+                    v,
+                    r.pick::<&str>(TOPICS),
+                    q,
+                    if q == QoS::AtMostOnce { 0 } else { pkid },
+                )
             };
             let payload = vec![b'p'; [0, 1, 100, 5000][r.below(4)]];
             encode::publish(&h, &payload, out);
