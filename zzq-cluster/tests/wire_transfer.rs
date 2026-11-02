@@ -126,66 +126,6 @@ fn operations(bodies: &[Vec<u8>]) -> Vec<Operation<'_>> {
 }
 
 #[test]
-fn dispatch_fence_checks_exact_history_metadata_without_hashing_payload() {
-    use zzq_cluster::wire::ReceiveFence;
-    use zzq_cluster::{EnvelopeLimits, decode_packet};
-
-    let bodies = bodies();
-    let operations = operations(&bodies);
-    let mut request = request();
-    request.source.accepted = operations[2].prefix();
-    let mut metadata = [0; 512];
-    let mut payload = [0; 64];
-    let encoded = encode_ops(
-        EncodeContext {
-            sender: node(1),
-            session: session(),
-            limits: WireLimits::default(),
-        },
-        request,
-        &operations[..2],
-        &mut metadata,
-        &mut payload,
-    )
-    .unwrap();
-    // Dispatch handles fixed routing metadata. The actor must still reject the
-    // corrupt body through its complete decoder before accepting any history.
-    payload[0] ^= 1;
-    let frames: [&[u8]; 3] = [
-        &encoded.header,
-        &metadata[..encoded.metadata_bytes],
-        &payload[..encoded.payload_bytes],
-    ];
-    let packet = decode_packet(&frames, EnvelopeLimits::default()).unwrap();
-    ReceiveFence::History(request)
-        .validate_routing(packet, EnvelopeLimits::default())
-        .unwrap();
-    assert!(
-        decode(
-            &frames,
-            PeerBinding::new(configuration(), node(1), session()).unwrap(),
-            WireLimits::default()
-        )
-        .is_err()
-    );
-    let mut stale = [request; 7];
-    stale[0].scope.view += 1;
-    stale[1].request_id = RequestId::from_bytes([12; 16]);
-    stale[2].source.generation = JournalGeneration(21);
-    stale[3].source.accepted.digest = Digest::from_bytes([12; 32]);
-    stale[4].predecessor = operations[0].prefix();
-    stale[5].max_operations = 1;
-    stale[6].max_body_bytes = encoded.payload_bytes as u32 - 1;
-    for request in stale {
-        assert!(
-            ReceiveFence::History(request)
-                .validate_routing(packet, EnvelopeLimits::default())
-                .is_err()
-        );
-    }
-}
-
-#[test]
 fn ops_transfers_borrowed_consecutive_chunks_bound_to_the_request_and_source() {
     let bodies = bodies();
     let operations = operations(&bodies);

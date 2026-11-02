@@ -456,7 +456,6 @@ impl Node {
             ReplicaMessage::HistoryRetired(notice) => self.on_retired(from, notice),
             ReplicaMessage::Recovery(message) => self.on_recovery(from, &message, now),
             ReplicaMessage::Checkpoint(message) => self.on_checkpoint(from, message, now),
-            ReplicaMessage::Flow(_) => {}
         }
         self.after_input();
         Ok(())

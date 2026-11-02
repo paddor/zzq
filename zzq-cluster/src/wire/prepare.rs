@@ -14,7 +14,6 @@ use super::{
     validate_scope,
 };
 use super::{ReadFields, WriteFields};
-use crate::flow::ReceiveEpoch;
 use crate::{Digest, OpNumber, Prefix, Scope};
 
 mod plan;
@@ -117,30 +116,13 @@ pub struct PrepareEncoding {
     pub payload_bytes: usize,
 }
 
-/// Canonical metadata encoded before a transport session or receive epoch is
-/// available. This is not a sendable packet and contains no envelope header.
+/// Frame sizes of a planned prepare.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PrepareMetadata {
-    /// Exact metadata prefix in the supplied buffer, without a receive epoch.
-    pub metadata_bytes: usize,
-    /// Exact length of the shared canonical body backing to pair with it.
-    pub payload_bytes: usize,
-}
-
-/// Encode bounded canonical descriptors without inventing a link session.
-/// Bind a real session, receive epoch, and current commit before transmission.
-/// Invalid fields or capacity leave the output unchanged, as for wire encoding.
-///
-/// # Errors
-///
-/// [`WireError`] when the message is malformed or does not fit the limits.
-pub fn encode_prepare_unbound(
-    sender: NodeId,
-    prepare: Prepare<'_>,
-    metadata: &mut [u8],
-    limits: WireLimits,
-) -> Result<PrepareMetadata, WireError> {
-    Planned::new(sender, None, prepare, limits)?.write(metadata, None)
+struct PrepareMetadata {
+    /// Exact metadata bytes.
+    metadata_bytes: usize,
+    /// Exact length of the canonical bodies.
+    payload_bytes: usize,
 }
 
 /// Encode into reusable caller-owned buffers, preserving them on rejection.
@@ -157,11 +139,7 @@ pub fn encode_prepare(
     metadata: &mut [u8],
     payload: &mut [u8],
 ) -> Result<PrepareEncoding, WireError> {
-    Planned::new(context.sender, None, prepare, context.limits)?.bind(
-        context,
-        metadata,
-        Some(payload),
-    )
+    Planned::new(context.sender, prepare, context.limits)?.bind(context, metadata, Some(payload))
 }
 
 /// Encode only PREPARE framing. Pair with the identical canonical body backing.
@@ -174,51 +152,7 @@ pub fn encode_prepare_metadata(
     prepare: Prepare<'_>,
     metadata: &mut [u8],
 ) -> Result<PrepareEncoding, WireError> {
-    Planned::new(context.sender, None, prepare, context.limits)?.bind(context, metadata, None)
-}
-
-/// Encode epoch-bound normal data with a mandatory receiver-issued epoch.
-///
-/// Distinct `PREPARE_FLOW` bytes prevent silent mixing with legacy PREPARE schemas.
-/// Adds exactly 16 metadata bytes per batch. Canonical identities/body digests
-/// are unchanged, and no additional body hashing or allocation is performed.
-///
-/// # Errors
-///
-/// [`WireError`] when the message is malformed or does not fit the limits.
-pub fn encode_flow_prepare(
-    context: EncodeContext,
-    epoch: ReceiveEpoch,
-    prepare: Prepare<'_>,
-    metadata: &mut [u8],
-    payload: &mut [u8],
-) -> Result<PrepareEncoding, WireError> {
-    Planned::new(context.sender, Some(epoch), prepare, context.limits)?.bind(
-        context,
-        metadata,
-        Some(payload),
-    )
-}
-
-/// Encode only the header and metadata of a credited `PREPARE_FLOW`.
-///
-/// The payload frame of a prepare is the concatenation of its canonical bodies
-/// and does not depend on the receiver or its epoch. A sender that already
-/// encoded that exact payload for another peer can pair it with this metadata
-/// instead of copying the bodies again. `payload_bytes` reports the length the
-/// paired payload must have.
-///
-/// # Errors
-///
-/// [`WireError`] when the message is malformed or does not fit the limits.
-pub fn encode_flow_prepare_metadata(
-    context: EncodeContext,
-    epoch: ReceiveEpoch,
-    prepare: Prepare<'_>,
-    metadata: &mut [u8],
-) -> Result<PrepareEncoding, WireError> {
-    Planned::new(context.sender, Some(epoch), prepare, context.limits)?
-        .bind(context, metadata, None)
+    Planned::new(context.sender, prepare, context.limits)?.bind(context, metadata, None)
 }
 
 /// Hash-validated prepare borrowing the packet's backing buffers.

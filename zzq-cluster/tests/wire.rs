@@ -274,10 +274,8 @@ fn prepare_roundtrip_preserves_canonical_bodies_views_and_hash_chain() {
 }
 
 #[test]
-fn unbound_prepare_metadata_requires_real_framing_and_preserves_publication_bytes() {
-    use zzq_cluster::wire::{
-        Operation, Prepare, encode_prepare_metadata, encode_prepare_unbound, encode_publication,
-    };
+fn prepare_metadata_matches_the_full_encoding_and_pairs_with_the_bodies() {
+    use zzq_cluster::wire::{Operation, Prepare, encode_prepare, encode_prepare_metadata};
     let scope = configuration().scope();
     let body = [11; 16];
     let operation = Operation::from_verified(
@@ -299,49 +297,34 @@ fn unbound_prepare_metadata_requires_real_framing_and_preserves_publication_byte
         operations: &operations,
     };
     let limits = WireLimits::default();
+    let context = EncodeContext {
+        sender: node(0),
+        session: session(),
+        limits,
+    };
     let mut metadata = [0xff; 512];
-    let sizes = encode_prepare_unbound(node(0), prepare, &mut metadata, limits).unwrap();
+    let mut payload = [0xff; 16];
+    let full = encode_prepare(context, prepare, &mut metadata, &mut payload).unwrap();
     let mut bound = [0xff; 512];
-    let wire = encode_prepare_metadata(
-        EncodeContext {
-            sender: node(0),
-            session: session(),
-            limits,
-        },
-        prepare,
-        &mut bound,
-    )
-    .unwrap();
-    assert_eq!(sizes.metadata_bytes, wire.metadata_bytes);
-    assert_eq!(sizes.payload_bytes, body.len());
-    assert_eq!(metadata, bound);
-    let unbound: [&[u8]; 3] = [&[], &metadata[..sizes.metadata_bytes], &body];
+    let wire = encode_prepare_metadata(context, prepare, &mut bound).unwrap();
+    assert_eq!(wire, full);
+    assert_eq!(bound, metadata);
+    assert_eq!(payload, body);
     let binding = PeerBinding::new(configuration(), node(0), session()).unwrap();
-    assert!(decode(&unbound, binding, limits).is_err());
     let frames: [&[u8]; 3] = [&wire.header, &bound[..wire.metadata_bytes], &body];
     assert!(decode(&frames, binding, limits).is_ok());
 
-    let mut published = [0xff; 512];
-    let expected =
-        encode_publication(node(0), &frames, operation.prefix(), &mut published, limits).unwrap();
-    let mut output = [0xff; 512];
-    assert_eq!(
-        encode_publication(node(0), &unbound, operation.prefix(), &mut output, limits).unwrap(),
-        expected
-    );
-    assert_eq!(output, published);
-
-    for length in 0..sizes.metadata_bytes {
+    for length in 0..wire.metadata_bytes {
         let mut truncated = [0xab; 512];
-        assert!(
-            encode_prepare_unbound(node(0), prepare, &mut truncated[..length], limits).is_err()
-        );
+        assert!(encode_prepare_metadata(context, prepare, &mut truncated[..length]).is_err());
         assert_eq!(truncated, [0xab; 512]);
     }
+    let zero = EncodeContext {
+        sender: NodeId::from_bytes([0; 16]),
+        ..context
+    };
     let mut invalid = [0xab; 512];
-    assert!(
-        encode_prepare_unbound(NodeId::from_bytes([0; 16]), prepare, &mut invalid, limits).is_err()
-    );
+    assert!(encode_prepare_metadata(zero, prepare, &mut invalid).is_err());
     assert_eq!(invalid, [0xab; 512]);
 }
 

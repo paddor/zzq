@@ -4,14 +4,10 @@ use crate::EnvelopeError;
 use crate::layout::LayoutError;
 
 use crate::ReplicationError;
-use crate::flow::FlowError;
 
 /// Structural wire failure. No rejection changes replica or journal state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum WireError {
-    /// Invalid receipt metadata or mismatched local receive incarnation.
-    #[error(transparent)]
-    Flow(#[from] FlowError),
     /// Response does not match the live source, request, range, or response bound.
     #[error("replica history response does not match the outstanding request")]
     Transfer,

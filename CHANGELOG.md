@@ -17,6 +17,13 @@ Notable changes to zzq. The format follows
   says on stderr while a node's clock is off the others and while no
   two clocks agree. `NodeStatus::clock` has the offsets.
 
+### Removed
+
+- `zzq-cluster`: the flow layer copied from Ozzy, which no node used:
+  the `flow` module, receive epochs, `ReceiveFence`, publications,
+  `Frames`, `encode_prepare_unbound` and the opcodes `REPLICA_OPEN`,
+  `REPLICA_STATE`, `PREPARE_FLOW`, `PREPARE_PUB` and `REPLICA_RECEIPT`.
+
 ### Fixed
 
 - Clustering: a node that missed views and heard only a follower of the
