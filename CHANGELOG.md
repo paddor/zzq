@@ -36,6 +36,10 @@ Notable changes to zzq. The format follows
   followers' lease promise, so they never helped each other replace it
   and the cluster stopped taking writes. A leader that asks to leave its
   view now sends no ops, as it already sent no heartbeats.
+- Clustering: a retained QoS 2 publish wrote its message expiry in the
+  leader's own clock, and followers read it in cluster time, so on a
+  node whose clock was off the others the message expired early or
+  late there. It now writes cluster time, as other records do.
 
 ## [0.5.0] - 2026-10-31
 

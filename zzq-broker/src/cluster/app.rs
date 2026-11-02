@@ -305,4 +305,32 @@ mod tests {
             assert!(apart < Duration::from_millis(50), "{apart:?}");
         }
     }
+
+    #[test]
+    fn a_retained_handoff_writes_its_expiry_in_cluster_time() {
+        use crate::cluster::{ClusterLog, Groups};
+        use crate::disk::Log;
+        use crate::msg::Msg;
+        use crate::retain::Retained;
+        use std::sync::Arc;
+        use zzq_proto::QoS;
+
+        // Cluster time is an hour ahead of this host's clock.
+        let groups = Arc::new(Groups::new(ClusterClock::new(3_600_000, 1000)));
+        let leader = Retained::clustered(10, |s| {
+            Log::Cluster(ClusterLog::new(Journal::Retained(s as u8), groups.clone()))
+        });
+        let mut m = Msg::new("a/b", b"x", &[], QoS::AtLeastOnce, true);
+        let expires = crate::time::now() + Duration::from_secs(60);
+        m.expires_at = Some(expires);
+        assert!(leader.set_once(0, 1, &m, false).is_some());
+        let group = groups.take().pop_front().unwrap();
+        let mut acc = Accumulators::new(1, 8, &groups.clock);
+        acc.apply(OpNumber(1), &group.body, &groups.clock).unwrap();
+        let follower = Retained::new(10);
+        acc.finish().1.install(&follower);
+        let read = follower.messages()[0].expires_at.unwrap();
+        let apart = read.max(expires).duration_since(read.min(expires));
+        assert!(apart < Duration::from_millis(50), "{apart:?}");
+    }
 }

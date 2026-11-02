@@ -2,8 +2,8 @@
 
 use super::tree::Receipt;
 use super::{
-    Clock, JournalId, Journaled, Msg, ONCE, Ordering, REMOVE, Record, Replay, Retained, SET, State,
-    Tree, Wait, io, state, stripe_of,
+    JournalId, Journaled, Msg, ONCE, Ordering, REMOVE, Record, Replay, Retained, SET, State, Tree,
+    Wait, io, state, stripe_of,
 };
 
 impl Retained {
@@ -89,7 +89,7 @@ impl State {
         self.head.push(operation);
         let tail = match operation {
             1 => {
-                state::msg_head(&mut self.head, msg, Clock::now());
+                state::msg_head(&mut self.head, msg, log.clock());
                 msg.payload()
             }
             2 => msg.topic().as_bytes(),
