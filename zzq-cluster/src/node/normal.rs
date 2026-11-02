@@ -349,7 +349,7 @@ impl Node {
                     fence: HistoryFence::Fetch(RequestId::new()),
                     before: self.log.base(),
                 };
-                if let Some(out) = self.notice_message(id, session, notice) {
+                if let Ok(out) = self.encoder.notice(id, session, notice) {
                     self.out.push_back(out);
                 }
             }

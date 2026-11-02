@@ -10,13 +10,11 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
-use super::link::Side;
 use super::{Event, Node, NodeError, Outgoing};
 use crate::integrity::hash;
 use crate::recovery::{CheckpointAnchor, RecoveryLog, RecoveryResponse};
 use crate::wire::{
-    CheckpointMessage, CheckpointRequest, ControlEncoding, RecoveryMessage, RecoveryRequest,
-    RecoveryState, encode_checkpoint, encode_recovery, encode_recovery_state,
+    CheckpointMessage, CheckpointRequest, RecoveryMessage, RecoveryRequest, RecoveryState,
 };
 use crate::{Digest, LogSource, NodeId, OpNumber, RequestId};
 
@@ -223,14 +221,7 @@ impl Node {
             request_id: request.request_id,
             response,
         };
-        if let Some(out) = self.on_link(from, |me, session| {
-            let mut metadata = vec![0; 512];
-            let encoded =
-                encode_recovery_state(me.local, session, state, &mut metadata, me.limits).ok()?;
-            Some(control_frames(from, &encoded, metadata))
-        }) {
-            self.out.push_back(out);
-        }
+        self.send(from, |e, session| e.recovery_state(from, session, &state));
     }
 
     /// The answer to `request`: the one given before in this view, or a new
@@ -326,31 +317,7 @@ impl Node {
             .min(image.anchor.chunk_bytes as usize)
             .min(image.bytes.len() - offset);
         let chunk = image.bytes.slice(offset..offset + len);
-        if let Some(out) = self.on_link(from, |me, session| {
-            let mut metadata = vec![0; 512];
-            let encoded = encode_checkpoint(
-                me.local,
-                session,
-                CheckpointMessage::Chunk {
-                    request,
-                    bytes: &chunk,
-                },
-                &mut metadata,
-                me.limits,
-            )
-            .ok()?;
-            metadata.truncate(encoded.metadata_bytes);
-            Some(Outgoing {
-                to: from,
-                frames: [
-                    Bytes::copy_from_slice(&encoded.header),
-                    Bytes::from(metadata),
-                    chunk.clone(),
-                ],
-            })
-        }) {
-            self.out.push_back(out);
-        }
+        self.send(from, |e, session| e.chunk(from, session, request, chunk));
     }
 
     /// Starts rebuilding the application's state from an image: it holds
@@ -398,14 +365,7 @@ impl Node {
         rebuild.asked_at = Some(now);
         rebuild.request.scope.view = view;
         let request = rebuild.request;
-        if let Some(out) = self.on_link(primary, |me, session| {
-            let mut metadata = vec![0; 256];
-            let encoded =
-                encode_recovery(me.local, session, request, &mut metadata, me.limits).ok()?;
-            Some(control_frames(primary, &encoded, metadata))
-        }) {
-            self.out.push_back(out);
-        }
+        self.send(primary, |e, session| e.recovery(primary, session, request));
     }
 
     fn on_recovery_state(&mut self, from: NodeId, state: &RecoveryState) {
@@ -482,31 +442,28 @@ impl Node {
 
     /// Asks `to` for an image chunk.
     pub(super) fn ask_chunk(&mut self, to: NodeId, request: CheckpointRequest) {
-        if let Some(out) = self.on_link(to, |me, session| {
-            let mut metadata = vec![0; 512];
-            let encoded = encode_checkpoint(
-                me.local,
-                session,
-                CheckpointMessage::Request(request),
-                &mut metadata,
-                me.limits,
-            )
-            .ok()?;
-            Some(control_frames(to, &encoded, metadata))
-        }) {
-            self.out.push_back(out);
-        }
+        self.send(to, |e, session| e.chunk_request(to, session, request));
     }
 
-    /// Runs `encode` for `peer`'s bound session, if it has one.
-    pub(super) fn on_link(
-        &self,
+    /// Queues what `encode` makes for `peer`'s bound session, if it has
+    /// one.
+    pub(super) fn send(
+        &mut self,
         peer: NodeId,
-        encode: impl FnOnce(&super::link::Encoder, crate::LinkSessionId) -> Option<Outgoing>,
-    ) -> Option<Outgoing> {
-        let side: Side = self.peer_index(peer)?;
-        let session = self.peers[side].session?;
-        encode(&self.encoder, session)
+        encode: impl FnOnce(
+            &super::link::Encoder,
+            crate::LinkSessionId,
+        ) -> Result<Outgoing, crate::wire::WireError>,
+    ) {
+        let Some(side) = self.peer_index(peer) else {
+            return;
+        };
+        let Some(session) = self.peers[side].session else {
+            return;
+        };
+        if let Ok(out) = encode(&self.encoder, session) {
+            self.out.push_back(out);
+        }
     }
 }
 
@@ -516,22 +473,6 @@ pub(super) const fn source(primary: NodeId, log: &RecoveryLog) -> LogSource {
         voter: primary,
         generation: log.generation,
         accepted: log.accepted,
-    }
-}
-
-pub(super) fn control_frames(
-    to: NodeId,
-    encoded: &ControlEncoding,
-    mut metadata: Vec<u8>,
-) -> Outgoing {
-    metadata.truncate(encoded.metadata_bytes);
-    Outgoing {
-        to,
-        frames: [
-            Bytes::copy_from_slice(&encoded.header),
-            Bytes::from(metadata),
-            Bytes::new(),
-        ],
     }
 }
 

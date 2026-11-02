@@ -8,8 +8,10 @@ use bytes::Bytes;
 use xxhash_rust::xxh3::xxh3_128;
 
 use crate::wire::{
-    ControlEncoding, EncodeContext, PeerBinding, Prepare, WireError, WireLimits, encode_control,
-    encode_prepare,
+    CheckpointMessage, CheckpointRequest, ControlEncoding, EncodeContext, FetchOps, HistoryRetired,
+    Operation, PeerBinding, Prepare, PrepareEncoding, RecoveryRequest, RecoveryState, WireError,
+    WireLimits, encode_checkpoint, encode_control, encode_fetch, encode_history_retired,
+    encode_ops, encode_prepare, encode_recovery, encode_recovery_state,
 };
 use crate::{
     Configuration, Digest, ENVELOPE_BYTES, Envelope, LinkSessionId, NodeId, OpNumber, Opcode,
@@ -251,51 +253,45 @@ impl Encoder {
         PeerBinding::new(self.configuration, peer, session)
     }
 
-    pub(super) fn control(
-        &self,
+    const fn context(&self, session: LinkSessionId) -> EncodeContext {
+        EncodeContext {
+            sender: self.local,
+            session,
+            limits: self.limits,
+        }
+    }
+
+    /// The frames of a message without payload, whose metadata `encode`
+    /// writes into `room` bytes.
+    fn control_frames(
         to: NodeId,
-        session: LinkSessionId,
-        message: Control,
+        room: usize,
+        encode: impl FnOnce(&mut [u8]) -> Result<ControlEncoding, WireError>,
     ) -> Result<Outgoing, WireError> {
-        let mut metadata = vec![0; 256];
-        let ControlEncoding {
-            header,
-            metadata_bytes,
-        } = encode_control(self.local, session, message, &mut metadata)?;
-        metadata.truncate(metadata_bytes);
+        let mut metadata = vec![0; room];
+        let encoded = encode(&mut metadata)?;
+        metadata.truncate(encoded.metadata_bytes);
         Ok(Outgoing {
             to,
             frames: [
-                Bytes::copy_from_slice(&header),
+                Bytes::copy_from_slice(&encoded.header),
                 Bytes::from(metadata),
                 Bytes::new(),
             ],
         })
     }
 
-    pub(super) fn prepare(
+    /// The frames of a message with the canonical bodies of `ops` as
+    /// payload, which `encode` writes with the metadata.
+    fn payload_frames(
         &self,
         to: NodeId,
-        session: LinkSessionId,
-        prepare: Prepare<'_>,
+        ops: &[Operation<'_>],
+        encode: impl FnOnce(&mut [u8], &mut [u8]) -> Result<PrepareEncoding, WireError>,
     ) -> Result<Outgoing, WireError> {
         let mut metadata = vec![0; self.limits.envelope.max_metadata_bytes];
-        let payload_bytes: usize = prepare
-            .operations
-            .iter()
-            .map(|o| o.canonical().body.len())
-            .sum();
-        let mut payload = vec![0; payload_bytes];
-        let encoded = encode_prepare(
-            EncodeContext {
-                sender: self.local,
-                session,
-                limits: self.limits,
-            },
-            prepare,
-            &mut metadata,
-            &mut payload,
-        )?;
+        let mut payload = vec![0; ops.iter().map(|o| o.canonical().body.len()).sum()];
+        let encoded = encode(&mut metadata, &mut payload)?;
         metadata.truncate(encoded.metadata_bytes);
         payload.truncate(encoded.payload_bytes);
         debug_assert_eq!(encoded.header.len(), ENVELOPE_BYTES);
@@ -307,6 +303,119 @@ impl Encoder {
                 Bytes::from(payload),
             ],
         })
+    }
+
+    pub(super) fn control(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        message: Control,
+    ) -> Result<Outgoing, WireError> {
+        Self::control_frames(to, 256, |m| encode_control(self.local, session, message, m))
+    }
+
+    pub(super) fn prepare(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        prepare: Prepare<'_>,
+    ) -> Result<Outgoing, WireError> {
+        self.payload_frames(to, prepare.operations, |m, p| {
+            encode_prepare(self.context(session), prepare, m, p)
+        })
+    }
+
+    /// `OPS` with `ops`, for `request`.
+    pub(super) fn ops(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        request: FetchOps,
+        ops: &[Operation<'_>],
+    ) -> Result<Outgoing, WireError> {
+        self.payload_frames(to, ops, |m, p| {
+            encode_ops(self.context(session), request, ops, m, p)
+        })
+    }
+
+    /// `FETCH_OPS`.
+    pub(super) fn fetch(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        request: FetchOps,
+    ) -> Result<Outgoing, WireError> {
+        Self::control_frames(to, 256, |m| {
+            encode_fetch(self.local, session, request, m, self.limits)
+        })
+    }
+
+    /// `HISTORY_RETIRED`.
+    pub(super) fn notice(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        notice: HistoryRetired,
+    ) -> Result<Outgoing, WireError> {
+        Self::control_frames(to, 256, |m| {
+            encode_history_retired(self.local, session, notice, m, self.limits)
+        })
+    }
+
+    /// `RECOVERY`.
+    pub(super) fn recovery(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        request: RecoveryRequest,
+    ) -> Result<Outgoing, WireError> {
+        Self::control_frames(to, 256, |m| {
+            encode_recovery(self.local, session, request, m, self.limits)
+        })
+    }
+
+    /// `RECOVERY_STATE`.
+    pub(super) fn recovery_state(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        state: &RecoveryState,
+    ) -> Result<Outgoing, WireError> {
+        Self::control_frames(to, 512, |m| {
+            encode_recovery_state(self.local, session, *state, m, self.limits)
+        })
+    }
+
+    /// A request for an image chunk.
+    pub(super) fn chunk_request(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        request: CheckpointRequest,
+    ) -> Result<Outgoing, WireError> {
+        Self::control_frames(to, 512, |m| {
+            let message = CheckpointMessage::Request(request);
+            encode_checkpoint(self.local, session, message, m, self.limits)
+        })
+    }
+
+    /// Image chunk `bytes`, for `request`.
+    pub(super) fn chunk(
+        &self,
+        to: NodeId,
+        session: LinkSessionId,
+        request: CheckpointRequest,
+        bytes: Bytes,
+    ) -> Result<Outgoing, WireError> {
+        let mut out = Self::control_frames(to, 512, |m| {
+            let message = CheckpointMessage::Chunk {
+                request,
+                bytes: &bytes,
+            };
+            encode_checkpoint(self.local, session, message, m, self.limits)
+        })?;
+        out.frames[2] = bytes;
+        Ok(out)
     }
 }
 
