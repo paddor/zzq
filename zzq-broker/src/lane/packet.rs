@@ -184,15 +184,17 @@ impl Lane {
             (None, None)
         };
         let topic = aliased.as_deref().unwrap_or(p.topic);
-        if crate::msg::too_deep(topic, self.shared.opts.max_topic_levels) {
-            return Err(Close::Protocol(reason::TOPIC_NAME_INVALID));
-        }
-        // `$SYS/` is the broker's own.
-        let allowed = !topic.starts_with("$SYS/")
-            && match self.shared.opts.authorizer.as_deref() {
-                Some(acl) => may_publish(acl, s, topic),
-                None => true,
-            };
+        let allowed = match self
+            .shared
+            .opts
+            .may_publish(topic, |acl| authorized(acl, s, topic))
+        {
+            Ok(()) => true,
+            Err(reason::TOPIC_NAME_INVALID) => {
+                return Err(Close::Protocol(reason::TOPIC_NAME_INVALID));
+            }
+            Err(_) => false,
+        };
         // v3 has no reason codes: a denied publish gets a positive ack and is
         // dropped [MQTT-3.3.5-2].
         let code = if allowed || !s.version.is_v5() {
@@ -279,7 +281,7 @@ fn resolve_alias(
 /// Asks the authorizer about a publish, reusing the answer for a repeated
 /// topic.
 #[inline]
-fn may_publish(acl: &dyn Authorizer, s: &mut Session, topic: &str) -> bool {
+fn authorized(acl: &dyn Authorizer, s: &mut Session, topic: &str) -> bool {
     if let Some((last, allowed)) = &s.inbound.last_allowed
         && **last == *topic
     {

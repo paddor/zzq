@@ -244,23 +244,15 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
         c.assigned = c.version.is_v5();
     }
     if let Some(w) = &c.will {
-        let l = lane.borrow();
         let client = ClientInfo {
             client_id: &c.client_id,
             username: c.username.as_deref(),
         };
-        if crate::msg::too_deep(w.msg.topic(), l.shared.opts.max_topic_levels) {
-            return Err(reason::TOPIC_NAME_INVALID);
-        }
-        let allowed = !w.msg.topic().starts_with("$SYS/")
-            && l.shared
-                .opts
-                .authorizer
-                .as_deref()
-                .is_none_or(|acl| acl.may_publish(&client, w.msg.topic()));
-        if !allowed {
-            return Err(reason::NOT_AUTHORIZED);
-        }
+        let topic = w.msg.topic();
+        lane.borrow()
+            .shared
+            .opts
+            .may_publish(topic, |acl| acl.may_publish(&client, topic))?;
     }
     {
         let l = lane.borrow();

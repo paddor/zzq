@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use zzq_proto::{ReasonCode, Version};
+use zzq_proto::{ReasonCode, Version, reason};
 use zzq_tokio::transport::TransportOptions;
 
 /// What a client presented in CONNECT.
@@ -198,6 +198,30 @@ impl Default for BrokerOptions {
             sn: SnOptions::default(),
             cluster: None,
         }
+    }
+}
+
+impl BrokerOptions {
+    /// Whether a client may publish to `topic`: not deeper than
+    /// `max_topic_levels`, not under `$SYS/`, which is the broker's own,
+    /// and if there is an authorizer, as `authorize` asks it.
+    ///
+    /// # Errors
+    ///
+    /// The reason: `TOPIC_NAME_INVALID` or `NOT_AUTHORIZED`.
+    #[inline]
+    pub(crate) fn may_publish(
+        &self,
+        topic: &str,
+        authorize: impl FnOnce(&dyn Authorizer) -> bool,
+    ) -> Result<(), u8> {
+        if crate::msg::too_deep(topic, self.max_topic_levels) {
+            return Err(reason::TOPIC_NAME_INVALID);
+        }
+        if topic.starts_with("$SYS/") || self.authorizer.as_deref().is_some_and(|a| !authorize(a)) {
+            return Err(reason::NOT_AUTHORIZED);
+        }
+        Ok(())
     }
 }
 
