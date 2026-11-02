@@ -403,27 +403,60 @@ pub fn define_const(module: VALUE, name: &CStr, value: VALUE) -> RbResult<()> {
     Ok(())
 }
 
-/// A method with `arity` arguments. `func` takes `self` and then each
-/// argument as a `VALUE`.
-pub fn define_method(class: VALUE, name: &CStr, func: *const (), arity: i32) -> RbResult<()> {
-    let func = unsafe { std::mem::transmute::<*const (), unsafe extern "C" fn() -> VALUE>(func) };
-    protect(|| unsafe {
-        rb_sys::rb_define_method(class, name.as_ptr(), Some(func), arity);
-        qnil()
-    })?;
-    Ok(())
+/// Defines method `$name` of `$class`, which runs `$body` with the
+/// receiver as `$this` and each argument as a `VALUE`. The macro writes
+/// the C function and counts its arguments, so Ruby's arity matches it.
+macro_rules! method {
+    ($class:expr, $name:expr, |$this:ident $(, $arg:ident)*| $body:expr) => {{
+        unsafe extern "C" fn shim(
+            $this: ::rb_sys::VALUE $(, $arg: ::rb_sys::VALUE)*
+        ) -> ::rb_sys::VALUE {
+            $crate::rb::wrap(|| $body)
+        }
+        let arity = 0 $(+ $crate::rb::one(stringify!($arg)))*;
+        $crate::rb::define(false, $class, $name, shim as *const (), arity)
+    }};
 }
 
-/// A singleton method, as [`define_method`].
-pub fn define_singleton_method(
+/// [`method!`] on the singleton class: `$this` is the class or module.
+macro_rules! singleton {
+    ($object:expr, $name:expr, |$this:ident $(, $arg:ident)*| $body:expr) => {{
+        unsafe extern "C" fn shim(
+            $this: ::rb_sys::VALUE $(, $arg: ::rb_sys::VALUE)*
+        ) -> ::rb_sys::VALUE {
+            $crate::rb::wrap(|| $body)
+        }
+        let arity = 0 $(+ $crate::rb::one(stringify!($arg)))*;
+        $crate::rb::define(true, $object, $name, shim as *const (), arity)
+    }};
+}
+
+pub(crate) use {method, singleton};
+
+/// One argument, for the arity [`method!`] counts.
+pub const fn one(_: &str) -> i32 {
+    1
+}
+
+/// Defines `func`, a C function of `arity` arguments after the receiver,
+/// as a method of `object`, or of its singleton class. Only [`method!`]
+/// and [`singleton!`] call it, with a `func` they made for that arity.
+pub fn define(
+    singleton: bool,
     object: VALUE,
     name: &CStr,
     func: *const (),
     arity: i32,
 ) -> RbResult<()> {
+    // SAFETY: Ruby calls `func` with the receiver and `arity` VALUEs,
+    // the parameters `method!` gave it.
     let func = unsafe { std::mem::transmute::<*const (), unsafe extern "C" fn() -> VALUE>(func) };
     protect(|| unsafe {
-        rb_sys::rb_define_singleton_method(object, name.as_ptr(), Some(func), arity);
+        if singleton {
+            rb_sys::rb_define_singleton_method(object, name.as_ptr(), Some(func), arity);
+        } else {
+            rb_sys::rb_define_method(object, name.as_ptr(), Some(func), arity);
+        }
         qnil()
     })?;
     Ok(())

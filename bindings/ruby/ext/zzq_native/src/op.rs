@@ -109,12 +109,11 @@ fn to_ruby(out: Out) -> RbResult<VALUE> {
     }
 }
 
-unsafe extern "C" fn op_poll(this: VALUE, wake: VALUE) -> VALUE {
-    rb::wrap(|| poll(this, wake))
-}
-
-unsafe extern "C" fn op_cancel(this: VALUE) -> VALUE {
-    rb::wrap(|| {
+pub fn register(native: VALUE) -> RbResult<()> {
+    let class = rb::define_class_under(native, c"Op")?;
+    let _ = CLASS.set(class as usize);
+    rb::method!(class, c"poll", |this, wake| poll(this, wake))?;
+    rb::method!(class, c"cancel", |this| {
         let task = get(this)?
             .task
             .lock()
@@ -122,14 +121,7 @@ unsafe extern "C" fn op_cancel(this: VALUE) -> VALUE {
             .take();
         drop(task);
         Ok(rb::qnil())
-    })
-}
-
-pub fn register(native: VALUE) -> RbResult<()> {
-    let class = rb::define_class_under(native, c"Op")?;
-    let _ = CLASS.set(class as usize);
-    rb::define_method(class, c"poll", op_poll as *const (), 1)?;
-    rb::define_method(class, c"cancel", op_cancel as *const (), 0)?;
+    })?;
     let pending = rb::freeze(rb::protect(|| unsafe {
         rb_sys::rb_obj_alloc(rb_sys::rb_cObject)
     })?);
