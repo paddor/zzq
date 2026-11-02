@@ -355,16 +355,15 @@ fn a_snapshot_cut_off_counts_for_nothing() {
     let stripe = stripe_of("a/b");
     let replay = Replay::new(usize::MAX);
     let run = |records: &[&Vec<u8>]| {
-        let mut tree = Tree::default();
-        let mut snapshot = None;
+        let mut trees = Snapshotted::default();
         for r in records {
             let rec = Record {
                 kind: r[0],
                 body: &r[1..],
             };
-            replay.apply(&mut tree, &mut snapshot, stripe, rec).unwrap();
+            replay.apply(&mut trees, stripe, rec).unwrap();
         }
-        tree.len()
+        trees.live.len()
     };
     // A finished snapshot without the topic clears it.
     assert_eq!(run(&[set, clear_rec, cleared]), 0);
@@ -428,21 +427,21 @@ fn replay_refuses_records_no_stripe_wrote() {
         assert!(replay_one(s).is_ok(), "{s:?}");
     }
     assert_eq!(replay_one(&seeds[0]), Ok(1));
-    let mut tree = Tree::default();
+    let mut trees = Snapshotted::default();
     let rec = |kind, body| Record { kind, body };
     let replay = Replay::new(9);
     let other = (stripe_of("a/b") + 1) % STRIPES;
     let refused = [
-        replay.apply(&mut tree, &mut None, other, rec(SET, &seeds[0][1..])),
-        replay.apply(&mut tree, &mut None, 0, rec(9, b"")),
-        replay.apply(&mut tree, &mut None, 0, rec(CLEAR, b"x")),
-        replay.apply(&mut tree, &mut None, 0, rec(REMOVE, &[0xff])),
-        replay.apply(&mut tree, &mut None, 0, rec(SET, b"short")),
+        replay.apply(&mut trees, other, rec(SET, &seeds[0][1..])),
+        replay.apply(&mut trees, 0, rec(9, b"")),
+        replay.apply(&mut trees, 0, rec(CLEAR, b"x")),
+        replay.apply(&mut trees, 0, rec(REMOVE, &[0xff])),
+        replay.apply(&mut trees, 0, rec(SET, b"short")),
     ];
     assert!(refused.iter().all(Result::is_err), "{refused:?}");
     let mut empty = vec![];
     state::msg_head(&mut empty, &clear("a/b"), replay.clock);
     let stripe = stripe_of("a/b");
-    let r = replay.apply(&mut tree, &mut None, stripe, rec(SET, &empty));
+    let r = replay.apply(&mut trees, stripe, rec(SET, &empty));
     assert_eq!(r, Err("empty retained message"));
 }

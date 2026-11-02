@@ -13,7 +13,7 @@ use crate::msg::Msg;
 use crate::session::Queued;
 use crate::state::codec::Decoder;
 use crate::state::handoff::{self, Handoffs, LaneState};
-use crate::state::{Clock, Deliveries, SessionState};
+use crate::state::{Clock, Deliveries, SessionState, Snapshotted};
 
 use super::{
     CLEAR, CLEARED, DONE, DOWN, END, HANDED, HANDOFF, HANDOFF_KEPT, IMAGE, INBOUND, INBOUND_DONE,
@@ -28,16 +28,19 @@ pub(crate) struct Sessions {
     /// any lane: its sessions and handoffs are not checked.
     lane: usize,
     lanes: usize,
-    by_client: FxHashMap<Box<str>, Replayed>,
-    /// The sessions of a snapshot still being read: they take the place
-    /// of `by_client` at its end, and are dropped if it never comes.
-    snapshot: Option<(FxHashMap<Box<str>, Replayed>, Handoffs)>,
-    handoffs: Handoffs,
+    state: Snapshotted<LaneReplay>,
     /// The message of the last [`MSG`] record, which [`QUEUED`] records
     /// after it deliver.
     msg: Option<Msg>,
     /// The [`PART`] records of a record that has not ended.
     pub(super) parts: Vec<u8>,
+}
+
+/// What a lane journal holds: its sessions and handoffs.
+#[derive(Debug, Default)]
+struct LaneReplay {
+    by_client: FxHashMap<Box<str>, Replayed>,
+    handoffs: Handoffs,
 }
 
 #[derive(Debug, Clone)]
@@ -155,87 +158,80 @@ impl Sessions {
     fn apply_one(&mut self, kind: u8, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         let mut d = Decoder(body);
         match kind {
-            CLEAR => self.snapshot = Some((FxHashMap::default(), Handoffs::default())),
-            CLEARED => {
-                if let Some((snapshot, handoffs)) = self.snapshot.take() {
-                    self.by_client = snapshot;
-                    self.handoffs = handoffs;
-                }
-            }
+            CLEAR => self.state.begin(),
+            CLEARED => self.state.end(),
             IMAGE => {
                 let r = image(&mut d, clock)?;
                 if !self.owns(&r.st.client_id) {
                     return Err("session in the journal of another lane");
                 }
-                let (into, h) = self
-                    .snapshot
-                    .as_mut()
-                    .map(|s| (&mut s.0, &mut s.1))
-                    .unwrap_or((&mut self.by_client, &mut self.handoffs));
-                h.serial = h.serial.max(r.st.birth);
-                into.insert(r.st.client_id.clone(), r);
+                let into = self.state.target();
+                into.handoffs.serial = into.handoffs.serial.max(r.st.birth);
+                into.by_client.insert(r.st.client_id.clone(), r);
             }
             ROUTING => {
-                let h = self
-                    .snapshot
-                    .as_mut()
-                    .map(|s| &mut s.1)
-                    .unwrap_or(&mut self.handoffs);
-                handoff::read_meta(&mut d, h)?;
+                handoff::read_meta(&mut d, &mut self.state.target().handoffs)?;
             }
             HANDOFF_KEPT => {
                 let p = self.pending(&mut d, clock)?;
-                let h = self
-                    .snapshot
-                    .as_mut()
-                    .map(|s| &mut s.1)
-                    .unwrap_or(&mut self.handoffs);
+                let h = &mut self.state.target().handoffs;
                 h.serial = h.serial.max(p.seq);
                 h.pending.insert(p.seq, std::sync::Arc::new(p));
             }
             // Any other record after an unfinished snapshot: the snapshot
             // was cut off, and the lane went on without it.
-            _ if self.snapshot.take().is_some() => return self.apply_one(kind, body, clock),
+            _ if self.state.cut() => return self.apply_one(kind, body, clock),
             HANDOFF => {
                 let p = self.pending(&mut d, clock)?;
                 if let Some(r) = self
+                    .state
+                    .live
                     .by_client
                     .get_mut(&p.publisher)
                     .filter(|r| r.st.birth == p.birth)
                 {
                     r.awaiting_rel.insert(p.pkid);
                 }
-                self.handoffs.serial = self.handoffs.serial.max(p.seq);
-                self.handoffs.pending.insert(p.seq, std::sync::Arc::new(p));
+                self.state.live.handoffs.serial = self.state.live.handoffs.serial.max(p.seq);
+                self.state
+                    .live
+                    .handoffs
+                    .pending
+                    .insert(p.seq, std::sync::Arc::new(p));
             }
             HANDED => {
-                self.handoffs.pending.remove(&d.u64()?);
+                self.state.live.handoffs.pending.remove(&d.u64()?);
             }
             RECEIVED => {
-                self.handoffs.receive(d.u16()?, d.u64()?);
+                self.state.live.handoffs.receive(d.u16()?, d.u64()?);
             }
             MSG => self.msg = Some(d.msg(clock)?),
             SESSION => {
                 let client_id = d.str()?;
                 let st = session_head(&mut d, client_id, clock)?;
-                self.handoffs.serial = self.handoffs.serial.max(st.birth);
+                self.state.live.handoffs.serial = self.state.live.handoffs.serial.max(st.birth);
                 if !self.owns(client_id) {
                     return Err("session in the journal of another lane");
                 }
                 // A new connection to a session goes on with what it held.
-                match self.by_client.get_mut(client_id) {
+                match self.state.live.by_client.get_mut(client_id) {
                     Some(r) => r.attach(st),
                     None => {
-                        self.by_client.insert(client_id.into(), Replayed::new(st));
+                        self.state
+                            .live
+                            .by_client
+                            .insert(client_id.into(), Replayed::new(st));
                     }
                 }
             }
             END => {
-                self.by_client.remove(d.str()?);
+                self.state.live.by_client.remove(d.str()?);
             }
             _ => {
                 let client_id = d.str()?;
                 let r = self
+                    .state
+                    .live
                     .by_client
                     .get_mut(client_id)
                     .ok_or("record of an unknown session")?;
@@ -253,13 +249,13 @@ impl Sessions {
     }
 
     pub(crate) fn into_lane(self, now: Instant) -> LaneState {
-        let mut out = Vec::with_capacity(self.by_client.len());
-        for r in self.by_client.into_values() {
+        let mut out = Vec::with_capacity(self.state.live.by_client.len());
+        for r in self.state.live.by_client.into_values() {
             out.push(r.finish(now));
         }
         LaneState {
             sessions: out,
-            handoffs: self.handoffs,
+            handoffs: self.state.live.handoffs,
         }
     }
 
@@ -269,12 +265,12 @@ impl Sessions {
     pub(crate) fn image(&self, out: &mut impl Append, clock: Clock) -> io::Result<()> {
         let mut buf = Vec::new();
         out.append(CLEAR, &[])?;
-        for r in self.by_client.values() {
+        for r in self.state.live.by_client.values() {
             buf.clear();
             super::image_state(&mut buf, r.clone().into_state(), r.connected, clock);
             super::append_record(out, IMAGE, &[&buf])?;
         }
-        super::handoffs(out, &self.handoffs, &mut buf, clock)?;
+        super::handoffs(out, &self.state.live.handoffs, &mut buf, clock)?;
         out.append(CLEARED, &[])?;
         if let Some(m) = &self.msg {
             buf.clear();

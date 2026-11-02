@@ -172,6 +172,40 @@ impl Deliveries {
     }
 }
 
+/// A replayed state, and the one a snapshot being read builds: at the
+/// snapshot's end it takes the place of the first, and if another
+/// record cuts the snapshot off, it is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct Snapshotted<T> {
+    pub(crate) live: T,
+    next: Option<T>,
+}
+
+impl<T: Default> Snapshotted<T> {
+    /// A snapshot starts.
+    pub(crate) fn begin(&mut self) {
+        self.next = Some(T::default());
+    }
+
+    /// The snapshot ends: it becomes the live state.
+    pub(crate) fn end(&mut self) {
+        if let Some(next) = self.next.take() {
+            self.live = next;
+        }
+    }
+
+    /// Where a snapshot's records go: into the snapshot being read, or
+    /// else the live state.
+    pub(crate) fn target(&mut self) -> &mut T {
+        self.next.as_mut().unwrap_or(&mut self.live)
+    }
+
+    /// Drops a snapshot another record cut off. Whether there was one.
+    pub(crate) fn cut(&mut self) -> bool {
+        self.next.take().is_some()
+    }
+}
+
 /// One decoded record.
 #[derive(Debug)]
 pub(crate) enum Record {

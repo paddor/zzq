@@ -140,8 +140,8 @@ pub(super) fn replay(
     }
     match head[10] {
         0 if body.is_empty() => {}
-        1 => r.apply(tree, &mut None, stripe, Record { kind: SET, body })?,
-        2 => r.apply(tree, &mut None, stripe, Record { kind: REMOVE, body })?,
+        1 => r.change(tree, stripe, Record { kind: SET, body })?,
+        2 => r.change(tree, stripe, Record { kind: REMOVE, body })?,
         _ => return Err("invalid retained handoff operation"),
     }
     tree.receipts
