@@ -8,7 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::cpu::{CpuUse, CpuWindow};
-use crate::wire::{self, Head, PUBACK, PUBCOMP, PUBREC, PUBREL, Reader};
+use crate::wire::{self, Conn, Head, PUBACK, PUBCOMP, PUBREC, PUBREL, Reader, Session};
 
 /// Time stopped publishers have to finish their last write before the run
 /// shuts the sockets down.
@@ -106,6 +106,17 @@ pub struct Keep {
     pub retain: bool,
     /// Subscribers have sessions that outlive their connection.
     pub sessions: bool,
+}
+
+impl Keep {
+    /// The session a subscriber has.
+    const fn session(self) -> Session {
+        if self.sessions {
+            Session::Kept
+        } else {
+            Session::Clean
+        }
+    }
 }
 
 /// Throughput result.
@@ -232,26 +243,6 @@ impl Shape {
     }
 }
 
-/// A connected client.
-struct Conn {
-    id: String,
-    s: TcpStream,
-    rd: Reader,
-    /// The broker's Receive Maximum.
-    rmax: Option<u16>,
-}
-
-impl Conn {
-    fn open(addr: &str, id: String, v5: bool, persistent: bool) -> io::Result<Conn> {
-        let (s, rd, rmax) = if persistent {
-            wire::connect_persistent(addr, &id, v5)?
-        } else {
-            wire::connect(addr, &id, v5)?
-        };
-        Ok(Conn { id, s, rd, rmax })
-    }
-}
-
 /// Subscribers, and publishers with their topics.
 type Conns = (Vec<Conn>, Vec<(String, Conn)>);
 
@@ -262,8 +253,8 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<Conns> {
     for i in 0..shape.subs {
         let lane = load.local.map_or(i, |local| usize::from(i >= local));
         let id = client_id(&format!("zb-{pid}-s{i}"), lane, load.lanes);
-        let mut c = Conn::open(&load.addr, id, load.v5, load.keep.sessions)?;
-        wire::subscribe(&mut c.s, &mut c.rd, &shape.filter(i), load.qos, load.v5)?;
+        let mut c = Conn::open(&load.addr, id, load.v5, load.keep.session())?;
+        c.subscribe(&shape.filter(i), load.qos)?;
         c.s.set_read_timeout(Some(Duration::from_millis(100)))?;
         run.register(&c.s)?;
         subs.push(c);
@@ -275,7 +266,7 @@ fn connect_all(shape: &Shape, load: &Load, run: &Run) -> io::Result<Conns> {
             i + usize::from(load.cross),
             load.lanes,
         );
-        let c = Conn::open(&load.addr, id, load.v5, false)?;
+        let c = Conn::open(&load.addr, id, load.v5, Session::Clean)?;
         run.register(&c.s)?;
         pubs.push((shape.topic(i), c));
     }
@@ -747,11 +738,11 @@ impl Rtt {
         let pid = std::process::id();
         let topic = format!("zb/{pid}/rtt");
         let id = client_id(&format!("zb-{pid}-rs"), 0, load.lanes);
-        let mut sub = Conn::open(&load.addr, id, load.v5, load.keep.sessions)?;
-        wire::subscribe(&mut sub.s, &mut sub.rd, &topic, load.qos, load.v5)?;
+        let mut sub = Conn::open(&load.addr, id, load.v5, load.keep.session())?;
+        sub.subscribe(&topic, load.qos)?;
         sub.s.set_read_timeout(Some(Duration::from_secs(1)))?;
         let id = client_id(&format!("zb-{pid}-rp"), usize::from(load.cross), load.lanes);
-        let publisher = Conn::open(&load.addr, id, load.v5, false)?;
+        let publisher = Conn::open(&load.addr, id, load.v5, Session::Clean)?;
         publisher.s.set_read_timeout(Some(Duration::from_secs(1)))?;
         Ok(Rtt {
             sub,
@@ -905,6 +896,7 @@ mod tests {
             s,
             rd: Reader::with_capacity(1 << 10),
             rmax: None,
+            v5: true,
         };
         (c, server)
     }

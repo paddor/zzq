@@ -176,7 +176,7 @@ async fn open(plan: &Plan, role: Role) -> io::Result<Conn> {
         &plan.client_id(role),
         cfg.v5,
         wire::KEEP_ALIVE,
-        false,
+        wire::Session::Clean,
     );
     s.write_all(&out).await?;
     let mut rd = Reader::with_capacity(4096);

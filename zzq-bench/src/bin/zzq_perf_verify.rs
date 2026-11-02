@@ -698,11 +698,11 @@ fn idle_memory(addr: &str, conns: usize, broker: u32) -> Result<String, String> 
     let before = rss()?;
     let mut open = Vec::with_capacity(conns);
     for i in 0..conns {
-        let (mut s, mut rd, _) = wire::connect(addr, &format!("idle-{i}"), true)
+        let mut c = wire::Conn::open(addr, format!("idle-{i}"), true, wire::Session::Clean)
             .map_err(|e| format!("connect {i}: {e}"))?;
-        wire::subscribe(&mut s, &mut rd, &format!("idle/{i}"), 0, true)
+        c.subscribe(&format!("idle/{i}"), 0)
             .map_err(|e| format!("subscribe {i}: {e}"))?;
-        open.push(s);
+        open.push(c.s);
     }
     std::thread::sleep(Duration::from_millis(500));
     let after = rss()?;
