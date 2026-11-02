@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod args;
 pub mod cache;
 pub mod child;
 pub mod cpu;

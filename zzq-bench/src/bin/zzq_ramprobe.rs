@@ -14,13 +14,13 @@
 //! interval in seconds, for its own estimate: 10 for `zzq_broker`, 0 for
 //! brokers other than zzq.
 
-use std::collections::HashMap;
 use std::io;
 use std::net::TcpStream;
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use zzq_bench::args::Kv;
 use zzq_bench::child;
 use zzq_bench::ram::{Growth, Probe};
 
@@ -74,16 +74,13 @@ fn parse(args: &[String]) -> Option<Args> {
         Some(i) => (&args[..i], args[i + 1..].to_vec()),
         None => (args, Vec::new()),
     };
-    let kv = keys
-        .iter()
-        .map(|a| a.split_once('='))
-        .collect::<Option<HashMap<_, _>>>()?;
-    let get = |k: &str, d: &'static str| kv.get(k).copied().unwrap_or(d);
+    let kv = Kv::parse(keys)?;
+    let get = |k: &str, d: &'static str| kv.get(k).unwrap_or(d);
     let num = |k: &str, d: &'static str| get(k, d).parse::<usize>().ok();
     let sys = get("sys", if command.is_empty() { "1" } else { "0" })
         .parse::<f64>()
         .ok()?;
-    Some(Args {
+    let parsed = Args {
         v5: get("v", "5") == "5",
         lanes: num("lanes", "1")?.max(1),
         sessions: num("sessions", "50000")?,
@@ -95,9 +92,11 @@ fn parse(args: &[String]) -> Option<Args> {
             .map(|s| s.parse().ok())
             .collect::<Option<_>>()?,
         sys: (sys > 0.0).then(|| Duration::from_secs_f64(sys)),
-        addr: kv.get("addr").map(|&a| a.to_owned()),
+        addr: kv.get("addr").map(str::to_owned),
         command,
-    })
+    };
+    kv.finish()?;
+    Some(parsed)
 }
 
 /// Measures one step on a fresh broker.
@@ -185,4 +184,21 @@ fn broker_child(lanes: &str, sys_ms: &str) -> ExitCode {
         ..zzq_broker::BrokerOptions::default()
     };
     child::serve(&cfg, opts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused() {
+        assert!(parse(&args(&["sessions=10"])).is_some());
+        assert!(parse(&args(&["session=10"])).is_none());
+        // The broker command after `--` is not keys.
+        assert!(parse(&args(&["sessions=10", "--", "broker", "x"])).is_some());
+    }
 }

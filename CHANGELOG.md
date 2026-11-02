@@ -44,6 +44,9 @@ Notable changes to zzq. The format follows
   bind named the endpoint `tcp://`, and TCP and QUIC errors dropped the
   brackets of an IPv6 host. Bind and connect errors now name the
   endpoint as given.
+- `zzq-bench`: `zzq_brokerbench`, `zzq_loadbench` and `zzq_ramprobe`
+  ignored keys they do not know, so a misspelled key ran with the
+  default. They now refuse it.
 
 ## [0.5.0] - 2026-10-31
 

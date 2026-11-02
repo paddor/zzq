@@ -24,10 +24,10 @@
 //! to the load generator's own CPU. Closed connections and a stalled
 //! publisher go to stderr.
 
-use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use zzq_bench::args::Kv;
 use zzq_bench::load::{self, Keep, Latency, Load, Scenario, Throughput, Until};
 
 fn main() -> ExitCode {
@@ -64,11 +64,8 @@ fn main() -> ExitCode {
 /// The scenario, the load, and for `rtt` the round trips and what they time.
 fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
     let (scenario, rest) = args.split_first()?;
-    let kv = rest
-        .iter()
-        .map(|a| a.split_once('='))
-        .collect::<Option<HashMap<_, _>>>()?;
-    let get = |k: &str, d: &'static str| kv.get(k).copied().unwrap_or(d);
+    let kv = Kv::parse(rest)?;
+    let get = |k: &str, d: &'static str| kv.get(k).unwrap_or(d);
     let num = |k: &str, d: &'static str| get(k, d).parse::<u64>().ok();
     let cfg = Load {
         addr: get("addr", "127.0.0.1:1883").to_owned(),
@@ -100,6 +97,7 @@ fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
         Until::Delivered
     };
     let iters = num("iters", "20000")? as usize;
+    kv.finish()?;
     Some((scenario.clone(), cfg, (iters, until)))
 }
 
@@ -158,4 +156,19 @@ fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
         t.cpu,
         secs.join(" ")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused() {
+        assert!(parse(&args(&["p2p", "persist=1"])).is_some());
+        assert!(parse(&args(&["p2p", "persit=1"])).is_none());
+    }
 }
