@@ -118,15 +118,7 @@ pub(crate) async fn save(shared: &Shared, path: &Path) -> Result<()> {
 
 /// Closes every connection, then waits for deliveries between lanes.
 pub(crate) async fn quiesce(shared: &Shared) -> Result<()> {
-    let mut closed = Vec::with_capacity(shared.lanes.len());
-    for lane in &shared.lanes {
-        let (tx, rx) = oneshot::channel();
-        push(lane, Control::Quiesce(tx))?;
-        closed.push(rx);
-    }
-    for rx in closed {
-        rx.await.map_err(|_| Error::Closed)?;
-    }
+    shared.ask_lanes(|_, tx| Control::Quiesce(tx)).await?;
     // Each lane passes its share on to the markers it queues for the others.
     let drained = Arc::new(SyncAck::default());
     for lane in &shared.lanes {
@@ -209,18 +201,16 @@ pub(crate) async fn restore(shared: &Shared, sessions: Vec<LaneState>) -> Result
     // them a level at a time.
     let max = shared.opts.max_topic_levels;
     let subscribed = Arc::new(SyncAck::default());
-    let mut restored = Vec::with_capacity(sessions.len());
-    for (lane, mut states) in shared.lanes.iter().zip(sessions) {
-        for st in &mut states.sessions {
-            st.subs.retain(|(filter, _, _)| !too_deep(filter, max));
-        }
-        let (tx, rx) = oneshot::channel();
-        push(lane, Control::Restore(states, subscribed.clone(), tx))?;
-        restored.push(rx);
-    }
-    for rx in restored {
-        rx.await.map_err(|_| Error::Closed)?;
-    }
+    let mut sessions = sessions.into_iter();
+    shared
+        .ask_lanes(|_, tx| {
+            let mut states = sessions.next().unwrap_or_default();
+            for st in &mut states.sessions {
+                st.subs.retain(|(filter, _, _)| !too_deep(filter, max));
+            }
+            Control::Restore(states, subscribed.clone(), tx)
+        })
+        .await?;
     subscribed.wait().await;
     Ok(())
 }

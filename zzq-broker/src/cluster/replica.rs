@@ -326,15 +326,13 @@ impl Replica {
     }
 
     async fn cut_lanes(&self) -> Option<Cut> {
-        let mut asked = Vec::new();
-        for lane in &self.shared.lanes {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            lane.control.push(crate::lane::Control::CutImage(tx)).ok()?;
-            asked.push(rx);
-        }
+        let cuts = self
+            .shared
+            .ask_lanes(|_, tx| crate::lane::Control::CutImage(tx))
+            .await
+            .ok()?;
         let mut cut = Cut::default();
-        for (j, rx) in asked.into_iter().enumerate() {
-            let (last, body) = rx.await.ok()?;
+        for (j, (last, body)) in cuts.into_iter().enumerate() {
             cut.add(Journal::Lane(u16::try_from(j).ok()?), last, body);
         }
         let retained = &self.shared.retained;
