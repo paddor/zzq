@@ -327,7 +327,7 @@ mod tests {
     use super::codec::{put_bytes, put_count, put_u16, put_u32, put_u64};
     use super::*;
     use crate::budget::LaneTotal;
-    use crate::index::SubIds;
+    use crate::index::{Grant, SubIds};
     use crate::session::DelayedWill;
 
     fn msg(topic: &str, payload: &[u8], qos: QoS, expires_at: Option<Instant>) -> Msg {
@@ -344,9 +344,11 @@ mod tests {
     fn item(n: u8, qos: QoS) -> Queued {
         Queued {
             msg: msg("a/b", &[n], qos, None),
-            qos,
-            retain: n.is_multiple_of(2),
-            sub_id: SubIds::one(u32::from(n) + 1),
+            grant: Grant {
+                qos,
+                retain: n.is_multiple_of(2),
+                sub_id: SubIds::one(u32::from(n) + 1),
+            },
         }
     }
 

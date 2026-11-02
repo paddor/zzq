@@ -48,14 +48,16 @@
 
 use std::io;
 
-use zzq_proto::{QoS, SubscriptionOptions, Version};
+use zzq_proto::{SubscriptionOptions, Version};
 
 use crate::disk::Append;
-use crate::index::SubIds;
+use crate::index::Grant;
 use crate::msg::Publication;
 use crate::session::Session;
 
-use super::codec::{put_bytes, put_count, put_msg, put_session, put_u16, put_u32, put_u64};
+use super::codec::{
+    put_bytes, put_count, put_grant, put_msg, put_session, put_u16, put_u32, put_u64,
+};
 use super::{Clock, SessionState};
 
 mod replay;
@@ -218,19 +220,10 @@ pub(crate) fn msg_head(b: &mut Vec<u8>, p: &Publication<'_>, clock: Clock) {
 }
 
 /// The body of a [`QUEUED`] record.
-pub(crate) fn queued(
-    b: &mut Vec<u8>,
-    client_id: &str,
-    seq: u64,
-    (qos, retain, sub_id): (QoS, bool, SubIds),
-) {
+pub(crate) fn queued(b: &mut Vec<u8>, client_id: &str, seq: u64, grant: Grant) {
     put_bytes(b, client_id.as_bytes());
     put_u64(b, seq);
-    b.push(qos as u8);
-    b.push(u8::from(retain));
-    for slot in sub_id.slots() {
-        put_u32(b, slot);
-    }
+    put_grant(b, grant);
 }
 
 /// The body of a [`DONE`] or [`RELEASED`] record.
@@ -303,7 +296,10 @@ pub(crate) fn framed(records: &[Vec<u8>]) -> Vec<u8> {
 pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     use std::time::Duration;
 
+    use zzq_proto::QoS;
+
     use crate::budget::LaneTotal;
+    use crate::index::SubIds;
     use crate::session::{DelayedWill, Will};
 
     let clock = Clock::now();
@@ -338,7 +334,11 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     add(END, &|b| client(b, "c"));
     add(CLEAR, &|_| {});
     add(MSG, &|b| put_msg(b, &will_msg(), clock));
-    let grant = (QoS::ExactlyOnce, false, SubIds::one(7));
+    let grant = Grant {
+        qos: QoS::ExactlyOnce,
+        retain: false,
+        sub_id: SubIds::one(7),
+    };
     add(QUEUED, &|b| queued(b, "c", 1, grant));
     add(SENT, &|b| sent(b, "c", 1, 9));
     add(RELEASED, &|b| delivery(b, "c", 1));
@@ -352,6 +352,9 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
 
 #[cfg(any(test, feature = "fuzzing"))]
 fn handoff_seeds(clock: Clock) -> Vec<Vec<u8>> {
+    use zzq_proto::QoS;
+
+    use crate::index::SubIds;
     use crate::msg::Msg;
 
     use super::handoff::{Handoffs, Pending, Target};
@@ -368,9 +371,11 @@ fn handoff_seeds(clock: Clock) -> Vec<Vec<u8>> {
             lane: 0,
             client: "c".into(),
             birth: 0,
-            qos: QoS::ExactlyOnce,
-            retain: false,
-            sub_id: SubIds::one(7),
+            grant: Grant {
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                sub_id: SubIds::one(7),
+            },
         }],
     };
     let mut pending = vec![HANDOFF];

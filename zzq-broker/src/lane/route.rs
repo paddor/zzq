@@ -8,7 +8,7 @@ use zzq_proto::packet::decode;
 use zzq_proto::{Packet, QoS, Version};
 
 use crate::budget::LaneTotal;
-use crate::index::{Entry, Matches, SubIds, SubRef};
+use crate::index::{Entry, Grant, Matches, SubRef};
 use crate::msg::{Arena, Block, Msg, Publication};
 use crate::session::{Kept, KeptMsg, Outcome, QueueLimit, Queued, Session, SharedMsg};
 use crate::slab::Key;
@@ -152,12 +152,11 @@ impl Owned {
     }
 }
 
-/// QoS, retain flag and Subscription Identifier of one delivery.
+/// One delivery of a publish: what it grants the session, and whether it
+/// is the last.
 #[derive(Debug, Clone, Copy)]
-pub(super) struct Grant {
-    pub(super) qos: QoS,
-    pub(super) retain: bool,
-    pub(super) sub_id: SubIds,
+pub(super) struct Pick {
+    pub(super) grant: Grant,
     /// The last delivery of this publish: it may take the owned message
     /// instead of cloning it.
     pub(super) last: bool,
@@ -294,17 +293,12 @@ impl Lane {
                 let msg = owned.cloned(p);
                 let pins = p.pins && p.chunk.is_some_and(|c| msg.pins(c));
                 let lane = usize::from(e.sub.lane);
-                let qos = p.qos.min(e.opts.qos);
-                let sequence = self.count_sent(lane, e.journaled && qos != QoS::AtMostOnce);
+                let grant = e.grant(p.qos, p.retain);
+                let sequence = self.count_sent(lane, e.journaled && grant.qos != QoS::AtMostOnce);
                 self.out.remote[lane].push(Remote::Deliver {
                     key: e.sub.key,
                     pins,
-                    item: Queued {
-                        msg,
-                        qos,
-                        retain: e.opts.retain_as_published && p.retain,
-                        sub_id: e.sub_id,
-                    },
+                    item: Queued { msg, grant },
                     sender: self.id,
                     epoch: self.epoch,
                     sequence,
@@ -403,14 +397,12 @@ impl Lane {
 
     /// What `e` gets of `p`, unless No Local skips its own publish.
     #[inline]
-    fn grant(from: Option<Key>, e: &Entry, p: &Publication<'_>, last: bool) -> Option<Grant> {
+    fn grant(from: Option<Key>, e: &Entry, p: &Publication<'_>, last: bool) -> Option<Pick> {
         if e.opts.no_local && from == Some(e.sub.key) {
             return None;
         }
-        Some(Grant {
-            qos: p.qos.min(e.opts.qos),
-            retain: e.opts.retain_as_published && p.retain,
-            sub_id: e.sub_id,
+        Some(Pick {
+            grant: e.grant(p.qos, p.retain),
             last,
         })
     }
@@ -422,14 +414,13 @@ impl Lane {
         key: Key,
         p: &Publication<'_>,
         owned: &mut Owned,
-        g: Grant,
+        g: Pick,
     ) -> bool {
         let Grant {
             qos,
             retain,
             sub_id,
-            ..
-        } = g;
+        } = g.grant;
         let o = &self.shared.opts;
         let Some(s) = self.sessions.get_mut(key) else {
             return false;
@@ -482,7 +473,7 @@ impl Lane {
         key: Key,
         p: &Publication<'_>,
         owned: &mut Owned,
-        g: Grant,
+        g: Pick,
     ) -> Outcome {
         let o = &self.shared.opts;
         let limit = QueueLimit {
@@ -495,7 +486,7 @@ impl Lane {
         if limit.state_full && self.sessions.get(key).is_some_and(Session::would_queue) {
             return Outcome::StateFull;
         }
-        let seq = self.journal_delivery(key, p, owned, (g.qos, g.retain, g.sub_id));
+        let seq = self.journal_delivery(key, p, owned, g.grant);
         let Some(s) = self.sessions.get_mut(key) else {
             return Outcome::Offline;
         };
@@ -577,15 +568,13 @@ impl Lane {
                     ..Publication::of(&item.msg)
                 };
                 let mut owned = Owned::of(item.msg.clone());
-                let g = Grant {
-                    qos: item.qos,
-                    retain: item.retain,
-                    sub_id: item.sub_id,
+                let g = Pick {
+                    grant: item.grant,
                     last: true,
                 };
                 // The member's session ended after another lane picked it.
                 if !self.deliver(key, &p, &mut owned, g) {
-                    if item.qos == QoS::AtMostOnce {
+                    if item.grant.qos == QoS::AtMostOnce {
                         self.stats.dropped.offline += 1;
                     } else {
                         self.stats.dropped.session_ended += 1;
@@ -642,13 +631,11 @@ fn keep(
     p: &Publication<'_>,
     owned: &mut Owned,
     total: &LaneTotal,
-    g: Grant,
+    g: Pick,
 ) -> Kept {
     let kept = |msg: KeptMsg, charged: bool| Kept {
         msg,
-        qos: g.qos,
-        retain: g.retain,
-        sub_id: g.sub_id,
+        grant: g.grant,
         charged,
         seq: 0,
     };
@@ -721,11 +708,10 @@ mod tests {
     use zzq_proto::{QoS, Version};
 
     use super::super::Remote;
-    use super::{
-        DATA_ITEM, DATA_RUN_BYTES, Grant, Origin, Owned, deliver_batches, forward_packet, keep,
-    };
+    use super::Pick;
+    use super::{DATA_ITEM, DATA_RUN_BYTES, Origin, Owned, deliver_batches, forward_packet, keep};
     use crate::budget::LaneTotal;
-    use crate::index::SubIds;
+    use crate::index::{Grant, SubIds};
     use crate::msg::{Arena, Msg, Publication};
     use crate::session::{KeptMsg, Queued, Session, SharedMsg};
     use crate::slab::Key;
@@ -746,9 +732,11 @@ mod tests {
                 pins: false,
                 item: Queued {
                     msg: Msg::new("t", &payload, &[], QoS::AtLeastOnce, false),
-                    qos: QoS::AtLeastOnce,
-                    retain: false,
-                    sub_id: SubIds::default(),
+                    grant: Grant {
+                        qos: QoS::AtLeastOnce,
+                        retain: false,
+                        sub_id: SubIds::default(),
+                    },
                 },
                 sender: 0,
                 epoch: 0,
@@ -875,9 +863,11 @@ mod tests {
                     pins: false,
                     item: Queued {
                         msg,
-                        qos,
-                        retain: false,
-                        sub_id: SubIds::default(),
+                        grant: Grant {
+                            qos,
+                            retain: false,
+                            sub_id: SubIds::default(),
+                        },
                     },
                     sender: 0,
                     epoch: 0,
@@ -909,10 +899,12 @@ mod tests {
             expires_at: None,
         };
         let total = LaneTotal::default();
-        let g = Grant {
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            sub_id: SubIds::default(),
+        let g = Pick {
+            grant: Grant {
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                sub_id: SubIds::default(),
+            },
             last: false,
         };
         let pinned = Rc::new(SharedMsg::new(p.to_msg(), total.clone()));

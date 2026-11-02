@@ -64,6 +64,16 @@ impl SubIds {
     }
 }
 
+/// How a session gets a message: at the lower of the publish's and the
+/// subscription's QoS, with or without its RETAIN flag, and with the
+/// subscription identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Grant {
+    pub(crate) qos: QoS,
+    pub(crate) retain: bool,
+    pub(crate) sub_id: SubIds,
+}
+
 /// One subscription of one session.
 #[derive(Debug, Clone)]
 pub(crate) struct Entry {
@@ -78,6 +88,18 @@ pub(crate) struct Entry {
     /// The session journals its QoS 1/2 deliveries, so a publisher on
     /// another lane waits for that lane's journal before its ack.
     pub(crate) journaled: bool,
+}
+
+impl Entry {
+    /// What a publish at `qos`, retained or not, grants this subscriber.
+    #[inline]
+    pub(crate) fn grant(&self, qos: QoS, retain: bool) -> Grant {
+        Grant {
+            qos: qos.min(self.opts.qos),
+            retain: self.opts.retain_as_published && retain,
+            sub_id: self.sub_id,
+        }
+    }
 }
 
 /// What a shared subscription adds to its entry.

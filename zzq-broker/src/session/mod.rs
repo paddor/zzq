@@ -9,11 +9,11 @@ use std::time::Instant;
 
 use bytestring::ByteString;
 use rustc_hash::{FxHashMap, FxHashSet};
-use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
+use zzq_proto::{PacketType, SubscriptionOptions, Version};
 
 use crate::budget::{self, Charge, LaneTotal};
 use crate::conn::ConnShared;
-use crate::index::{Matches, SubIds};
+use crate::index::{Grant, Matches};
 use crate::msg::{Arena, Msg};
 use crate::slab::Key;
 use crate::state::SessionState;
@@ -49,18 +49,14 @@ pub(crate) struct DelayedWill {
 #[derive(Debug, Clone)]
 pub(crate) struct Queued {
     pub(crate) msg: Msg,
-    pub(crate) qos: QoS,
-    pub(crate) retain: bool,
-    pub(crate) sub_id: SubIds,
+    pub(crate) grant: Grant,
 }
 
 /// A QoS 1/2 message a session keeps.
 #[derive(Debug)]
 pub(crate) struct Kept {
     pub(crate) msg: KeptMsg,
-    pub(crate) qos: QoS,
-    pub(crate) retain: bool,
-    pub(crate) sub_id: SubIds,
+    pub(crate) grant: Grant,
     /// Whether the session pays for the message's bytes: not when the lane
     /// shares them, or the retained store counts them.
     pub(crate) charged: bool,
@@ -74,9 +70,7 @@ impl Kept {
     pub(crate) fn own(item: Queued) -> Kept {
         Kept {
             msg: KeptMsg::Own(item.msg),
-            qos: item.qos,
-            retain: item.retain,
-            sub_id: item.sub_id,
+            grant: item.grant,
             charged: true,
             seq: 0,
         }
@@ -502,14 +496,19 @@ impl Session {
 
 #[cfg(test)]
 mod tests {
+    use zzq_proto::QoS;
+
     use super::*;
+    use crate::index::SubIds;
 
     fn item() -> Queued {
         Queued {
             msg: Msg::new("t", b"x", &[], QoS::AtLeastOnce, false),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            sub_id: SubIds::default(),
+            grant: Grant {
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                sub_id: SubIds::default(),
+            },
         }
     }
 

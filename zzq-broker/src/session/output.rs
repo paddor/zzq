@@ -30,11 +30,11 @@ impl<'a> Fields<'a> {
             topic: item.msg.topic(),
             payload: item.msg.payload(),
             props: item.msg.props(),
-            qos: item.qos,
-            retain: item.retain,
+            qos: item.grant.qos,
+            retain: item.grant.retain,
             dup,
             pkid,
-            sub_id: item.sub_id,
+            sub_id: item.grant.sub_id,
             expires_at: item.msg.expires_at,
         }
     }

@@ -99,7 +99,7 @@ impl Session {
             self.progress(h.seq, Progress::Done(h.seq));
             return Outcome::TooLarge;
         }
-        if h.qos == QoS::ExactlyOnce {
+        if h.grant.qos == QoS::ExactlyOnce {
             self.progress(h.seq, Progress::Sent(h.seq, pkid));
         }
         let cap = self.flow.inflight.capacity();
@@ -245,7 +245,7 @@ impl Session {
         let Some(i) = self.inflight_at(pkid) else {
             return Ok(false);
         };
-        if self.flow.inflight[i].held.qos != QoS::AtLeastOnce {
+        if self.flow.inflight[i].held.grant.qos != QoS::AtLeastOnce {
             return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
         self.take_inflight(i);
@@ -264,7 +264,7 @@ impl Session {
             return Ok(true);
         };
         let f = &mut self.flow.inflight[i];
-        if f.held.qos != QoS::ExactlyOnce {
+        if f.held.grant.qos != QoS::ExactlyOnce {
             return Err(zzq_proto::reason::PROTOCOL_ERROR);
         }
         if reason >= 0x80 {
@@ -354,15 +354,17 @@ mod tests {
 
     use super::super::{Inflight, Kept, Queued, Session};
     use crate::budget::LaneTotal;
-    use crate::index::SubIds;
+    use crate::index::{Grant, SubIds};
     use crate::msg::Msg;
 
     fn inflight(pkid: u16) -> Inflight {
         let item = Queued {
             msg: Msg::new("t", b"x", &[], QoS::AtLeastOnce, false),
-            qos: QoS::AtLeastOnce,
-            retain: false,
-            sub_id: SubIds::default(),
+            grant: Grant {
+                qos: QoS::AtLeastOnce,
+                retain: false,
+                sub_id: SubIds::default(),
+            },
         };
         Inflight {
             pkid,

@@ -4,7 +4,7 @@
 use zzq_proto::topic::{validate_filter, validate_name};
 use zzq_proto::{Properties, QoS, SubscriptionOptions, Version};
 
-use crate::index::SubIds;
+use crate::index::{Grant, SubIds};
 use crate::msg::{Msg, Publication};
 use crate::session::{Kept, Queued, Session, Will};
 
@@ -92,12 +92,18 @@ pub(super) fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
 }
 
 pub(super) fn put_item(b: &mut Vec<u8>, q: &Kept, clock: Clock) {
-    b.push(q.qos as u8);
-    b.push(u8::from(q.retain));
-    for slot in q.sub_id.slots() {
+    put_grant(b, q.grant);
+    put_msg(b, &q.msg, clock);
+}
+
+/// What a delivery grants: QoS, retain flag and the four subscription
+/// identifier slots.
+pub(crate) fn put_grant(b: &mut Vec<u8>, g: Grant) {
+    b.push(g.qos as u8);
+    b.push(u8::from(g.retain));
+    for slot in g.sub_id.slots() {
         put_u32(b, slot);
     }
-    put_msg(b, &q.msg, clock);
 }
 
 pub(super) fn put_msg(b: &mut Vec<u8>, m: &Msg, clock: Clock) {
@@ -220,21 +226,35 @@ impl<'a> Decoder<'a> {
 
     /// A QoS 1/2 message a session holds.
     pub(super) fn item(&mut self, clock: Clock) -> Result<Queued, &'static str> {
+        let grant = self.held_grant()?;
+        Ok(Queued {
+            msg: self.msg(clock)?,
+            grant,
+        })
+    }
+
+    /// A [`put_grant`].
+    pub(super) fn grant(&mut self) -> Result<Grant, &'static str> {
         let qos = self.qos()?;
-        if qos == QoS::AtMostOnce {
-            return Err("QoS 0 message held");
-        }
         let retain = self.flag()?;
         let mut sub_id = SubIds::default();
         for _ in 0..4 {
             sub_id.add(self.u32()?);
         }
-        Ok(Queued {
-            msg: self.msg(clock)?,
+        Ok(Grant {
             qos,
             retain,
             sub_id,
         })
+    }
+
+    /// A [`put_grant`] of a message a session holds: at QoS 1 or 2.
+    pub(super) fn held_grant(&mut self) -> Result<Grant, &'static str> {
+        let grant = self.grant()?;
+        if grant.qos == QoS::AtMostOnce {
+            return Err("QoS 0 message held");
+        }
+        Ok(grant)
     }
 
     pub(super) fn session(&mut self, clock: Clock) -> Result<SessionState, &'static str> {
@@ -343,7 +363,7 @@ impl<'a> Decoder<'a> {
             seen[word] |= bit;
             let released = self.flag()?;
             let item = self.item(clock)?;
-            if released && item.qos != QoS::ExactlyOnce {
+            if released && item.grant.qos != QoS::ExactlyOnce {
                 return Err("released QoS 1 message");
             }
             inflight.push((pkid, item, released));

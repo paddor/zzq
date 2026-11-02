@@ -6,10 +6,9 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 use zzq_proto::topic::validate_filter;
-use zzq_proto::{QoS, SubscriptionOptions, Version};
+use zzq_proto::{SubscriptionOptions, Version};
 
 use crate::disk::Append;
-use crate::index::SubIds;
 use crate::msg::Msg;
 use crate::session::{Queued, Will};
 use crate::state::codec::Decoder;
@@ -385,20 +384,9 @@ impl Replayed {
 
     fn queued(&mut self, d: &mut Decoder<'_>, msg: &Msg) -> Result<(), &'static str> {
         let seq = d.u64()?;
-        let qos = d.qos()?;
-        if qos == QoS::AtMostOnce {
-            return Err("QoS 0 message held");
-        }
-        let retain = d.flag()?;
-        let mut sub_id = SubIds::default();
-        for _ in 0..4 {
-            sub_id.add(d.u32()?);
-        }
         let queued = Queued {
+            grant: d.held_grant()?,
             msg: msg.clone(),
-            qos,
-            retain,
-            sub_id,
         };
         let item = Item {
             queued,

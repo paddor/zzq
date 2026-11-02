@@ -29,6 +29,7 @@ impl crate::disk::Append for Records {
 
 /// The body of a handoff of session `c`, for packet ID 3.
 fn pending_body(clock: Clock) -> Vec<u8> {
+    use crate::index::SubIds;
     use crate::state::handoff::{Pending, Target};
 
     let pending = Pending {
@@ -43,9 +44,11 @@ fn pending_body(clock: Clock) -> Vec<u8> {
             lane: 1,
             client: "target".into(),
             birth: 7,
-            qos: QoS::ExactlyOnce,
-            retain: false,
-            sub_id: SubIds::one(5),
+            grant: Grant {
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                sub_id: SubIds::one(5),
+            },
         }],
     };
     let mut body = Vec::new();

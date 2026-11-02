@@ -7,12 +7,12 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use zzq_proto::{QoS, SubscriptionOptions};
+use zzq_proto::SubscriptionOptions;
 
 use crate::cluster::{GroupWriter, Journal};
 use crate::disk::{self, Append, Completion, Log};
 use crate::durable::{Cursor, JournalId, Journaled, RETRY, Wait};
-use crate::index::SubIds;
+use crate::index::Grant;
 use crate::msg::Publication;
 use crate::session::{Progress, Session};
 use crate::slab::{Key, Slab};
@@ -377,7 +377,7 @@ impl Lane {
         key: Key,
         p: &Publication<'_>,
         owned: &mut Owned,
-        g: (QoS, bool, SubIds),
+        g: Grant,
     ) -> u64 {
         let Some(s) = self.sessions.get_mut(key).filter(|s| s.journaled) else {
             return 0;
