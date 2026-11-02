@@ -1,5 +1,7 @@
 use std::io;
 
+use crate::Endpoint;
+
 /// A source error from a dependency, such as rustls or quinn.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -56,3 +58,29 @@ pub enum Error {
 
 /// Engine result.
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    /// Names `endpoint` in a failure to bind or connect it: one of the
+    /// socket below it, or one a transport named itself.
+    pub(crate) fn at(self, endpoint: &Endpoint) -> Error {
+        match self {
+            Error::Io(source) if source.kind() == io::ErrorKind::AddrInUse => Error::AddressInUse {
+                endpoint: endpoint.to_string(),
+                source,
+            },
+            Error::Io(e) if e.kind() == io::ErrorKind::ConnectionRefused => Error::Refused {
+                endpoint: endpoint.to_string(),
+                source: Some(e.into()),
+            },
+            Error::AddressInUse { source, .. } => Error::AddressInUse {
+                endpoint: endpoint.to_string(),
+                source,
+            },
+            Error::Refused { source, .. } => Error::Refused {
+                endpoint: endpoint.to_string(),
+                source,
+            },
+            e => e,
+        }
+    }
+}

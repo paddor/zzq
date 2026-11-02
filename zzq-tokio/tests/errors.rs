@@ -53,6 +53,36 @@ async fn bind_and_connect_errors_keep_their_source() {
     assert_eq!(e.to_string(), format!("connection refused: {taken}"));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn errors_name_the_endpoint_as_bound_or_dialed() {
+    let ctx = Context::new().unwrap();
+    let opts = TransportOptions::default();
+    // A WebSocket listener binds TCP below it; its error names ws://.
+    let ws = Listener::bind(&ctx, &"ws://127.0.0.1:0".parse().unwrap(), &opts)
+        .await
+        .unwrap();
+    let taken = ws.endpoint();
+    let Err(e) = Listener::bind(&ctx, &taken, &opts).await else {
+        panic!("second ws bind succeeded");
+    };
+    assert_eq!(e.to_string(), format!("address in use: {taken}"));
+    // An IPv6 host keeps its brackets, where the host has IPv6.
+    let Ok(v6) = Listener::bind(&ctx, &"tcp://[::1]:0".parse().unwrap(), &opts).await else {
+        return;
+    };
+    let taken = v6.endpoint();
+    assert!(taken.to_string().starts_with("tcp://[::1]:"), "{taken}");
+    let Err(e) = Listener::bind(&ctx, &taken, &opts).await else {
+        panic!("second tcp bind succeeded");
+    };
+    assert_eq!(e.to_string(), format!("address in use: {taken}"));
+    drop(v6);
+    let Err(e) = connect(&ctx, &taken, &opts).await else {
+        panic!("connect to a closed port succeeded");
+    };
+    assert_eq!(e.to_string(), format!("connection refused: {taken}"));
+}
+
 #[cfg(feature = "tls")]
 #[tokio::test(flavor = "multi_thread")]
 async fn tls_errors_name_the_failed_step() {

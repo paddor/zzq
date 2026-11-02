@@ -40,6 +40,10 @@ Notable changes to zzq. The format follows
   leader's own clock, and followers read it in cluster time, so on a
   node whose clock was off the others the message expired early or
   late there. It now writes cluster time, as other records do.
+- `zzq-tokio`: `Error::AddressInUse` for a `tls://`, `ws://` or `wss://`
+  bind named the endpoint `tcp://`, and TCP and QUIC errors dropped the
+  brackets of an IPv6 host. Bind and connect errors now name the
+  endpoint as given.
 
 ## [0.5.0] - 2026-10-31
 

@@ -263,16 +263,16 @@ impl Listener {
         opts: &TransportOptions,
     ) -> Result<Listener> {
         let _ = opts;
-        match endpoint {
+        let res = match endpoint {
             #[cfg(feature = "tls")]
             Endpoint::Tls { host, port } => {
                 let tls = opts.tls.as_ref().ok_or(Error::Tls {
                     what: "tls:// needs TransportOptions::tls",
                     source: None,
                 })?;
-                Ok(Listener::Tls(
-                    tls::TlsListener::bind(host, *port, tls).await?,
-                ))
+                tls::TlsListener::bind(host, *port, tls)
+                    .await
+                    .map(Listener::Tls)
             }
             #[cfg(feature = "quic")]
             Endpoint::Quic { host, port } => {
@@ -280,26 +280,27 @@ impl Listener {
                     what: "quic:// needs TransportOptions::tls",
                     source: None,
                 })?;
-                Ok(Listener::Quic(
-                    quic::QuicListener::bind(ctx, host, *port, tls).await?,
-                ))
+                quic::QuicListener::bind(ctx, host, *port, tls)
+                    .await
+                    .map(Listener::Quic)
             }
-            Endpoint::Ws { host, port, path } => Ok(Listener::Ws(
-                ws::WsListener::bind(host, *port, path, None).await?,
-            )),
-            Endpoint::Wss { host, port, path } => Ok(Listener::Ws(
-                ws::WsListener::bind(host, *port, path, Some(opts)).await?,
-            )),
+            Endpoint::Ws { host, port, path } => ws::WsListener::bind(host, *port, path, None)
+                .await
+                .map(Listener::Ws),
+            Endpoint::Wss { host, port, path } => {
+                ws::WsListener::bind(host, *port, path, Some(opts))
+                    .await
+                    .map(Listener::Ws)
+            }
             Endpoint::Tcp { host, port } => {
-                Ok(Listener::Tcp(tcp::TcpListener::bind(host, *port).await?))
+                tcp::TcpListener::bind(host, *port).await.map(Listener::Tcp)
             }
             #[cfg(unix)]
-            Endpoint::Ipc(path) => Ok(Listener::Ipc(ipc::IpcListener::bind(path)?)),
-            Endpoint::Inproc(name) => {
-                Ok(Listener::Inproc(inproc::InprocListener::bind(ctx, name)?))
-            }
+            Endpoint::Ipc(path) => ipc::IpcListener::bind(path).map(Listener::Ipc),
+            Endpoint::Inproc(name) => inproc::InprocListener::bind(ctx, name).map(Listener::Inproc),
             other => Err(unsupported(other)),
-        }
+        };
+        res.map_err(|e| e.at(endpoint))
     }
 
     /// Waits for the next connection.
@@ -369,14 +370,7 @@ pub async fn connect(
         Endpoint::Inproc(name) => inproc::connect(ctx, name).await,
         other => Err(unsupported(other)),
     };
-    // The TCP connect under TLS or WebSocket.
-    res.map_err(|e| match e {
-        Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => Error::Refused {
-            endpoint: endpoint.to_string(),
-            source: Some(e.into()),
-        },
-        e => e,
-    })
+    res.map_err(|e| e.at(endpoint))
 }
 
 const fn unsupported(endpoint: &Endpoint) -> Error {

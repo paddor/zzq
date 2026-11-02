@@ -229,22 +229,13 @@ impl QuicListener {
     ) -> Result<QuicListener> {
         let config = server_config(o)?;
         let addr = resolve(host, port).await?[0];
-        let in_use = |e: io::Error| match e.kind() {
-            io::ErrorKind::AddrInUse => Error::AddressInUse {
-                endpoint: format!("quic://{host}:{port}"),
-                source: e,
-            },
-            _ => Error::Io(e),
-        };
         // A plain socket first: SO_REUSEPORT would share a port that another
         // listener holds with it too, such as another QUIC listener.
-        let bound = std::net::UdpSocket::bind(addr)
-            .and_then(|probe| probe.local_addr())
-            .map_err(in_use)?;
+        let bound = std::net::UdpSocket::bind(addr).and_then(|probe| probe.local_addr())?;
         let lanes = if cfg!(unix) { ctx.lanes() } else { 1 };
         let mut sockets = Vec::with_capacity(lanes);
         for _ in 0..lanes {
-            sockets.push(reuse_socket(bound).map_err(in_use)?);
+            sockets.push(reuse_socket(bound)?);
         }
         // Unbounded: each entry is a connection whose handshake took the
         // client round trips, and the listener's owner takes them as they
