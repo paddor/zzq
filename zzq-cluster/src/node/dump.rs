@@ -323,6 +323,10 @@ mod tests {
             log: LogLimits::default(),
             wire: WireLimits::for_transfer(64, 1 << 20).unwrap(),
             fingerprint: 4,
+            clock: crate::clock::ClockConfig {
+                origin_millis: 0,
+                tolerance_millis: 1000,
+            },
         }
     }
 

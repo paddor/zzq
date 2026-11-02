@@ -5,21 +5,28 @@ use bytes::Bytes;
 use zzq_cluster::OpNumber;
 
 use super::app::Accumulators;
+use super::clock::ClusterClock;
 use super::{GroupWriter, Journal, dump, image};
 use crate::disk::Append;
 
 const LANES: usize = 2;
 const LEVELS: usize = 8;
 
+fn clock() -> ClusterClock {
+    ClusterClock::new(0, 1000)
+}
+
 /// Applies `data` as an op, and reads it as an image and as a dump. A
-/// state an image rebuilt cuts an image that rebuilds it again.
+/// state an image rebuilt cuts an image that rebuilds it again, also read
+/// in a cluster time an hour away.
 ///
 /// # Panics
 ///
 /// When it finds a bug.
 pub(crate) fn state(data: &[u8]) {
     let bytes = Bytes::copy_from_slice(data);
-    let _ = Accumulators::new(LANES, LEVELS).apply(OpNumber(1), data);
+    let clock = clock();
+    let _ = Accumulators::new(LANES, LEVELS, &clock).apply(OpNumber(1), data, &clock);
     install(&bytes);
     if let Ok(d) = dump::decode(&bytes) {
         install(&d.image);
@@ -30,13 +37,19 @@ fn install(bytes: &Bytes) {
     let Ok(parts) = image::decode(bytes) else {
         return;
     };
-    let Ok(acc) = Accumulators::from_image(LANES, LEVELS, &parts) else {
+    let clock = clock();
+    let Ok(acc) = Accumulators::from_image(LANES, LEVELS, &parts, &clock) else {
         return;
     };
-    let again = image::decode(&image::encode(&acc.image(OpNumber(1))));
+    let again = image::decode(&image::encode(&acc.image(OpNumber(1), &clock)));
     assert!(
-        again.is_ok_and(|p| Accumulators::from_image(LANES, LEVELS, &p).is_ok()),
+        again.is_ok_and(|p| Accumulators::from_image(LANES, LEVELS, &p, &clock).is_ok()),
         "an image of a rebuilt state rebuilds it"
+    );
+    clock.observe(Some(-3_600_000));
+    assert!(
+        acc.anchored(OpNumber(1), &clock).is_ok(),
+        "a rebuilt state reads in another time"
     );
 }
 
@@ -54,11 +67,12 @@ pub(crate) fn seeds() -> Vec<Vec<u8>> {
         let _ = retained.append(r[0], &[&r[1..]]);
     }
     let ops = [sessions.finish(), retained.finish()];
-    let mut acc = Accumulators::new(LANES, LEVELS);
+    let clock = clock();
+    let mut acc = Accumulators::new(LANES, LEVELS, &clock);
     for (n, op) in (1..).zip(&ops) {
-        let _ = acc.apply(OpNumber(n), op);
+        let _ = acc.apply(OpNumber(n), op, &clock);
     }
-    let image = image::encode(&acc.image(OpNumber(2)));
+    let image = image::encode(&acc.image(OpNumber(2), &clock));
     let dump = dump::encode(b"node", &image);
     let mut seeds: Vec<Vec<u8>> = ops.iter().map(|b| b.to_vec()).collect();
     seeds.push(image.to_vec());

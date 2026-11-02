@@ -49,6 +49,13 @@ impl Driver {
         }
     }
 
+    pub(super) const fn suspects_view(&self) -> bool {
+        match &self.inner {
+            Some(d) => d.suspects_view(),
+            None => false,
+        }
+    }
+
     pub(super) fn intact_state(&self) -> Option<crate::RecoveredState> {
         self.inner.as_ref()?.intact_state()
     }

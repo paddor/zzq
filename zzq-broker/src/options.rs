@@ -243,12 +243,16 @@ impl fmt::Debug for BrokerOptions {
 pub struct ClusterOptions {
     /// The cluster and this node in it. The broker sets its
     /// `fingerprint` from what its state depends on: the lane count and
-    /// `max_topic_levels`.
+    /// `max_topic_levels`, and its clock's `origin_millis` from its own
+    /// clock.
     pub node: zzq_cluster::node::NodeConfig,
     /// How the node starts without an exit dump.
     pub start: ClusterStart,
     /// Frames to and from the other two nodes.
     pub links: ClusterLinks,
+    /// Milliseconds this node's wall clock is moved by: zero, but where a
+    /// simulation gives a node a wrong clock.
+    pub clock_offset_millis: i64,
 }
 
 /// How a node starts.

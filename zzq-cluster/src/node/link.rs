@@ -49,6 +49,8 @@ pub(super) struct Peer {
     pub(super) acked_at: Option<Duration>,
     /// The first op it fetches while it recovers, and when it last asked.
     pub(super) pin: Option<(OpNumber, Duration)>,
+    /// The session this node last sent its wall time on.
+    pub(super) sampled: Option<LinkSessionId>,
 }
 
 impl Peer {
@@ -65,6 +67,7 @@ impl Peer {
             retired_at: None,
             acked_at: None,
             pin: None,
+            sampled: None,
         }
     }
 }

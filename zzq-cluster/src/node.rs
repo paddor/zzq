@@ -8,6 +8,7 @@
 //! [`Node::propose`] and acks clients once [`Event::Committed`] covers
 //! them. Storage is RAM: an op is stored once it is in the log.
 
+mod clock;
 mod dump;
 mod election;
 mod epoch;
@@ -30,8 +31,8 @@ use bytes::Bytes;
 use crate::driver::{Action, DriverError, ReplicaDriver, Timing};
 use crate::wire::{ReplicaMessage, WireError, WireLimits};
 use crate::{
-    Configuration, JournalGeneration, NodeId, NormalReplica, OpNumber, PipelineLimits, Prefix,
-    ReplicationError, RequestId, StartView, Status, decode_packet,
+    Configuration, JournalGeneration, NodeId, NormalReplica, OpNumber, Opcode, PipelineLimits,
+    Prefix, ReplicationError, RequestId, StartView, Status, decode_packet,
 };
 
 use history::Fetch;
@@ -64,6 +65,8 @@ pub struct NodeConfig {
     /// The application's shape, such as its lane count: links bind only
     /// between nodes with the same.
     pub fingerprint: u64,
+    /// Its wall clock, for samples to the other two.
+    pub clock: crate::clock::ClockConfig,
 }
 
 /// Frames for one other node.
@@ -114,6 +117,8 @@ pub struct NodeStatus {
     /// A newer epoch another node forced, which this node, holding state,
     /// does not join.
     pub newer_epoch: Option<u64>,
+    /// What the clock samples say.
+    pub clock: crate::clock::ClockStatus,
 }
 
 /// What the application acts on.
@@ -247,6 +252,7 @@ pub struct Node {
     images: Images,
     lease: Lease,
     epochs: epoch::Epochs,
+    clock: clock::Sampling,
     /// The time of the last input.
     now: Duration,
     out: VecDeque<Outgoing>,
@@ -279,6 +285,7 @@ impl Node {
         let (Some(a), Some(b)) = (peers.next(), peers.next()) else {
             return Err(ReplicationError::UnknownVoter.into());
         };
+        let clock = clock::Sampling::new(config.clock, [a.id, b.id]);
         let mut node = Node {
             config,
             encoder: Encoder {
@@ -315,6 +322,7 @@ impl Node {
                 follow_until: now + config.timing.primary_timeout / 2 + config.timing.heartbeat,
                 led: None,
             },
+            clock,
             now,
         };
         node.update_role();
@@ -362,6 +370,7 @@ impl Node {
             log_last: self.log.last().op,
             epoch: self.epoch(),
             newer_epoch: self.epochs.newer,
+            clock: self.clock(),
         }
     }
 
@@ -403,6 +412,15 @@ impl Node {
             self.hello_again(i, now)?;
             return Err(NodeError::NoSession);
         };
+        if packet.envelope.opcode == Opcode::ClockSample {
+            if packet.envelope.session != Some(session) {
+                self.hello_again(i, now)?;
+                return Err(WireError::Peer.into());
+            }
+            self.peers[i].knows_us = true;
+            self.now = self.now.max(now);
+            return self.on_sample(from, packet, now);
+        }
         let binding = self.encoder.binding(from, session)?;
         let message = match crate::wire::decode(&borrowed, binding, self.config.wire) {
             Ok(message) => message,
@@ -473,6 +491,7 @@ impl Node {
                 }
             }
         }
+        self.send_samples(now);
         if self.recovering.is_some() {
             self.poll_recovery(now);
             self.emit_commits();
@@ -492,7 +511,12 @@ impl Node {
 
     /// When [`Node::poll`] next has work, if it knows.
     pub fn next_deadline(&self) -> Option<Duration> {
-        self.driver.next_deadline()
+        let sample = self.clock.next();
+        Some(
+            self.driver
+                .next_deadline()
+                .map_or(sample, |d| d.min(sample)),
+        )
     }
 
     /// The next frames to send.

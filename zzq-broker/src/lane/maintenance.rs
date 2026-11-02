@@ -26,16 +26,18 @@ impl Lane {
         self.reap_handoffs();
         self.check_state();
         // A state dump keeps sessions and delayed wills with their due
-        // times.
-        let open = self.phase == Phase::Open;
-        if open {
+        // times, and so does a cluster node without cluster time yet.
+        let expire = self.phase == Phase::Open && !self.shared.expiry_held();
+        if expire {
             self.fire_wills(now);
         }
         let part = self.sweeps % SWEEP_PARTS;
         self.sweeps = self.sweeps.wrapping_add(1);
         // The retained store is shared; one lane, once a round, is enough.
         if self.id == 0 && part == 0 {
-            self.shared.retained.sweep(now);
+            if expire {
+                self.shared.retained.sweep(now);
+            }
             let _ = self.shared.retained.snapshot(false);
         }
         if self.pairs_on() {
@@ -75,7 +77,7 @@ impl Lane {
                 {
                     Self::kick(c, s.version, reason::KEEP_ALIVE_TIMEOUT);
                 }
-            } else if open && s.expires_at.is_some_and(|t| t <= now) {
+            } else if expire && s.expires_at.is_some_and(|t| t <= now) {
                 self.remove_session(key);
             }
         }

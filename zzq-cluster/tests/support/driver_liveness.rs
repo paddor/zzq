@@ -557,3 +557,50 @@ fn an_isolated_primary_asks_to_leave_its_view_until_a_backup_acks() {
     backup.observe_isolation(now).unwrap();
     assert_eq!(backup.poll(now).unwrap(), None);
 }
+
+/// A voter that missed a view, and cannot hear that view's primary, learns of
+/// it from a follower: an installed voter answers a request to leave an older
+/// view with its own view's `START_VIEW_CHANGE`, once per retransmission
+/// interval. Otherwise, with the primary gone, the two could never form a view.
+#[test]
+fn an_installed_voter_answers_an_old_request_with_its_view_fence() {
+    let (mut replicas, mut stable, acknowledged) = rejoining_fixture();
+    let now = admit_rejoin(&mut replicas, &mut stable, acknowledged);
+    // Voter 1 leads view 1; voter 0 follows it.
+    let follower = &mut replicas[0];
+    assert_eq!(follower.scope().view, 1);
+    follower
+        .receive(node(2), wire_control(2, wish(0)), now)
+        .unwrap();
+    let Some(Action::Send {
+        to,
+        message: Control::StartViewChange(fence),
+    }) = follower.poll(now).unwrap()
+    else {
+        panic!("an installed voter answers with its view's fence");
+    };
+    assert_eq!(to, node(2));
+    assert_eq!(fence.scope.view, 1);
+    follower
+        .receive(node(2), wire_control(2, wish(0)), now)
+        .unwrap();
+    assert!(
+        !matches!(
+            follower.poll(now).unwrap(),
+            Some(Action::Send {
+                message: Control::StartViewChange(_),
+                ..
+            })
+        ),
+        "answered twice within one retransmission interval"
+    );
+    let mut lagging = driver(normal(2));
+    lagging
+        .receive(
+            node(0),
+            wire_control(0, Control::StartViewChange(fence)),
+            now,
+        )
+        .unwrap();
+    assert_eq!(lagging.scope().view, 1);
+}

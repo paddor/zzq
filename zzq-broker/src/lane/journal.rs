@@ -237,7 +237,7 @@ impl LogState {
         let LogState { log, buf, .. } = self;
         let log = log.as_mut().ok_or(io::ErrorKind::NotConnected)?;
         buf.clear();
-        encode(buf, Clock::now());
+        encode(buf, log.clock());
         if self.in_transaction {
             let len =
                 u32::try_from(buf.len() + tail.len()).map_err(|_| io::ErrorKind::InvalidInput)?;
@@ -257,7 +257,8 @@ impl LogState {
     fn write_all(&mut self, state: (&Slab<Session>, &Handoffs)) -> io::Result<u64> {
         let LogState { log, buf, .. } = self;
         let log = log.as_mut().ok_or(io::ErrorKind::NotConnected)?;
-        let n = put_sessions(log, state, buf, Clock::now())?;
+        let clock = log.clock();
+        let n = put_sessions(log, state, buf, clock)?;
         self.last = n;
         self.stale = false;
         Ok(n)
@@ -545,19 +546,19 @@ impl Lane {
         let log = &self.shared.lane_logs[usize::from(self.id)];
         let mut st = log.lock();
         let st = &mut *st;
-        let last = match st.log.as_mut() {
+        let (last, clock) = match st.log.as_mut() {
             Some(Log::Cluster(c)) => {
                 c.flush();
-                c.appended()
+                (c.appended(), c.clock())
             }
-            _ => 0,
+            _ => (0, Clock::now()),
         };
         let mut part = GroupWriter::new(Journal::Lane(self.id));
         let _ = put_sessions(
             &mut part,
             (&self.sessions, &self.handoffs.state),
             &mut st.buf,
-            Clock::now(),
+            clock,
         );
         (last, part.finish())
     }

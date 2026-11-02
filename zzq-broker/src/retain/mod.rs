@@ -136,15 +136,15 @@ impl Retained {
         let State {
             tree, log, head, ..
         } = &mut *st;
-        let last = match log.as_mut() {
+        let (last, clock) = match log.as_mut() {
             Some(Log::Cluster(c)) => {
                 c.flush();
-                c.appended()
+                (c.appended(), c.clock())
             }
-            _ => 0,
+            _ => (0, Clock::now()),
         };
         let mut part = GroupWriter::new(Journal::Retained(u8::try_from(i).ok()?));
-        let _ = put_messages(&mut part, tree, head, Clock::now());
+        let _ = put_messages(&mut part, tree, head, clock);
         Some((last, part.finish()))
     }
 
@@ -483,7 +483,7 @@ impl State {
             log.append(REMOVE, &[msg.topic().as_bytes()])?
         } else {
             head.clear();
-            state::msg_head(head, msg, Clock::now());
+            state::msg_head(head, msg, log.clock());
             log.append(SET, &[head, msg.payload()])?
         };
         log.flush()?;
@@ -499,7 +499,8 @@ impl State {
         let Some(log) = log else {
             return Err(io::ErrorKind::NotConnected.into());
         };
-        let n = put_messages(log, tree, head, Clock::now())?;
+        let clock = log.clock();
+        let n = put_messages(log, tree, head, clock)?;
         log.flush()?;
         self.stale = false;
         Ok((n, log.backlog()))
@@ -557,25 +558,41 @@ impl Accumulator {
         }
     }
 
-    /// Applies a record of stripe `stripe`.
+    /// Applies a record of stripe `stripe`, its deadlines read with `clock`.
     pub(crate) fn apply(
         &mut self,
         stripe: usize,
         kind: u8,
         body: &[u8],
+        clock: Clock,
     ) -> Result<(), &'static str> {
         let (Some(tree), Some(snapshot)) =
             (self.trees.get_mut(stripe), self.snapshots.get_mut(stripe))
         else {
             return Err("unknown retained stripe");
         };
-        Replay::new(self.max_levels).apply(tree, snapshot, stripe, Record { kind, body })
+        Replay::with_clock(clock, self.max_levels).apply(
+            tree,
+            snapshot,
+            stripe,
+            Record { kind, body },
+        )
     }
 
-    /// Appends a snapshot of stripe `stripe` to `out`.
-    pub(crate) fn image(&self, stripe: usize, out: &mut impl Append) -> io::Result<u64> {
+    /// Appends a snapshot of stripe `stripe` to `out`, its deadlines
+    /// written with `clock`.
+    pub(crate) fn image(
+        &self,
+        stripe: usize,
+        out: &mut impl Append,
+        clock: Clock,
+    ) -> io::Result<u64> {
         let tree = self.trees.get(stripe).ok_or(io::ErrorKind::NotFound)?;
-        put_messages(out, tree, &mut Vec::new(), Clock::now())
+        put_messages(out, tree, &mut Vec::new(), clock)
+    }
+
+    pub(crate) const fn max_levels(&self) -> usize {
+        self.max_levels
     }
 
     /// Hands the trees to `retained`, in place of its own.
@@ -625,8 +642,12 @@ struct Replay {
 
 impl Replay {
     fn new(max_levels: usize) -> Replay {
+        Replay::with_clock(Clock::now(), max_levels)
+    }
+
+    fn with_clock(clock: Clock, max_levels: usize) -> Replay {
         Replay {
-            clock: Clock::now(),
+            clock,
             now: crate::time::now(),
             max_levels,
         }

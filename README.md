@@ -84,7 +84,9 @@ leader listens, so a load balancer's TCP health check finds it. A clean
 stop writes each node's state to its `--state-file`, so the whole cluster
 can stop and come back. If two nodes lost their state at once, as in a
 power cut, `--cluster-force-start` brings the cluster back from the
-newest state one node has.
+newest state one node has. Session expiry, will delays and message expiry
+follow the time two of the three clocks agree on, within
+`--cluster-max-clock-offset-ms`, so one wrong clock moves none of them.
 
 ## Further reading
 

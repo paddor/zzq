@@ -3,6 +3,10 @@
 
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests fail loudly")]
 
+#[path = "cluster/clock.rs"]
+mod clock;
+#[path = "cluster/partition.rs"]
+mod partition;
 #[path = "cluster/sim.rs"]
 mod sim;
 #[path = "cluster/workload.rs"]

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use super::{App, Replica, appended, commits, journals};
 use zzq_cluster::OpNumber;
+use zzq_cluster::clock::SAMPLE_FRESH;
+use zzq_cluster::node::Role;
 
 /// How long a leader without its lease keeps its state and its clients
 /// before the others surely lead without it.
@@ -19,12 +21,33 @@ impl Replica {
             crate::cluster::open_listeners(&self.shared).await;
             return;
         }
+        self.leading_since = Some(self.now());
+        self.promote_when_clocked().await;
+    }
+
+    /// Takes the follower's state in once the clock samples showed a
+    /// majority, so its deadlines are read in cluster time, or once the
+    /// node waited as long as a sample counts: no two clocks agree then.
+    /// Samples go out as links come up, so it seldom waits.
+    pub(super) async fn promote_when_clocked(&mut self) {
+        let Some(since) = self.leading_since else {
+            return;
+        };
+        if self.node.role() != Role::Leader {
+            self.leading_since = None;
+            return;
+        }
+        if !self.groups.clock.read() && self.now() < since + SAMPLE_FRESH {
+            return;
+        }
+        self.leading_since = None;
         self.promote().await;
     }
 
     /// The node does not lead now. Still the leader of its view, it only
     /// missed acks: it stops taking clients and waits for them.
     pub(super) async fn step_down(&mut self) {
+        self.leading_since = None;
         if matches!(self.app, App::Leader) && self.node.leads_view() {
             self.suspended.get_or_insert(self.now());
             crate::cluster::close_listeners(&self.shared);

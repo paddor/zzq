@@ -125,7 +125,7 @@ impl<'a> Iterator for Records<'a> {
 }
 
 /// Groups from every journal for the replica, oldest first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct Groups {
     queue: Mutex<VecDeque<Group>>,
     /// Marked on the push that made the queue non-empty.
@@ -136,6 +136,8 @@ pub(crate) struct Groups {
     pub(crate) listeners: Mutex<Listeners>,
     /// Asks the replica for its exit dump, once.
     pub(crate) exit: Mutex<Option<tokio::sync::mpsc::Sender<super::ExitReply>>>,
+    /// The time deadlines are written and read in.
+    pub(crate) clock: super::clock::ClusterClock,
 }
 
 /// A node's client endpoints, and the accept tasks while it leads.
@@ -161,7 +163,24 @@ impl Listeners {
     }
 }
 
+impl Default for Groups {
+    fn default() -> Groups {
+        Groups::new(super::clock::ClusterClock::new(0, 0))
+    }
+}
+
 impl Groups {
+    pub(crate) fn new(clock: super::clock::ClusterClock) -> Groups {
+        Groups {
+            queue: Mutex::default(),
+            ready: DataSignal::default(),
+            status: Mutex::default(),
+            listeners: Mutex::default(),
+            exit: Mutex::default(),
+            clock,
+        }
+    }
+
     fn lock(&self) -> MutexGuard<'_, VecDeque<Group>> {
         self.queue.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -271,6 +290,11 @@ pub(crate) struct ClusterLog {
 }
 
 impl ClusterLog {
+    /// Both clocks now, in cluster time.
+    pub(crate) fn clock(&self) -> crate::state::Clock {
+        self.groups.clock.clock()
+    }
+
     pub(crate) fn new(journal: Journal, groups: Arc<Groups>) -> ClusterLog {
         ClusterLog {
             journal,

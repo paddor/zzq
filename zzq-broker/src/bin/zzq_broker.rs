@@ -4,7 +4,8 @@
 //! [--client-ca PEM] [--data-dir PATH] [--state-file PATH]
 //! [--max-state-mib N] [--busy-poll] [--spin-us N]
 //! [--cluster-node NAME --cluster-peers NAME=URI,NAME=URI,NAME=URI
-//! [--cluster-name NAME] [--cluster-bootstrap | --cluster-force-start]]`
+//! [--cluster-name NAME] [--cluster-max-clock-offset-ms N]
+//! [--cluster-bootstrap | --cluster-force-start]]`
 //!
 //! Without `--bind`, it binds `tcp://0.0.0.0:1883`. `--cert` and `--key`,
 //! which go together, enable `tls://`, `wss://` and `quic://` binds.
@@ -32,11 +33,19 @@
 //! without theirs. What was acked after that state is lost. It says on
 //! stderr when it leads, follows or elects, and when another node forced
 //! an epoch it does not join.
+//!
+//! Cluster nodes send each other their wall time once a second. Clocks
+//! within `--cluster-max-clock-offset-ms` of each other (1000 by default)
+//! agree. Session expiry, will delays and message expiry follow the time
+//! most clocks agree on, so one wrong clock moves none of them; a node
+//! holds them until it first has that time. It says on stderr while its
+//! clock is off the others and while no two clocks agree.
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use zzq_broker::{Broker, BrokerOptions, Config, Context};
+use zzq_cluster::clock::SAMPLE_INTERVAL;
 use zzq_cluster::node::Role;
 
 struct Args {
@@ -58,6 +67,7 @@ struct ClusterArgs {
     name: Option<String>,
     node: Option<String>,
     peers: Option<String>,
+    max_clock_offset_ms: Option<u64>,
     bootstrap: bool,
     force: bool,
 }
@@ -107,6 +117,9 @@ fn set(a: &mut Args, flag: &str, value: String) -> Option<()> {
         "--cluster-name" => a.cluster.name = Some(value),
         "--cluster-node" => a.cluster.node = Some(value),
         "--cluster-peers" => a.cluster.peers = Some(value),
+        "--cluster-max-clock-offset-ms" => {
+            a.cluster.max_clock_offset_ms = Some(value.parse().ok()?);
+        }
         _ => return None,
     }
     Some(())
@@ -158,6 +171,7 @@ mod cluster {
 
     use xxhash_rust::xxh3::xxh3_128;
     use zzq_broker::{ClusterOptions, ClusterStart};
+    use zzq_cluster::clock::ClockConfig;
     use zzq_cluster::driver::Timing;
     use zzq_cluster::node::{LogLimits, NodeConfig};
     use zzq_cluster::wire::WireLimits;
@@ -213,7 +227,7 @@ mod cluster {
         let links =
             zzq_broker::omq_links(local, &nodes).map_err(|e| format!("cluster: {}", chain(&e)))?;
         Ok(Some(ClusterOptions {
-            node: node_config(configuration, local)?,
+            node: node_config(configuration, local, c.max_clock_offset_ms.unwrap_or(1000))?,
             start: match (c.bootstrap, c.force) {
                 (true, true) => {
                     return Err("--cluster-bootstrap or --cluster-force-start, not both".to_owned());
@@ -223,10 +237,15 @@ mod cluster {
                 (false, false) => ClusterStart::Recover,
             },
             links,
+            clock_offset_millis: 0,
         }))
     }
 
-    fn node_config(configuration: Configuration, local: NodeId) -> Result<NodeConfig, String> {
+    fn node_config(
+        configuration: Configuration,
+        local: NodeId,
+        tolerance_millis: u64,
+    ) -> Result<NodeConfig, String> {
         Ok(NodeConfig {
             configuration,
             local,
@@ -245,6 +264,11 @@ mod cluster {
             wire: WireLimits::for_transfer(256, 64 << 20).ok_or("cluster wire limits")?,
             // The broker sets it.
             fingerprint: 0,
+            clock: ClockConfig {
+                // The broker sets it.
+                origin_millis: 0,
+                tolerance_millis,
+            },
         })
     }
 }
@@ -337,16 +361,24 @@ async fn watch(broker: &Broker, dir: Option<&str>, max_state: usize) {
 }
 
 /// Says on stderr, checked every 100 ms, when cluster node `node` comes to
-/// lead, follow or elect. Ends never.
+/// lead, follow or elect, and once a change of what its clock samples say
+/// lasted a sample interval. Ends never.
 async fn roles(broker: &Broker, node: Option<&str>) {
     let Some(node) = node else {
         return std::future::pending().await;
     };
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let (mut was, mut told) = (None, None);
+    let mut clock = Lasting::new(ClockNote::Agreed);
     loop {
         tick.tick().await;
         let status = broker.cluster_status();
+        if let Some(s) = status
+            && let Some(note) = clock.settle(clock_note(&s.clock), SAMPLE_INTERVAL)
+            && let Some(line) = clock_line(node, note)
+        {
+            eprintln!("{line}");
+        }
         let role = status.map(|s| s.role);
         if role != was
             && let Some(line) = role.and_then(|r| role_line(node, r))
@@ -364,6 +396,80 @@ async fn roles(broker: &Broker, node: Option<&str>) {
             );
         }
         told = newer;
+    }
+}
+
+/// What the clock samples of a node say, for stderr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClockNote {
+    /// Its clock is one of the majority's.
+    Agreed,
+    /// Its clock is this many ms off the majority's, which it follows.
+    Off(i64),
+    /// It hears a clock, but no two agree.
+    Disagreed(Option<i64>, Option<i64>),
+    /// It hears no clock.
+    Alone,
+}
+
+const fn clock_note(c: &zzq_cluster::clock::ClockStatus) -> ClockNote {
+    let [(_, a), (_, b)] = c.offsets;
+    match c.majority {
+        Some(0) => ClockNote::Agreed,
+        Some(off) => ClockNote::Off(off),
+        None if a.is_some() || b.is_some() => ClockNote::Disagreed(a, b),
+        None => ClockNote::Alone,
+    }
+}
+
+fn clock_line(node: &str, said: ClockNote) -> Option<String> {
+    let ms = |o: Option<i64>| o.map_or_else(|| "none".to_owned(), |o| format!("{o:+} ms"));
+    Some(match said {
+        ClockNote::Agreed => format!("cluster node {node} clock agrees with the others"),
+        ClockNote::Off(off) => format!(
+            "cluster node {node} clock is {} ms {} the other two; deadlines follow theirs",
+            off.unsigned_abs(),
+            if off < 0 { "ahead of" } else { "behind" }
+        ),
+        ClockNote::Disagreed(a, b) => format!(
+            "cluster node {node}: no two clocks agree (the others {}, {}); \
+             deadlines follow the last time most agreed on, expiry waits without one",
+            ms(a),
+            ms(b)
+        ),
+        ClockNote::Alone => return None,
+    })
+}
+
+/// A value said once a change of its kind lasted a while.
+struct Lasting {
+    said: ClockNote,
+    seen: ClockNote,
+    since: tokio::time::Instant,
+}
+
+impl Lasting {
+    fn new(said: ClockNote) -> Lasting {
+        Lasting {
+            said,
+            seen: said,
+            since: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Takes what is `seen` now. Returns it once its kind differs from
+    /// the one said last and held for `lasting`.
+    fn settle(&mut self, seen: ClockNote, lasting: Duration) -> Option<ClockNote> {
+        let kind = std::mem::discriminant::<ClockNote>;
+        if kind(&seen) != kind(&self.seen) {
+            self.since = tokio::time::Instant::now();
+        }
+        self.seen = seen;
+        if kind(&seen) == kind(&self.said) || self.since.elapsed() < lasting {
+            return None;
+        }
+        self.said = seen;
+        Some(seen)
     }
 }
 
@@ -440,7 +546,8 @@ fn main() -> ExitCode {
              [--client-ca PEM] [--data-dir PATH] [--state-file PATH] \
              [--max-state-mib N] [--busy-poll] [--spin-us N] \
              [--cluster-node NAME --cluster-peers NAME=URI,NAME=URI,NAME=URI \
-             [--cluster-name NAME] [--cluster-bootstrap | --cluster-force-start]]"
+             [--cluster-name NAME] [--cluster-max-clock-offset-ms N] \
+             [--cluster-bootstrap | --cluster-force-start]]"
         );
         return ExitCode::FAILURE;
     };
@@ -464,7 +571,70 @@ fn main() -> ExitCode {
 mod tests {
     use zzq_cluster::node::Role;
 
-    use super::{ClusterArgs, full_change, role_line, room_change};
+    use std::time::Duration;
+
+    use zzq_cluster::NodeId;
+    use zzq_cluster::clock::ClockStatus;
+
+    use super::{
+        ClockNote, ClusterArgs, Lasting, clock_line, clock_note, full_change, role_line,
+        room_change,
+    };
+
+    fn status(a: Option<i64>, b: Option<i64>, majority: Option<i64>) -> ClockStatus {
+        let id = |n| NodeId::from_bytes([n; 16]);
+        ClockStatus {
+            offsets: [(id(1), a), (id(2), b)],
+            majority,
+        }
+    }
+
+    #[test]
+    fn what_the_clock_samples_say_is_said_by_node_name() {
+        let line = |a, b, m| clock_line("a", clock_note(&status(a, b, m)));
+        assert_eq!(
+            line(Some(-3), Some(5), Some(0)).as_deref(),
+            Some("cluster node a clock agrees with the others")
+        );
+        assert_eq!(
+            line(Some(-5000), Some(-5002), Some(-5000)).as_deref(),
+            Some("cluster node a clock is 5000 ms ahead of the other two; deadlines follow theirs")
+        );
+        assert!(
+            line(Some(7000), Some(7000), Some(7000))
+                .unwrap()
+                .contains("7000 ms behind")
+        );
+        let none = line(Some(-5000), None, None).unwrap();
+        assert!(
+            none.contains("no two clocks agree (the others -5000 ms, none)"),
+            "{none}"
+        );
+        assert_eq!(line(None, None, None), None, "alone, nothing to say");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_clock_note_is_said_once_it_lasted() {
+        let second = Duration::from_secs(1);
+        let mut l = Lasting::new(ClockNote::Agreed);
+        assert_eq!(l.settle(ClockNote::Off(-9000), second), None);
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(l.settle(ClockNote::Agreed, second), None, "a burst");
+        assert_eq!(l.settle(ClockNote::Off(-9000), second), None);
+        tokio::time::advance(second).await;
+        assert_eq!(
+            l.settle(ClockNote::Off(-9001), second),
+            Some(ClockNote::Off(-9001))
+        );
+        assert_eq!(
+            l.settle(ClockNote::Off(-9002), second),
+            None,
+            "said already"
+        );
+        assert_eq!(l.settle(ClockNote::Agreed, second), None);
+        tokio::time::advance(second).await;
+        assert_eq!(l.settle(ClockNote::Agreed, second), Some(ClockNote::Agreed));
+    }
 
     #[test]
     fn a_role_change_is_said_by_node_name() {

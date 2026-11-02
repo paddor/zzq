@@ -59,6 +59,16 @@ pub(crate) struct Clock {
 }
 
 impl Clock {
+    /// Both clocks read together: `now` on Tokio's, Unix time `wall_ms`.
+    pub(crate) const fn at(now: Instant, wall_ms: u64) -> Clock {
+        Clock { now, wall_ms }
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn wall_ms(self) -> u64 {
+        self.wall_ms
+    }
+
     pub(crate) fn now() -> Clock {
         Clock {
             now: crate::time::now(),
