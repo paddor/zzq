@@ -7,31 +7,21 @@
     reason = "tests fail loudly"
 )]
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
+use support::{WAIT, client, next, nothing};
 use tokio::time::timeout;
 use zzq_broker::{
     AuthDecision, Authenticator, Broker, BrokerOptions, Config, ConnectInfo, Context, SnOptions,
 };
-use zzq_client::{Client, ClientOptions, LastWill, Message};
+use zzq_client::{Client, ClientOptions, LastWill};
 use zzq_proto::{QoS, ReasonCode, SubscriptionOptions, Version};
 
-const WAIT: Duration = Duration::from_secs(5);
-
 async fn setup(lanes: usize) -> (Context, Broker, String) {
-    setup_with(lanes, BrokerOptions::default()).await
-}
-
-async fn setup_with(lanes: usize, opts: BrokerOptions) -> (Context, Broker, String) {
-    let ctx = Context::with_config(&Config {
-        io_threads: lanes,
-        ..Config::default()
-    })
-    .unwrap();
-    let broker = Broker::new(&ctx, opts).await.unwrap();
-    let ep = broker.bind("tcp://127.0.0.1:0").await.unwrap();
-    (ctx, broker, ep.to_string())
+    support::setup(lanes, BrokerOptions::default()).await
 }
 
 #[cfg(feature = "tls")]
@@ -54,28 +44,6 @@ fn test_tls() -> (zzq_broker::TransportOptions, zzq_client::TransportOptions) {
         }),
     };
     (server, client)
-}
-
-async fn client(ctx: &Context, uri: &str, id: &str, version: Version) -> Client {
-    let opts = ClientOptions {
-        version,
-        ..ClientOptions::new(id)
-    };
-    Client::connect(ctx, uri, opts).await.unwrap()
-}
-
-async fn next(c: &mut Client) -> Message {
-    timeout(WAIT, c.recv())
-        .await
-        .expect("timed out")
-        .expect("closed")
-}
-
-async fn nothing(c: &mut Client) {
-    assert!(
-        timeout(Duration::from_millis(200), c.recv()).await.is_err(),
-        "unexpected message"
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -172,7 +140,7 @@ async fn retained_messages() {
         sys_interval: None,
         ..BrokerOptions::default()
     };
-    let (ctx, broker, uri) = setup_with(1, opts).await;
+    let (ctx, broker, uri) = support::setup(1, opts).await;
     let publ = client(&ctx, &uri, "p", Version::V5).await;
     publ.publish_retained("r/1", "one", QoS::AtLeastOnce)
         .await
@@ -404,7 +372,7 @@ async fn authenticator() {
         authenticator: Some(Arc::new(OnlyAlice)),
         ..BrokerOptions::default()
     };
-    let (ctx, _broker, uri) = setup_with(1, opts).await;
+    let (ctx, _broker, uri) = support::setup(1, opts).await;
     let bad = ClientOptions {
         username: Some("bob".into()),
         ..ClientOptions::new("b")
@@ -498,7 +466,7 @@ async fn tls_pub_sub_on_any_lane() {
             },
             ..BrokerOptions::default()
         };
-        let (ctx, broker, _) = setup_with(lanes, opts).await;
+        let (ctx, broker, _) = support::setup(lanes, opts).await;
         let uri = broker.bind("tls://127.0.0.1:0").await.unwrap().to_string();
         let tls = |id: &str| ClientOptions {
             transport: zzq_client::TransportOptions {
@@ -537,7 +505,7 @@ async fn tls_client_skips_verification_only_when_asked() {
         transport: server_tls,
         ..BrokerOptions::default()
     };
-    let (ctx, broker, _) = setup_with(1, opts).await;
+    let (ctx, broker, _) = support::setup(1, opts).await;
     let uri = broker.bind("tls://127.0.0.1:0").await.unwrap().to_string();
     let tls = |danger| ClientOptions {
         transport: zzq_client::TransportOptions {
@@ -885,7 +853,7 @@ mod mqtt_sn {
             sn: sn_with(|sn| sn.retry = Duration::from_millis(200)),
             ..BrokerOptions::default()
         };
-        let (ctx, broker, uri) = setup_with(1, opts).await;
+        let (ctx, broker, uri) = support::setup(1, opts).await;
         let addr = broker
             .bind("udp://127.0.0.1:0")
             .await
@@ -927,7 +895,7 @@ mod mqtt_sn {
     }
 
     async fn bind_sn(opts: BrokerOptions) -> (Context, Broker, String, String) {
-        let (ctx, broker, uri) = setup_with(1, opts).await;
+        let (ctx, broker, uri) = support::setup(1, opts).await;
         let addr = broker
             .bind("udp://127.0.0.1:0")
             .await
@@ -1420,7 +1388,7 @@ async fn quic_refusal_reaches_the_client() {
         max_connections: 1,
         ..BrokerOptions::default()
     };
-    let (ctx, broker, _tcp) = setup_with(1, opts).await;
+    let (ctx, broker, _tcp) = support::setup(1, opts).await;
     let uri = broker.bind("quic://127.0.0.1:0").await.unwrap().to_string();
     let quic = |id: &str| ClientOptions {
         transport: client_tls.clone(),
@@ -1446,7 +1414,7 @@ async fn websocket_plain_and_secure() {
             transport: server_tls.clone(),
             ..BrokerOptions::default()
         };
-        let (ctx, broker, tcp) = setup_with(lanes, opts).await;
+        let (ctx, broker, tcp) = support::setup(lanes, opts).await;
         let ws = broker
             .bind("ws://127.0.0.1:0/mqtt")
             .await
@@ -1490,7 +1458,7 @@ async fn quic_pub_sub_on_any_lane() {
             transport: server_tls.clone(),
             ..BrokerOptions::default()
         };
-        let (ctx, broker, tcp) = setup_with(lanes, opts).await;
+        let (ctx, broker, tcp) = support::setup(lanes, opts).await;
         let uri = broker.bind("quic://127.0.0.1:0").await.unwrap().to_string();
         let mut watcher = client(&ctx, &tcp, "quic-watch", Version::V5).await;
         watcher.subscribe("quic/#", QoS::AtLeastOnce).await.unwrap();
@@ -1577,7 +1545,7 @@ async fn mutual_tls_identifies_clients() {
         authenticator: Some(Arc::new(CertIs(client_cert.der().to_vec()))),
         ..BrokerOptions::default()
     };
-    let (ctx, broker, _) = setup_with(2, opts).await;
+    let (ctx, broker, _) = support::setup(2, opts).await;
     let mut uris = vec![broker.bind("tls://127.0.0.1:0").await.unwrap()];
     if cfg!(feature = "quic") {
         uris.push(broker.bind("quic://127.0.0.1:0").await.unwrap());
@@ -1618,7 +1586,7 @@ async fn retained_messages_survive_restart() {
             data_dir: Some(dir.clone()),
             ..BrokerOptions::default()
         };
-        let (ctx, broker, uri) = setup_with(2, opts).await;
+        let (ctx, broker, uri) = support::setup(2, opts).await;
         if run == 0 {
             let p = client(&ctx, &uri, "p", Version::V5).await;
             for (topic, payload) in [("keep/a", "A"), ("keep/b", "B"), ("keep/b", "")] {
@@ -1657,7 +1625,7 @@ async fn sessions_move_lanes_when_the_lane_count_changes() {
             data_dir: Some(dir.clone()),
             ..BrokerOptions::default()
         };
-        let (ctx, broker, uri) = setup_with(lanes, opts).await;
+        let (ctx, broker, uri) = support::setup(lanes, opts).await;
         let mut clients = Vec::new();
         for id in &ids {
             let c = Client::connect(&ctx, &uri, durable(id.clone()))
@@ -1787,7 +1755,7 @@ async fn client_respects_receive_maximum() {
         receive_maximum: 2,
         ..BrokerOptions::default()
     };
-    let (ctx, _broker, uri) = setup_with(1, opts).await;
+    let (ctx, _broker, uri) = support::setup(1, opts).await;
     let mut sub = client(&ctx, &uri, "rm-sub", Version::V5).await;
     sub.subscribe("rm/#", QoS::AtLeastOnce).await.unwrap();
     let publ = Arc::new(client(&ctx, &uri, "rm-pub", Version::V5).await);
@@ -1883,7 +1851,7 @@ async fn quic_clients_on_every_lane() {
         transport: server_tls,
         ..BrokerOptions::default()
     };
-    let (ctx, broker, _) = setup_with(3, opts).await;
+    let (ctx, broker, _) = support::setup(3, opts).await;
     let uri = broker.bind("quic://127.0.0.1:0").await.unwrap().to_string();
     let clients: Vec<_> = (0..12)
         .map(|i| {

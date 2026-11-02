@@ -2,132 +2,23 @@
 
 #![expect(clippy::unwrap_used, clippy::expect_used, reason = "tests fail loudly")]
 
+mod support;
+
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use support::{Got, Raw, WAIT, next, nothing, setup};
 use tokio::time::timeout;
 use zzq_broker::{Broker, BrokerOptions, Config, Context};
-use zzq_client::{Client, ClientOptions, LastWill, Message};
-use zzq_proto::encode::{self, AckFields, ConnectFields, PublishHeader};
-use zzq_proto::{PacketType, QoS, ReasonCode, SubscriptionOptions, Version, decode};
-
-const WAIT: Duration = Duration::from_secs(5);
-
-async fn setup(lanes: usize, opts: BrokerOptions) -> (Context, Broker, String) {
-    let ctx = Context::with_config(&Config {
-        io_threads: lanes,
-        ..Config::default()
-    })
-    .unwrap();
-    let broker = Broker::new(&ctx, opts).await.unwrap();
-    let uri = broker.bind("tcp://127.0.0.1:0").await.unwrap().to_string();
-    (ctx, broker, uri)
-}
-
-async fn next(c: &mut Client) -> Message {
-    timeout(WAIT, c.recv())
-        .await
-        .expect("timed out")
-        .expect("closed")
-}
-
-async fn nothing(c: &mut Client) {
-    assert!(
-        timeout(Duration::from_millis(300), c.recv()).await.is_err(),
-        "unexpected message"
-    );
-}
-
-/// A raw MQTT connection for packets the client never sends.
-struct Raw {
-    s: TcpStream,
-    buf: Vec<u8>,
-    version: Version,
-}
-
-impl Raw {
-    async fn connect(uri: &str, id: &str, version: Version, keep_alive: u16) -> Raw {
-        Raw::connect_ack(uri, id, version, keep_alive).await.0
-    }
-
-    /// Connects and also returns the CONNACK packet.
-    async fn connect_ack(uri: &str, id: &str, version: Version, keep_alive: u16) -> (Raw, Vec<u8>) {
-        let c = ConnectFields {
-            version,
-            clean_start: true,
-            keep_alive,
-            properties: &[],
-            client_id: id,
-            will: None,
-            username: None,
-            password: None,
-        };
-        Raw::connect_with(uri, &c).await
-    }
-
-    /// Sends `c` and returns the connection and its CONNACK, which must be
-    /// the first packet.
-    async fn connect_with(uri: &str, c: &ConnectFields<'_>) -> (Raw, Vec<u8>) {
-        let addr = uri.trim_start_matches("tcp://");
-        let s = TcpStream::connect(addr).await.unwrap();
-        let mut raw = Raw {
-            s,
-            buf: Vec::new(),
-            version: c.version,
-        };
-        let mut out = Vec::new();
-        encode::connect(c, &mut out);
-        raw.s.write_all(&out).await.unwrap();
-        let (byte1, connack) = raw.packet().await.expect("CONNACK");
-        assert_eq!(byte1 >> 4, 2, "first packet must be CONNACK");
-        (raw, connack)
-    }
-
-    async fn subscribe(&mut self, filter: &str, qos: QoS) {
-        let mut out = Vec::new();
-        let opts = SubscriptionOptions::from(qos);
-        encode::subscribe(self.version, 1, &[], &[(filter, opts)], &mut out);
-        self.write(&out).await;
-        let (byte1, _) = self.packet().await.expect("SUBACK");
-        assert_eq!(byte1 >> 4, 9);
-    }
-
-    async fn write(&mut self, bytes: &[u8]) {
-        self.s.write_all(bytes).await.unwrap();
-    }
-
-    /// Next packet as (first byte, whole packet), `None` once closed.
-    async fn packet(&mut self) -> Option<(u8, Vec<u8>)> {
-        loop {
-            if let Ok(Some((_, n))) = decode(&self.buf, self.version, usize::MAX) {
-                let p: Vec<u8> = self.buf.drain(..n).collect();
-                return Some((p[0], p));
-            }
-            let mut chunk = [0u8; 4096];
-            let n = timeout(WAIT, self.s.read(&mut chunk))
-                .await
-                .expect("read timed out")
-                .ok()?;
-            if n == 0 {
-                return None;
-            }
-            self.buf.extend_from_slice(&chunk[..n]);
-        }
-    }
-}
+use zzq_client::{Client, ClientOptions, LastWill};
+use zzq_proto::encode::{self, ConnectFields, PublishHeader};
+use zzq_proto::{PacketType, QoS, ReasonCode, SubscriptionOptions, Version, reason};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn keep_alive_timeout_closes() {
     let (_ctx, _broker, uri) = setup(1, BrokerOptions::default()).await;
     let mut raw = Raw::connect(&uri, "idle", Version::V5, 1).await;
     let started = std::time::Instant::now();
-    let p = raw.packet().await;
-    if let Some((byte1, packet)) = p {
-        assert_eq!(byte1 >> 4, 14, "expected DISCONNECT");
-        assert_eq!(packet[2], zzq_proto::reason::KEEP_ALIVE_TIMEOUT);
-        assert!(raw.packet().await.is_none());
-    }
+    raw.disconnected(&[reason::KEEP_ALIVE_TIMEOUT]).await;
     assert!(started.elapsed() >= Duration::from_millis(1400));
 }
 
@@ -150,10 +41,8 @@ async fn oversized_packet_disconnects() {
     };
     let mut out = Vec::new();
     encode::publish(&h, &[0; 2000], &mut out);
-    raw.write(&out).await;
-    let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
-    assert_eq!(byte1 >> 4, 14);
-    assert_eq!(packet[2], zzq_proto::reason::PACKET_TOO_LARGE);
+    raw.send(&out).await;
+    raw.disconnected(&[reason::PACKET_TOO_LARGE]).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -176,19 +65,31 @@ async fn qos2_duplicate_is_delivered_once() {
         };
         let mut out = Vec::new();
         encode::publish(&h, b"once", &mut out);
-        raw.write(&out).await;
-        let (byte1, _) = raw.packet().await.unwrap();
-        assert_eq!(byte1 >> 4, 5, "PUBREC");
+        raw.send(&out).await;
+        assert!(
+            matches!(
+                raw.next().await,
+                Got::Ack {
+                    kind: PacketType::PubRec,
+                    pkid: 7,
+                    ..
+                }
+            ),
+            "PUBREC"
+        );
     }
-    let mut rel = Vec::new();
-    encode::ack(
-        &AckFields::new(PacketType::PubRel, 7),
-        Version::V311,
-        &mut rel,
+    raw.ack(PacketType::PubRel, 7).await;
+    assert!(
+        matches!(
+            raw.next().await,
+            Got::Ack {
+                kind: PacketType::PubComp,
+                pkid: 7,
+                ..
+            }
+        ),
+        "PUBCOMP"
     );
-    raw.write(&rel).await;
-    let (byte1, _) = raw.packet().await.unwrap();
-    assert_eq!(byte1 >> 4, 7, "PUBCOMP");
     assert_eq!(next(&mut sub).await.payload, "once");
     nothing(&mut sub).await;
 }
@@ -439,9 +340,8 @@ async fn a_retained_message_sent_on_subscribe_counts_once() {
     // A subscriber that never acks holds the message in its window.
     let mut s = Raw::connect(&uri, "s", Version::V311, 0).await;
     let before = broker.stats().await.unwrap().state_bytes;
-    s.subscribe("r", QoS::AtLeastOnce).await;
-    let (byte1, _) = s.packet().await.expect("PUBLISH");
-    assert_eq!(byte1 >> 4, 3);
+    s.subscribe("r", QoS::AtLeastOnce.into()).await;
+    s.publish().await;
     let grown = broker.stats().await.unwrap().state_bytes - before;
     // The subscription and a slot; the store counts the bytes.
     assert!(grown < (size / 4) as u64, "{grown}");
@@ -641,9 +541,17 @@ async fn queued_messages_expire() {
         };
         let mut out = Vec::new();
         encode::publish(&h, payload, &mut out);
-        raw.write(&out).await;
-        let (byte1, _) = raw.packet().await.unwrap();
-        assert_eq!(byte1 >> 4, 4, "PUBACK");
+        raw.send(&out).await;
+        assert!(
+            matches!(
+                raw.next().await,
+                Got::Ack {
+                    kind: PacketType::PubAck,
+                    ..
+                }
+            ),
+            "PUBACK"
+        );
     }
     tokio::time::sleep(Duration::from_millis(1500)).await;
     let mut c = Client::connect(&ctx, &uri, durable.clone()).await.unwrap();
@@ -881,16 +789,27 @@ async fn max_keep_alive_applies_to_silent_clients() {
         ..BrokerOptions::default()
     };
     let (_ctx, _broker, uri) = setup(1, opts).await;
-    let (mut raw, connack) = Raw::connect_ack(&uri, "forever", Version::V5, 0).await;
-    let props = zzq_proto::Properties::try_from(&connack[5..]).unwrap();
+    let fields = ConnectFields {
+        version: Version::V5,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &[],
+        client_id: "forever",
+        will: None,
+        username: None,
+        password: None,
+    };
+    let (mut raw, connack) = Raw::connack_with(&uri, &fields).await;
+    let Got::ConnAck { props, .. } = connack else {
+        panic!("expected CONNACK, got {connack:?}");
+    };
+    let props = zzq_proto::Properties::try_from(&props[..]).unwrap();
     assert_eq!(
         props.get_int(zzq_proto::property::SERVER_KEEP_ALIVE),
         Some(1)
     );
     let started = std::time::Instant::now();
-    let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
-    assert_eq!(byte1 >> 4, 14);
-    assert_eq!(packet[2], zzq_proto::reason::KEEP_ALIVE_TIMEOUT);
+    raw.disconnected(&[reason::KEEP_ALIVE_TIMEOUT]).await;
     assert!(started.elapsed() >= Duration::from_millis(1400));
 }
 
@@ -923,10 +842,8 @@ async fn deep_topics_are_rejected() {
     };
     let mut out = Vec::new();
     encode::publish(&h, b"x", &mut out);
-    raw.write(&out).await;
-    let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
-    assert_eq!(byte1 >> 4, 14);
-    assert_eq!(packet[2], zzq_proto::reason::TOPIC_NAME_INVALID);
+    raw.send(&out).await;
+    raw.disconnected(&[reason::TOPIC_NAME_INVALID]).await;
     assert!(
         broker
             .publish_retained(&topic, "x", QoS::AtMostOnce)
@@ -1154,19 +1071,23 @@ async fn retained_qos0_delivery_carries_the_time_left() {
     };
     let mut out = Vec::new();
     encode::publish(&h, b"x", &mut out);
-    publ.write(&out).await;
-    assert_eq!(publ.packet().await.unwrap().0 >> 4, 4, "PUBACK");
+    publ.send(&out).await;
+    assert!(
+        matches!(
+            publ.next().await,
+            Got::Ack {
+                kind: PacketType::PubAck,
+                ..
+            }
+        ),
+        "PUBACK"
+    );
     tokio::time::sleep(Duration::from_millis(2200)).await;
     let mut sub = Raw::connect(&uri, "ttl-sub", Version::V5, 0).await;
-    sub.subscribe("ttl", QoS::AtMostOnce).await;
-    let (_, packet) = sub.packet().await.expect("retained PUBLISH");
-    let Some((zzq_proto::Packet::Publish(p), _)) =
-        decode(&packet, Version::V5, usize::MAX).unwrap()
-    else {
-        panic!("expected PUBLISH");
-    };
+    sub.subscribe("ttl", QoS::AtMostOnce.into()).await;
+    let p = sub.publish().await;
     let left = p
-        .properties
+        .properties()
         .get_int(zzq_proto::property::MESSAGE_EXPIRY_INTERVAL)
         .unwrap();
     assert!(left <= 8, "expiry {left}");
@@ -1196,10 +1117,8 @@ async fn publisher_subscription_identifier_is_a_protocol_error() {
     };
     let mut out = Vec::new();
     encode::publish(&h, b"x", &mut out);
-    raw.write(&out).await;
-    let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
-    assert_eq!(byte1 >> 4, 14);
-    assert_eq!(packet[2], zzq_proto::reason::PROTOCOL_ERROR);
+    raw.send(&out).await;
+    raw.disconnected(&[reason::PROTOCOL_ERROR]).await;
     nothing(&mut sub).await;
 }
 
@@ -1217,7 +1136,7 @@ async fn takeover_drops_output_queued_for_the_old_connection() {
         password: None,
     };
     let (mut old, _) = Raw::connect_with(&uri, &fields).await;
-    old.subscribe("flood", QoS::AtMostOnce).await;
+    old.subscribe("flood", QoS::AtMostOnce.into()).await;
     // The old connection stops reading, so output piles up for it.
     let publ = Client::connect(&ctx, &uri, ClientOptions::new("flooder"))
         .await
@@ -1232,14 +1151,16 @@ async fn takeover_drops_output_queued_for_the_old_connection() {
     let (mut new, _) = Raw::connect_with(&uri, &fields).await;
     let mut ping = Vec::new();
     encode::pingreq(&mut ping);
-    new.write(&ping).await;
-    let (byte1, _) = new.packet().await.expect("PINGRESP");
-    assert_eq!(byte1 >> 4, 13, "stale output after CONNACK");
+    new.send(&ping).await;
+    assert_eq!(
+        new.next().await,
+        Got::PingResp,
+        "stale output after CONNACK"
+    );
     drop(old);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-#[expect(clippy::too_many_lines, reason = "one exchange with a fake broker")]
 async fn client_waits_for_a_free_packet_id() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let uri = format!("tcp://{}", listener.local_addr().unwrap());
@@ -1256,15 +1177,14 @@ async fn client_waits_for_a_free_packet_id() {
         let ctx = ctx.clone();
         async move { Client::connect(&ctx, &uri, opts).await.unwrap() }
     });
-    let mut broker = Raw {
-        s: listener.accept().await.unwrap().0,
-        buf: Vec::new(),
-        version: Version::V311,
-    };
-    assert_eq!(broker.packet().await.unwrap().0 >> 4, 1, "CONNECT");
+    let mut broker = Raw::accepted(listener.accept().await.unwrap().0, Version::V311);
+    assert!(
+        matches!(broker.next().await, Got::Other(b) if b >> 4 == 1),
+        "CONNECT"
+    );
     let mut out = Vec::new();
     encode::connack(&encode::ConnAckFields::default(), Version::V311, &mut out);
-    broker.write(&out).await;
+    broker.send(&out).await;
     let c = std::sync::Arc::new(connecting.await.unwrap());
     // No Receive Maximum: every packet ID goes to an unacked publish.
     for _ in 0..u16::MAX {
@@ -1272,26 +1192,20 @@ async fn client_waits_for_a_free_packet_id() {
         tokio::spawn(async move { c.publish("t", "x", QoS::AtLeastOnce).await });
     }
     for _ in 0..u16::MAX {
-        assert_eq!(broker.packet().await.unwrap().0 >> 4, 3, "PUBLISH");
+        broker.publish().await;
     }
     let sub = tokio::spawn({
         let c = c.clone();
         async move { c.subscribe("s", QoS::AtMostOnce).await }
     });
     // The SUBSCRIBE waits for an ID.
-    let mut byte = [0u8; 1];
-    let early = timeout(Duration::from_millis(300), broker.s.read(&mut byte)).await;
-    assert!(early.is_err(), "SUBSCRIBE without a free packet ID");
-    let mut puback = Vec::new();
-    encode::ack(
-        &AckFields::new(PacketType::PubAck, 1),
-        Version::V311,
-        &mut puback,
+    broker.quiet(300).await;
+    broker.ack(PacketType::PubAck, 1).await;
+    assert_eq!(
+        broker.next().await,
+        Got::Subscribe { pkid: 1 },
+        "the freed packet ID"
     );
-    broker.write(&puback).await;
-    let (byte1, packet) = broker.packet().await.expect("SUBSCRIBE");
-    assert_eq!(byte1 >> 4, 8);
-    assert_eq!(&packet[2..4], &[0, 1], "the freed packet ID");
     let mut suback = Vec::new();
     encode::suback(
         &encode::SubAckFields {
@@ -1303,7 +1217,7 @@ async fn client_waits_for_a_free_packet_id() {
         Version::V311,
         &mut suback,
     );
-    broker.write(&suback).await;
+    broker.send(&suback).await;
     assert_eq!(sub.await.unwrap().unwrap(), ReasonCode::SUCCESS);
 }
 
@@ -1368,24 +1282,6 @@ async fn errors_say_what_failed_and_keep_the_cause() {
     let _ = std::fs::remove_file(&file);
 }
 
-/// A v5 PUBLISH with `props`.
-fn publish_v5(topic: &str, props: &[zzq_proto::property::Property<'_>], payload: &[u8]) -> Vec<u8> {
-    let mut raw = Vec::new();
-    zzq_proto::property::encode_all(props, &mut raw);
-    let h = PublishHeader {
-        version: Version::V5,
-        dup: false,
-        qos: QoS::AtMostOnce,
-        retain: false,
-        topic,
-        pkid: 0,
-        properties: &raw,
-    };
-    let mut out = Vec::new();
-    encode::publish(&h, payload, &mut out);
-    out
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn inbound_topic_aliases_resolve_and_bad_ones_disconnect() {
     use zzq_proto::property::{Property, TOPIC_ALIAS};
@@ -1395,13 +1291,10 @@ async fn inbound_topic_aliases_resolve_and_bad_ones_disconnect() {
         .unwrap();
     sub.subscribe("ta/#", QoS::AtMostOnce).await.unwrap();
     let mut raw = Raw::connect(&uri, "alias-pub", Version::V5, 0).await;
-    raw.write(&publish_v5(
-        "ta/x",
-        &[Property::U16(TOPIC_ALIAS, 1)],
-        b"set",
-    ))
-    .await;
-    raw.write(&publish_v5("", &[Property::U16(TOPIC_ALIAS, 1)], b"used"))
+    let alias = |n| support::props(&[Property::U16(TOPIC_ALIAS, n)]);
+    raw.pub_props("ta/x", b"set", QoS::AtMostOnce, 0, &alias(1))
+        .await;
+    raw.pub_props("", b"used", QoS::AtMostOnce, 0, &alias(1))
         .await;
     for payload in ["set", "used"] {
         let m = next(&mut sub).await;
@@ -1411,14 +1304,13 @@ async fn inbound_topic_aliases_resolve_and_bad_ones_disconnect() {
         );
     }
     for (alias, code) in [
-        (2, zzq_proto::reason::PROTOCOL_ERROR),
-        (0, zzq_proto::reason::TOPIC_ALIAS_INVALID),
+        (2, reason::PROTOCOL_ERROR),
+        (0, reason::TOPIC_ALIAS_INVALID),
     ] {
         let mut raw = Raw::connect(&uri, "alias-bad", Version::V5, 0).await;
-        raw.write(&publish_v5("", &[Property::U16(TOPIC_ALIAS, alias)], b"x"))
-            .await;
-        let (byte1, packet) = raw.packet().await.expect("DISCONNECT");
-        assert_eq!((byte1 >> 4, packet[2]), (14, code), "alias {alias}");
+        let props = support::props(&[Property::U16(TOPIC_ALIAS, alias)]);
+        raw.pub_props("", b"x", QoS::AtMostOnce, 0, &props).await;
+        raw.disconnected(&[code]).await;
     }
 }
 
@@ -1438,7 +1330,7 @@ async fn messages_over_the_client_maximum_packet_size_are_dropped() {
         password: None,
     };
     let (mut small, _) = Raw::connect_with(&uri, &fields).await;
-    small.subscribe("mps/#", QoS::AtMostOnce).await;
+    small.subscribe("mps/#", QoS::AtMostOnce.into()).await;
     let publ = Client::connect(&ctx, &uri, ClientOptions::new("mps-pub"))
         .await
         .unwrap();
@@ -1448,13 +1340,7 @@ async fn messages_over_the_client_maximum_packet_size_are_dropped() {
     publ.publish("mps/fits", "ok", QoS::AtLeastOnce)
         .await
         .unwrap();
-    let (_, packet) = small.packet().await.expect("PUBLISH");
-    let Some((zzq_proto::Packet::Publish(p), _)) =
-        decode(&packet, Version::V5, usize::MAX).unwrap()
-    else {
-        panic!("expected PUBLISH");
-    };
-    assert_eq!(p.topic, "mps/fits");
+    assert_eq!(small.publish().await.topic, "mps/fits");
     assert_eq!(broker.stats().await.unwrap().dropped.too_large, 1);
 }
 

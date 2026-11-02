@@ -164,6 +164,10 @@ pub(crate) enum Got {
     Disconnect {
         reason: u8,
     },
+    /// From a client, to a fake broker.
+    Subscribe {
+        pkid: u16,
+    },
     /// Anything a broker should not send.
     Other(u8),
 }
@@ -204,6 +208,7 @@ impl Got {
             },
             Packet::PingResp => Got::PingResp,
             Packet::Disconnect(d) => Got::Disconnect { reason: d.reason },
+            Packet::Subscribe(s) => Got::Subscribe { pkid: s.pkid },
             _ => Got::Other(byte1),
         }
     }
@@ -231,6 +236,17 @@ impl Raw {
             buf: Vec::new(),
             early: VecDeque::new(),
             version: Version::V5,
+        }
+    }
+
+    /// A connection a fake broker accepted, reading the client's packets
+    /// as `version`.
+    pub(crate) const fn accepted(s: TcpStream, version: Version) -> Raw {
+        Raw {
+            s,
+            buf: Vec::new(),
+            early: VecDeque::new(),
+            version,
         }
     }
 
