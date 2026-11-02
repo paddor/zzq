@@ -1,5 +1,5 @@
 use super::{
-    config, durable, local_report, lookup, node, normal, operations, promised, remote_report,
+    configuration, durable, local_report, lookup, node, normal, operations, promised, remote_report,
 };
 use zzq_cluster::GroupId;
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
@@ -172,7 +172,7 @@ fn selected_tail_requires_new_view_quorum_and_application_before_fresh_work() {
 fn old_view_ack_and_old_writer_callbacks_cannot_activate_the_new_primary() {
     let mut old = normal(1);
     let Admission::Write { ticket: write, .. } = old
-        .prepare(node(0), config().scope(), &operations(2))
+        .prepare(node(0), configuration().scope(), &operations(2))
         .unwrap()
     else {
         panic!("new write");
@@ -242,7 +242,7 @@ fn already_committed_selected_tail_still_needs_a_new_view_backup_vote() {
     old.receive_commit(
         node(0),
         Commit {
-            scope: config().scope(),
+            scope: configuration().scope(),
             committed,
         },
     )
@@ -464,7 +464,7 @@ fn installation_rejects_missing_wrong_or_new_view_tail_and_capacity_overruns() {
     let current_view_operation = next(
         Scope {
             view: 1,
-            ..config().scope()
+            ..configuration().scope()
         },
         Prefix::GENESIS,
         1,
@@ -478,7 +478,7 @@ fn installation_rejects_missing_wrong_or_new_view_tail_and_capacity_overruns() {
     let start = StartView {
         scope: Scope {
             view: 1,
-            ..config().scope()
+            ..configuration().scope()
         },
         generation: JournalGeneration(100),
         accepted: operations(33)[32].prefix(),
@@ -499,7 +499,7 @@ fn installation_rejects_missing_wrong_or_new_view_tail_and_capacity_overruns() {
         Err(Error::Replication(ReplicationError::Capacity))
     ));
     let mut small = NormalReplica::bootstrap(
-        config(),
+        configuration(),
         node(2),
         JournalGeneration(3),
         PipelineLimits {
@@ -569,7 +569,7 @@ fn backup_rejects_wrong_primary_or_view_and_conflicting_protected_history() {
     old.receive_commit(
         node(0),
         Commit {
-            scope: config().scope(),
+            scope: configuration().scope(),
             committed: operations(2)[1].prefix(),
         },
     )
@@ -628,7 +628,7 @@ fn rejected_installation_returns_fenced_ownership_for_missing_data_and_stale_ret
     old.receive_commit(
         node(0),
         Commit {
-            scope: config().scope(),
+            scope: configuration().scope(),
             committed: operations(2)[1].prefix(),
         },
     )
@@ -652,7 +652,7 @@ fn rejected_installation_returns_fenced_ownership_for_missing_data_and_stale_ret
     let election = error.into_view_change();
     assert_eq!(election.normal_snapshot(), before);
     let stale = StartView {
-        scope: config().scope(),
+        scope: configuration().scope(),
         ..start
     };
     let error = election
@@ -705,7 +705,7 @@ fn streamed_backup_installation_leaves_its_commit_to_the_stream() {
         old.receive_commit(
             node(0),
             Commit {
-                scope: config().scope(),
+                scope: configuration().scope(),
                 committed,
             },
         )

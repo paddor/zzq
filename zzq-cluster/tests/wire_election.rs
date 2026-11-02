@@ -10,34 +10,19 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node, session};
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
 use zzq_cluster::wire::{
     Control, PeerBinding, ReplicaMessage, WireError, WireLimits, decode, encode_control,
 };
 use zzq_cluster::{
-    Admission, Configuration, Digest, DoViewChange, FrozenLog, InstallOutcome, JournalGeneration,
-    NormalReplica, PipelineLimits, Prefix, PreparedOperation, ReceivedStart, StartView,
-    StartViewChange, ViewChange, ViewChangeError,
+    Admission, Digest, DoViewChange, FrozenLog, InstallOutcome, JournalGeneration, NormalReplica,
+    PipelineLimits, Prefix, PreparedOperation, ReceivedStart, StartView, StartViewChange,
+    ViewChange, ViewChangeError,
 };
-use zzq_cluster::{GroupId, LinkSessionId, NodeId};
-
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
-const fn session() -> LinkSessionId {
-    LinkSessionId::from_bytes([9; 16])
-}
 
 fn normal(index: u8) -> NormalReplica {
     NormalReplica::bootstrap(

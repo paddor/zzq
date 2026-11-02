@@ -11,31 +11,17 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node, session};
 use zzq_cluster::recovery::{RecoveryLog, RecoveryResponse};
 use zzq_cluster::wire::{
     PeerBinding, RecoveryMessage, RecoveryRequest, RecoveryState, ReplicaMessage, WireError,
     WireLimits, decode, encode_recovery, encode_recovery_state,
 };
-use zzq_cluster::{Configuration, Digest, JournalGeneration, OpNumber, Prefix};
-use zzq_cluster::{GroupId, LinkSessionId, NodeId, RequestId};
-
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
-const fn session() -> LinkSessionId {
-    LinkSessionId::from_bytes([9; 16])
-}
+use zzq_cluster::{Digest, JournalGeneration, OpNumber, Prefix};
+use zzq_cluster::{LinkSessionId, NodeId, RequestId};
 
 fn request() -> RecoveryRequest {
     RecoveryRequest {

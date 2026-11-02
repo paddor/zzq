@@ -11,29 +11,19 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node};
+use zzq_cluster::RequestId;
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
 use zzq_cluster::recovery::{
     Recovery, RecoveryError, RecoveryLog, RecoveryResponse, RecoveryTicket,
 };
 use zzq_cluster::{
-    Admission, Configuration, Digest, JournalGeneration, NormalReplica, PipelineLimits, Prefix,
-    PrepareOk, PreparedOperation, Scope, Status, ViewChange, ViewChangeError,
+    Admission, Digest, JournalGeneration, NormalReplica, PipelineLimits, Prefix, PrepareOk,
+    PreparedOperation, Scope, Status, ViewChange, ViewChangeError,
 };
-use zzq_cluster::{GroupId, NodeId, RequestId};
-
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
 
 const fn limits() -> PipelineLimits {
     PipelineLimits {

@@ -10,31 +10,17 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node, session};
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
 use zzq_cluster::wire::{
     Control, EncodeContext, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control,
 };
 use zzq_cluster::{Admission, JournalGeneration, NormalReplica, PipelineLimits, PreparedOperation};
-use zzq_cluster::{Commit, Configuration, Digest, Prefix};
-use zzq_cluster::{GroupId, LinkSessionId, NodeId};
-
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
-const fn session() -> LinkSessionId {
-    LinkSessionId::from_bytes([9; 16])
-}
+use zzq_cluster::{Commit, Digest, Prefix};
+use zzq_cluster::{LinkSessionId, NodeId};
 
 #[test]
 fn replica_routing_uses_fixed_scope_without_accepting_its_history() {

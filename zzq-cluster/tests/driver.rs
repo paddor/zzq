@@ -10,6 +10,10 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node};
 use std::collections::VecDeque;
 use std::time::Duration;
 
@@ -17,11 +21,11 @@ use zzq_cluster::driver::{Action, DriverError, ReplicaDriver, Timing};
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
 use zzq_cluster::wire::{Control, PeerBinding, ReplicaMessage, WireLimits, decode, encode_control};
 use zzq_cluster::{
-    Admission, Configuration, Digest, FrozenLog, JournalGeneration, NormalReplica, PipelineLimits,
-    Prefix, PreparedOperation, RecoveredState, ReplicationError, Scope, StartViewChange,
-    ViewChange, ViewChangeError,
+    Admission, Digest, FrozenLog, JournalGeneration, NormalReplica, PipelineLimits, Prefix,
+    PreparedOperation, RecoveredState, ReplicationError, Scope, StartViewChange, ViewChange,
+    ViewChangeError,
 };
-use zzq_cluster::{GroupId, LinkSessionId, NodeId};
+use zzq_cluster::{LinkSessionId, NodeId};
 
 #[path = "support/driver_installation.rs"]
 mod installation;
@@ -133,20 +137,6 @@ fn partitioned_minority_cannot_select_but_healed_quorum_resumes_after_lost_votes
         }
     }
     panic!("healthy quorum failed to select acknowledged history");
-}
-
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
 }
 
 fn normal(index: u8) -> NormalReplica {
