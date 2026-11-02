@@ -408,7 +408,7 @@ pub(crate) fn replay_records(data: &[u8]) -> Result<usize, &'static str> {
     while let [kind, a, b, tail @ ..] = rest {
         let len = usize::from(u16::from_be_bytes([*a, *b]));
         let (body, r) = tail.split_at_checked(len).ok_or("torn")?;
-        sessions.apply(*kind, body, clock, |_| true)?;
+        sessions.apply(*kind, body, clock)?;
         rest = r;
     }
     Ok(sessions.finish(crate::time::now()).len())

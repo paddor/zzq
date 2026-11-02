@@ -24,6 +24,9 @@ use super::{
 /// The sessions a lane journal leaves, record by record.
 #[derive(Debug, Default)]
 pub(crate) struct Sessions {
+    /// The lane whose journal it reads, of `lanes`. With 0 lanes, of
+    /// any lane: its sessions and handoffs are not checked.
+    lane: usize,
     lanes: usize,
     by_client: FxHashMap<Box<str>, Replayed>,
     /// The sessions of a snapshot still being read: they take the place
@@ -59,20 +62,26 @@ struct Item {
 }
 
 impl Sessions {
-    pub(crate) fn new(lanes: usize) -> Sessions {
+    /// The sessions of lane `lane` of `lanes`.
+    pub(crate) fn new(lane: usize, lanes: usize) -> Sessions {
         Sessions {
+            lane,
             lanes,
             ..Sessions::default()
         }
     }
-    /// Applies a record. `owned` tells whether a client ID belongs to the
-    /// journal's lane.
+
+    /// Whether `client_id` belongs to the journal's lane.
+    fn owns(&self, client_id: &str) -> bool {
+        self.lanes == 0 || crate::broker::lane_for(client_id, self.lanes) == self.lane
+    }
+
+    /// Applies a record.
     pub(crate) fn apply(
         &mut self,
         kind: u8,
         body: &[u8],
         clock: Clock,
-        owned: impl Fn(&str) -> bool,
     ) -> Result<(), &'static str> {
         match kind {
             PART => {
@@ -87,25 +96,19 @@ impl Sessions {
                 let (&kind, piece) = body.split_first().ok_or("empty record end")?;
                 let mut whole = std::mem::take(&mut self.parts);
                 whole.extend_from_slice(piece);
-                self.apply_whole(kind, &whole, clock, &owned)
+                self.apply_whole(kind, &whole, clock)
             }
             _ => {
                 // What a failed write left of a long record.
                 self.parts.clear();
-                self.apply_whole(kind, body, clock, &owned)
+                self.apply_whole(kind, body, clock)
             }
         }
     }
 
-    fn apply_whole(
-        &mut self,
-        kind: u8,
-        body: &[u8],
-        clock: Clock,
-        owned: &dyn Fn(&str) -> bool,
-    ) -> Result<(), &'static str> {
+    fn apply_whole(&mut self, kind: u8, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         if kind != TRANSACTION {
-            return self.apply_one(kind, body, clock, owned);
+            return self.apply_one(kind, body, clock);
         }
         let mut d = Decoder(body);
         while !d.0.is_empty() {
@@ -126,19 +129,14 @@ impl Sessions {
                 return Err("invalid transaction record");
             }
             let len = d.u32()? as usize;
-            self.apply_one(kind, d.take(len)?, clock, owned)?;
+            self.apply_one(kind, d.take(len)?, clock)?;
         }
         Ok(())
     }
 
     /// Decodes a [`HANDOFF`] or [`HANDOFF_KEPT`] body, and checks it belongs
     /// in the journal of this lane.
-    fn pending(
-        &self,
-        d: &mut Decoder<'_>,
-        clock: Clock,
-        owned: &dyn Fn(&str) -> bool,
-    ) -> Result<handoff::Pending, &'static str> {
+    fn pending(&self, d: &mut Decoder<'_>, clock: Clock) -> Result<handoff::Pending, &'static str> {
         let p = handoff::read_pending(d, clock)?;
         if self.lanes != 0
             && p.targets
@@ -147,20 +145,14 @@ impl Sessions {
         {
             return Err("handoff destination belongs to another lane");
         }
-        if !owned(&p.publisher) {
+        if !self.owns(&p.publisher) {
             return Err("handoff in the journal of another lane");
         }
         Ok(p)
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per journal record")]
-    fn apply_one(
-        &mut self,
-        kind: u8,
-        body: &[u8],
-        clock: Clock,
-        owned: &dyn Fn(&str) -> bool,
-    ) -> Result<(), &'static str> {
+    fn apply_one(&mut self, kind: u8, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         let mut d = Decoder(body);
         match kind {
             CLEAR => self.snapshot = Some((FxHashMap::default(), Handoffs::default())),
@@ -172,7 +164,7 @@ impl Sessions {
             }
             IMAGE => {
                 let r = image(&mut d, clock)?;
-                if !owned(&r.st.client_id) {
+                if !self.owns(&r.st.client_id) {
                     return Err("session in the journal of another lane");
                 }
                 let (into, h) = self
@@ -192,7 +184,7 @@ impl Sessions {
                 handoff::read_meta(&mut d, h)?;
             }
             HANDOFF_KEPT => {
-                let p = self.pending(&mut d, clock, owned)?;
+                let p = self.pending(&mut d, clock)?;
                 let h = self
                     .snapshot
                     .as_mut()
@@ -203,9 +195,9 @@ impl Sessions {
             }
             // Any other record after an unfinished snapshot: the snapshot
             // was cut off, and the lane went on without it.
-            _ if self.snapshot.take().is_some() => return self.apply_one(kind, body, clock, owned),
+            _ if self.snapshot.take().is_some() => return self.apply_one(kind, body, clock),
             HANDOFF => {
-                let p = self.pending(&mut d, clock, owned)?;
+                let p = self.pending(&mut d, clock)?;
                 if let Some(r) = self
                     .by_client
                     .get_mut(&p.publisher)
@@ -227,7 +219,7 @@ impl Sessions {
                 let client_id = d.str()?;
                 let st = session_head(&mut d, client_id, clock)?;
                 self.handoffs.serial = self.handoffs.serial.max(st.birth);
-                if !owned(client_id) {
+                if !self.owns(client_id) {
                     return Err("session in the journal of another lane");
                 }
                 // A new connection to a session goes on with what it held.

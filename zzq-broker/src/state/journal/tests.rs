@@ -8,7 +8,7 @@ fn replay(records: &[Vec<u8>]) -> Result<Vec<SessionState>, &'static str> {
     let clock = Clock::now();
     let mut sessions = Sessions::default();
     for r in records {
-        sessions.apply(r[0], &r[1..], clock, |_| true)?;
+        sessions.apply(r[0], &r[1..], clock)?;
     }
     Ok(sessions.finish(crate::time::now()))
 }
@@ -61,25 +61,21 @@ fn a_handoff_snapshot_preserves_receipts_and_does_not_revive_a_released_packet_i
     let clock = Clock::now();
     let mut sessions = Sessions::default();
     let s = seeds();
-    sessions
-        .apply(SESSION, &s[0][1..], clock, |_| true)
-        .unwrap();
+    sessions.apply(SESSION, &s[0][1..], clock).unwrap();
     let mut body = pending_body(clock);
-    sessions.apply(HANDOFF, &body, clock, |_| true).unwrap();
+    sessions.apply(HANDOFF, &body, clock).unwrap();
     body.clear();
     inbound(&mut body, "c", 3);
-    sessions
-        .apply(INBOUND_DONE, &body, clock, |_| true)
-        .unwrap();
+    sessions.apply(INBOUND_DONE, &body, clock).unwrap();
     body.clear();
     body.extend_from_slice(&1u16.to_be_bytes());
     body.extend_from_slice(&8u64.to_be_bytes());
-    sessions.apply(RECEIVED, &body, clock, |_| true).unwrap();
+    sessions.apply(RECEIVED, &body, clock).unwrap();
     let mut image = Records::default();
     sessions.image(&mut image, clock).unwrap();
     let mut rebuilt = Sessions::default();
     for (kind, body) in image.0 {
-        rebuilt.apply(kind, &body, clock, |_| true).unwrap();
+        rebuilt.apply(kind, &body, clock).unwrap();
     }
     let lane = rebuilt.into_lane(crate::time::now());
     assert_eq!(lane.sessions[0].awaiting_rel, [] as [u16; 0]);
@@ -96,17 +92,15 @@ fn a_live_handoff_after_a_cut_off_snapshot_counts() {
     let clock = Clock::now();
     let mut sessions = Sessions::default();
     let s = seeds();
-    sessions
-        .apply(SESSION, &s[0][1..], clock, |_| true)
-        .unwrap();
-    sessions.apply(CLEAR, &[], clock, |_| true).unwrap();
+    sessions.apply(SESSION, &s[0][1..], clock).unwrap();
+    sessions.apply(CLEAR, &[], clock).unwrap();
     let image = s.iter().find(|r| r[0] == IMAGE).unwrap();
-    sessions.apply(IMAGE, &image[1..], clock, |_| true).unwrap();
+    sessions.apply(IMAGE, &image[1..], clock).unwrap();
     let mut body = pending_body(clock);
-    sessions.apply(HANDOFF, &body, clock, |_| true).unwrap();
+    sessions.apply(HANDOFF, &body, clock).unwrap();
     body.clear();
     client(&mut body, "c");
-    sessions.apply(WILL_SENT, &body, clock, |_| true).unwrap();
+    sessions.apply(WILL_SENT, &body, clock).unwrap();
     let lane = sessions.into_lane(crate::time::now());
     assert_eq!(lane.handoffs.pending[&9].msg.payload(), b"once");
     assert_eq!(lane.sessions[0].awaiting_rel, [3]);
@@ -131,12 +125,12 @@ fn a_long_record_goes_in_parts_and_replays_whole() {
     assert_eq!(kinds, [PART, PART, PART_END]);
     let mut sessions = Sessions::default();
     for (kind, body) in &out.0[..2] {
-        sessions.apply(*kind, body, Clock::now(), |_| true).unwrap();
+        sessions.apply(*kind, body, Clock::now()).unwrap();
     }
     assert_eq!(sessions.parts.len(), body.len() - out.0[2].1.len() + 1);
     // It reached the session records whole, and names no session here.
     let (kind, last) = &out.0[2];
-    let refused = sessions.apply(*kind, last, Clock::now(), |_| true);
+    let refused = sessions.apply(*kind, last, Clock::now());
     assert_eq!(refused, Err("record of an unknown session"));
     assert_eq!(sessions.parts, [] as [u8; 0]);
 }
@@ -152,18 +146,18 @@ fn a_short_record_goes_as_it_is() {
 fn what_a_failed_write_left_of_a_long_record_is_dropped() {
     let clock = Clock::now();
     let mut sessions = Sessions::default();
-    sessions.apply(PART, &[1, 9, 9], clock, |_| true).unwrap();
-    sessions.apply(CLEAR, &[], clock, |_| true).unwrap();
+    sessions.apply(PART, &[1, 9, 9], clock).unwrap();
+    sessions.apply(CLEAR, &[], clock).unwrap();
     assert_eq!(sessions.parts, [] as [u8; 0]);
-    sessions.apply(PART, &[1, 9, 9], clock, |_| true).unwrap();
+    sessions.apply(PART, &[1, 9, 9], clock).unwrap();
     let whole = pending_body(clock);
     let (head, tail) = whole.split_at(5);
     let mut part = vec![1];
     part.extend_from_slice(head);
-    sessions.apply(PART, &part, clock, |_| true).unwrap();
+    sessions.apply(PART, &part, clock).unwrap();
     let mut end = vec![HANDOFF];
     end.extend_from_slice(tail);
-    sessions.apply(PART_END, &end, clock, |_| true).unwrap();
+    sessions.apply(PART_END, &end, clock).unwrap();
     let lane = sessions.into_lane(crate::time::now());
     assert_eq!(lane.handoffs.pending[&9].msg.payload(), b"once");
 }
@@ -172,26 +166,14 @@ fn what_a_failed_write_left_of_a_long_record_is_dropped() {
 fn malformed_parts_are_refused() {
     let clock = Clock::now();
     let mut sessions = Sessions::default();
-    assert!(sessions.apply(PART, &[], clock, |_| true).is_err());
-    assert!(sessions.apply(PART_END, &[], clock, |_| true).is_err());
+    assert!(sessions.apply(PART, &[], clock).is_err());
+    assert!(sessions.apply(PART_END, &[], clock).is_err());
     // A piece cannot end as a piece: it is no record of its own.
-    assert!(
-        sessions
-            .apply(PART_END, &[PART, 1], clock, |_| true)
-            .is_err()
-    );
+    assert!(sessions.apply(PART_END, &[PART, 1], clock).is_err());
     let mut nested = vec![PART, 0, 0, 0, 1, 1];
-    assert!(
-        sessions
-            .apply(TRANSACTION, &nested, clock, |_| true)
-            .is_err()
-    );
+    assert!(sessions.apply(TRANSACTION, &nested, clock).is_err());
     nested[0] = HANDOFF_KEPT;
-    assert!(
-        sessions
-            .apply(TRANSACTION, &nested, clock, |_| true)
-            .is_err()
-    );
+    assert!(sessions.apply(TRANSACTION, &nested, clock).is_err());
 }
 
 #[test]
@@ -202,16 +184,16 @@ fn a_replica_image_keeps_a_long_record_that_has_not_ended() {
     let mut sessions = Sessions::default();
     let mut part = vec![1];
     part.extend_from_slice(head);
-    sessions.apply(PART, &part, clock, |_| true).unwrap();
+    sessions.apply(PART, &part, clock).unwrap();
     let mut image = Records::default();
     sessions.image(&mut image, clock).unwrap();
     let mut rebuilt = Sessions::default();
     for (kind, body) in image.0 {
-        rebuilt.apply(kind, &body, clock, |_| true).unwrap();
+        rebuilt.apply(kind, &body, clock).unwrap();
     }
     let mut end = vec![HANDOFF];
     end.extend_from_slice(tail);
-    rebuilt.apply(PART_END, &end, clock, |_| true).unwrap();
+    rebuilt.apply(PART_END, &end, clock).unwrap();
     let lane = rebuilt.into_lane(crate::time::now());
     assert_eq!(lane.handoffs.pending[&9].msg.payload(), b"once");
 }
@@ -221,11 +203,11 @@ fn nested_or_torn_transactions_are_refused() {
     let clock = Clock::now();
     let mut sessions = Sessions::default();
     for body in [&[TRANSACTION, 0, 0, 0, 0][..], &[RECEIVED, 0, 0, 0, 10, 0]] {
-        assert!(sessions.apply(TRANSACTION, body, clock, |_| true).is_err());
+        assert!(sessions.apply(TRANSACTION, body, clock).is_err());
     }
     let mut body = vec![RECEIVED, 0, 0, 0, 10, 0, 2];
     body.extend_from_slice(&5u64.to_be_bytes());
-    sessions.apply(TRANSACTION, &body, clock, |_| true).unwrap();
+    sessions.apply(TRANSACTION, &body, clock).unwrap();
     assert_eq!(
         sessions.into_lane(crate::time::now()).handoffs.received(2),
         5
@@ -239,7 +221,7 @@ fn session_records_without_birth_ids_still_replay() {
         let old = &s[kind];
         let mut replay = Sessions::default();
         replay
-            .apply(old[0], &old[1..old.len() - 8], Clock::now(), |_| true)
+            .apply(old[0], &old[1..old.len() - 8], Clock::now())
             .unwrap();
         assert_eq!(replay.finish(crate::time::now())[0].birth, 0);
     }
@@ -330,16 +312,17 @@ fn records_that_no_lane_wrote_are_refused() {
         (SESSION, [&s[0][1..], b"x"].concat()),
     ];
     for (kind, body) in refused {
-        let r = sessions.apply(kind, &body, clock, |_| true);
+        let r = sessions.apply(kind, &body, clock);
         assert!(r.is_err(), "kind {kind}: {r:?}");
     }
-    let r = sessions.apply(SESSION, &s[0][1..], clock, |_| false);
+    let other = 1 - crate::broker::lane_for("c", 2);
+    let r = Sessions::new(other, 2).apply(SESSION, &s[0][1..], clock);
     assert_eq!(r, Err("session in the journal of another lane"));
     let mut bad = vec![];
     client(&mut bad, "c");
     bad.extend_from_slice(&[0, 9, 0, 0, 0, 0, 0]);
     assert_eq!(
-        sessions.apply(SESSION, &bad, clock, |_| true),
+        sessions.apply(SESSION, &bad, clock),
         Err("invalid protocol level")
     );
     let mut sub_bad = vec![];
@@ -350,13 +333,8 @@ fn records_that_no_lane_wrote_are_refused() {
         SubscriptionOptions::from(QoS::AtMostOnce),
         0,
     );
-    sessions
-        .apply(SESSION, &s[0][1..], clock, |_| true)
-        .unwrap();
-    assert_eq!(
-        sessions.apply(SUB, &sub_bad, clock, |_| true),
-        Err("invalid filter")
-    );
+    sessions.apply(SESSION, &s[0][1..], clock).unwrap();
+    assert_eq!(sessions.apply(SUB, &sub_bad, clock), Err("invalid filter"));
 }
 
 #[test]

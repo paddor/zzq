@@ -252,10 +252,8 @@ pub(crate) fn open_lanes(
 /// Opens journal `name` of lane `j` of `n`, with the sessions it holds.
 fn read_lane(dir: &DataDir, name: &str, j: usize, n: usize) -> io::Result<(Log, LaneState)> {
     let clock = Clock::now();
-    let mut sessions = Sessions::new(n);
-    let log = dir.journal(name, |r| {
-        sessions.apply(r.kind, r.body, clock, |id| lane_for(id, n) == j)
-    })?;
+    let mut sessions = Sessions::new(j, n);
+    let log = dir.journal(name, |r| sessions.apply(r.kind, r.body, clock))?;
     Ok((log, sessions.into_lane(crate::time::now())))
 }
 

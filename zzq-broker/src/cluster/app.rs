@@ -5,7 +5,6 @@
 use rustc_hash::FxHashMap;
 use zzq_cluster::OpNumber;
 
-use crate::broker::lane_for;
 use crate::retain::{self, STRIPES};
 use crate::state::Clock;
 use crate::state::handoff::LaneState;
@@ -33,7 +32,7 @@ impl Accumulators {
     /// has it now.
     pub(crate) fn new(lanes: usize, max_levels: usize, clock: &ClusterClock) -> Accumulators {
         Accumulators {
-            lanes: (0..lanes).map(|_| Sessions::new(lanes)).collect(),
+            lanes: (0..lanes).map(|j| Sessions::new(j, lanes)).collect(),
             retained: retain::Accumulator::new(max_levels),
             cuts: FxHashMap::default(),
             correction: clock.correction(),
@@ -60,14 +59,15 @@ impl Accumulators {
 
     fn apply_body(&mut self, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         let (journal, recs) = records(body).ok_or("malformed op")?;
-        let lanes = self.lanes.len();
         for rec in recs {
             let (kind, body) = rec.map_err(|()| "malformed record")?;
             match journal {
                 Journal::Lane(j) => {
-                    let j = usize::from(j);
-                    let sessions = self.lanes.get_mut(j).ok_or("op of an unknown lane")?;
-                    sessions.apply(kind, body, clock, |id| lane_for(id, lanes) == j)?;
+                    let sessions = self
+                        .lanes
+                        .get_mut(usize::from(j))
+                        .ok_or("op of an unknown lane")?;
+                    sessions.apply(kind, body, clock)?;
                 }
                 Journal::Retained(s) => self.retained.apply(usize::from(s), kind, body, clock)?,
             }
