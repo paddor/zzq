@@ -18,8 +18,7 @@ use crate::op::{self, Out};
 use crate::rb::{self, DataType, RbResult, RubyErr};
 use crate::{context, options, wake};
 
-static TYPE: DataType = DataType::new::<NativeClient>(c"ZZQ::Native::Client");
-static CLASS: OnceLock<usize> = OnceLock::new();
+static TYPE: DataType<NativeClient> = DataType::new(c"ZZQ::Native::Client");
 /// `ZZQ::Message` and a frozen empty Array for messages without
 /// Subscription Identifiers.
 static MESSAGE: OnceLock<(usize, usize)> = OnceLock::new();
@@ -44,7 +43,7 @@ impl std::fmt::Debug for NativeClient {
 }
 
 fn get(value: VALUE) -> RbResult<&'static NativeClient> {
-    unsafe { TYPE.get(value) }
+    TYPE.get(value)
 }
 
 /// A Ruby object for a connected client.
@@ -57,7 +56,7 @@ pub fn wrap(c: Client) -> RbResult<VALUE> {
         client: Arc::new(tokio::sync::Mutex::new(c)),
         recv: Mutex::new(None),
     };
-    TYPE.wrap(*CLASS.get().expect("registered") as VALUE, native)
+    TYPE.wrap(native)
 }
 
 fn connect(uri: VALUE, opts: VALUE) -> RbResult<VALUE> {
@@ -229,8 +228,7 @@ pub fn register(zzq: VALUE, native: VALUE) -> RbResult<()> {
     rb::define_const(native, c"NO_SUBSCRIPTION_IDS", no_ids)?;
     let _ = MESSAGE.set((message as usize, no_ids as usize));
 
-    let class = rb::define_class_under(native, c"Client")?;
-    let _ = CLASS.set(class as usize);
+    let class = TYPE.register(native, c"Client")?;
     rb::singleton!(class, c"connect", |_class, uri, opts| connect(uri, opts))?;
     rb::method!(class, c"publish", |this, topic, payload, qos, retain| {
         publish(this, topic, payload, qos, retain)

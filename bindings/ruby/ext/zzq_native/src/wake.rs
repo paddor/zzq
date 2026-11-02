@@ -16,8 +16,7 @@ use rb_sys::VALUE;
 
 use crate::rb::{self, DataType, RbResult, RubyErr};
 
-static TYPE: DataType = DataType::new::<Wake>(c"ZZQ::Native::Wake");
-static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static TYPE: DataType<Wake> = DataType::new(c"ZZQ::Native::Wake");
 
 /// A pipe one fiber waits on.
 #[derive(Debug)]
@@ -124,15 +123,14 @@ unsafe fn pipe(fds: &mut [RawFd; 2]) -> i32 {
 
 /// The `Wake` inside `value`.
 pub fn get(value: VALUE) -> RbResult<&'static Wake> {
-    unsafe { TYPE.get(value) }
+    TYPE.get(value)
 }
 
 pub fn register(native: VALUE) -> RbResult<()> {
-    let class = rb::define_class_under(native, c"Wake")?;
-    let _ = CLASS.set(class as usize);
+    let class = TYPE.register(native, c"Wake")?;
     rb::singleton!(class, c"new", |_class| {
         let wake = Wake::new().map_err(|e| RubyErr::runtime(format!("pipe failed: {e}")))?;
-        TYPE.wrap(*CLASS.get().expect("registered") as VALUE, wake)
+        TYPE.wrap(wake)
     })?;
     rb::method!(class, c"fd", |this| Ok(rb::u64_value(
         get(this)?.pipe.read_fd as u64
