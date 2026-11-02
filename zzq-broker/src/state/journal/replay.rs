@@ -13,7 +13,7 @@ use crate::msg::Msg;
 use crate::session::Queued;
 use crate::state::codec::Decoder;
 use crate::state::handoff::{self, Handoffs, LaneState};
-use crate::state::{Clock, SessionState};
+use crate::state::{Clock, Deliveries, SessionState};
 
 use super::{
     CLEAR, CLEARED, DONE, DOWN, END, HANDED, HANDOFF, HANDOFF_KEPT, IMAGE, INBOUND, INBOUND_DONE,
@@ -414,19 +414,21 @@ impl Replayed {
         for (seq, item) in self.items {
             match item.pkid {
                 Some(pkid) => {
-                    st.inflight.push((pkid, item.queued, item.released));
-                    st.seqs.push(seq);
+                    st.deliveries
+                        .inflight
+                        .push((pkid, item.queued, item.released));
+                    st.deliveries.seqs.push(seq);
                 }
                 // Released under an ID the journal lost: the client has it.
                 None if item.released => {}
                 None => {
-                    st.queue.push(item.queued);
+                    st.deliveries.queue.push(item.queued);
                     queue_seqs.push(seq);
                 }
             }
         }
-        st.seqs.extend(queue_seqs);
-        st.last_seq = self.last_seq;
+        st.deliveries.seqs.extend(queue_seqs);
+        st.deliveries.last_seq = self.last_seq;
         st
     }
 }
@@ -437,11 +439,14 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
     let mut st = d.session(clock)?;
     let last_seq = d.u64()?;
     let n = d.count(8)?;
-    if n != st.inflight.len() + st.queue.len() {
+    let Deliveries {
+        inflight, queue, ..
+    } = std::mem::take(&mut st.deliveries);
+    if n != inflight.len() + queue.len() {
         return Err("delivery numbers do not match the deliveries");
     }
     let mut items = BTreeMap::new();
-    for (pkid, queued, released) in std::mem::take(&mut st.inflight) {
+    for (pkid, queued, released) in inflight {
         let item = Item {
             queued,
             pkid: Some(pkid),
@@ -449,7 +454,7 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
         };
         items.insert(d.u64()?, item);
     }
-    for queued in std::mem::take(&mut st.queue) {
+    for queued in queue {
         let item = Item {
             queued,
             pkid: None,
@@ -503,19 +508,9 @@ fn session_head(
     let birth = d.birth()?;
     Ok(SessionState {
         birth,
-        client_id: client_id.into(),
         username,
-        version,
         expiry,
-        expires_at: None,
         will,
-        delayed_will: None,
-        next_pkid: 0,
-        subs: Vec::new(),
-        awaiting_rel: Vec::new(),
-        inflight: Vec::new(),
-        queue: Vec::new(),
-        seqs: Vec::new(),
-        last_seq: 0,
+        ..SessionState::new(client_id.into(), version)
     })
 }

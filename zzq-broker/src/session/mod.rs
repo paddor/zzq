@@ -16,7 +16,7 @@ use crate::conn::ConnShared;
 use crate::index::{Grant, Matches};
 use crate::msg::{Arena, Msg};
 use crate::slab::Key;
-use crate::state::SessionState;
+use crate::state::{Deliveries, SessionState};
 
 mod hold;
 mod outbound;
@@ -461,9 +461,15 @@ impl Session {
             s.subscribe(filter, *opts, *sub_id, lanes);
         }
         s.inbound.awaiting_rel.extend(st.awaiting_rel);
-        s.flow.last_seq = st.last_seq;
-        let mut seqs = st.seqs.into_iter();
-        for (pkid, item, released) in st.inflight {
+        let Deliveries {
+            inflight,
+            queue,
+            seqs,
+            last_seq,
+        } = st.deliveries;
+        s.flow.last_seq = last_seq;
+        let mut seqs = seqs.into_iter();
+        for (pkid, item, released) in inflight {
             let mut held = Kept::own(item);
             held.seq = seqs.next().unwrap_or(0);
             s.charge.add(budget::held(&held));
@@ -482,7 +488,7 @@ impl Session {
             }
             s.flow.in_use = Some(bits);
         }
-        for item in st.queue {
+        for item in queue {
             let mut h = Kept::own(item);
             h.seq = seqs.next().unwrap_or(0);
             s.charge.add(budget::held(&h));
@@ -630,25 +636,19 @@ mod tests {
     fn restored_session_skips_ids_in_use() {
         let total = LaneTotal::default();
         let st = SessionState {
-            birth: 0,
-            client_id: "c".into(),
-            username: None,
-            version: Version::V5,
             expiry: 60,
-            expires_at: None,
-            will: None,
-            delayed_will: None,
             next_pkid: 7,
             subs: vec![("a/#".into(), SubscriptionOptions::default(), 0)],
-            awaiting_rel: Vec::new(),
-            inflight: vec![
-                (65535, item(), false),
-                (8, item(), false),
-                (7, item(), false),
-            ],
-            queue: vec![item()],
-            seqs: Vec::new(),
-            last_seq: 0,
+            deliveries: Deliveries {
+                inflight: vec![
+                    (65535, item(), false),
+                    (8, item(), false),
+                    (7, item(), false),
+                ],
+                queue: vec![item()],
+                ..Deliveries::default()
+            },
+            ..SessionState::new("c".into(), Version::V5)
         };
         let (mut s, _) = Session::restore(st, total.clone(), 1);
         assert_eq!((s.queued(), s.flow.inflight.len()), (1, 3));

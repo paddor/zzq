@@ -10,7 +10,7 @@ use crate::index::{Grant, SubIds};
 use crate::msg::{Msg, Publication};
 use crate::session::{DelayedWill, Kept, Queued, Session, Will};
 
-use super::{Clock, Sent, SessionState, Sub};
+use super::{Clock, Deliveries, Sent, SessionState, Sub};
 
 /// Smallest encodings, which bound counts by the bytes left.
 const MIN_MSG: usize = 4 + 1 + 1 + 8 + 4 + 4;
@@ -303,10 +303,11 @@ impl<'a> Decoder<'a> {
             next_pkid,
             subs,
             awaiting_rel,
-            inflight,
-            queue,
-            seqs: Vec::new(),
-            last_seq: 0,
+            deliveries: Deliveries {
+                inflight,
+                queue,
+                ..Deliveries::default()
+            },
         })
     }
 

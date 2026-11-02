@@ -115,9 +115,7 @@ pub(crate) fn materialize(
                     if let Some(s) = lane.sessions.iter_mut().find(|s| {
                         s.client_id.as_ref() == &*target.client && s.birth == target.birth
                     }) {
-                        s.last_seq += 1;
-                        s.seqs.push(s.last_seq);
-                        s.queue.push(crate::session::Queued {
+                        s.deliveries.push_journaled(crate::session::Queued {
                             msg: p.msg.clone(),
                             grant: target.grant,
                         });
