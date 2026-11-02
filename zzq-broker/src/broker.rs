@@ -169,6 +169,13 @@ impl Shared {
         self.cluster.clone().unwrap_or_default()
     }
 
+    /// Whether session expiry, delayed wills and retained message expiry
+    /// wait: a cluster node whose clock samples never showed a majority
+    /// has no cluster time to judge deadlines by.
+    pub(crate) fn expiry_held(&self) -> bool {
+        self.cluster.as_ref().is_some_and(|g| !g.clock.read())
+    }
+
     /// Bytes the state may take: `max_state_bytes`, and no more than the
     /// room on the device of the data directory.
     pub(crate) fn state_limit(&self) -> usize {

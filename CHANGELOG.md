@@ -5,6 +5,31 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- Clustering: the nodes send each other their wall time once a second
+  (`CLOCK_SAMPLE`). Session expiry, will delays and message expiry
+  follow the time two of the three clocks agree on, within
+  `--cluster-max-clock-offset-ms` (1000 by default), so a node whose
+  clock is off, as one that booted before its clock synced, moves none
+  of them. A node takes its state in once it has that time, or after
+  five seconds without, and holds expiry until it has it. `zzq_broker`
+  says on stderr while a node's clock is off the others and while no
+  two clocks agree. `NodeStatus::clock` has the offsets.
+
+### Fixed
+
+- Clustering: a node that missed views and heard only a follower of the
+  newest took one election timeout per missed view to join the others
+  once that view's leader was gone. A node now responds to a request to
+  leave an older view with its own view's `START_VIEW_CHANGE`, also while
+  it installs that view, as Ozzy does.
+- Clustering: a leader that heard no follower but was still heard by
+  both kept resending its uncommitted ops. Each resend renewed the
+  followers' lease promise, so they never helped each other replace it
+  and the cluster stopped taking writes. A leader that asks to leave its
+  view now sends no ops, as it already sent no heartbeats.
+
 ## [0.5.0] - 2026-10-31
 
 ### Added

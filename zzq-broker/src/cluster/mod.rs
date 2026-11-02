@@ -4,6 +4,7 @@
 //! describe until it leads.
 
 mod app;
+mod clock;
 mod dump;
 #[cfg(feature = "fuzzing")]
 pub(crate) mod fuzzing;
@@ -36,7 +37,10 @@ use zzq_tokio::Endpoint;
 
 /// Journals that replicate to the cluster, for `n` lanes.
 pub(crate) fn open(opts: &BrokerOptions, n: usize) -> Opened {
-    let groups = Arc::new(Groups::default());
+    let (offset, tolerance) = opts.cluster.as_ref().map_or((0, 0), |c| {
+        (c.clock_offset_millis, c.node.clock.tolerance_millis)
+    });
+    let groups = Arc::new(Groups::new(clock::ClusterClock::new(offset, tolerance)));
     let journal = |j| Log::Cluster(ClusterLog::new(j, groups.clone()));
     Opened {
         retained: Retained::clustered(opts.max_retained, |s| journal(Journal::Retained(s as u8))),
@@ -126,9 +130,16 @@ pub(crate) struct Booted {
 /// The node: forced as `opts.start` says, from an unused exit dump in the
 /// state file, which is set aside then, or else as `opts.start` says.
 fn boot(shared: &Shared, opts: &ClusterOptions) -> Result<Booted> {
-    let (lanes, levels) = (shared.lanes.len(), shared.opts.max_topic_levels);
+    let at = Shape {
+        lanes: shared.lanes.len(),
+        levels: shared.opts.max_topic_levels,
+        groups: shared.cluster_groups(),
+    };
+    let clock = &at.groups.clock;
     let mut config = opts.node;
-    config.fingerprint = fingerprint(lanes, levels);
+    config.fingerprint = fingerprint(at.lanes, at.levels);
+    config.clock.origin_millis = clock.origin_millis();
+    let now = clock.since_origin();
     let path = shared.opts.state_file.as_deref();
     let read = |p: &Path| dump::read(p).map_err(Error::State);
     let unused = path.map(read).transpose()?.flatten();
@@ -140,18 +151,18 @@ fn boot(shared: &Shared, opts: &ClusterOptions) -> Result<Booted> {
                 Some(b) => Some(b),
                 None => loaded().transpose()?.flatten(),
             };
-            forced(&config, bytes.as_ref(), lanes, levels)?
+            forced(&config, bytes.as_ref(), &at, now)?
         }
-        (_, Some(bytes)) => restored(&config, &bytes, lanes, levels)?,
+        (_, Some(bytes)) => restored(&config, &bytes, &at, now)?,
         (start, None) => {
             let node = if start == ClusterStart::Bootstrap {
-                Node::bootstrap(config, Duration::ZERO)
+                Node::bootstrap(config, now)
             } else {
-                Node::recover(config, Duration::ZERO)
+                Node::recover(config, now)
             };
             Booted {
                 node: node.map_err(|_| Error::InvalidOption("cluster"))?,
-                app: Accumulators::new(lanes, levels),
+                app: Accumulators::new(at.lanes, at.levels, clock),
                 rewrite: false,
             }
         }
@@ -162,12 +173,27 @@ fn boot(shared: &Shared, opts: &ClusterOptions) -> Result<Booted> {
     Ok(booted)
 }
 
+/// The shape of the application state, and the clock its deadlines are
+/// read with.
+struct Shape {
+    lanes: usize,
+    levels: usize,
+    groups: Arc<Groups>,
+}
+
+impl Shape {
+    fn read_image(&self, parts: &[image::Part]) -> Result<Accumulators> {
+        Accumulators::from_image(self.lanes, self.levels, parts, &self.groups.clock)
+            .map_err(crate::dump::damaged)
+    }
+}
+
 /// A node from its exit dump `bytes`.
-fn restored(config: &NodeConfig, bytes: &Bytes, lanes: usize, levels: usize) -> Result<Booted> {
+fn restored(config: &NodeConfig, bytes: &Bytes, at: &Shape, now: Duration) -> Result<Booted> {
     let d = dump::decode(bytes).map_err(crate::dump::damaged)?;
-    let node = Node::restore(*config, &d.node, Duration::ZERO).map_err(crate::dump::damaged)?;
+    let node = Node::restore(*config, &d.node, now).map_err(crate::dump::damaged)?;
     let parts = image::decode(&d.image).map_err(crate::dump::damaged)?;
-    let app = Accumulators::from_image(lanes, levels, &parts).map_err(crate::dump::damaged)?;
+    let app = at.read_image(&parts)?;
     Ok(Booted {
         node,
         app,
@@ -176,23 +202,18 @@ fn restored(config: &NodeConfig, bytes: &Bytes, lanes: usize, levels: usize) -> 
 }
 
 /// A node forced to a new epoch, with the state of dump `bytes`, if any.
-fn forced(
-    config: &NodeConfig,
-    bytes: Option<&Bytes>,
-    lanes: usize,
-    levels: usize,
-) -> Result<Booted> {
+fn forced(config: &NodeConfig, bytes: Option<&Bytes>, at: &Shape, now: Duration) -> Result<Booted> {
     let Some(bytes) = bytes else {
         return Ok(Booted {
-            node: Node::force(*config, None, Duration::ZERO).map_err(crate::dump::damaged)?,
-            app: Accumulators::new(lanes, levels),
+            node: Node::force(*config, None, now).map_err(crate::dump::damaged)?,
+            app: Accumulators::new(at.lanes, at.levels, &at.groups.clock),
             rewrite: true,
         });
     };
     let d = dump::decode(bytes).map_err(crate::dump::damaged)?;
-    let node = Node::force(*config, Some(&d.node), Duration::ZERO).map_err(crate::dump::damaged)?;
+    let node = Node::force(*config, Some(&d.node), now).map_err(crate::dump::damaged)?;
     let parts = image::decode(&d.image).map_err(crate::dump::damaged)?;
-    let app = Accumulators::from_image(lanes, levels, &parts).map_err(crate::dump::damaged)?;
+    let app = at.read_image(&parts)?;
     Ok(Booted {
         node,
         app: app.for_new_epoch(),

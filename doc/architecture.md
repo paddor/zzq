@@ -215,6 +215,14 @@ the cluster instead, in RAM:
 - **Forced start.** When no two nodes have the state, one node starts a
   new configuration epoch from the newest state it has and journals it
   all as its first ops. Nodes without state join that epoch.
+- **Clocks.** Each node sends the others its wall time once a second.
+  Journals write deadlines in Unix time and followers read them in
+  cluster time: this node's clock, moved to the median clock when two
+  of the three agree and this one is not among them. A follower whose
+  cluster time moved past the tolerance reads its state again through
+  an image. A node takes its state into the lanes once it has that
+  time, or after five seconds without; until it has it, session expiry,
+  delayed wills and retained expiry wait.
 - **Links.** The nodes talk over OMQ, one PEER socket per node, on a
   thread of its own.
 

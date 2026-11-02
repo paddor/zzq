@@ -53,6 +53,7 @@ opcodes! {
     PreparePub = 0x52 => "`PREPARE_PUB`: publish canonical operations to followers.",
     ReplicaReceipt = 0x54 => "`REPLICA_RECEIPT`: compact same-channel volatile receipt.",
     HistoryRetired = 0x55 => "`HISTORY_RETIRED`: require nonvoting checkpoint recovery below retained history.",
+    ClockSample = 0x56 => "`CLOCK_SAMPLE`: report a node's wall time to a peer.",
 }
 
 /// Directional receive bounds checked before command decoding.

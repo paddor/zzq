@@ -43,10 +43,9 @@ impl Replica {
             return false;
         };
         let dump = match &self.app {
-            App::Follower(acc) => self
-                .node
-                .export()
-                .map(|(node, op)| dump::encode(&node, &image::encode(&acc.image(op)))),
+            App::Follower(acc) => self.node.export().map(|(node, op)| {
+                dump::encode(&node, &image::encode(&acc.image(op, &self.groups.clock)))
+            }),
             App::Leader if now >= ex.until => None,
             App::Leader => match self.leader_dump() {
                 Ok(dump) => dump,

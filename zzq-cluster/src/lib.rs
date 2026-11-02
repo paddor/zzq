@@ -3,8 +3,9 @@
 //!
 //! [`node::Node`] is one node: the cores below with its ops in RAM, the
 //! links to the other two, elections, images of the application's state
-//! for a node that has none, recovery after a crash, and exit dumps for a
-//! restart. It is sans-I/O: the caller moves frames, supplies time and
+//! for a node that has none, recovery after a crash, exit dumps for a
+//! restart, and clock samples that tell it the time most clocks agree on
+//! ([`clock`]). It is sans-I/O: the caller moves frames, supplies time and
 //! applies committed ops. Ops are opaque bytes.
 //!
 //! Below it, sans-I/O cores for normal operation, view change, log
@@ -26,6 +27,7 @@
     )
 )]
 
+pub mod clock;
 mod configuration_record;
 pub mod driver;
 mod envelope;

@@ -8,6 +8,10 @@
     reason = "test code"
 )]
 
+#[path = "cluster/clock.rs"]
+mod clock;
+#[path = "cluster/partition.rs"]
+mod partition;
 #[path = "cluster/sim.rs"]
 mod sim;
 
@@ -186,18 +190,17 @@ fn seeded_splits_drops_and_delays_never_lose_an_acked_op() {
         let mut sim = Sim::new(1000 + seed, Faults { drop: 5, jitter: 8 });
         started(&mut sim);
         for round in 0..20 {
-            let cut = sim.rng.below(5) as usize;
+            let cut = sim.rng.below(6) as usize;
             for i in 0..3 {
                 sim.isolate(i, false);
             }
-            if cut < 3 {
-                sim.isolate(cut, true);
-            } else if cut == 3 {
-                // One way only.
-                let a = sim.rng.below(3) as usize;
-                let b = (a + 1 + sim.rng.below(2) as usize) % 3;
-                sim.links[a][b] = false;
-                sim.timeline.push(format!("{:?} cut {a} to {b}", sim.now));
+            let a = sim.rng.below(3) as usize;
+            let b = (a + 1 + sim.rng.below(2) as usize) % 3;
+            match cut {
+                0..3 => sim.isolate(cut, true),
+                3 => sim.cut(a, b, true),
+                4 => sim.cut_pair(a, b, true),
+                _ => {}
             }
             propose_for(&mut sim, 20, 300);
             let _ = round;

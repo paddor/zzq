@@ -12,6 +12,7 @@ use crate::state::handoff::LaneState;
 use crate::state::journal::Sessions;
 
 use super::GroupWriter;
+use super::clock::ClusterClock;
 use super::image::Part;
 use super::log::{Journal, records};
 
@@ -23,14 +24,19 @@ pub(crate) struct Accumulators {
     /// The op through which an image gave a journal's state: replay skips
     /// its ops up to there.
     cuts: FxHashMap<Journal, OpNumber>,
+    /// The correction to cluster time its deadlines are read in.
+    correction: i64,
 }
 
 impl Accumulators {
-    pub(crate) fn new(lanes: usize, max_levels: usize) -> Accumulators {
+    /// No state yet, its deadlines to be read in cluster time as `clock`
+    /// has it now.
+    pub(crate) fn new(lanes: usize, max_levels: usize, clock: &ClusterClock) -> Accumulators {
         Accumulators {
             lanes: (0..lanes).map(|_| Sessions::new(lanes)).collect(),
             retained: retain::Accumulator::new(max_levels),
             cuts: FxHashMap::default(),
+            correction: clock.correction(),
         }
     }
 
@@ -39,18 +45,22 @@ impl Accumulators {
     /// # Errors
     ///
     /// When the op is malformed or does not fit the state.
-    pub(crate) fn apply(&mut self, op: OpNumber, body: &[u8]) -> Result<(), &'static str> {
+    pub(crate) fn apply(
+        &mut self,
+        op: OpNumber,
+        body: &[u8],
+        clock: &ClusterClock,
+    ) -> Result<(), &'static str> {
         let (journal, _) = records(body).ok_or("malformed op")?;
         if self.cuts.get(&journal).is_some_and(|&cut| op <= cut) {
             return Ok(());
         }
-        self.apply_body(body)
+        self.apply_body(body, clock.with(self.correction))
     }
 
-    fn apply_body(&mut self, body: &[u8]) -> Result<(), &'static str> {
+    fn apply_body(&mut self, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         let (journal, recs) = records(body).ok_or("malformed op")?;
         let lanes = self.lanes.len();
-        let clock = Clock::now();
         for rec in recs {
             let (kind, body) = rec.map_err(|()| "malformed record")?;
             match journal {
@@ -59,7 +69,7 @@ impl Accumulators {
                     let sessions = self.lanes.get_mut(j).ok_or("op of an unknown lane")?;
                     sessions.apply(kind, body, clock, |id| lane_for(id, lanes) == j)?;
                 }
-                Journal::Retained(s) => self.retained.apply(usize::from(s), kind, body)?,
+                Journal::Retained(s) => self.retained.apply(usize::from(s), kind, body, clock)?,
             }
         }
         Ok(())
@@ -74,14 +84,42 @@ impl Accumulators {
         lanes: usize,
         max_levels: usize,
         parts: &[Part],
+        clock: &ClusterClock,
     ) -> Result<Accumulators, &'static str> {
-        let mut acc = Accumulators::new(lanes, max_levels);
+        let mut acc = Accumulators::new(lanes, max_levels, clock);
+        let read = clock.with(acc.correction);
         for p in parts {
             let (journal, _) = records(&p.body).ok_or("malformed image part")?;
-            acc.apply_body(&p.body)?;
+            acc.apply_body(&p.body, read)?;
             acc.cuts.insert(journal, p.op);
         }
         Ok(acc)
+    }
+
+    /// The correction to cluster time its deadlines are read in.
+    pub(crate) const fn correction(&self) -> i64 {
+        self.correction
+    }
+
+    /// The same state read in cluster time as `clock` has it now, if the
+    /// time it was read in is off by more than the tolerance, as before
+    /// the first majority reading: its deadlines go out as they were read
+    /// and come back in the new time. Through op `applied`.
+    ///
+    /// # Errors
+    ///
+    /// When its own image does not fit the state, which a bug would be.
+    pub(crate) fn anchored(
+        self,
+        applied: OpNumber,
+        clock: &ClusterClock,
+    ) -> Result<Accumulators, &'static str> {
+        if !clock.moved_from(self.correction) {
+            return Ok(self);
+        }
+        let (lanes, max_levels) = (self.lanes.len(), self.retained.max_levels());
+        let parts = self.image(applied, clock);
+        Accumulators::from_image(lanes, max_levels, &parts, clock)
     }
 
     /// The same state for a new epoch, whose op numbers start over.
@@ -92,8 +130,8 @@ impl Accumulators {
 
     /// An image of the state, every part through op `applied`, or the op
     /// an image gave its journal, if later.
-    pub(crate) fn image(&self, applied: OpNumber) -> Vec<Part> {
-        let clock = Clock::now();
+    pub(crate) fn image(&self, applied: OpNumber, clock: &ClusterClock) -> Vec<Part> {
+        let clock = clock.with(self.correction);
         let mut parts = Vec::with_capacity(self.lanes.len() + STRIPES);
         for (j, sessions) in self.lanes.iter().enumerate() {
             let Ok(j) = u16::try_from(j) else { break };
@@ -105,7 +143,7 @@ impl Accumulators {
         for s in 0..STRIPES {
             let Ok(stripe) = u8::try_from(s) else { break };
             let mut w = GroupWriter::new(Journal::Retained(stripe));
-            if self.retained.image(s, &mut w).is_ok() {
+            if self.retained.image(s, &mut w, clock).is_ok() {
                 parts.push(self.part(applied, w));
             }
         }
@@ -137,6 +175,7 @@ mod tests {
     use super::*;
     use crate::disk::Append;
     use crate::state::journal::record_seeds;
+    use std::time::{Duration, Instant};
 
     /// An op of lane 0 with the seed records at `picks`.
     fn op(picks: &[usize]) -> Bytes {
@@ -164,49 +203,106 @@ mod tests {
         s
     }
 
+    fn clock() -> ClusterClock {
+        ClusterClock::new(0, 1000)
+    }
+
     fn live() -> Accumulators {
-        let mut acc = Accumulators::new(1, 8);
-        acc.apply(OpNumber(1), &op(&LIVE)).unwrap();
+        let mut acc = Accumulators::new(1, 8, &clock());
+        acc.apply(OpNumber(1), &op(&LIVE), &clock()).unwrap();
         acc
     }
 
     #[test]
     fn an_image_rebuilds_the_sessions_with_their_delivery_numbers() {
-        let mut rebuilt = Accumulators::from_image(1, 8, &live().image(OpNumber(1))).unwrap();
+        let mut rebuilt =
+            Accumulators::from_image(1, 8, &live().image(OpNumber(1), &clock()), &clock()).unwrap();
         let mut acc = live();
         // The next op names the delivery by the number the leader gave it.
         for a in [&mut acc, &mut rebuilt] {
-            a.apply(OpNumber(2), &op(&[DONE])).unwrap();
+            a.apply(OpNumber(2), &op(&[DONE]), &clock()).unwrap();
         }
         assert_eq!(state(rebuilt), state(acc));
     }
 
     #[test]
     fn replay_skips_the_ops_of_a_journal_its_image_holds() {
-        let parts = live().image(OpNumber(5));
+        let parts = live().image(OpNumber(5), &clock());
         assert!(parts.iter().all(|p| p.op == OpNumber(5)));
-        let fresh = || Accumulators::from_image(1, 8, &parts).unwrap();
+        let fresh = || Accumulators::from_image(1, 8, &parts, &clock()).unwrap();
         let mut skipped = fresh();
-        skipped.apply(OpNumber(5), &op(&[DONE])).unwrap();
+        skipped.apply(OpNumber(5), &op(&[DONE]), &clock()).unwrap();
         assert_eq!(state(skipped), state(fresh()), "op 5 is in the image");
         let mut rebuilt = fresh();
-        rebuilt.apply(OpNumber(6), &op(&[DONE])).unwrap();
+        rebuilt.apply(OpNumber(6), &op(&[DONE]), &clock()).unwrap();
         let mut done = live();
-        done.apply(OpNumber(6), &op(&[DONE])).unwrap();
+        done.apply(OpNumber(6), &op(&[DONE]), &clock()).unwrap();
         assert_eq!(state(rebuilt), state(done));
         // An image of an image keeps each journal's later cut.
-        let again = fresh().image(OpNumber(3));
+        let again = fresh().image(OpNumber(3), &clock());
         assert!(again.iter().all(|p| p.op == OpNumber(5)));
     }
 
     #[test]
     fn a_malformed_op_or_part_is_refused() {
-        let mut acc = Accumulators::new(1, 8);
-        assert!(acc.apply(OpNumber(1), &[9, 9]).is_err());
+        let mut acc = Accumulators::new(1, 8, &clock());
+        assert!(acc.apply(OpNumber(1), &[9, 9], &clock()).is_err());
         let part = Part {
             op: OpNumber(1),
             body: Bytes::from_static(&[0, 0, 0, 1]),
         };
-        assert!(Accumulators::from_image(1, 8, &[part]).is_err());
+        assert!(Accumulators::from_image(1, 8, &[part], &clock()).is_err());
+    }
+
+    /// Each session's expiry, and each delayed will's due time.
+    fn deadlines(acc: Accumulators) -> Vec<Instant> {
+        let (lanes, _) = acc.finish();
+        let sessions = lanes.into_iter().flat_map(|l| l.sessions);
+        sessions
+            .flat_map(|s| s.expires_at.into_iter().chain(s.delayed_will.map(|w| w.0)))
+            .collect()
+    }
+
+    #[test]
+    fn a_state_read_before_the_majority_moves_into_its_time() {
+        let clock = clock();
+        let read = || {
+            let mut acc = Accumulators::new(1, 8, &clock);
+            acc.apply(OpNumber(1), &op(&LIVE), &clock).unwrap();
+            acc
+        };
+        let (first, second) = (read(), read());
+        let before = deadlines(first);
+        assert!(!before.is_empty(), "the seeds have deadlines");
+        // This clock turns out an hour fast: what it read is an hour early.
+        clock.observe(Some(-3_600_000));
+        let after = deadlines(second.anchored(OpNumber(1), &clock).unwrap());
+        assert_eq!(before.len(), after.len());
+        for (b, a) in before.iter().zip(&after) {
+            let moved = a.duration_since(*b);
+            let hour = Duration::from_secs(3600);
+            assert!(
+                moved.abs_diff(hour) < Duration::from_millis(50),
+                "{moved:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_correction_within_the_tolerance_leaves_the_state_as_read() {
+        let clock = clock();
+        let mut acc = Accumulators::new(1, 8, &clock);
+        acc.apply(OpNumber(1), &op(&LIVE), &clock).unwrap();
+        let before = deadlines(
+            Accumulators::from_image(1, 8, &acc.image(OpNumber(1), &clock), &clock).unwrap(),
+        );
+        clock.observe(Some(-900));
+        let kept = acc.anchored(OpNumber(1), &clock).unwrap();
+        assert_eq!(kept.correction, 0, "not read again");
+        let after = deadlines(kept);
+        for (b, a) in before.iter().zip(&after) {
+            let apart = a.max(b).duration_since(*a.min(b));
+            assert!(apart < Duration::from_millis(50), "{apart:?}");
+        }
     }
 }

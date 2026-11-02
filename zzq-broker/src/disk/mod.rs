@@ -43,6 +43,15 @@ pub(crate) enum Log {
 }
 
 impl Log {
+    /// The clocks a record's deadlines are written in: this host's, or
+    /// for a cluster the time most of its clocks agree on.
+    pub(crate) fn clock(&self) -> crate::state::Clock {
+        match self {
+            Log::Disk(_) => crate::state::Clock::now(),
+            Log::Cluster(c) => c.clock(),
+        }
+    }
+
     pub(crate) fn append(&mut self, kind: u8, parts: &[&[u8]]) -> io::Result<u64> {
         match self {
             Log::Disk(d) => d.append(kind, parts),

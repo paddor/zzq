@@ -306,8 +306,13 @@ impl Node {
         };
         let snapshot = normal.snapshot();
         // The primary sends, also while it activates the view it installed.
+        // Not while it asks to leave the view: like its missing heartbeats,
+        // silence lets the followers time out. Each resend would earn an
+        // ack, and an ack backs its lease, so the followers would never
+        // help each other leave a view whose primary hears neither.
         if snapshot.status != crate::Status::Normal
             || self.config.configuration.primary(snapshot.scope.view) != self.config.local
+            || self.driver.suspects_view()
         {
             return;
         }

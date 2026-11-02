@@ -152,6 +152,9 @@ pub struct ReplicaDriver {
     exit_echo: Option<(Scope, VoterSet)>,
     /// Earliest next answer to each voter's request to leave an older view.
     exit_echo_at: Voters<Duration>,
+    /// Voters still asking to leave a view older than this voter's durably
+    /// promised one. Each gets that view's `START_VIEW_CHANGE`.
+    fence_answers: VoterSet,
 }
 
 impl ReplicaDriver {
@@ -239,6 +242,7 @@ impl ReplicaDriver {
             exit_retry_at: None,
             exit_echo: None,
             exit_echo_at: Voters::splat(Duration::ZERO),
+            fence_answers: VoterSet::EMPTY,
         })
     }
 
@@ -273,6 +277,12 @@ impl ReplicaDriver {
             Role::Normal(normal) => Some(normal),
             Role::ViewChanging(_) | Role::Installing(_) | Role::Fenced(_) => None,
         }
+    }
+
+    /// Whether this voter asks to leave its current view. Its poll then
+    /// sends no heartbeats.
+    pub const fn suspects_view(&self) -> bool {
+        self.exit_retry_at.is_some()
     }
 
     /// A fenced old view needs an actual barrier before publishing its promise.
@@ -440,6 +450,8 @@ impl ReplicaDriver {
         self.exit_votes = VoterSet::EMPTY;
         self.exit_retry_at = None;
         self.isolated = false;
+        // A new view is not durably promised yet.
+        self.fence_answers = VoterSet::EMPTY;
         self.election_deadline = self.now.saturating_add(self.election_delay);
         self.retry_at = self.now.saturating_add(self.timing.retransmit);
         self.pending.start = true;

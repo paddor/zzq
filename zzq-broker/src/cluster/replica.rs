@@ -14,7 +14,7 @@ use zzq_cluster::node::{Event, Node, Outgoing, ProposeError, Role};
 
 use super::app::Accumulators;
 use super::image::{self, Cut};
-use super::log::{Commits, Group, Journal};
+use super::log::{Commits, Group, Groups, Journal};
 use crate::broker::Shared;
 
 mod exit;
@@ -54,6 +54,7 @@ pub(crate) struct Links {
 
 pub(crate) struct Replica {
     shared: Arc<Shared>,
+    groups: Arc<Groups>,
     node: Node,
     links: Links,
     /// Groups not proposed yet: the pipeline was full.
@@ -75,7 +76,9 @@ pub(crate) struct Replica {
     /// A forced epoch's history starts empty: the first leadership writes
     /// the whole state into it.
     rewrite: bool,
-    origin: tokio::time::Instant,
+    /// Since when the node leads without having taken in its state: it
+    /// waits for a majority clock reading to read deadlines in.
+    leading_since: Option<Duration>,
 }
 
 impl std::fmt::Debug for Replica {
@@ -91,6 +94,7 @@ impl Replica {
     pub(crate) fn new(shared: Arc<Shared>, booted: super::Booted, links: Links) -> Replica {
         let super::Booted { node, app, rewrite } = booted;
         Replica {
+            groups: shared.cluster_groups(),
             shared,
             node,
             rewrite,
@@ -103,18 +107,18 @@ impl Replica {
             exiting: None,
             failed: None,
             suspended: None,
-            origin: tokio::time::Instant::now(),
+            leading_since: None,
         }
     }
 
     fn now(&self) -> Duration {
-        self.origin.elapsed()
+        self.groups.clock.since_origin()
     }
 
     /// Runs until the broker stops or the node exits: input, node,
     /// output, events.
     pub(crate) async fn run(mut self) {
-        let groups = self.shared.cluster_groups();
+        let groups = self.groups.clone();
         loop {
             let now = self.now();
             let wait = self
@@ -146,7 +150,7 @@ impl Replica {
     /// The node's work after an input, then the exit if it is due. True
     /// once the node exited.
     async fn step(&mut self) -> bool {
-        let groups = self.shared.cluster_groups();
+        let groups = self.groups.clone();
         let now = self.now();
         // Before the poll, which sends what was proposed.
         self.propose(now);
@@ -158,9 +162,12 @@ impl Replica {
             // A full link drops; the node sends again.
             let _ = self.links.outbound.try_send(out);
         }
+        groups.clock.observe(self.node.clock().majority);
+        self.anchor();
         while let Some(event) = self.node.next_event() {
             self.event(event).await;
         }
+        self.promote_when_clocked().await;
         self.check_suspended(now).await;
         // The leader's log holds its own view's history: what committed
         // there is its own, also what committed while it had no lease.
@@ -254,7 +261,7 @@ impl Replica {
         let App::Follower(acc) = &mut self.app else {
             return;
         };
-        if acc.apply(op, body).is_ok() {
+        if acc.apply(op, body, &self.groups.clock).is_ok() {
             let _ = self.node.applied(op);
         } else if rebuild_after(&mut self.failed, op) {
             self.app = App::Follower(self.empty());
@@ -263,14 +270,38 @@ impl Replica {
     }
 
     fn empty(&self) -> Accumulators {
-        Accumulators::new(self.shared.lanes.len(), self.shared.opts.max_topic_levels)
+        let (lanes, levels) = (self.shared.lanes.len(), self.shared.opts.max_topic_levels);
+        Accumulators::new(lanes, levels, &self.groups.clock)
+    }
+
+    /// A follower's state read in cluster time as it is now, once that
+    /// moved past the tolerance from the time it was read in.
+    fn anchor(&mut self) {
+        let App::Follower(acc) = &self.app else {
+            return;
+        };
+        if !self.groups.clock.moved_from(acc.correction()) {
+            return;
+        }
+        let applied = self.node.status().applied;
+        let App::Follower(acc) = std::mem::replace(&mut self.app, App::Leader) else {
+            return;
+        };
+        if let Ok(acc) = acc.anchored(applied, &self.groups.clock) {
+            self.app = App::Follower(acc);
+        } else {
+            self.node.reset_application();
+            self.app = App::Follower(self.empty());
+        }
     }
 
     /// A follower's state becomes the image's. One that does not fit is
     /// dropped, and the state comes again.
     fn install(&mut self, bytes: &Bytes) {
         let (lanes, levels) = (self.shared.lanes.len(), self.shared.opts.max_topic_levels);
-        let acc = image::decode(bytes).and_then(|p| Accumulators::from_image(lanes, levels, &p));
+        let clock = &self.groups.clock;
+        let acc =
+            image::decode(bytes).and_then(|p| Accumulators::from_image(lanes, levels, &p, clock));
         let Ok(acc) = acc else {
             self.app = App::Follower(self.empty());
             self.node.reset_application();
@@ -288,7 +319,7 @@ impl Replica {
             return;
         };
         let applied = self.node.status().applied;
-        let parts = acc.image(applied);
+        let parts = acc.image(applied, &self.groups.clock);
         let _ = self
             .node
             .offer_image(applied, applied, image::encode(&parts));

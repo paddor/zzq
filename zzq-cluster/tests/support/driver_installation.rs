@@ -454,28 +454,33 @@ fn installation_progress_keeps_its_view_until_one_delay_after_the_last() {
 }
 
 #[test]
-fn a_normal_voter_past_a_view_supports_a_lagging_peer_leaving_it() {
+fn an_installing_voter_responds_to_an_old_request_with_its_view_fence() {
     let (mut primary, _, now) = selected_pair();
     let ticket = primary
         .begin_primary_install(JournalGeneration(10))
         .unwrap();
+    // The third voter never learned of view 1 and asks to leave view 0. No
+    // traffic of view 1 reaches it while it lags.
+    let old = Control::ExitView(Scope {
+        view: 0,
+        ..configuration().scope()
+    });
+    let fenced = |primary: &mut ReplicaDriver, at| {
+        primary.receive(node(0), wire_control(0, old), at).unwrap();
+        (0..4).any(|_| {
+            matches!(
+                primary.poll(at).unwrap(),
+                Some(Action::Send { to, message: Control::StartViewChange(fence) })
+                    if to == node(0) && fence.scope.view == 1
+            )
+        })
+    };
+    assert!(fenced(&mut primary, now), "an installing voter responds");
     primary.validate_install_suffix(&[operation()]).unwrap();
     primary
         .complete_installation(ticket, Prefix::GENESIS, now)
         .unwrap();
     assert!(primary.normal().is_some());
-    // The third voter never learned of view 1 and asks to leave view 0. No
-    // normal traffic of view 1 reaches it while it lags.
-    let old = Control::ExitView(Scope {
-        view: 0,
-        ..configuration().scope()
-    });
-    primary.receive(node(0), wire_control(0, old), now).unwrap();
-    let echoed = (0..4).any(|_| {
-        matches!(
-            primary.poll(now).unwrap(),
-            Some(Action::Send { to, message }) if to == node(0) && message == old
-        )
-    });
-    assert!(echoed, "a normal voter supports leaving the view it left");
+    let later = now + timing().retransmit;
+    assert!(fenced(&mut primary, later), "a normal voter responds");
 }

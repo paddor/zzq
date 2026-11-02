@@ -12,6 +12,7 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use zzq_broker::{Broker, BrokerOptions, ClusterLinks, ClusterOptions, ClusterStart, Context};
 use zzq_client::{Client, ClientOptions};
+use zzq_cluster::clock::ClockConfig;
 use zzq_cluster::driver::Timing;
 use zzq_cluster::node::{LogLimits, NodeConfig, NodeStatus, Outgoing, Role};
 use zzq_cluster::wire::WireLimits;
@@ -68,6 +69,10 @@ fn node_config(i: usize, log: LogLimits) -> NodeConfig {
         log,
         wire: WireLimits::for_transfer(256, 64 << 20).unwrap(),
         fingerprint: 2,
+        clock: ClockConfig {
+            origin_millis: 0,
+            tolerance_millis: 1000,
+        },
     }
 }
 
@@ -111,6 +116,8 @@ pub(crate) struct Cluster {
     log: LogLimits,
     /// Where the nodes write their exit dumps.
     dir: PathBuf,
+    /// Milliseconds each node's wall clock is off, from its next start.
+    clocks: Mutex<[i64; NODES]>,
 }
 
 impl Drop for Cluster {
@@ -139,6 +146,7 @@ impl Cluster {
             net: Arc::default(),
             log,
             dir,
+            clocks: Mutex::default(),
         };
         for i in 0..NODES {
             let (outbound, out) = mpsc::channel(4096);
@@ -205,6 +213,7 @@ impl Cluster {
                 node: node_config(i, self.log),
                 start,
                 links,
+                clock_offset_millis: self.clocks.lock().unwrap()[i],
             }),
             state_file: Some(self.dump(i)),
             ..BrokerOptions::default()
@@ -212,6 +221,11 @@ impl Cluster {
         let broker = Broker::new(&self.ctx, opts).await.unwrap();
         broker.bind(&format!("inproc://node-{i}")).await.unwrap();
         broker
+    }
+
+    /// Puts node `i`'s wall clock `millis` off from its next start.
+    pub(crate) fn set_clock(&self, i: usize, millis: i64) {
+        self.clocks.lock().unwrap()[i] = millis;
     }
 
     /// Node `i`'s exit dump.
@@ -287,6 +301,12 @@ impl Cluster {
     /// Cuts what node `a` sends node `b`, or joins it again.
     pub(crate) fn cut(&self, a: usize, b: usize, cut: bool) {
         self.cuts.lock().unwrap()[a][b] = cut;
+    }
+
+    /// Cuts nodes `a` and `b` from each other both ways, or joins them.
+    pub(crate) fn cut_pair(&self, a: usize, b: usize, cut: bool) {
+        self.cut(a, b, cut);
+        self.cut(b, a, cut);
     }
 
     /// Cuts node `i` off the others, or joins it again.

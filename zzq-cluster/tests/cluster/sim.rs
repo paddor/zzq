@@ -7,6 +7,7 @@ use std::collections::BinaryHeap;
 use std::time::Duration;
 
 use bytes::Bytes;
+use zzq_cluster::clock::ClockConfig;
 use zzq_cluster::driver::Timing;
 use zzq_cluster::node::{Event, LogLimits, Node, NodeConfig, Role};
 use zzq_cluster::wire::WireLimits;
@@ -66,7 +67,11 @@ pub(crate) const fn timing() -> Timing {
     }
 }
 
-pub(crate) fn node_config(i: usize, log: LogLimits) -> NodeConfig {
+/// Unix time in milliseconds at sim time zero, on a right clock.
+pub(crate) const WALL: u64 = 1_800_000_000_000;
+
+/// Node `i` of the sim, whose wall clock reads `origin` at sim time zero.
+pub(crate) fn node_config(i: usize, log: LogLimits, origin: u64) -> NodeConfig {
     NodeConfig {
         configuration: configuration(),
         local: node_id(i),
@@ -78,6 +83,10 @@ pub(crate) fn node_config(i: usize, log: LogLimits) -> NodeConfig {
         log,
         wire: WireLimits::for_transfer(64, 1 << 20).unwrap(),
         fingerprint: 4,
+        clock: ClockConfig {
+            origin_millis: origin,
+            tolerance_millis: 1000,
+        },
     }
 }
 
@@ -144,6 +153,8 @@ pub(crate) struct Sim {
     pub(crate) images: [usize; 3],
     /// The log limits of every node.
     log: LogLimits,
+    /// What each node's wall clock reads at sim time zero.
+    clocks: [u64; 3],
     /// Exit dumps and the application ops dumped with them.
     dumps: [Option<(Bytes, Vec<Bytes>)>; 3],
     /// Record each message's opcode in `traced`.
@@ -162,14 +173,40 @@ impl Sim {
 
     /// A sim whose nodes keep at most `log` ops.
     pub(crate) fn with_log(seed: u64, faults: Faults, log: LogLimits) -> Sim {
+        Sim::linked(seed, faults, log, [[true; 3]; 3], [WALL; 3])
+    }
+
+    /// A sim whose nodes' wall clocks read `clocks` at sim time zero.
+    pub(crate) fn with_clocks(seed: u64, faults: Faults, clocks: [u64; 3]) -> Sim {
+        Sim::linked(seed, faults, LogLimits::default(), [[true; 3]; 3], clocks)
+    }
+
+    /// A sim whose node `i` is cut off before it sends anything.
+    pub(crate) fn cut_off_from_start(seed: u64, faults: Faults, i: usize) -> Sim {
+        let mut links = [[true; 3]; 3];
+        for j in (0..3).filter(|&j| j != i) {
+            links[i][j] = false;
+            links[j][i] = false;
+        }
+        Sim::linked(seed, faults, LogLimits::default(), links, [WALL; 3])
+    }
+
+    fn linked(
+        seed: u64,
+        faults: Faults,
+        log: LogLimits,
+        links: [[bool; 3]; 3],
+        clocks: [u64; 3],
+    ) -> Sim {
         let now = Duration::ZERO;
         let mut sim = Sim {
             now,
             rng: Rng::new(seed),
-            nodes: [0, 1, 2].map(|i| Some(Node::bootstrap(node_config(i, log), now).unwrap())),
+            nodes: [0, 1, 2]
+                .map(|i| Some(Node::bootstrap(node_config(i, log, clocks[i]), now).unwrap())),
             apps: Default::default(),
             faults,
-            links: [[true; 3]; 3],
+            links,
             net: BinaryHeap::new(),
             seq: 0,
             acked: Vec::new(),
@@ -181,6 +218,7 @@ impl Sim {
             trace: false,
             traced: Vec::new(),
             log,
+            clocks,
         };
         for i in 0..3 {
             for j in (0..3).filter(|&j| j != i) {
@@ -240,7 +278,8 @@ impl Sim {
             return;
         };
         self.timeline.push(format!("{:?} start node {i}", self.now));
-        let node = Node::restore(node_config(i, self.log), &bytes, self.now).unwrap();
+        let node =
+            Node::restore(node_config(i, self.log, self.clocks[i]), &bytes, self.now).unwrap();
         self.nodes[i] = Some(node);
         self.apps[i].ops = ops;
         for j in (0..3).filter(|&j| j != i) {
@@ -252,7 +291,7 @@ impl Sim {
     pub(crate) fn restart(&mut self, i: usize) {
         self.timeline
             .push(format!("{:?} restart node {i}", self.now));
-        let node = Node::recover(node_config(i, self.log), self.now).unwrap();
+        let node = Node::recover(node_config(i, self.log, self.clocks[i]), self.now).unwrap();
         self.nodes[i] = Some(node);
         for j in (0..3).filter(|&j| j != i) {
             self.node(i).connected(node_id(j)).unwrap();
@@ -265,7 +304,12 @@ impl Sim {
     pub(crate) fn force(&mut self, i: usize) {
         self.timeline.push(format!("{:?} force node {i}", self.now));
         let dump = self.dumps[i].take().map(|(bytes, _)| bytes);
-        let node = Node::force(node_config(i, self.log), dump.as_deref(), self.now).unwrap();
+        let node = Node::force(
+            node_config(i, self.log, self.clocks[i]),
+            dump.as_deref(),
+            self.now,
+        )
+        .unwrap();
         self.nodes[i] = Some(node);
         self.apps[i] = App::default();
         self.acked.clear();
@@ -277,6 +321,20 @@ impl Sim {
     /// The epoch node `i` runs, if it runs.
     pub(crate) fn epoch(&self, i: usize) -> Option<u64> {
         self.nodes[i].as_ref().map(Node::epoch)
+    }
+
+    /// Cuts what node `a` sends node `b`, or joins it again.
+    pub(crate) fn cut(&mut self, a: usize, b: usize, cut: bool) {
+        if cut {
+            self.timeline.push(format!("{:?} cut {a} to {b}", self.now));
+        }
+        self.links[a][b] = !cut;
+    }
+
+    /// Cuts nodes `a` and `b` from each other both ways, or joins them.
+    pub(crate) fn cut_pair(&mut self, a: usize, b: usize, cut: bool) {
+        self.cut(a, b, cut);
+        self.cut(b, a, cut);
     }
 
     /// Splits node `i` off from the others, or heals it.
