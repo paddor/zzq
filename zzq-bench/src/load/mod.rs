@@ -1,6 +1,8 @@
 //! Throughput and latency scenarios.
 
+use std::fmt;
 use std::io::{self, ErrorKind};
+use std::str::FromStr;
 use std::time::Duration;
 
 use crate::wire::Session;
@@ -20,6 +22,40 @@ pub enum Scenario {
     Fanout,
     /// `pubs` publishers on distinct topics, one wildcard subscriber.
     Fanin,
+}
+
+impl Scenario {
+    /// Publishers and subscribers it connects for `load`.
+    pub const fn conns(self, load: &Load) -> (usize, usize) {
+        match self {
+            Scenario::Pairs => (load.pubs, load.pubs),
+            Scenario::Fanout => (1, load.subs),
+            Scenario::Fanin => (load.pubs, 1),
+        }
+    }
+}
+
+impl FromStr for Scenario {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pairs" => Ok(Scenario::Pairs),
+            "fanout" => Ok(Scenario::Fanout),
+            "fanin" => Ok(Scenario::Fanin),
+            _ => Err(format!("unknown scenario {s}")),
+        }
+    }
+}
+
+impl fmt::Display for Scenario {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Scenario::Pairs => "pairs",
+            Scenario::Fanout => "fanout",
+            Scenario::Fanin => "fanin",
+        })
+    }
 }
 
 /// Load settings.

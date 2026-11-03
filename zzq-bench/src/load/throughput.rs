@@ -118,10 +118,11 @@ struct Shape {
 
 impl Shape {
     fn new(scenario: Scenario, load: &Load) -> Shape {
-        let (pubs, subs, fan) = match scenario {
-            Scenario::Pairs => (load.pubs, load.pubs, 1),
-            Scenario::Fanout => (1, load.subs, load.subs as u64),
-            Scenario::Fanin => (load.pubs, 1, 1),
+        let (pubs, subs) = scenario.conns(load);
+        let fan = if scenario == Scenario::Fanout {
+            subs as u64
+        } else {
+            1
         };
         Shape {
             scenario,

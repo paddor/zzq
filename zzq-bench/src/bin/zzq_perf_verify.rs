@@ -509,14 +509,13 @@ fn run_load(cpus: &str, addr: &str, sec: &Section, kind: Kind) -> Result<String,
             cross,
             topics,
         }) => {
-            let s = match scenario {
-                Scenario::Pairs => "pairs",
-                Scenario::Fanout => "fanout",
-                Scenario::Fanin => "fanin",
+            let s = if cross {
+                "cross".to_owned()
+            } else {
+                scenario.to_string()
             };
-            let s = if cross { "cross" } else { s };
             c.args([
-                s,
+                &s,
                 &qos.to_string(),
                 &size.to_string(),
                 &pubs.to_string(),
@@ -655,9 +654,8 @@ fn load_child(args: &[String]) -> ExitCode {
     let scenario_name = scenario.as_str();
     let scenario = match scenario_name {
         "rtt" => return latency_child(&cfg, keep),
-        "fanout" | "behind" => Scenario::Fanout,
-        "fanin" => Scenario::Fanin,
-        _ => Scenario::Pairs,
+        "behind" => Scenario::Fanout,
+        s => s.parse().unwrap_or(Scenario::Pairs),
     };
     // A fifth of the subscribers share the publisher's lane.
     let local = (scenario_name == "behind").then_some(cfg.subs / 5);
