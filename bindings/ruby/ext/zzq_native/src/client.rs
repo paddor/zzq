@@ -18,8 +18,7 @@ use crate::op::{self, Out};
 use crate::rb::{self, DataType, RbResult, RubyErr};
 use crate::{context, options, wake};
 
-static TYPE: DataType = DataType::new::<NativeClient>(c"ZZQ::Native::Client");
-static CLASS: OnceLock<usize> = OnceLock::new();
+static TYPE: DataType<NativeClient> = DataType::new(c"ZZQ::Native::Client");
 /// `ZZQ::Message` and a frozen empty Array for messages without
 /// Subscription Identifiers.
 static MESSAGE: OnceLock<(usize, usize)> = OnceLock::new();
@@ -44,7 +43,7 @@ impl std::fmt::Debug for NativeClient {
 }
 
 fn get(value: VALUE) -> RbResult<&'static NativeClient> {
-    unsafe { TYPE.get(value) }
+    TYPE.get(value)
 }
 
 /// A Ruby object for a connected client.
@@ -57,7 +56,7 @@ pub fn wrap(c: Client) -> RbResult<VALUE> {
         client: Arc::new(tokio::sync::Mutex::new(c)),
         recv: Mutex::new(None),
     };
-    TYPE.wrap(*CLASS.get().expect("registered") as VALUE, native)
+    TYPE.wrap(native)
 }
 
 fn connect(uri: VALUE, opts: VALUE) -> RbResult<VALUE> {
@@ -223,72 +222,37 @@ fn disconnect(this: VALUE, reason: VALUE) -> RbResult<VALUE> {
     })
 }
 
-unsafe extern "C" fn client_connect(_class: VALUE, uri: VALUE, opts: VALUE) -> VALUE {
-    rb::wrap(|| connect(uri, opts))
-}
-
-unsafe extern "C" fn client_publish(
-    this: VALUE,
-    topic: VALUE,
-    payload: VALUE,
-    qos: VALUE,
-    retain: VALUE,
-) -> VALUE {
-    rb::wrap(|| publish(this, topic, payload, qos, retain))
-}
-
-unsafe extern "C" fn client_subscribe(this: VALUE, filters: VALUE, sub_id: VALUE) -> VALUE {
-    rb::wrap(|| subscribe(this, filters, sub_id))
-}
-
-unsafe extern "C" fn client_unsubscribe(this: VALUE, filters: VALUE) -> VALUE {
-    rb::wrap(|| unsubscribe(this, filters))
-}
-
-unsafe extern "C" fn client_receive(this: VALUE, wake: VALUE, max: VALUE) -> VALUE {
-    rb::wrap(|| receive(this, wake, max))
-}
-
-unsafe extern "C" fn client_disconnect(this: VALUE, reason: VALUE) -> VALUE {
-    rb::wrap(|| disconnect(this, reason))
-}
-
-unsafe extern "C" fn client_session_present(this: VALUE) -> VALUE {
-    rb::wrap(|| Ok(rb::bool_value(get(this)?.session_present)))
-}
-
-unsafe extern "C" fn client_assigned_client_id(this: VALUE) -> VALUE {
-    rb::wrap(|| match &get(this)?.assigned_client_id {
-        Some(id) => rb::new_utf8_string(id),
-        None => Ok(rb::qnil()),
-    })
-}
-
 pub fn register(zzq: VALUE, native: VALUE) -> RbResult<()> {
     let message = rb::const_get(zzq, c"Message")?;
     let no_ids = rb::freeze(rb::array_new_capa(0)?);
     rb::define_const(native, c"NO_SUBSCRIPTION_IDS", no_ids)?;
     let _ = MESSAGE.set((message as usize, no_ids as usize));
 
-    let class = rb::define_class_under(native, c"Client")?;
-    let _ = CLASS.set(class as usize);
-    rb::define_singleton_method(class, c"connect", client_connect as *const (), 2)?;
-    rb::define_method(class, c"publish", client_publish as *const (), 4)?;
-    rb::define_method(class, c"subscribe", client_subscribe as *const (), 2)?;
-    rb::define_method(class, c"unsubscribe", client_unsubscribe as *const (), 1)?;
-    rb::define_method(class, c"receive", client_receive as *const (), 2)?;
-    rb::define_method(class, c"disconnect", client_disconnect as *const (), 1)?;
-    rb::define_method(
-        class,
-        c"session_present?",
-        client_session_present as *const (),
-        0,
-    )?;
-    rb::define_method(
-        class,
-        c"assigned_client_id",
-        client_assigned_client_id as *const (),
-        0,
-    )?;
+    let class = TYPE.register(native, c"Client")?;
+    rb::singleton!(class, c"connect", |_class, uri, opts| connect(uri, opts))?;
+    rb::method!(class, c"publish", |this, topic, payload, qos, retain| {
+        publish(this, topic, payload, qos, retain)
+    })?;
+    rb::method!(class, c"subscribe", |this, filters, sub_id| {
+        subscribe(this, filters, sub_id)
+    })?;
+    rb::method!(class, c"unsubscribe", |this, filters| unsubscribe(
+        this, filters
+    ))?;
+    rb::method!(class, c"receive", |this, wake, max| receive(
+        this, wake, max
+    ))?;
+    rb::method!(class, c"disconnect", |this, reason| disconnect(
+        this, reason
+    ))?;
+    rb::method!(class, c"session_present?", |this| {
+        Ok(rb::bool_value(get(this)?.session_present))
+    })?;
+    rb::method!(class, c"assigned_client_id", |this| {
+        match &get(this)?.assigned_client_id {
+            Some(id) => rb::new_utf8_string(id),
+            None => Ok(rb::qnil()),
+        }
+    })?;
     Ok(())
 }

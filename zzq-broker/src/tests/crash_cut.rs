@@ -2,11 +2,14 @@
 
 use std::path::Path;
 
+use zzq_proto::encode::PublishHeader;
 use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 
-use super::support::{Got, Raw, publish_bytes};
+use super::support::{Got, Raw, header, publish, set_dup};
 use super::{Broker, Context, WAIT, durable, id_on, on_disk, setup};
 
+/// A crash image of the running broker's `source`. A file it removes
+/// meanwhile, as a segment a snapshot trimmed, is gone in a crash too.
 fn copy_tree(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
@@ -14,8 +17,8 @@ fn copy_tree(source: &Path, target: &Path) {
         let to = target.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_tree(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), to).unwrap();
+        } else if let Err(e) = std::fs::copy(entry.path(), to) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
         }
     }
 }
@@ -104,7 +107,10 @@ async fn missing_destination(name: &str, snapshot: bool, lanes_after: usize) {
     let (copy, copy_opts) = on_disk(&format!("qos2-crash-copy-{name}"));
     let publisher = id_on("crash-pub", 0, 2);
     let subscriber = id_on("crash-sub", 1, 2);
-    let mut packet = publish_bytes(Version::V5, "crash/t", b"once", QoS::ExactlyOnce, 5, &[]);
+    let mut packet = publish(
+        &header(Version::V5, "crash/t", QoS::ExactlyOnce, 5),
+        b"once",
+    );
     {
         let (ctx, broker, uri) = setup(2, opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
@@ -128,7 +134,7 @@ async fn missing_destination(name: &str, snapshot: bool, lanes_after: usize) {
     let (_ctx, broker, uri) = setup(lanes_after, copy_opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable(&publisher)).await;
-    packet[0] |= 0x08;
+    set_dup(&mut packet);
     p.send(&packet).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec));
     p.ack(PacketType::PubRel, 5).await;
@@ -148,7 +154,10 @@ async fn a_committed_destination_does_not_repeat_an_unfinished_source_handoff() 
     let (copy, copy_opts) = on_disk("qos2-receipt-copy");
     let publisher = id_on("receipt-pub", 0, 2);
     let subscriber = id_on("receipt-sub", 1, 2);
-    let mut packet = publish_bytes(Version::V5, "receipt/t", b"once", QoS::ExactlyOnce, 5, &[]);
+    let mut packet = publish(
+        &header(Version::V5, "receipt/t", QoS::ExactlyOnce, 5),
+        b"once",
+    );
     {
         let (ctx, broker, uri) = setup(2, opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
@@ -186,7 +195,7 @@ async fn a_committed_destination_does_not_repeat_an_unfinished_source_handoff() 
     let (_ctx, broker, uri) = setup(2, copy_opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable(&publisher)).await;
-    packet[0] |= 0x08;
+    set_dup(&mut packet);
     p.send(&packet).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec));
     p.ack(PacketType::PubRel, 5).await;
@@ -239,7 +248,10 @@ async fn a_pubrec_sent_before_the_destination_has_it_still_delivers_after_a_cras
 async fn a_written_publish_to_its_own_lane_is_not_repeated_after_a_crash() {
     let (dir, opts) = on_disk("qos2-local-written");
     let (copy, copy_opts) = on_disk("qos2-local-written-copy");
-    let mut packet = publish_bytes(Version::V5, "local/t", b"once", QoS::ExactlyOnce, 5, &[]);
+    let mut packet = publish(
+        &header(Version::V5, "local/t", QoS::ExactlyOnce, 5),
+        b"once",
+    );
     {
         let (_ctx, _broker, uri) = setup(1, opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable("local-sub")).await;
@@ -252,7 +264,7 @@ async fn a_written_publish_to_its_own_lane_is_not_repeated_after_a_crash() {
     }
     let (_ctx, broker, uri) = setup(1, copy_opts()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("local-pub")).await;
-    packet[0] |= 0x08;
+    set_dup(&mut packet);
     p.send(&packet).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec));
     p.ack(PacketType::PubRel, 5).await;
@@ -274,7 +286,10 @@ async fn an_unwritten_publish_to_its_own_lane_is_new_after_a_crash() {
 
     let (dir, opts) = on_disk("qos2-local-unwritten");
     let (copy, copy_opts) = on_disk("qos2-local-unwritten-copy");
-    let mut packet = publish_bytes(Version::V5, "local2/t", b"once", QoS::ExactlyOnce, 5, &[]);
+    let mut packet = publish(
+        &header(Version::V5, "local2/t", QoS::ExactlyOnce, 5),
+        b"once",
+    );
     {
         let (_ctx, broker, uri) = setup(1, opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable("local2-sub")).await;
@@ -296,7 +311,7 @@ async fn an_unwritten_publish_to_its_own_lane_is_new_after_a_crash() {
     }
     let (_ctx, broker, uri) = setup(1, copy_opts()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("local2-pub")).await;
-    packet[0] |= 0x08;
+    set_dup(&mut packet);
     p.send(&packet).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec));
     let (mut sub, _) = Raw::connect_with(&uri, &durable("local2-sub")).await;
@@ -316,8 +331,13 @@ async fn a_recovered_handoff_puts_its_retained_message_in_the_store() {
     let (copy, copy_opts) = on_disk("qos2-recovered-store-copy");
     let publisher = id_on("store-pub", 0, 2);
     let subscriber = id_on("store-sub", 1, 2);
-    let mut packet = publish_bytes(Version::V5, "store/t", b"once", QoS::ExactlyOnce, 5, &[]);
-    packet[0] |= 1;
+    let packet = publish(
+        &PublishHeader {
+            retain: true,
+            ..header(Version::V5, "store/t", QoS::ExactlyOnce, 5)
+        },
+        b"once",
+    );
     {
         let (ctx, broker, uri) = setup(2, opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable(&subscriber)).await;
@@ -354,8 +374,13 @@ async fn a_negative_pubrec_releases_the_packet_id_after_restart() {
         let (_ctx, broker, uri) = setup(1, opts()).await;
         broker.shared().retained.cursor_of("nack/t").fail(1, 1);
         let (mut p, _) = Raw::connect_with(&uri, &durable("nack-publisher")).await;
-        let mut packet = publish_bytes(Version::V5, "nack/t", b"failed", QoS::ExactlyOnce, 5, &[]);
-        packet[0] |= 1;
+        let packet = publish(
+            &PublishHeader {
+                retain: true,
+                ..header(Version::V5, "nack/t", QoS::ExactlyOnce, 5)
+            },
+            b"failed",
+        );
         p.send(&packet).await;
         assert_eq!(
             p.next().await,

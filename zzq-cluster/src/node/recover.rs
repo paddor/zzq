@@ -9,14 +9,14 @@
 
 use std::time::Duration;
 
-use super::image::{ImageIn, Taken, control_frames};
+use super::image::{ImageIn, Taken};
 use super::link::Side;
 use super::log::{Entry, Log};
 use super::voting::Driver;
 use super::{Event, Node, NodeError, Role};
 use crate::driver::ReplicaDriver;
 use crate::recovery::{Recovery, RecoveryTicket};
-use crate::wire::{CheckpointRequest, RecoveryRequest, RecoveryState, encode_recovery};
+use crate::wire::{CheckpointRequest, RecoveryRequest, RecoveryState};
 use crate::{NodeId, OpNumber, Prefix, PreparedOperation, RequestId, Scope, StartView};
 
 /// A recovery in progress.
@@ -158,12 +158,7 @@ impl Node {
         }
     }
 
-    pub(super) fn recovery_chunk(
-        &mut self,
-        request: CheckpointRequest,
-        bytes: &[u8],
-        now: Duration,
-    ) {
+    pub(super) fn recovery_chunk(&mut self, request: CheckpointRequest, bytes: &[u8]) {
         let Some(r) = self.recovering.as_mut() else {
             return;
         };
@@ -190,11 +185,12 @@ impl Node {
                 self.install_image(anchor, bytes);
             }
         }
-        self.poll_recovery(now);
+        self.poll_recovery();
     }
 
     /// Asks, transfers and finishes, as far as answers allow.
-    pub(super) fn poll_recovery(&mut self, now: Duration) {
+    pub(super) fn poll_recovery(&mut self) {
+        let now = self.now;
         let retransmit = self.config.timing.retransmit;
         let Some(r) = self.recovering.as_mut() else {
             return;
@@ -228,7 +224,7 @@ impl Node {
             self.begin_recovery();
             return;
         }
-        self.finish_recovery(&ticket, now);
+        self.finish_recovery(&ticket);
     }
 
     /// Checks and keeps the ops fetched so far.
@@ -259,7 +255,8 @@ impl Node {
 
     /// Joins the ticket's view as a backup once the history is whole, the
     /// application caught up and the view's `START_VIEW` is known.
-    fn finish_recovery(&mut self, ticket: &RecoveryTicket, now: Duration) {
+    fn finish_recovery(&mut self, ticket: &RecoveryTicket) {
+        let now = self.now;
         let Some(r) = self.recovering.as_mut() else {
             return;
         };
@@ -294,14 +291,7 @@ impl Node {
 
     fn ask_recovery(&mut self, side: Side, request: RecoveryRequest) {
         let to = self.peers[side].id;
-        if let Some(out) = self.on_link(to, |me, session| {
-            let mut metadata = vec![0; 256];
-            let encoded =
-                encode_recovery(me.local, session, request, &mut metadata, me.limits).ok()?;
-            Some(control_frames(to, &encoded, metadata))
-        }) {
-            self.out.push_back(out);
-        }
+        self.send(to, |e, session| e.recovery(to, session, request));
     }
 
     /// The view of the recovery's ticket, once it has one.

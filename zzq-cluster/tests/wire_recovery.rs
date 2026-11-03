@@ -11,31 +11,17 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node, session};
 use zzq_cluster::recovery::{RecoveryLog, RecoveryResponse};
 use zzq_cluster::wire::{
     PeerBinding, RecoveryMessage, RecoveryRequest, RecoveryState, ReplicaMessage, WireError,
     WireLimits, decode, encode_recovery, encode_recovery_state,
 };
-use zzq_cluster::{Configuration, Digest, JournalGeneration, OpNumber, Prefix};
-use zzq_cluster::{GroupId, LinkSessionId, NodeId, RequestId};
-
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn configuration() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
-const fn session() -> LinkSessionId {
-    LinkSessionId::from_bytes([9; 16])
-}
+use zzq_cluster::{Digest, JournalGeneration, OpNumber, Prefix};
+use zzq_cluster::{LinkSessionId, NodeId, RequestId};
 
 fn request() -> RecoveryRequest {
     RecoveryRequest {
@@ -703,61 +689,60 @@ fn checkpoint_chunks_bind_source_nonce_range_and_live_link_session() {
 }
 
 #[test]
-fn retired_history_notice_is_bound_to_scope_session_and_live_receive_or_fetch() {
+fn retired_history_notice_is_bound_to_scope_session_and_live_fetch() {
     use zzq_cluster::wire::{HistoryFence, HistoryRetired, encode_history_retired};
     let mut output = [0xff; 160];
-    for fence in [
-        HistoryFence::Receive(zzq_cluster::flow::ReceiveEpoch::new(15).unwrap()),
-        HistoryFence::Fetch(RequestId::from_bytes([16; 16])),
-    ] {
-        let notice = HistoryRetired {
-            scope: configuration().scope(),
-            fence,
-            before: Prefix {
-                op: OpNumber(8),
-                digest: Digest::from_bytes([17; 32]),
-            },
-        };
-        let encoded = encode_history_retired(
-            node(0),
-            session(),
-            notice,
-            &mut output,
-            WireLimits::default(),
-        )
-        .unwrap();
-        assert_eq!(encoded.metadata_bytes, 137);
-        assert_eq!(
-            decode_bytes(node(0), &encoded.header, &output[..137], &[]).unwrap(),
-            ReplicaMessage::HistoryRetired(notice)
-        );
-        for end in 0..137 {
-            assert!(decode_bytes(node(0), &encoded.header, &output[..end], &[]).is_err());
-        }
-        let mut stale = encoded.header;
-        stale[49] ^= 1;
-        assert!(decode_bytes(node(0), &stale, &output[..137], &[]).is_err());
-        let mut invalid = notice;
-        invalid.fence = HistoryFence::Fetch(RequestId::from_bytes([0; 16]));
-        let before = output;
-        assert!(
-            encode_history_retired(
-                node(0),
-                session(),
-                invalid,
-                &mut output,
-                WireLimits::default()
-            )
-            .is_err()
-        );
-        assert_eq!(output, before);
-    }
-    // A source without retired history serves a fetch from genesis; a
-    // receive window never restarts there.
-    let fetch = HistoryRetired {
+    let notice = HistoryRetired {
         scope: configuration().scope(),
         fence: HistoryFence::Fetch(RequestId::from_bytes([16; 16])),
+        before: Prefix {
+            op: OpNumber(8),
+            digest: Digest::from_bytes([17; 32]),
+        },
+    };
+    let encoded = encode_history_retired(
+        node(0),
+        session(),
+        notice,
+        &mut output,
+        WireLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(encoded.metadata_bytes, 137);
+    assert_eq!(
+        decode_bytes(node(0), &encoded.header, &output[..137], &[]).unwrap(),
+        ReplicaMessage::HistoryRetired(notice)
+    );
+    for end in 0..137 {
+        assert!(decode_bytes(node(0), &encoded.header, &output[..end], &[]).is_err());
+    }
+    let mut stale = encoded.header;
+    stale[49] ^= 1;
+    assert!(decode_bytes(node(0), &stale, &output[..137], &[]).is_err());
+    // The fence tag after the 80-byte scope: 1 names a fetch, nothing else.
+    for tag in [0, 2] {
+        let mut other = output;
+        other[80] = tag;
+        assert!(decode_bytes(node(0), &encoded.header, &other[..137], &[]).is_err());
+    }
+    let mut invalid = notice;
+    invalid.fence = HistoryFence::Fetch(RequestId::from_bytes([0; 16]));
+    let before = output;
+    assert!(
+        encode_history_retired(
+            node(0),
+            session(),
+            invalid,
+            &mut output,
+            WireLimits::default()
+        )
+        .is_err()
+    );
+    assert_eq!(output, before);
+    // A source without retired history serves a fetch from genesis.
+    let fetch = HistoryRetired {
         before: Prefix::GENESIS,
+        ..notice
     };
     let encoded = encode_history_retired(
         node(0),
@@ -770,19 +755,5 @@ fn retired_history_notice_is_bound_to_scope_session_and_live_receive_or_fetch() 
     assert_eq!(
         decode_bytes(node(0), &encoded.header, &output[..137], &[]).unwrap(),
         ReplicaMessage::HistoryRetired(fetch)
-    );
-    let receive = HistoryRetired {
-        fence: HistoryFence::Receive(zzq_cluster::flow::ReceiveEpoch::new(15).unwrap()),
-        ..fetch
-    };
-    assert!(
-        encode_history_retired(
-            node(0),
-            session(),
-            receive,
-            &mut output,
-            WireLimits::default()
-        )
-        .is_err()
     );
 }

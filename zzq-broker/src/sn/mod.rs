@@ -218,9 +218,6 @@ fn publish_without_connection(shared: &Shared, topic: Topic, retain: bool, data:
         return;
     };
     let o = &shared.opts;
-    if name.starts_with("$SYS/") || crate::msg::too_deep(&name, o.max_topic_levels) {
-        return;
-    }
     let info = ConnectInfo {
         client_id: "",
         username: None,
@@ -237,8 +234,8 @@ fn publish_without_connection(shared: &Shared, topic: Topic, retain: bool, data:
         client_id: "",
         username: None,
     };
-    if let Some(acl) = &o.authorizer
-        && !acl.may_publish(&client, &name)
+    if o.may_publish(&name, |acl| acl.may_publish(&client, &name))
+        .is_err()
     {
         return;
     }

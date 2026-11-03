@@ -157,20 +157,30 @@ fn invalid(what: String) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
-/// Encodes a CONNECT. A `persistent` session outlives the connection.
+/// Whether a client's session outlives its connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Session {
+    /// It ends with the connection.
+    Clean,
+    /// It stays for ever.
+    Kept,
+}
+
+/// Encodes a CONNECT.
 pub fn connect_packet(
     out: &mut Vec<u8>,
     client_id: &str,
     v5: bool,
     keep_alive: u16,
-    persistent: bool,
+    session: Session,
 ) {
     let forever = [Property::U32(property::SESSION_EXPIRY_INTERVAL, u32::MAX)];
+    let kept = session == Session::Kept;
     let c = ConnectFields {
         version: version(v5),
-        clean_start: !persistent,
+        clean_start: !kept,
         keep_alive,
-        properties: if persistent && v5 { &forever } else { &[] },
+        properties: if kept && v5 { &forever } else { &[] },
         client_id,
         will: None,
         username: None,
@@ -185,107 +195,103 @@ pub fn subscribe_packet(out: &mut Vec<u8>, filter: &str, qos: u8, v5: bool) {
     encode::subscribe(version(v5), 1, &[], &[(filter, opts)], out);
 }
 
-/// Connects and waits for CONNACK. Returns the v5 Receive Maximum.
-///
-/// # Errors
-///
-/// If a connection fails, the broker closes one, or a reply is malformed.
-pub fn connect(
-    addr: &str,
-    client_id: &str,
-    v5: bool,
-) -> io::Result<(TcpStream, Reader, Option<u16>)> {
-    open(addr, client_id, v5, false)
+/// A connected client.
+#[derive(Debug)]
+pub struct Conn {
+    /// The client ID.
+    pub id: String,
+    /// The socket.
+    pub s: TcpStream,
+    /// The reader of the broker's packets.
+    pub rd: Reader,
+    /// The broker's Receive Maximum.
+    pub rmax: Option<u16>,
+    /// MQTT 5, not 3.1.1.
+    pub v5: bool,
 }
 
-/// Connects with a session that outlives the connection, and waits for
-/// CONNACK. Returns the v5 Receive Maximum.
-///
-/// # Errors
-///
-/// If a connection fails, the broker closes one, or a reply is malformed.
-pub fn connect_persistent(
-    addr: &str,
-    client_id: &str,
-    v5: bool,
-) -> io::Result<(TcpStream, Reader, Option<u16>)> {
-    open(addr, client_id, v5, true)
-}
-
-fn open(
-    addr: &str,
-    client_id: &str,
-    v5: bool,
-    persistent: bool,
-) -> io::Result<(TcpStream, Reader, Option<u16>)> {
-    let mut s = TcpStream::connect(addr)?;
-    s.set_nodelay(true)?;
-    let mut out = Vec::new();
-    connect_packet(&mut out, client_id, v5, KEEP_ALIVE, persistent);
-    s.write_all(&out)?;
-    let mut rd = Reader::default();
-    loop {
-        if rd.fill(&mut s)? == 0 {
-            return Err(closed("CONNACK"));
-        }
-        if let Some((h, body)) = rd.next_packet() {
-            if h != 0x20 || body.len() < 2 || body[1] != 0 {
-                return Err(invalid(format!("{client_id}: CONNACK {h:#x} {body:x?}")));
+impl Conn {
+    /// Connects as `id` and waits for CONNACK.
+    ///
+    /// # Errors
+    ///
+    /// If the connection fails, the broker closes it, or CONNACK is
+    /// malformed or refuses.
+    pub fn open(addr: &str, id: impl Into<String>, v5: bool, session: Session) -> io::Result<Conn> {
+        let id = id.into();
+        let mut s = TcpStream::connect(addr)?;
+        s.set_nodelay(true)?;
+        let mut out = Vec::new();
+        connect_packet(&mut out, &id, v5, KEEP_ALIVE, session);
+        s.write_all(&out)?;
+        let mut rd = Reader::default();
+        loop {
+            if rd.fill(&mut s)? == 0 {
+                return Err(closed("CONNACK"));
             }
-            let rmax = if v5 && body.len() > 2 {
-                zzq_proto::varint::decode(&body[2..])
-                    .ok()
-                    .flatten()
-                    .and_then(|(len, n)| Properties::try_from(body.get(2 + n..2 + n + len)?).ok())
-                    .and_then(|p| p.get_int(property::RECEIVE_MAXIMUM))
-                    .map(|v| v as u16)
-            } else {
-                None
-            };
-            return Ok((s, rd, rmax));
+            if let Some((h, body)) = rd.next_packet() {
+                if h != 0x20 || body.len() < 2 || body[1] != 0 {
+                    return Err(invalid(format!("{id}: CONNACK {h:#x} {body:x?}")));
+                }
+                let rmax = if v5 && body.len() > 2 {
+                    receive_maximum(&body[2..])
+                } else {
+                    None
+                };
+                return Ok(Conn {
+                    id,
+                    s,
+                    rd,
+                    rmax,
+                    v5,
+                });
+            }
         }
+    }
+
+    /// Subscribes to `filter` and waits for SUBACK.
+    ///
+    /// # Errors
+    ///
+    /// If the connection fails, the broker closes it, or SUBACK is
+    /// malformed or refuses.
+    pub fn subscribe(&mut self, filter: &str, qos: u8) -> io::Result<()> {
+        let mut out = Vec::new();
+        subscribe_packet(&mut out, filter, qos, self.v5);
+        self.s.write_all(&out)?;
+        loop {
+            if self.rd.fill(&mut self.s)? == 0 {
+                return Err(closed("SUBACK"));
+            }
+            if let Some((h, body)) = self.rd.next_packet() {
+                let code = body.last().copied().unwrap_or(0x80);
+                if h != 0x90 || code >= 0x80 {
+                    return Err(invalid(format!("SUBACK {filter}: {h:#x} {code:#x}")));
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    /// Sends DISCONNECT and waits for the broker to close the connection,
+    /// so the session is offline when this returns.
+    ///
+    /// # Errors
+    ///
+    /// If the connection fails.
+    pub fn disconnect(mut self) -> io::Result<()> {
+        self.s.write_all(&[0xe0, 0])?;
+        while self.rd.fill(&mut self.s)? > 0 {}
+        Ok(())
     }
 }
 
-/// Subscribes and waits for SUBACK.
-///
-/// # Errors
-///
-/// If a connection fails, the broker closes one, or a reply is malformed.
-pub fn subscribe(
-    s: &mut TcpStream,
-    rd: &mut Reader,
-    filter: &str,
-    qos: u8,
-    v5: bool,
-) -> io::Result<()> {
-    let mut out = Vec::new();
-    subscribe_packet(&mut out, filter, qos, v5);
-    s.write_all(&out)?;
-    loop {
-        if rd.fill(s)? == 0 {
-            return Err(closed("SUBACK"));
-        }
-        if let Some((h, body)) = rd.next_packet() {
-            let code = body.last().copied().unwrap_or(0x80);
-            if h != 0x90 || code >= 0x80 {
-                return Err(invalid(format!("SUBACK {filter}: {h:#x} {code:#x}")));
-            }
-            return Ok(());
-        }
-    }
-}
-
-/// Sends DISCONNECT and waits for the broker to close the connection, so
-/// the session is offline when this returns.
-///
-/// # Errors
-///
-/// If the connection fails.
-pub fn disconnect(mut s: TcpStream, rd: &mut Reader) -> io::Result<()> {
-    s.write_all(&[0xe0, 0])?;
-    while rd.fill(&mut s)? > 0 {}
-    Ok(())
+/// The Receive Maximum in CONNACK properties: the length, then the
+/// properties.
+fn receive_maximum(props: &[u8]) -> Option<u16> {
+    let (len, n) = zzq_proto::varint::decode(props).ok().flatten()?;
+    let p = Properties::try_from(props.get(n..n + len)?).ok()?;
+    p.get_int(property::RECEIVE_MAXIMUM).map(|v| v as u16)
 }
 
 #[cfg(test)]
@@ -305,7 +311,7 @@ mod tests {
             s.read_exact(&mut connect).unwrap();
             connect
         });
-        assert!(connect(&addr, "c", false).is_err());
+        assert!(Conn::open(&addr, "c", false, Session::Clean).is_err());
         let connect = server.join().unwrap();
         assert_eq!(connect[..10], *b"\x10\x0d\x00\x04MQTT\x04\x02");
         assert_eq!(u16::from_be_bytes([connect[10], connect[11]]), 300);

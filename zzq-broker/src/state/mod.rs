@@ -128,6 +128,32 @@ pub(crate) struct SessionState {
     pub(crate) next_pkid: u16,
     pub(crate) subs: Vec<Sub>,
     pub(crate) awaiting_rel: Vec<u16>,
+    pub(crate) deliveries: Deliveries,
+}
+
+impl SessionState {
+    /// A session of `client_id` on `version` with nothing else yet.
+    pub(crate) fn new(client_id: Box<str>, version: Version) -> SessionState {
+        SessionState {
+            client_id,
+            birth: 0,
+            username: None,
+            version,
+            expiry: 0,
+            expires_at: None,
+            will: None,
+            delayed_will: None,
+            next_pkid: 0,
+            subs: Vec::new(),
+            awaiting_rel: Vec::new(),
+            deliveries: Deliveries::default(),
+        }
+    }
+}
+
+/// The QoS 1/2 deliveries of a session that are not done.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Deliveries {
     pub(crate) inflight: Vec<Sent>,
     pub(crate) queue: Vec<Queued>,
     /// The journal numbers of the deliveries in `inflight`, then in
@@ -135,6 +161,49 @@ pub(crate) struct SessionState {
     pub(crate) seqs: Vec<u64>,
     /// The last journal number the session gave a delivery.
     pub(crate) last_seq: u64,
+}
+
+impl Deliveries {
+    /// Queues `q` as the next journaled delivery.
+    pub(crate) fn push_journaled(&mut self, q: Queued) {
+        self.last_seq += 1;
+        self.seqs.push(self.last_seq);
+        self.queue.push(q);
+    }
+}
+
+/// A replayed state, and the one a snapshot being read builds: at the
+/// snapshot's end it takes the place of the first, and if another
+/// record cuts the snapshot off, it is dropped.
+#[derive(Debug, Default)]
+pub(crate) struct Snapshotted<T> {
+    pub(crate) live: T,
+    next: Option<T>,
+}
+
+impl<T: Default> Snapshotted<T> {
+    /// A snapshot starts.
+    pub(crate) fn begin(&mut self) {
+        self.next = Some(T::default());
+    }
+
+    /// The snapshot ends: it becomes the live state.
+    pub(crate) fn end(&mut self) {
+        if let Some(next) = self.next.take() {
+            self.live = next;
+        }
+    }
+
+    /// Where a snapshot's records go: into the snapshot being read, or
+    /// else the live state.
+    pub(crate) fn target(&mut self) -> &mut T {
+        self.next.as_mut().unwrap_or(&mut self.live)
+    }
+
+    /// Drops a snapshot another record cut off. Whether there was one.
+    pub(crate) fn cut(&mut self) -> bool {
+        self.next.take().is_some()
+    }
 }
 
 /// One decoded record.
@@ -327,7 +396,7 @@ mod tests {
     use super::codec::{put_bytes, put_count, put_u16, put_u32, put_u64};
     use super::*;
     use crate::budget::LaneTotal;
-    use crate::index::SubIds;
+    use crate::index::{Grant, SubIds};
     use crate::session::DelayedWill;
 
     fn msg(topic: &str, payload: &[u8], qos: QoS, expires_at: Option<Instant>) -> Msg {
@@ -344,9 +413,11 @@ mod tests {
     fn item(n: u8, qos: QoS) -> Queued {
         Queued {
             msg: msg("a/b", &[n], qos, None),
-            qos,
-            retain: n.is_multiple_of(2),
-            sub_id: SubIds::one(u32::from(n) + 1),
+            grant: Grant {
+                qos,
+                retain: n.is_multiple_of(2),
+                sub_id: SubIds::one(u32::from(n) + 1),
+            },
         }
     }
 
@@ -380,15 +451,16 @@ mod tests {
                 ("$share/g/c/#".into(), QoS::AtLeastOnce.into(), 0),
             ],
             awaiting_rel: vec![65535, 3],
-            // Wrapped: the oldest ID is the highest.
-            inflight: vec![
-                (65535, item(1, QoS::AtLeastOnce), false),
-                (6, item(2, QoS::ExactlyOnce), true),
-                (7, item(3, QoS::ExactlyOnce), false),
-            ],
-            queue: vec![item(4, QoS::AtLeastOnce), expiring],
-            seqs: Vec::new(),
-            last_seq: 0,
+            deliveries: Deliveries {
+                // Wrapped: the oldest ID is the highest.
+                inflight: vec![
+                    (65535, item(1, QoS::AtLeastOnce), false),
+                    (6, item(2, QoS::ExactlyOnce), true),
+                    (7, item(3, QoS::ExactlyOnce), false),
+                ],
+                queue: vec![item(4, QoS::AtLeastOnce), expiring],
+                ..Deliveries::default()
+            },
         }
     }
 
@@ -433,10 +505,15 @@ mod tests {
         let st = session(records);
         assert_eq!(st.subs[0].0.as_ref(), "$share/g/c/#");
         assert_eq!(st.awaiting_rel, [3, 65535]);
-        let ids: Vec<(u16, bool)> = st.inflight.iter().map(|f| (f.0, f.2)).collect();
+        let ids: Vec<(u16, bool)> = st.deliveries.inflight.iter().map(|f| (f.0, f.2)).collect();
         assert_eq!(ids, [(65535, false), (6, true), (7, false)]);
         assert!(st.delayed_will.is_some());
-        assert!(st.queue[1].msg.expires_at.is_some_and(|t| t < clock.now));
+        assert!(
+            st.deliveries.queue[1]
+                .msg
+                .expires_at
+                .is_some_and(|t| t < clock.now)
+        );
         assert_eq!(image(clock, st), first);
     }
 

@@ -17,6 +17,13 @@ Notable changes to zzq. The format follows
   says on stderr while a node's clock is off the others and while no
   two clocks agree. `NodeStatus::clock` has the offsets.
 
+### Removed
+
+- `zzq-cluster`: the flow layer copied from Ozzy, which no node used:
+  the `flow` module, receive epochs, `ReceiveFence`, publications,
+  `Frames`, `encode_prepare_unbound` and the opcodes `REPLICA_OPEN`,
+  `REPLICA_STATE`, `PREPARE_FLOW`, `PREPARE_PUB` and `REPLICA_RECEIPT`.
+
 ### Fixed
 
 - Clustering: a node that missed views and heard only a follower of the
@@ -29,6 +36,26 @@ Notable changes to zzq. The format follows
   followers' lease promise, so they never helped each other replace it
   and the cluster stopped taking writes. A leader that asks to leave its
   view now sends no ops, as it already sent no heartbeats.
+- Clustering: a retained QoS 2 publish wrote its message expiry in the
+  leader's own clock, and followers read it in cluster time, so on a
+  node whose clock was off the others the message expired early or
+  late there. It now writes cluster time, as other records do.
+- Clustering: a connection a leader took just before it lost the
+  leadership could send CONNECT after the node dropped its state. The
+  node then gave the client a new, empty session and kept it, so a
+  resuming client got none of its queued messages, and its next request
+  failed. Such a node now refuses CONNECT with Use Another Server until
+  it leads again.
+- Clustering: a leader that could not bind a client endpoint, as one
+  another process held, said nothing and served no client there.
+  `zzq_broker` now says so on stderr.
+- `zzq-tokio`: `Error::AddressInUse` for a `tls://`, `ws://` or `wss://`
+  bind named the endpoint `tcp://`, and TCP and QUIC errors dropped the
+  brackets of an IPv6 host. Bind and connect errors now name the
+  endpoint as given.
+- `zzq-bench`: `zzq_brokerbench`, `zzq_loadbench` and `zzq_ramprobe`
+  ignored keys they do not know, so a misspelled key ran with the
+  default. They now refuse it.
 
 ## [0.5.0] - 2026-10-31
 

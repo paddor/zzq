@@ -2,14 +2,13 @@
 
 use super::{
     BATCH_BYTES, Chain, EncodeContext, Envelope, NodeId, OpNumber, Opcode, Prefix, Prepare,
-    PrepareEncoding, PrepareMetadata, ReceiveEpoch, WireError, WireLimits, WriteFields, Writer,
-    metadata_length, validate_batch, validate_prefix, validate_scope, write_batch,
+    PrepareEncoding, PrepareMetadata, WireError, WireLimits, WriteFields, Writer, metadata_length,
+    validate_batch, validate_prefix, validate_scope, write_batch,
 };
 
 /// A checked prepare whose sizes are known before any byte is written.
 pub(super) struct Planned<'a> {
     sender: NodeId,
-    epoch: Option<ReceiveEpoch>,
     prepare: Prepare<'a>,
     first: u64,
     predecessor: Prefix,
@@ -19,7 +18,6 @@ pub(super) struct Planned<'a> {
 impl<'a> Planned<'a> {
     pub(super) fn new(
         sender: NodeId,
-        epoch: Option<ReceiveEpoch>,
         prepare: Prepare<'a>,
         limits: WireLimits,
     ) -> Result<Self, WireError> {
@@ -29,12 +27,7 @@ impl<'a> Planned<'a> {
         validate_scope(prepare.scope)?;
         validate_prefix(prepare.committed)?;
         let count = prepare.operations.len();
-        let batch_bytes = if epoch.is_some() {
-            BATCH_BYTES + 16
-        } else {
-            BATCH_BYTES
-        };
-        let metadata_bytes = metadata_length(count, batch_bytes, limits)?;
+        let metadata_bytes = metadata_length(count, BATCH_BYTES, limits)?;
         let Some(first) = prepare.operations.first().map(|op| op.canonical) else {
             return Err(WireError::Limit);
         };
@@ -52,7 +45,6 @@ impl<'a> Planned<'a> {
         u32::try_from(payload_bytes).map_err(|_| WireError::Limit)?;
         Ok(Self {
             sender,
-            epoch,
             prepare,
             first: first.op_number,
             predecessor,
@@ -71,11 +63,7 @@ impl<'a> Planned<'a> {
         payload: Option<&mut [u8]>,
     ) -> Result<PrepareEncoding, WireError> {
         let header = Envelope {
-            opcode: if self.epoch.is_some() {
-                Opcode::PrepareFlow
-            } else {
-                Opcode::Prepare
-            },
+            opcode: Opcode::Prepare,
             response: false,
             request_id: None,
             sender: self.sender,
@@ -94,7 +82,7 @@ impl<'a> Planned<'a> {
         })
     }
 
-    pub(super) fn write(
+    fn write(
         &self,
         metadata: &mut [u8],
         payload: Option<&mut [u8]>,
@@ -109,9 +97,6 @@ impl<'a> Planned<'a> {
         }
         let mut writer = Writer::with_len(metadata, sizes.metadata_bytes)?;
         writer.scope(self.prepare.scope, self.sender)?;
-        if let Some(epoch) = self.epoch {
-            writer.bytes(&epoch.get().to_be_bytes())?;
-        }
         writer.u64(self.first)?;
         writer.bytes(self.predecessor.digest.as_bytes())?;
         writer.prefix(self.prepare.committed)?;

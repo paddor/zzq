@@ -3,9 +3,10 @@
 #![allow(
     dead_code,
     clippy::panic,
-    clippy::too_many_arguments,
-    reason = "each test file uses a part; a raw connection fails loudly; raw packets take every field"
+    reason = "each test file uses a part; a raw connection fails loudly"
 )]
+
+pub(crate) mod sn;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
@@ -76,27 +77,48 @@ pub(crate) fn props(p: &[Property<'_>]) -> Vec<u8> {
     out
 }
 
-/// A PUBLISH as raw bytes.
-pub(crate) fn publish_bytes(
+/// A CONNECT with clean start and nothing else.
+pub(crate) const fn fields(version: Version, client_id: &str) -> ConnectFields<'_> {
+    ConnectFields {
+        version,
+        clean_start: true,
+        keep_alive: 0,
+        properties: &[],
+        client_id,
+        will: None,
+        username: None,
+        password: None,
+    }
+}
+
+/// A PUBLISH without DUP, RETAIN or properties.
+pub(crate) const fn header(
     version: Version,
     topic: &str,
-    payload: &[u8],
     qos: QoS,
     pkid: u16,
-    properties: &[u8],
-) -> Vec<u8> {
-    let h = PublishHeader {
+) -> PublishHeader<'_> {
+    PublishHeader {
         version,
         dup: false,
         qos,
         retain: false,
         topic,
         pkid,
-        properties,
-    };
+        properties: &[],
+    }
+}
+
+/// A PUBLISH as raw bytes.
+pub(crate) fn publish(h: &PublishHeader<'_>, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
-    encode::publish(&h, payload, &mut out);
+    encode::publish(h, payload, &mut out);
     out
+}
+
+/// Sets DUP in an encoded PUBLISH, as for sending it again.
+pub(crate) const fn set_dup(packet: &mut [u8]) {
+    packet[0] |= 0x08;
 }
 
 /// A CONNECT as raw bytes, with clean start.
@@ -104,14 +126,8 @@ pub(crate) fn connect_bytes(version: Version, id: &str, properties: &[Property<'
     let mut out = Vec::new();
     encode::connect(
         &ConnectFields {
-            version,
-            clean_start: true,
-            keep_alive: 0,
             properties,
-            client_id: id,
-            will: None,
-            username: None,
-            password: None,
+            ..fields(version, id)
         },
         &mut out,
     );
@@ -164,6 +180,10 @@ pub(crate) enum Got {
     Disconnect {
         reason: u8,
     },
+    /// From a client, to a fake broker.
+    Subscribe {
+        pkid: u16,
+    },
     /// Anything a broker should not send.
     Other(u8),
 }
@@ -204,6 +224,7 @@ impl Got {
             },
             Packet::PingResp => Got::PingResp,
             Packet::Disconnect(d) => Got::Disconnect { reason: d.reason },
+            Packet::Subscribe(s) => Got::Subscribe { pkid: s.pkid },
             _ => Got::Other(byte1),
         }
     }
@@ -234,17 +255,22 @@ impl Raw {
         }
     }
 
+    /// A connection a fake broker accepted, reading the client's packets
+    /// as `version`.
+    pub(crate) const fn accepted(s: TcpStream, version: Version) -> Raw {
+        Raw {
+            s,
+            buf: Vec::new(),
+            early: VecDeque::new(),
+            version,
+        }
+    }
+
     /// Connects with clean start and no properties.
     pub(crate) async fn connect(uri: &str, id: &str, version: Version, keep_alive: u16) -> Raw {
         let c = ConnectFields {
-            version,
-            clean_start: true,
             keep_alive,
-            properties: &[],
-            client_id: id,
-            will: None,
-            username: None,
-            password: None,
+            ..fields(version, id)
         };
         let (raw, code) = Raw::connect_with(uri, &c).await;
         assert_eq!(code, 0, "CONNACK code");
@@ -441,20 +467,17 @@ impl Raw {
 
     /// Sends a PUBLISH.
     pub(crate) async fn pub_(&mut self, topic: &str, payload: &[u8], qos: QoS, pkid: u16) {
-        self.pub_props(topic, payload, qos, pkid, &[]).await;
+        self.send(&publish(&header(self.version, topic, qos, pkid), payload))
+            .await;
     }
 
-    /// Sends a PUBLISH with raw v5 property bytes.
-    pub(crate) async fn pub_props(
-        &mut self,
-        topic: &str,
-        payload: &[u8],
-        qos: QoS,
-        pkid: u16,
-        properties: &[u8],
-    ) {
-        let out = publish_bytes(self.version, topic, payload, qos, pkid, properties);
-        self.send(&out).await;
+    /// Sends a QoS 0 PUBLISH with raw v5 property bytes.
+    pub(crate) async fn pub_props(&mut self, topic: &str, payload: &[u8], properties: &[u8]) {
+        let h = PublishHeader {
+            properties,
+            ..header(self.version, topic, QoS::AtMostOnce, 0)
+        };
+        self.send(&publish(&h, payload)).await;
     }
 
     /// Sends PUBACK, PUBREC, PUBREL or PUBCOMP.

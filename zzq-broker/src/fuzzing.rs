@@ -123,9 +123,11 @@ fn state_image_seed() -> Vec<u8> {
     for (i, qos) in [QoS::AtLeastOnce, QoS::ExactlyOnce].into_iter().enumerate() {
         let item = Queued {
             msg: Msg::new("a/b", &[b'0' + i as u8], &[1, 1], qos, false),
-            qos,
-            retain: false,
-            sub_id: SubIds::one(3),
+            grant: crate::index::Grant {
+                qos,
+                retain: false,
+                sub_id: SubIds::one(3),
+            },
         };
         s.deliver_qos12(Kept::own(item), limit);
     }

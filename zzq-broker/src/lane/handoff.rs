@@ -16,7 +16,7 @@ use crate::msg::Publication;
 use crate::slab::Key;
 use crate::state::handoff::{Handoffs, Pending, Target};
 
-use super::route::{Grant, Owned};
+use super::route::{Owned, Pick};
 use super::{Lane, LaneRef, Remote};
 
 /// Handoffs a sweep looks at for those that finished.
@@ -185,9 +185,7 @@ impl Lane {
                 lane: e.sub.lane,
                 client: e.client.clone(),
                 birth: e.birth,
-                qos: e.opts.qos.min(p.qos),
-                retain: e.opts.retain_as_published && p.retain,
-                sub_id: e.sub_id,
+                grant: e.grant(p.qos, p.retain),
             })
             .collect()
     }
@@ -444,10 +442,8 @@ impl Lane {
                 key,
                 &publication,
                 &mut owned,
-                Grant {
-                    qos: t.qos,
-                    retain: t.retain,
-                    sub_id: t.sub_id,
+                Pick {
+                    grant: t.grant,
                     last: false,
                 },
             );

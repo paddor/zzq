@@ -10,13 +10,17 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node};
+use zzq_cluster::GroupId;
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
 use zzq_cluster::{
-    Admission, Configuration, Digest, DoViewChange, FrozenLog, JournalGeneration, NormalReplica,
-    OpNumber, PipelineLimits, Prefix, PreparedOperation, ReplicationError, StartViewChange, Status,
+    Admission, Digest, DoViewChange, FrozenLog, JournalGeneration, NormalReplica, OpNumber,
+    PipelineLimits, Prefix, PreparedOperation, ReplicationError, StartViewChange, Status,
     ViewChange, ViewChangeError as Error,
 };
-use zzq_cluster::{GroupId, NodeId};
 
 #[path = "support/installation.rs"]
 mod installation;
@@ -24,27 +28,13 @@ mod installation;
 #[path = "support/recovery.rs"]
 mod recovery;
 
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn config() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
 fn operations(count: u8) -> Vec<PreparedOperation> {
     let mut previous = Prefix::GENESIS;
     (1..=count)
         .map(|number| {
             let bytes = [number; 16].to_vec();
             let operation = CanonicalOperation {
-                group_id: config().scope().group_id,
+                group_id: configuration().scope().group_id,
                 configuration_epoch: 1,
                 original_view: 0,
                 op_number: u64::from(number),
@@ -62,7 +52,7 @@ fn operations(count: u8) -> Vec<PreparedOperation> {
 
 fn normal(index: u8) -> NormalReplica {
     NormalReplica::bootstrap(
-        config(),
+        configuration(),
         node(index),
         JournalGeneration(u128::from(index) + 1),
         PipelineLimits {
@@ -77,7 +67,7 @@ fn durable(index: u8, count: u8) -> NormalReplica {
     let mut replica = normal(index);
     if count > 0 {
         let Admission::Write { ticket, .. } = replica
-            .prepare(node(0), config().scope(), &operations(count))
+            .prepare(node(0), configuration().scope(), &operations(count))
             .unwrap()
         else {
             panic!("new operations");
@@ -121,7 +111,7 @@ fn lookup(_: zzq_cluster::LogSource, expected: Prefix) -> Option<Digest> {
 fn old_writes_and_sync_must_settle_before_any_promise_or_election_message() {
     let mut old = normal(0);
     let Admission::Write { ticket, .. } = old
-        .prepare(node(0), config().scope(), &operations(3))
+        .prepare(node(0), configuration().scope(), &operations(3))
         .unwrap()
     else {
         panic!("new operations");
@@ -373,7 +363,7 @@ fn selected_history_cannot_omit_an_older_committed_prefix() {
     old.receive_commit(
         node(0),
         zzq_cluster::Commit {
-            scope: config().scope(),
+            scope: configuration().scope(),
             committed: operations(4)[3].prefix(),
         },
     )
@@ -462,7 +452,7 @@ fn malformed_reports_never_enter_the_quorum() {
 fn intact_restart_report_keeps_one_vote_and_the_original_transfer_source() {
     let original = remote_report(2, 3, 1);
     let mut restarted = ViewChange::recover_intact(
-        config(),
+        configuration(),
         node(2),
         JournalGeneration(101),
         zzq_cluster::RecoveredState {

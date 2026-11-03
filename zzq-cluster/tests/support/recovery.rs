@@ -1,4 +1,6 @@
-use super::{config, durable, installation::next, local_report, lookup, node, normal, operations};
+use super::{
+    configuration, durable, installation::next, local_report, lookup, node, normal, operations,
+};
 use zzq_cluster::progress::ProgressError;
 use zzq_cluster::{
     Admission, FrozenLog, InstallOutcome, JournalGeneration, PipelineLimits, Prefix, PrepareOk,
@@ -20,7 +22,7 @@ fn selected_pair(count: u8, bounds: PipelineLimits) -> (ViewChange, ViewChange) 
         .map_or(Prefix::GENESIS, |op| op.prefix());
     let restart = |index| {
         let mut replica = ViewChange::recover_intact(
-            config(),
+            configuration(),
             node(index),
             JournalGeneration(100 + u128::from(index)),
             state,
@@ -163,7 +165,7 @@ fn streamed_validation_rejects_gaps_scope_conflicts_and_chunk_overruns_atomicall
     );
     pending.validate_suffix(&operations[..4]).unwrap();
     let wrong_predecessor = next(
-        config().scope(),
+        configuration().scope(),
         Prefix {
             op: operations[3].prefix().op,
             digest: operations[2].prefix().digest,
@@ -179,7 +181,7 @@ fn streamed_validation_rejects_gaps_scope_conflicts_and_chunk_overruns_atomicall
         Error::HistoryMissing
     );
     pending.validate_suffix(&operations[4..]).unwrap();
-    let extra = next(config().scope(), operations[7].prefix(), 9);
+    let extra = next(configuration().scope(), operations[7].prefix(), 9);
     assert_eq!(
         pending.validate_suffix(&[extra]),
         Err(ReplicationError::ConflictingHistory.into())
@@ -256,7 +258,7 @@ fn recovered(promised: u64, normal: u64) -> RecoveredState {
     RecoveredState {
         scope: Scope {
             view: promised,
-            ..config().scope()
+            ..configuration().scope()
         },
         log: FrozenLog {
             last_normal_view: normal,
@@ -272,9 +274,14 @@ fn restart_retains_higher_promise_and_disk_tail_without_live_descriptors() {
     let mut state = recovered(17, 12);
     state.log.accepted = operations[199].prefix();
     state.log.committed = operations[99].prefix();
-    let mut restarting =
-        ViewChange::recover_intact(config(), node(2), JournalGeneration(101), state, limits())
-            .unwrap();
+    let mut restarting = ViewChange::recover_intact(
+        configuration(),
+        node(2),
+        JournalGeneration(101),
+        state,
+        limits(),
+    )
+    .unwrap();
     assert_eq!(restarting.scope().view, 17);
     assert_eq!(restarting.promised_view(), 17);
     let snapshot = restarting.normal_snapshot();
@@ -298,8 +305,14 @@ fn restart_retains_higher_promise_and_disk_tail_without_live_descriptors() {
 fn invalid_recovered_scope_history_and_view_exhaustion_cannot_vote() {
     let valid = recovered(5, 4);
     let restore = |state| {
-        ViewChange::recover_intact(config(), node(0), JournalGeneration(100), state, limits())
-            .unwrap_err()
+        ViewChange::recover_intact(
+            configuration(),
+            node(0),
+            JournalGeneration(100),
+            state,
+            limits(),
+        )
+        .unwrap_err()
     };
     let mut wrong_scope = valid;
     wrong_scope.scope.configuration_epoch += 1;
@@ -346,7 +359,7 @@ fn invalid_recovered_scope_history_and_view_exhaustion_cannot_vote() {
     assert_eq!(restore(recovered(u64::MAX, u64::MAX)), Error::ViewExhausted);
     assert!(
         ViewChange::recover_intact(
-            config(),
+            configuration(),
             node(0),
             JournalGeneration(100),
             recovered(u64::MAX, 4),
@@ -355,8 +368,14 @@ fn invalid_recovered_scope_history_and_view_exhaustion_cannot_vote() {
         .is_ok()
     ); // Can resume a promise, never wrap it.
     assert_eq!(
-        ViewChange::recover_intact(config(), node(99), JournalGeneration(100), valid, limits())
-            .unwrap_err(),
+        ViewChange::recover_intact(
+            configuration(),
+            node(99),
+            JournalGeneration(100),
+            valid,
+            limits()
+        )
+        .unwrap_err(),
         ReplicationError::UnknownVoter.into(),
     );
 }
@@ -365,7 +384,7 @@ fn invalid_recovered_scope_history_and_view_exhaustion_cannot_vote() {
 fn callbacks_from_crashed_writer_cannot_fault_or_change_recovered_evidence() {
     let mut old = normal(0);
     let Admission::Write { ticket: write, .. } = old
-        .prepare(node(0), config().scope(), &operations(1))
+        .prepare(node(0), configuration().scope(), &operations(1))
         .unwrap()
     else {
         panic!("new operation");
@@ -374,7 +393,7 @@ fn callbacks_from_crashed_writer_cannot_fault_or_change_recovered_evidence() {
     let sync = old.begin_sync().unwrap();
     drop(old);
     let mut restarted = ViewChange::recover_intact(
-        config(),
+        configuration(),
         node(0),
         JournalGeneration(100),
         recovered(0, 0),
@@ -396,18 +415,18 @@ fn restarted_primary_cannot_reuse_view_after_send_before_local_write() {
     let mut old_primary = normal(0);
     let operation = operations(1);
     assert!(matches!(
-        old_primary.prepare(node(0), config().scope(), &operation),
+        old_primary.prepare(node(0), configuration().scope(), &operation),
         Ok(Admission::Write { .. })
     ));
     // Backup persisted the transmitted prepare. Primary never wrote it locally.
     let backup = durable(1, 1);
     drop(old_primary);
     let mut restarted = ViewChange::recover_intact(
-        config(),
+        configuration(),
         node(0),
         JournalGeneration(100),
         RecoveredState {
-            scope: config().scope(),
+            scope: configuration().scope(),
             log: FrozenLog {
                 last_normal_view: 0,
                 accepted: Prefix::GENESIS,

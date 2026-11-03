@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use support::{Got, Raw, WAIT, client, next};
+use support::{Got, Raw, WAIT, client, fields, next};
 use tokio::time::timeout;
 use zzq_broker::{Broker, BrokerOptions, Config, Context, Error, lane_for};
 use zzq_client::{Client, ClientOptions, Handle, LastWill};
@@ -70,14 +70,9 @@ fn durable(id: &str) -> ClientOptions {
 async fn raw(uri: &str, id: &str, clean_start: bool) -> (Raw, bool) {
     let props = [KEEP];
     let c = ConnectFields {
-        version: Version::V5,
         clean_start,
-        keep_alive: 0,
         properties: &props,
-        client_id: id,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, id)
     };
     match Raw::connack_with(uri, &c).await {
         (

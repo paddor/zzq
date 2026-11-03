@@ -9,13 +9,13 @@ use zzq_proto::topic::{SharedFilter, is_shared};
 use zzq_proto::{PacketType, QoS, RetainHandling, SubscriptionOptions, reason};
 
 use crate::durable::Due;
-use crate::index::{Entry, Share, SubIds, SubRef};
+use crate::index::{Entry, Grant, Share, SubIds, SubRef};
 use crate::msg::{Msg, Publication};
 use crate::options::{Authorizer, ClientInfo};
 use crate::session::Session;
 use crate::slab::Key;
 
-use super::route::{Extra, Grant, Owned};
+use super::route::{Extra, Owned, Pick};
 use super::{Control, Lane, SyncAck};
 
 /// An ack packet held until other lanes applied a subscription change and
@@ -171,10 +171,12 @@ impl Lane {
                 retain: true,
                 ..Publication::of(&msg)
             };
-            let g = Grant {
-                qos: msg.qos.min(max_qos),
-                retain: true,
-                sub_id: SubIds::one(sub_id),
+            let g = Pick {
+                grant: Grant {
+                    qos: msg.qos.min(max_qos),
+                    retain: true,
+                    sub_id: SubIds::one(sub_id),
+                },
                 last: true,
             };
             let mut retained = msg.clone();

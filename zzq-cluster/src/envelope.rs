@@ -32,8 +32,6 @@ macro_rules! opcodes {
 opcodes! {
     Hello = 0x01 => "`HELLO`: initiate link negotiation.",
     Welcome = 0x02 => "`WELCOME`: establish the negotiated link session.",
-    ReplicaOpen = 0x30 => "`REPLICA_OPEN`: open a configured replica group.",
-    ReplicaState = 0x31 => "`REPLICA_STATE`: report replica state and volatile receipt.",
     Prepare = 0x32 => "`PREPARE`: replicate canonical operations.",
     PrepareOk = 0x33 => "`PREPARE_OK`: report contiguous replication evidence.",
     Commit = 0x34 => "`COMMIT`: announce the quorum-committed prefix.",
@@ -49,9 +47,6 @@ opcodes! {
     SnapshotEnd = 0x3e => "`SNAPSHOT_END`: finish a checkpoint transfer.",
     SnapshotInstalled = 0x3f => "`SNAPSHOT_INSTALLED`: confirm checkpoint installation.",
     ExitView = 0x50 => "`EXIT_VIEW`: request quorum-supported departure from the current view.",
-    PrepareFlow = 0x51 => "`PREPARE_FLOW`: replicate canonical operations in a fenced receive epoch.",
-    PreparePub = 0x52 => "`PREPARE_PUB`: publish canonical operations to followers.",
-    ReplicaReceipt = 0x54 => "`REPLICA_RECEIPT`: compact same-channel volatile receipt.",
     HistoryRetired = 0x55 => "`HISTORY_RETIRED`: require nonvoting checkpoint recovery below retained history.",
     ClockSample = 0x56 => "`CLOCK_SAMPLE`: report a node's wall time to a peer.",
 }
@@ -85,8 +80,7 @@ pub struct Envelope {
     pub request_id: Option<RequestId>,
     /// Claimed sender, which the authenticated link must independently verify.
     pub sender: NodeId,
-    /// Negotiated session; absent for HELLO and the receiver-fenced publications
-    /// `PREPARE_PUB` and `RECORDS_PUB`.
+    /// Negotiated session; absent for HELLO.
     pub session: Option<LinkSessionId>,
 }
 
@@ -160,10 +154,6 @@ impl Envelope {
             {
                 return Err(EnvelopeError::Handshake);
             }
-        } else if matches!(self.opcode, Opcode::PreparePub) {
-            if self.session.is_some() || self.response || self.request_id.is_some() {
-                return Err(EnvelopeError::Session);
-            }
         } else if self.session.is_none() {
             return Err(EnvelopeError::Session);
         } else if self.opcode == Opcode::Welcome && (!self.response || self.request_id.is_none()) {
@@ -185,16 +175,6 @@ pub struct Packet<'a> {
     pub metadata: &'a [u8],
     /// Exact bounded packed payload frame.
     pub payload: &'a [u8],
-}
-
-/// The metadata and payload frames of one data command: caller-reserved
-/// buffers to encode into, or received frames that decoded records share.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Frames<T> {
-    /// Metadata frame.
-    pub metadata: T,
-    /// Packed payload frame.
-    pub payload: T,
 }
 
 /// Decode exactly three frames, after the transport removes routing frames.

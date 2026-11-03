@@ -48,14 +48,17 @@
 
 use std::io;
 
-use zzq_proto::{QoS, SubscriptionOptions, Version};
+use zzq_proto::{SubscriptionOptions, Version};
 
 use crate::disk::Append;
-use crate::index::SubIds;
+use crate::index::Grant;
 use crate::msg::Publication;
 use crate::session::Session;
 
-use super::codec::{put_bytes, put_count, put_msg, put_session, put_u16, put_u32, put_u64};
+use super::codec::{
+    put_bytes, put_count, put_delayed_will, put_grant, put_opt_str, put_session, put_u16, put_u32,
+    put_u64, put_will,
+};
 use super::{Clock, SessionState};
 
 mod replay;
@@ -133,23 +136,10 @@ pub(crate) fn append_record(out: &mut impl Append, kind: u8, parts: &[&[u8]]) ->
 /// The body of a [`SESSION`] record for `s`.
 pub(crate) fn session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
     put_bytes(b, s.client_id.as_bytes());
-    match &s.username {
-        Some(u) => {
-            b.push(1);
-            put_bytes(b, u.as_bytes());
-        }
-        None => b.push(0),
-    }
+    put_opt_str(b, s.username.as_deref());
     b.push(s.version.level());
     put_u32(b, s.expiry);
-    match &s.will {
-        Some(w) => {
-            b.push(1);
-            put_u32(b, w.delay);
-            put_msg(b, &w.msg, clock);
-        }
-        None => b.push(0),
-    }
+    put_will(b, s.will.as_ref(), clock);
     put_u64(b, s.birth);
 }
 
@@ -158,14 +148,7 @@ pub(crate) fn down(b: &mut Vec<u8>, s: &Session, clock: Clock) {
     put_bytes(b, s.client_id.as_bytes());
     put_u32(b, s.expiry);
     put_u64(b, clock.unix_ms(s.expires_at));
-    match &s.delayed_will {
-        Some(w) => {
-            b.push(1);
-            put_u64(b, clock.unix_ms(Some(w.due)));
-            put_msg(b, &w.msg, clock);
-        }
-        None => b.push(0),
-    }
+    put_delayed_will(b, s.delayed_will.as_ref(), clock);
 }
 
 /// The body of an [`END`] or [`WILL_SENT`] record.
@@ -218,19 +201,10 @@ pub(crate) fn msg_head(b: &mut Vec<u8>, p: &Publication<'_>, clock: Clock) {
 }
 
 /// The body of a [`QUEUED`] record.
-pub(crate) fn queued(
-    b: &mut Vec<u8>,
-    client_id: &str,
-    seq: u64,
-    (qos, retain, sub_id): (QoS, bool, SubIds),
-) {
+pub(crate) fn queued(b: &mut Vec<u8>, client_id: &str, seq: u64, grant: Grant) {
     put_bytes(b, client_id.as_bytes());
     put_u64(b, seq);
-    b.push(qos as u8);
-    b.push(u8::from(retain));
-    for slot in sub_id.slots() {
-        put_u32(b, slot);
-    }
+    put_grant(b, grant);
 }
 
 /// The body of a [`DONE`] or [`RELEASED`] record.
@@ -303,7 +277,11 @@ pub(crate) fn framed(records: &[Vec<u8>]) -> Vec<u8> {
 pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     use std::time::Duration;
 
+    use zzq_proto::QoS;
+
+    use super::codec::put_msg;
     use crate::budget::LaneTotal;
+    use crate::index::SubIds;
     use crate::session::{DelayedWill, Will};
 
     let clock = Clock::now();
@@ -338,7 +316,11 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
     add(END, &|b| client(b, "c"));
     add(CLEAR, &|_| {});
     add(MSG, &|b| put_msg(b, &will_msg(), clock));
-    let grant = (QoS::ExactlyOnce, false, SubIds::one(7));
+    let grant = Grant {
+        qos: QoS::ExactlyOnce,
+        retain: false,
+        sub_id: SubIds::one(7),
+    };
     add(QUEUED, &|b| queued(b, "c", 1, grant));
     add(SENT, &|b| sent(b, "c", 1, 9));
     add(RELEASED, &|b| delivery(b, "c", 1));
@@ -352,6 +334,9 @@ pub(crate) fn record_seeds() -> Vec<Vec<u8>> {
 
 #[cfg(any(test, feature = "fuzzing"))]
 fn handoff_seeds(clock: Clock) -> Vec<Vec<u8>> {
+    use zzq_proto::QoS;
+
+    use crate::index::SubIds;
     use crate::msg::Msg;
 
     use super::handoff::{Handoffs, Pending, Target};
@@ -368,9 +353,11 @@ fn handoff_seeds(clock: Clock) -> Vec<Vec<u8>> {
             lane: 0,
             client: "c".into(),
             birth: 0,
-            qos: QoS::ExactlyOnce,
-            retain: false,
-            sub_id: SubIds::one(7),
+            grant: Grant {
+                qos: QoS::ExactlyOnce,
+                retain: false,
+                sub_id: SubIds::one(7),
+            },
         }],
     };
     let mut pending = vec![HANDOFF];
@@ -421,7 +408,7 @@ pub(crate) fn replay_records(data: &[u8]) -> Result<usize, &'static str> {
     while let [kind, a, b, tail @ ..] = rest {
         let len = usize::from(u16::from_be_bytes([*a, *b]));
         let (body, r) = tail.split_at_checked(len).ok_or("torn")?;
-        sessions.apply(*kind, body, clock, |_| true)?;
+        sessions.apply(*kind, body, clock)?;
         rest = r;
     }
     Ok(sessions.finish(crate::time::now()).len())

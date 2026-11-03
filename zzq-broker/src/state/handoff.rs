@@ -5,10 +5,10 @@ use std::sync::Arc;
 
 use zzq_proto::QoS;
 
-use crate::index::SubIds;
+use crate::index::Grant;
 use crate::msg::Msg;
 
-use super::codec::{Decoder, put_bytes, put_count, put_msg, put_u16, put_u64};
+use super::codec::{Decoder, put_bytes, put_count, put_grant, put_msg, put_u16, put_u64};
 use super::{Clock, SessionState};
 
 /// A lane's sessions and the handoffs that connect its journal to others.
@@ -49,9 +49,7 @@ pub(crate) struct Target {
     pub(crate) client: Arc<str>,
     /// Distinguishes a later clean session using the same client ID.
     pub(crate) birth: u64,
-    pub(crate) qos: QoS,
-    pub(crate) retain: bool,
-    pub(crate) sub_id: SubIds,
+    pub(crate) grant: Grant,
 }
 
 impl Handoffs {
@@ -111,19 +109,15 @@ pub(crate) fn materialize(
                     continue;
                 }
                 for target in &p.targets {
-                    if usize::from(target.lane) != to || target.qos == QoS::AtMostOnce {
+                    if usize::from(target.lane) != to || target.grant.qos == QoS::AtMostOnce {
                         continue;
                     }
                     if let Some(s) = lane.sessions.iter_mut().find(|s| {
                         s.client_id.as_ref() == &*target.client && s.birth == target.birth
                     }) {
-                        s.last_seq += 1;
-                        s.seqs.push(s.last_seq);
-                        s.queue.push(crate::session::Queued {
+                        s.deliveries.push_journaled(crate::session::Queued {
                             msg: p.msg.clone(),
-                            qos: target.qos,
-                            retain: target.retain,
-                            sub_id: target.sub_id,
+                            grant: target.grant,
                         });
                     }
                 }
@@ -145,10 +139,7 @@ pub(crate) fn put_pending(b: &mut Vec<u8>, p: &Pending, clock: Clock) {
         put_u16(b, t.lane);
         put_bytes(b, t.client.as_bytes());
         put_u64(b, t.birth);
-        b.extend_from_slice(&[t.qos as u8, u8::from(t.retain)]);
-        for id in t.sub_id.slots() {
-            super::codec::put_u32(b, id);
-        }
+        put_grant(b, t.grant);
     }
 }
 
@@ -170,19 +161,11 @@ pub(super) fn read_pending(d: &mut Decoder<'_>, clock: Clock) -> Result<Pending,
         let lane = d.u16()?;
         let client = d.str()?.into();
         let birth = d.u64()?;
-        let qos = d.qos()?;
-        let retain = d.flag()?;
-        let mut sub_id = SubIds::default();
-        for _ in 0..4 {
-            sub_id.add(d.u32()?);
-        }
         targets.push(Target {
             lane,
             client,
             birth,
-            qos,
-            retain,
-            sub_id,
+            grant: d.grant()?,
         });
     }
     Ok(Pending {

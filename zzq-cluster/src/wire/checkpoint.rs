@@ -148,11 +148,9 @@ pub(super) fn decode(
     }
 }
 
-/// Exact old receiver or history request being withdrawn. Neither is authority.
+/// Exact history request being withdrawn. Not authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryFence {
-    /// Volatile normal receive incarnation.
-    Receive(crate::flow::ReceiveEpoch),
     /// Outstanding election history request.
     Fetch(RequestId),
 }
@@ -163,12 +161,12 @@ pub enum HistoryFence {
 pub struct HistoryRetired {
     /// Exact normal authority view.
     pub scope: Scope,
-    /// Receiver incarnation whose independently checked history is unavailable.
+    /// Fetch whose independently checked history is unavailable.
     pub fence: HistoryFence,
     /// Last original operation preceding all required retained operations.
-    /// For a fetch, the first predecessor the source serves from: its
-    /// retained boundary, when the request predecessor is retired or not in
-    /// the source. Only a fetch fence may name genesis.
+    /// The first predecessor the source serves from: its retained
+    /// boundary, when the request predecessor is retired or not in the
+    /// source. Genesis when the source retired nothing.
     pub before: crate::Prefix,
 }
 
@@ -186,9 +184,7 @@ pub fn encode_history_retired(
 ) -> Result<ControlEncoding, WireError> {
     validate_scope(notice.scope)?;
     super::validate_prefix(notice.before)?;
-    if (notice.before.op.0 == 0 && matches!(notice.fence, HistoryFence::Receive(_)))
-        || matches!(notice.fence, HistoryFence::Fetch(id) if id.as_bytes() == &[0; 16])
-    {
+    if matches!(notice.fence, HistoryFence::Fetch(id) if id.as_bytes() == &[0; 16]) {
         return Err(WireError::History);
     }
     let length = COMMON_BYTES + 1 + 16 + 40;
@@ -206,10 +202,6 @@ pub fn encode_history_retired(
     let mut writer = Writer::with_len(output, length)?;
     writer.scope(notice.scope, sender)?;
     match notice.fence {
-        HistoryFence::Receive(epoch) => {
-            writer.bytes(&[0])?;
-            writer.bytes(&epoch.get().to_be_bytes())?;
-        }
         HistoryFence::Fetch(id) => {
             writer.bytes(&[1])?;
             writer.bytes(id.as_bytes())?;
@@ -236,16 +228,12 @@ pub(super) fn decode_retired(
     let tag: [u8; 1] = reader.array()?;
     let id: [u8; 16] = reader.array()?;
     let fence = match tag[0] {
-        0 => HistoryFence::Receive(crate::flow::ReceiveEpoch::new(u128::from_be_bytes(id))?),
         1 if id != [0; 16] => HistoryFence::Fetch(RequestId::from_bytes(id)),
         _ => return Err(WireError::Correlation),
     };
     let before = reader.prefix()?;
     reader.finish()?;
     super::validate_prefix(before)?;
-    if before.op.0 == 0 && matches!(fence, HistoryFence::Receive(_)) {
-        return Err(WireError::History);
-    }
     Ok(HistoryRetired {
         scope,
         fence,

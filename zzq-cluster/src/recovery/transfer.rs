@@ -225,9 +225,8 @@ impl Recovery {
             })
             || repaired.scope.view < ticket.scope.view
             || repaired.log.last_normal_view > repaired.scope.view
-            || [repaired.log.accepted, repaired.log.committed]
-                .iter()
-                .any(|prefix| (prefix.op.0 == 0) != (prefix.digest == crate::Digest::ZERO))
+            || !crate::view_change::valid_prefix(repaired.log.accepted)
+            || !crate::view_change::valid_prefix(repaired.log.committed)
             || repaired.log.committed.op > repaired.log.accepted.op
             || (repaired.log.committed.op == repaired.log.accepted.op
                 && repaired.log.committed != repaired.log.accepted)

@@ -6,15 +6,14 @@ use std::time::{Duration, Instant};
 
 use rustc_hash::FxHashMap;
 use zzq_proto::topic::validate_filter;
-use zzq_proto::{QoS, SubscriptionOptions, Version};
+use zzq_proto::{SubscriptionOptions, Version};
 
 use crate::disk::Append;
-use crate::index::SubIds;
 use crate::msg::Msg;
-use crate::session::{Queued, Will};
+use crate::session::Queued;
 use crate::state::codec::Decoder;
 use crate::state::handoff::{self, Handoffs, LaneState};
-use crate::state::{Clock, SessionState};
+use crate::state::{Clock, Deliveries, SessionState, Snapshotted};
 
 use super::{
     CLEAR, CLEARED, DONE, DOWN, END, HANDED, HANDOFF, HANDOFF_KEPT, IMAGE, INBOUND, INBOUND_DONE,
@@ -25,17 +24,23 @@ use super::{
 /// The sessions a lane journal leaves, record by record.
 #[derive(Debug, Default)]
 pub(crate) struct Sessions {
+    /// The lane whose journal it reads, of `lanes`. With 0 lanes, of
+    /// any lane: its sessions and handoffs are not checked.
+    lane: usize,
     lanes: usize,
-    by_client: FxHashMap<Box<str>, Replayed>,
-    /// The sessions of a snapshot still being read: they take the place
-    /// of `by_client` at its end, and are dropped if it never comes.
-    snapshot: Option<(FxHashMap<Box<str>, Replayed>, Handoffs)>,
-    handoffs: Handoffs,
+    state: Snapshotted<LaneReplay>,
     /// The message of the last [`MSG`] record, which [`QUEUED`] records
     /// after it deliver.
     msg: Option<Msg>,
     /// The [`PART`] records of a record that has not ended.
     pub(super) parts: Vec<u8>,
+}
+
+/// What a lane journal holds: its sessions and handoffs.
+#[derive(Debug, Default)]
+struct LaneReplay {
+    by_client: FxHashMap<Box<str>, Replayed>,
+    handoffs: Handoffs,
 }
 
 #[derive(Debug, Clone)]
@@ -60,20 +65,26 @@ struct Item {
 }
 
 impl Sessions {
-    pub(crate) fn new(lanes: usize) -> Sessions {
+    /// The sessions of lane `lane` of `lanes`.
+    pub(crate) fn new(lane: usize, lanes: usize) -> Sessions {
         Sessions {
+            lane,
             lanes,
             ..Sessions::default()
         }
     }
-    /// Applies a record. `owned` tells whether a client ID belongs to the
-    /// journal's lane.
+
+    /// Whether `client_id` belongs to the journal's lane.
+    fn owns(&self, client_id: &str) -> bool {
+        self.lanes == 0 || crate::broker::lane_for(client_id, self.lanes) == self.lane
+    }
+
+    /// Applies a record.
     pub(crate) fn apply(
         &mut self,
         kind: u8,
         body: &[u8],
         clock: Clock,
-        owned: impl Fn(&str) -> bool,
     ) -> Result<(), &'static str> {
         match kind {
             PART => {
@@ -88,25 +99,19 @@ impl Sessions {
                 let (&kind, piece) = body.split_first().ok_or("empty record end")?;
                 let mut whole = std::mem::take(&mut self.parts);
                 whole.extend_from_slice(piece);
-                self.apply_whole(kind, &whole, clock, &owned)
+                self.apply_whole(kind, &whole, clock)
             }
             _ => {
                 // What a failed write left of a long record.
                 self.parts.clear();
-                self.apply_whole(kind, body, clock, &owned)
+                self.apply_whole(kind, body, clock)
             }
         }
     }
 
-    fn apply_whole(
-        &mut self,
-        kind: u8,
-        body: &[u8],
-        clock: Clock,
-        owned: &dyn Fn(&str) -> bool,
-    ) -> Result<(), &'static str> {
+    fn apply_whole(&mut self, kind: u8, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         if kind != TRANSACTION {
-            return self.apply_one(kind, body, clock, owned);
+            return self.apply_one(kind, body, clock);
         }
         let mut d = Decoder(body);
         while !d.0.is_empty() {
@@ -127,19 +132,14 @@ impl Sessions {
                 return Err("invalid transaction record");
             }
             let len = d.u32()? as usize;
-            self.apply_one(kind, d.take(len)?, clock, owned)?;
+            self.apply_one(kind, d.take(len)?, clock)?;
         }
         Ok(())
     }
 
     /// Decodes a [`HANDOFF`] or [`HANDOFF_KEPT`] body, and checks it belongs
     /// in the journal of this lane.
-    fn pending(
-        &self,
-        d: &mut Decoder<'_>,
-        clock: Clock,
-        owned: &dyn Fn(&str) -> bool,
-    ) -> Result<handoff::Pending, &'static str> {
+    fn pending(&self, d: &mut Decoder<'_>, clock: Clock) -> Result<handoff::Pending, &'static str> {
         let p = handoff::read_pending(d, clock)?;
         if self.lanes != 0
             && p.targets
@@ -148,103 +148,90 @@ impl Sessions {
         {
             return Err("handoff destination belongs to another lane");
         }
-        if !owned(&p.publisher) {
+        if !self.owns(&p.publisher) {
             return Err("handoff in the journal of another lane");
         }
         Ok(p)
     }
 
     #[expect(clippy::too_many_lines, reason = "one arm per journal record")]
-    fn apply_one(
-        &mut self,
-        kind: u8,
-        body: &[u8],
-        clock: Clock,
-        owned: &dyn Fn(&str) -> bool,
-    ) -> Result<(), &'static str> {
+    fn apply_one(&mut self, kind: u8, body: &[u8], clock: Clock) -> Result<(), &'static str> {
         let mut d = Decoder(body);
         match kind {
-            CLEAR => self.snapshot = Some((FxHashMap::default(), Handoffs::default())),
-            CLEARED => {
-                if let Some((snapshot, handoffs)) = self.snapshot.take() {
-                    self.by_client = snapshot;
-                    self.handoffs = handoffs;
-                }
-            }
+            CLEAR => self.state.begin(),
+            CLEARED => self.state.end(),
             IMAGE => {
                 let r = image(&mut d, clock)?;
-                if !owned(&r.st.client_id) {
+                if !self.owns(&r.st.client_id) {
                     return Err("session in the journal of another lane");
                 }
-                let (into, h) = self
-                    .snapshot
-                    .as_mut()
-                    .map(|s| (&mut s.0, &mut s.1))
-                    .unwrap_or((&mut self.by_client, &mut self.handoffs));
-                h.serial = h.serial.max(r.st.birth);
-                into.insert(r.st.client_id.clone(), r);
+                let into = self.state.target();
+                into.handoffs.serial = into.handoffs.serial.max(r.st.birth);
+                into.by_client.insert(r.st.client_id.clone(), r);
             }
             ROUTING => {
-                let h = self
-                    .snapshot
-                    .as_mut()
-                    .map(|s| &mut s.1)
-                    .unwrap_or(&mut self.handoffs);
-                handoff::read_meta(&mut d, h)?;
+                handoff::read_meta(&mut d, &mut self.state.target().handoffs)?;
             }
             HANDOFF_KEPT => {
-                let p = self.pending(&mut d, clock, owned)?;
-                let h = self
-                    .snapshot
-                    .as_mut()
-                    .map(|s| &mut s.1)
-                    .unwrap_or(&mut self.handoffs);
+                let p = self.pending(&mut d, clock)?;
+                let h = &mut self.state.target().handoffs;
                 h.serial = h.serial.max(p.seq);
                 h.pending.insert(p.seq, std::sync::Arc::new(p));
             }
             // Any other record after an unfinished snapshot: the snapshot
             // was cut off, and the lane went on without it.
-            _ if self.snapshot.take().is_some() => return self.apply_one(kind, body, clock, owned),
+            _ if self.state.cut() => return self.apply_one(kind, body, clock),
             HANDOFF => {
-                let p = self.pending(&mut d, clock, owned)?;
+                let p = self.pending(&mut d, clock)?;
                 if let Some(r) = self
+                    .state
+                    .live
                     .by_client
                     .get_mut(&p.publisher)
                     .filter(|r| r.st.birth == p.birth)
                 {
                     r.awaiting_rel.insert(p.pkid);
                 }
-                self.handoffs.serial = self.handoffs.serial.max(p.seq);
-                self.handoffs.pending.insert(p.seq, std::sync::Arc::new(p));
+                self.state.live.handoffs.serial = self.state.live.handoffs.serial.max(p.seq);
+                self.state
+                    .live
+                    .handoffs
+                    .pending
+                    .insert(p.seq, std::sync::Arc::new(p));
             }
             HANDED => {
-                self.handoffs.pending.remove(&d.u64()?);
+                self.state.live.handoffs.pending.remove(&d.u64()?);
             }
             RECEIVED => {
-                self.handoffs.receive(d.u16()?, d.u64()?);
+                self.state.live.handoffs.receive(d.u16()?, d.u64()?);
             }
             MSG => self.msg = Some(d.msg(clock)?),
             SESSION => {
                 let client_id = d.str()?;
                 let st = session_head(&mut d, client_id, clock)?;
-                self.handoffs.serial = self.handoffs.serial.max(st.birth);
-                if !owned(client_id) {
+                self.state.live.handoffs.serial = self.state.live.handoffs.serial.max(st.birth);
+                if !self.owns(client_id) {
                     return Err("session in the journal of another lane");
                 }
                 // A new connection to a session goes on with what it held.
-                match self.by_client.get_mut(client_id) {
+                match self.state.live.by_client.get_mut(client_id) {
                     Some(r) => r.attach(st),
                     None => {
-                        self.by_client.insert(client_id.into(), Replayed::new(st));
+                        self.state
+                            .live
+                            .by_client
+                            .insert(client_id.into(), Replayed::new(st));
                     }
                 }
             }
             END => {
-                self.by_client.remove(d.str()?);
+                self.state.live.by_client.remove(d.str()?);
             }
             _ => {
                 let client_id = d.str()?;
                 let r = self
+                    .state
+                    .live
                     .by_client
                     .get_mut(client_id)
                     .ok_or("record of an unknown session")?;
@@ -262,13 +249,13 @@ impl Sessions {
     }
 
     pub(crate) fn into_lane(self, now: Instant) -> LaneState {
-        let mut out = Vec::with_capacity(self.by_client.len());
-        for r in self.by_client.into_values() {
+        let mut out = Vec::with_capacity(self.state.live.by_client.len());
+        for r in self.state.live.by_client.into_values() {
             out.push(r.finish(now));
         }
         LaneState {
             sessions: out,
-            handoffs: self.handoffs,
+            handoffs: self.state.live.handoffs,
         }
     }
 
@@ -278,12 +265,12 @@ impl Sessions {
     pub(crate) fn image(&self, out: &mut impl Append, clock: Clock) -> io::Result<()> {
         let mut buf = Vec::new();
         out.append(CLEAR, &[])?;
-        for r in self.by_client.values() {
+        for r in self.state.live.by_client.values() {
             buf.clear();
             super::image_state(&mut buf, r.clone().into_state(), r.connected, clock);
             super::append_record(out, IMAGE, &[&buf])?;
         }
-        super::handoffs(out, &self.handoffs, &mut buf, clock)?;
+        super::handoffs(out, &self.state.live.handoffs, &mut buf, clock)?;
         out.append(CLEARED, &[])?;
         if let Some(m) = &self.msg {
             buf.clear();
@@ -370,14 +357,7 @@ impl Replayed {
     fn down(&mut self, d: &mut Decoder<'_>, clock: Clock) -> Result<(), &'static str> {
         self.st.expiry = d.u32()?;
         self.st.expires_at = clock.instant(d.u64()?);
-        self.st.delayed_will = if d.flag()? {
-            let due = clock
-                .instant(d.u64()?)
-                .ok_or("delayed will without a time")?;
-            Some((due, d.msg(clock)?))
-        } else {
-            None
-        };
+        self.st.delayed_will = d.delayed_will(clock)?;
         self.st.will = None;
         self.connected = false;
         Ok(())
@@ -385,20 +365,9 @@ impl Replayed {
 
     fn queued(&mut self, d: &mut Decoder<'_>, msg: &Msg) -> Result<(), &'static str> {
         let seq = d.u64()?;
-        let qos = d.qos()?;
-        if qos == QoS::AtMostOnce {
-            return Err("QoS 0 message held");
-        }
-        let retain = d.flag()?;
-        let mut sub_id = SubIds::default();
-        for _ in 0..4 {
-            sub_id.add(d.u32()?);
-        }
         let queued = Queued {
+            grant: d.held_grant()?,
             msg: msg.clone(),
-            qos,
-            retain,
-            sub_id,
         };
         let item = Item {
             queued,
@@ -433,19 +402,21 @@ impl Replayed {
         for (seq, item) in self.items {
             match item.pkid {
                 Some(pkid) => {
-                    st.inflight.push((pkid, item.queued, item.released));
-                    st.seqs.push(seq);
+                    st.deliveries
+                        .inflight
+                        .push((pkid, item.queued, item.released));
+                    st.deliveries.seqs.push(seq);
                 }
                 // Released under an ID the journal lost: the client has it.
                 None if item.released => {}
                 None => {
-                    st.queue.push(item.queued);
+                    st.deliveries.queue.push(item.queued);
                     queue_seqs.push(seq);
                 }
             }
         }
-        st.seqs.extend(queue_seqs);
-        st.last_seq = self.last_seq;
+        st.deliveries.seqs.extend(queue_seqs);
+        st.deliveries.last_seq = self.last_seq;
         st
     }
 }
@@ -456,11 +427,14 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
     let mut st = d.session(clock)?;
     let last_seq = d.u64()?;
     let n = d.count(8)?;
-    if n != st.inflight.len() + st.queue.len() {
+    let Deliveries {
+        inflight, queue, ..
+    } = std::mem::take(&mut st.deliveries);
+    if n != inflight.len() + queue.len() {
         return Err("delivery numbers do not match the deliveries");
     }
     let mut items = BTreeMap::new();
-    for (pkid, queued, released) in std::mem::take(&mut st.inflight) {
+    for (pkid, queued, released) in inflight {
         let item = Item {
             queued,
             pkid: Some(pkid),
@@ -468,7 +442,7 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
         };
         items.insert(d.u64()?, item);
     }
-    for queued in std::mem::take(&mut st.queue) {
+    for queued in queue {
         let item = Item {
             queued,
             pkid: None,
@@ -476,10 +450,7 @@ fn image(d: &mut Decoder<'_>, clock: Clock) -> Result<Replayed, &'static str> {
         };
         items.insert(d.u64()?, item);
     }
-    st.birth = if d.0.is_empty() { 0 } else { d.u64()? };
-    if st.birth == u64::MAX {
-        return Err("invalid session birth");
-    }
+    st.birth = d.birth()?;
     let subs = std::mem::take(&mut st.subs)
         .into_iter()
         .map(|(f, o, id)| (f, (o, id)))
@@ -518,46 +489,16 @@ fn session_head(
     if client_id.is_empty() {
         return Err("empty client ID");
     }
-    let username = if d.flag()? {
-        Some(d.str()?.into())
-    } else {
-        None
-    };
-    let version = match d.u8()? {
-        3 => Version::V31,
-        4 => Version::V311,
-        5 => Version::V5,
-        _ => return Err("invalid protocol level"),
-    };
+    let username = d.opt_str()?.map(Into::into);
+    let version = d.version()?;
     let expiry = d.u32()?;
-    let will = if d.flag()? {
-        let delay = d.u32()?;
-        Some(Will {
-            msg: d.msg(clock)?,
-            delay,
-        })
-    } else {
-        None
-    };
-    let birth = if d.0.is_empty() { 0 } else { d.u64()? };
-    if birth == u64::MAX {
-        return Err("invalid session birth");
-    }
+    let will = d.will(clock)?;
+    let birth = d.birth()?;
     Ok(SessionState {
         birth,
-        client_id: client_id.into(),
         username,
-        version,
         expiry,
-        expires_at: None,
         will,
-        delayed_will: None,
-        next_pkid: 0,
-        subs: Vec::new(),
-        awaiting_rel: Vec::new(),
-        inflight: Vec::new(),
-        queue: Vec::new(),
-        seqs: Vec::new(),
-        last_seq: 0,
+        ..SessionState::new(client_id.into(), version)
     })
 }

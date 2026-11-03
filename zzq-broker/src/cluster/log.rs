@@ -149,6 +149,8 @@ pub(crate) struct Listeners {
     /// Counts changes of `leading`, so a bind that finishes after one
     /// closes its listener.
     pub(crate) epoch: u64,
+    /// The endpoints that did not bind while the node leads, and why.
+    pub(crate) unbound: Vec<(zzq_tokio::Endpoint, Arc<crate::Error>)>,
 }
 
 impl Listeners {
@@ -159,6 +161,14 @@ impl Listeners {
             self.bound.push(task);
         } else {
             task.abort();
+        }
+    }
+
+    /// Keeps why `endpoint` did not bind in `epoch`, if the leadership
+    /// did not change since.
+    pub(crate) fn unbound(&mut self, endpoint: zzq_tokio::Endpoint, e: crate::Error, epoch: u64) {
+        if self.epoch == epoch {
+            self.unbound.push((endpoint, Arc::new(e)));
         }
     }
 }

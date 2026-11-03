@@ -5,15 +5,18 @@ mod read;
 mod write;
 
 use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::Notify;
-use zzq_proto::{PacketType, encode};
+use tokio::task::JoinHandle;
+use zzq_proto::{PacketType, Version, encode};
 use zzq_tokio::transport::Driver;
 
 use crate::lane::{Close, LaneRef};
+use crate::slab::Key;
 
 pub(crate) use handshake::OwnedConnect;
 pub(crate) use read::ReadBlocks;
@@ -77,6 +80,53 @@ impl ConnShared {
     }
 }
 
+/// A connection attached to its session.
+#[derive(Debug, Clone)]
+struct Conn {
+    lane: LaneRef,
+    /// The session's key on the lane.
+    key: Key,
+    shared: Rc<ConnShared>,
+}
+
+/// A connection the handshake attached, with its writer running.
+#[derive(Debug)]
+struct Started {
+    conn: Conn,
+    version: Version,
+    /// Bytes read after CONNECT.
+    buf: BytesMut,
+    writer: JoinHandle<()>,
+}
+
+impl Conn {
+    /// Closes the connection as `close` says, detaches it from its
+    /// session and gives the writer `CLOSE_LINGER` to finish.
+    async fn end(&self, close: Close, version: Version, mut writer: JoinHandle<()>) {
+        if let Close::Protocol(code) = close {
+            let mut bye = Vec::new();
+            if version.is_v5() {
+                encode::reason_only(PacketType::Disconnect, version, code, &[], &mut bye);
+            }
+            self.shared.close(bye);
+        } else {
+            self.shared.close(Vec::new());
+        }
+        {
+            let mut l = self.lane.borrow_mut();
+            l.detach(self.key, self.shared.id, close);
+            l.flush();
+        }
+        crate::broker::ship(&self.lane).await;
+        if tokio::time::timeout(CLOSE_LINGER, &mut writer)
+            .await
+            .is_err()
+        {
+            writer.abort();
+        }
+    }
+}
+
 /// Runs broker connections on a lane.
 #[derive(Debug)]
 pub(crate) struct ConnDriver {
@@ -104,33 +154,18 @@ where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
-    let lane = d.lane;
     // Boxed, so the handshake's state is freed once it is done instead of
     // sizing every connection's future.
-    let started = Box::pin(handshake::start(&lane, d.initial, d.peer_cert, &mut r, w)).await;
-    let Some((key, conn, version, buf, mut writer)) = started else {
+    let started = Box::pin(handshake::start(d, &mut r, w)).await;
+    let Some(Started {
+        conn,
+        version,
+        buf,
+        writer,
+    }) = started
+    else {
         return;
     };
-    let close = read::read_loop(&lane, key, &conn, &mut r, buf).await;
-    if let Close::Protocol(code) = close {
-        let mut bye = Vec::new();
-        if version.is_v5() {
-            encode::reason_only(PacketType::Disconnect, version, code, &[], &mut bye);
-        }
-        conn.close(bye);
-    } else {
-        conn.close(Vec::new());
-    }
-    {
-        let mut l = lane.borrow_mut();
-        l.detach(key, conn.id, close);
-        l.flush();
-    }
-    crate::broker::ship(&lane).await;
-    if tokio::time::timeout(CLOSE_LINGER, &mut writer)
-        .await
-        .is_err()
-    {
-        writer.abort();
-    }
+    let close = conn.read_loop(&mut r, buf).await;
+    conn.end(close, version, writer).await;
 }

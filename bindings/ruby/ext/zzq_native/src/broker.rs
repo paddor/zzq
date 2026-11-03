@@ -1,6 +1,6 @@
 //! `ZZQ::Native::Broker`: a running broker.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use rb_sys::VALUE;
 use tokio::sync::{OwnedRwLockReadGuard, RwLock};
@@ -11,8 +11,7 @@ use crate::op::{self, Out};
 use crate::rb::{self, DataType, RbResult, RubyErr};
 use crate::{context, options};
 
-static TYPE: DataType = DataType::new::<NativeBroker>(c"ZZQ::Native::Broker");
-static CLASS: OnceLock<usize> = OnceLock::new();
+static TYPE: DataType<NativeBroker> = DataType::new(c"ZZQ::Native::Broker");
 
 #[derive(Debug)]
 struct NativeBroker {
@@ -26,7 +25,7 @@ type Held = OwnedRwLockReadGuard<Option<Broker>, Broker>;
 
 /// The broker for one call, or `Closed` once a shutdown has begun.
 fn get(value: VALUE) -> RbResult<Held> {
-    let native: &NativeBroker = unsafe { TYPE.get(value) }?;
+    let native: &NativeBroker = TYPE.get(value)?;
     native
         .broker
         .clone()
@@ -41,7 +40,7 @@ pub fn wrap(b: Broker) -> RbResult<VALUE> {
     let native = NativeBroker {
         broker: Arc::new(RwLock::new(Some(b))),
     };
-    TYPE.wrap(*CLASS.get().expect("registered") as VALUE, native)
+    TYPE.wrap(native)
 }
 
 pub fn stats_hash(s: &Stats) -> RbResult<VALUE> {
@@ -115,7 +114,7 @@ fn stats(this: VALUE) -> RbResult<VALUE> {
 /// An op that waits for the calls using the broker to finish, then shuts
 /// it down.
 fn shutdown(this: VALUE) -> RbResult<VALUE> {
-    let native: &NativeBroker = unsafe { TYPE.get(this) }?;
+    let native: &NativeBroker = TYPE.get(this)?;
     let broker = native.broker.clone();
     op::new(async move {
         let Some(b) = broker.write_owned().await.take() else {
@@ -126,39 +125,14 @@ fn shutdown(this: VALUE) -> RbResult<VALUE> {
     })
 }
 
-unsafe extern "C" fn broker_start(_class: VALUE, opts: VALUE) -> VALUE {
-    rb::wrap(|| start(opts))
-}
-
-unsafe extern "C" fn broker_bind(this: VALUE, uri: VALUE) -> VALUE {
-    rb::wrap(|| bind(this, uri))
-}
-
-unsafe extern "C" fn broker_publish(
-    this: VALUE,
-    topic: VALUE,
-    payload: VALUE,
-    qos: VALUE,
-    retain: VALUE,
-) -> VALUE {
-    rb::wrap(|| publish(this, topic, payload, qos, retain))
-}
-
-unsafe extern "C" fn broker_stats(this: VALUE) -> VALUE {
-    rb::wrap(|| stats(this))
-}
-
-unsafe extern "C" fn broker_shutdown(this: VALUE) -> VALUE {
-    rb::wrap(|| shutdown(this))
-}
-
 pub fn register(native: VALUE) -> RbResult<()> {
-    let class = rb::define_class_under(native, c"Broker")?;
-    let _ = CLASS.set(class as usize);
-    rb::define_singleton_method(class, c"start", broker_start as *const (), 1)?;
-    rb::define_method(class, c"bind", broker_bind as *const (), 1)?;
-    rb::define_method(class, c"publish", broker_publish as *const (), 4)?;
-    rb::define_method(class, c"stats", broker_stats as *const (), 0)?;
-    rb::define_method(class, c"shutdown", broker_shutdown as *const (), 0)?;
+    let class = TYPE.register(native, c"Broker")?;
+    rb::singleton!(class, c"start", |_class, opts| start(opts))?;
+    rb::method!(class, c"bind", |this, uri| bind(this, uri))?;
+    rb::method!(class, c"publish", |this, topic, payload, qos, retain| {
+        publish(this, topic, payload, qos, retain)
+    })?;
+    rb::method!(class, c"stats", |this| stats(this))?;
+    rb::method!(class, c"shutdown", |this| shutdown(this))?;
     Ok(())
 }

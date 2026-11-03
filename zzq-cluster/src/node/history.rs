@@ -6,11 +6,8 @@ use std::time::Duration;
 use bytes::Bytes;
 
 use super::log::Entry;
-use super::{Node, NodeError, Outgoing};
-use crate::wire::{
-    EncodeContext, FetchOps, HistoryFence, HistoryRetired, OpsBatch, encode_fetch,
-    encode_history_retired, encode_ops,
-};
+use super::{Node, NodeError};
+use crate::wire::{FetchOps, HistoryFence, HistoryRetired, OpsBatch};
 use crate::{Digest, LogSource, NodeId, OpNumber, Prefix, RequestId};
 
 /// Ops of another node's log, fetched after `from`.
@@ -110,7 +107,8 @@ impl Node {
     }
 
     /// Sends the next fetch request, or the last again once it timed out.
-    pub(super) fn poll_fetch(&mut self, now: Duration) {
+    pub(super) fn poll_fetch(&mut self) {
+        let now = self.now;
         let Some(fetch) = self.fetch.as_mut() else {
             return;
         };
@@ -139,30 +137,8 @@ impl Node {
                 .unwrap_or(u32::MAX),
         };
         fetch.request = Some((request, now));
-        let Some(i) = self.peer_index(request.source.voter) else {
-            return;
-        };
-        let Some(session) = self.peers[i].session else {
-            return;
-        };
-        let mut metadata = vec![0; 256];
-        if let Ok(encoded) = encode_fetch(
-            self.config.local,
-            session,
-            request,
-            &mut metadata,
-            self.config.wire,
-        ) {
-            metadata.truncate(encoded.metadata_bytes);
-            self.out.push_back(Outgoing {
-                to: request.source.voter,
-                frames: [
-                    Bytes::copy_from_slice(&encoded.header),
-                    Bytes::from(metadata),
-                    Bytes::new(),
-                ],
-            });
-        }
+        let to = request.source.voter;
+        self.send(to, |e, session| e.fetch(to, session, request));
     }
 
     /// Keeps the ops of a response to the request in flight, then asks for
@@ -171,8 +147,8 @@ impl Node {
         &mut self,
         batch: &OpsBatch<'_>,
         payload: &Bytes,
-        now: Duration,
     ) -> Result<(), NodeError> {
+        let now = self.now;
         let Some(fetch) = self.fetch.as_mut() else {
             return Ok(());
         };
@@ -190,7 +166,7 @@ impl Node {
         fetch.unanswered = 0;
         fetch.answered = true;
         self.driver.history_progress(now)?;
-        self.poll_fetch(now);
+        self.poll_fetch();
         Ok(())
     }
 
@@ -228,7 +204,12 @@ impl Node {
         }
         let out = if request.predecessor.op < self.log.base().op {
             // Gone, whatever the lineage: only a recovery helps.
-            self.retired_message(from, session, request)
+            let notice = HistoryRetired {
+                scope: request.scope,
+                fence: HistoryFence::Fetch(request.request_id),
+                before: self.log.base(),
+            };
+            self.encoder.notice(from, session, notice).ok()
         } else if self.log.prefix_at(request.source.accepted.op) != Some(request.source.accepted) {
             None
         } else if self.log.prefix_at(request.predecessor.op) == Some(request.predecessor) {
@@ -246,86 +227,12 @@ impl Node {
                 .iter()
                 .map(Entry::wire)
                 .collect();
-            self.ops_message(from, session, request, &wire)
+            self.encoder.ops(from, session, request, &wire).ok()
         } else {
             None
         };
         if let Some(out) = out {
             self.out.push_back(out);
         }
-    }
-
-    fn ops_message(
-        &self,
-        to: NodeId,
-        session: crate::LinkSessionId,
-        request: FetchOps,
-        wire: &[crate::wire::Operation<'_>],
-    ) -> Option<Outgoing> {
-        let mut metadata = vec![0; self.config.wire.envelope.max_metadata_bytes];
-        let mut payload = vec![0; wire.iter().map(|o| o.canonical().body.len()).sum()];
-        let encoded = encode_ops(
-            EncodeContext {
-                sender: self.config.local,
-                session,
-                limits: self.config.wire,
-            },
-            request,
-            wire,
-            &mut metadata,
-            &mut payload,
-        )
-        .ok()?;
-        metadata.truncate(encoded.metadata_bytes);
-        payload.truncate(encoded.payload_bytes);
-        Some(Outgoing {
-            to,
-            frames: [
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::from(metadata),
-                Bytes::from(payload),
-            ],
-        })
-    }
-
-    fn retired_message(
-        &self,
-        to: NodeId,
-        session: crate::LinkSessionId,
-        request: FetchOps,
-    ) -> Option<Outgoing> {
-        let notice = HistoryRetired {
-            scope: request.scope,
-            fence: HistoryFence::Fetch(request.request_id),
-            before: self.log.base(),
-        };
-        self.notice_message(to, session, notice)
-    }
-
-    /// `HISTORY_RETIRED` for `to`.
-    pub(super) fn notice_message(
-        &self,
-        to: NodeId,
-        session: crate::LinkSessionId,
-        notice: HistoryRetired,
-    ) -> Option<Outgoing> {
-        let mut metadata = vec![0; 256];
-        let encoded = encode_history_retired(
-            self.config.local,
-            session,
-            notice,
-            &mut metadata,
-            self.config.wire,
-        )
-        .ok()?;
-        metadata.truncate(encoded.metadata_bytes);
-        Some(Outgoing {
-            to,
-            frames: [
-                Bytes::copy_from_slice(&encoded.header),
-                Bytes::from(metadata),
-                Bytes::new(),
-            ],
-        })
     }
 }

@@ -214,32 +214,6 @@ pub(super) fn decode_ops(
     })
 }
 
-pub(super) fn validate_routing(
-    request: FetchOps,
-    envelope: Envelope,
-    mut reader: Reader<'_>,
-    payload_bytes: usize,
-) -> Result<(), WireError> {
-    request.validate()?;
-    if !envelope.response || envelope.request_id != Some(request.request_id) {
-        return Err(WireError::Correlation);
-    }
-    if envelope.sender != request.source.voter
-        || read_source(&mut reader)? != request.source
-        || reader.prefix()? != request.predecessor
-    {
-        return Err(WireError::Transfer);
-    }
-    let operations = reader.u32()?;
-    if operations == 0
-        || operations > request.max_operations
-        || payload_bytes > request.max_body_bytes as usize
-    {
-        return Err(WireError::Limit);
-    }
-    Ok(())
-}
-
 fn validate_tail(source: LogSource, end: Prefix) -> Result<(), WireError> {
     if end.op > source.accepted.op || (end.op == source.accepted.op && end != source.accepted) {
         return Err(WireError::History);

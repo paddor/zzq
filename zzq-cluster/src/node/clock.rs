@@ -101,7 +101,8 @@ impl Node {
 
     /// Sends each peer bound to this process its wall time: once a
     /// second, and at once on a new session.
-    pub(super) fn send_samples(&mut self, now: Duration) {
+    pub(super) fn send_samples(&mut self) {
+        let now = self.now;
         let due = now >= self.clock.next;
         if due {
             self.clock.next = now + SAMPLE_INTERVAL;
@@ -123,12 +124,8 @@ impl Node {
     }
 
     /// Keeps the sample a peer sent on its session.
-    pub(super) fn on_sample(
-        &mut self,
-        from: NodeId,
-        packet: Packet<'_>,
-        now: Duration,
-    ) -> Result<(), NodeError> {
+    pub(super) fn on_sample(&mut self, from: NodeId, packet: Packet<'_>) -> Result<(), NodeError> {
+        let now = self.now;
         let wall = read_sample(packet)?;
         let local = self.clock.wall(now);
         self.clock.guard.observe(from, wall, local, now);

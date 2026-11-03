@@ -2,8 +2,10 @@
 //! `rb_protect`, so a Ruby exception never unwinds through Rust frames.
 
 use std::ffi::{CStr, CString, c_char, c_long, c_void};
+use std::marker::PhantomData;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
+use std::sync::OnceLock;
 
 use rb_sys::{VALUE, rb_data_type_struct__bindgen_ty_1, rb_data_type_t, size_t};
 
@@ -310,47 +312,67 @@ pub fn const_get(module: VALUE, name: &CStr) -> RbResult<VALUE> {
     protect(|| unsafe { rb_sys::rb_const_get(module, rb_sys::rb_intern(name.as_ptr())) })
 }
 
-/// A Ruby type for a boxed `T`, which GC frees with the object.
-pub struct DataType(rb_data_type_t);
+/// A Ruby class whose objects each hold a boxed `T`, which GC frees with
+/// the object.
+pub struct DataType<T> {
+    raw: rb_data_type_t,
+    /// The class, once [`DataType::register`] defined it.
+    class: OnceLock<usize>,
+    _value: PhantomData<fn() -> T>,
+}
 
-unsafe impl Send for DataType {}
-unsafe impl Sync for DataType {}
+// SAFETY: the raw type holds only pointers to statics and functions,
+// which Ruby reads and nothing writes.
+unsafe impl<T> Send for DataType<T> {}
+unsafe impl<T> Sync for DataType<T> {}
 
-impl DataType {
-    pub const fn new<T>(name: &'static CStr) -> Self {
-        DataType(rb_data_type_t {
-            wrap_struct_name: name.as_ptr(),
-            function: rb_data_type_struct__bindgen_ty_1 {
-                dmark: None,
-                dfree: Some(free_box::<T>),
-                dsize: Some(size_box::<T>),
-                dcompact: None,
-                reserved: [ptr::null_mut(); 1],
+impl<T> DataType<T> {
+    pub const fn new(name: &'static CStr) -> Self {
+        DataType {
+            raw: rb_data_type_t {
+                wrap_struct_name: name.as_ptr(),
+                function: rb_data_type_struct__bindgen_ty_1 {
+                    dmark: None,
+                    dfree: Some(free_box::<T>),
+                    dsize: Some(size_box::<T>),
+                    dcompact: None,
+                    reserved: [ptr::null_mut(); 1],
+                },
+                parent: ptr::null(),
+                data: ptr::null_mut(),
+                // RUBY_TYPED_FREE_IMMEDIATELY: dropping never blocks or calls Ruby.
+                flags: 1,
             },
-            parent: ptr::null(),
-            data: ptr::null_mut(),
-            // RUBY_TYPED_FREE_IMMEDIATELY: dropping never blocks or calls Ruby.
-            flags: 1,
-        })
+            class: OnceLock::new(),
+            _value: PhantomData,
+        }
     }
 
     const fn ptr(&'static self) -> *const rb_data_type_t {
-        &raw const self.0
+        &raw const self.raw
     }
 
-    /// Wraps `value` in a new object of `class`.
-    pub fn wrap<T>(&'static self, class: VALUE, value: T) -> RbResult<VALUE> {
+    /// Defines the class, `name` under `outer`, whose objects hold a `T`.
+    pub fn register(&'static self, outer: VALUE, name: &CStr) -> RbResult<VALUE> {
+        let class = define_class_under(outer, name)?;
+        let _ = self.class.set(class as usize);
+        Ok(class)
+    }
+
+    /// Wraps `value` in a new object of the class.
+    pub fn wrap(&'static self, value: T) -> RbResult<VALUE> {
+        let class = *self
+            .class
+            .get()
+            .ok_or_else(|| RubyErr::runtime("native class not registered"))?
+            as VALUE;
         let raw = Box::into_raw(Box::new(value));
         protect(|| unsafe { rb_sys::rb_data_typed_object_wrap(class, raw.cast(), self.ptr()) })
             .inspect_err(|_| drop(unsafe { Box::from_raw(raw) }))
     }
 
-    /// The `T` inside `value`.
-    ///
-    /// # Safety
-    ///
-    /// `T` must be the type this data type was made for.
-    pub unsafe fn get<T>(&'static self, value: VALUE) -> RbResult<&'static T> {
+    /// The `T` inside `value`, which must be an object of the class.
+    pub fn get(&'static self, value: VALUE) -> RbResult<&'static T> {
         let mut ptr = ptr::null_mut();
         protect(|| unsafe {
             ptr = rb_sys::rb_check_typeddata(value, self.ptr());
@@ -359,6 +381,8 @@ impl DataType {
         if ptr.is_null() {
             return Err(RubyErr::runtime("native object is empty"));
         }
+        // SAFETY: Ruby checked that `value` has this data type, whose
+        // objects hold a boxed `T` that lives as long as the object.
         Ok(unsafe { &*ptr.cast::<T>() })
     }
 }
@@ -403,27 +427,60 @@ pub fn define_const(module: VALUE, name: &CStr, value: VALUE) -> RbResult<()> {
     Ok(())
 }
 
-/// A method with `arity` arguments. `func` takes `self` and then each
-/// argument as a `VALUE`.
-pub fn define_method(class: VALUE, name: &CStr, func: *const (), arity: i32) -> RbResult<()> {
-    let func = unsafe { std::mem::transmute::<*const (), unsafe extern "C" fn() -> VALUE>(func) };
-    protect(|| unsafe {
-        rb_sys::rb_define_method(class, name.as_ptr(), Some(func), arity);
-        qnil()
-    })?;
-    Ok(())
+/// Defines method `$name` of `$class`, which runs `$body` with the
+/// receiver as `$this` and each argument as a `VALUE`. The macro writes
+/// the C function and counts its arguments, so Ruby's arity matches it.
+macro_rules! method {
+    ($class:expr, $name:expr, |$this:ident $(, $arg:ident)*| $body:expr) => {{
+        unsafe extern "C" fn shim(
+            $this: ::rb_sys::VALUE $(, $arg: ::rb_sys::VALUE)*
+        ) -> ::rb_sys::VALUE {
+            $crate::rb::wrap(|| $body)
+        }
+        let arity = 0 $(+ $crate::rb::one(stringify!($arg)))*;
+        $crate::rb::define(false, $class, $name, shim as *const (), arity)
+    }};
 }
 
-/// A singleton method, as [`define_method`].
-pub fn define_singleton_method(
+/// [`method!`] on the singleton class: `$this` is the class or module.
+macro_rules! singleton {
+    ($object:expr, $name:expr, |$this:ident $(, $arg:ident)*| $body:expr) => {{
+        unsafe extern "C" fn shim(
+            $this: ::rb_sys::VALUE $(, $arg: ::rb_sys::VALUE)*
+        ) -> ::rb_sys::VALUE {
+            $crate::rb::wrap(|| $body)
+        }
+        let arity = 0 $(+ $crate::rb::one(stringify!($arg)))*;
+        $crate::rb::define(true, $object, $name, shim as *const (), arity)
+    }};
+}
+
+pub(crate) use {method, singleton};
+
+/// One argument, for the arity [`method!`] counts.
+pub const fn one(_: &str) -> i32 {
+    1
+}
+
+/// Defines `func`, a C function of `arity` arguments after the receiver,
+/// as a method of `object`, or of its singleton class. Only [`method!`]
+/// and [`singleton!`] call it, with a `func` they made for that arity.
+pub fn define(
+    singleton: bool,
     object: VALUE,
     name: &CStr,
     func: *const (),
     arity: i32,
 ) -> RbResult<()> {
+    // SAFETY: Ruby calls `func` with the receiver and `arity` VALUEs,
+    // the parameters `method!` gave it.
     let func = unsafe { std::mem::transmute::<*const (), unsafe extern "C" fn() -> VALUE>(func) };
     protect(|| unsafe {
-        rb_sys::rb_define_singleton_method(object, name.as_ptr(), Some(func), arity);
+        if singleton {
+            rb_sys::rb_define_singleton_method(object, name.as_ptr(), Some(func), arity);
+        } else {
+            rb_sys::rb_define_method(object, name.as_ptr(), Some(func), arity);
+        }
         qnil()
     })?;
     Ok(())

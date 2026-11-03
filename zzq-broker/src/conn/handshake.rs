@@ -5,14 +5,12 @@ use std::sync::atomic::Ordering;
 
 use bytes::BytesMut;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::task::JoinHandle;
 use zzq_proto::packet::{Connect, decode, fixed_header};
 use zzq_proto::property;
 use zzq_proto::{DecodeError, Packet, Version, encode, reason};
 
-use super::ConnShared;
 use super::read::MIN_CHUNK;
-use super::write::writer;
+use super::{Conn, ConnDriver, ConnShared, Started};
 use crate::lane::{LaneRef, Phase};
 use crate::msg::Msg;
 use crate::options::{AuthDecision, Authenticator, ClientInfo, ConnectInfo};
@@ -86,17 +84,17 @@ impl OwnedConnect {
 }
 
 /// Reads CONNECT, attaches the session and starts the writer.
-pub(super) async fn start<R, W>(
-    lane: &LaneRef,
-    mut buf: BytesMut,
-    peer_cert: Option<Vec<u8>>,
-    r: &mut R,
-    w: W,
-) -> Option<(Key, Rc<ConnShared>, Version, BytesMut, JoinHandle<()>)>
+pub(super) async fn start<R, W>(driver: ConnDriver, r: &mut R, w: W) -> Option<Started>
 where
     R: AsyncRead + Unpin + 'static,
     W: AsyncWrite + Unpin + 'static,
 {
+    let ConnDriver {
+        lane,
+        initial: mut buf,
+        peer_cert,
+    } = driver;
+    let lane = &lane;
     let (limit, max, auth) = {
         let l = lane.borrow();
         let o = &l.shared.opts;
@@ -139,8 +137,18 @@ where
         conn.last_rx.set(crate::time::now());
     }
     conn.held.set(false);
-    let writer = tokio::task::spawn_local(writer(lane.clone(), key, conn.clone(), w));
-    Some((key, conn, version, buf, writer))
+    let conn = Conn {
+        lane: lane.clone(),
+        key,
+        shared: conn,
+    };
+    let writer = tokio::task::spawn_local(conn.clone().writer(w));
+    Some(Started {
+        conn,
+        version,
+        buf,
+        writer,
+    })
 }
 
 type ConnectError = (Option<Version>, u8);
@@ -244,23 +252,15 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
         c.assigned = c.version.is_v5();
     }
     if let Some(w) = &c.will {
-        let l = lane.borrow();
         let client = ClientInfo {
             client_id: &c.client_id,
             username: c.username.as_deref(),
         };
-        if crate::msg::too_deep(w.msg.topic(), l.shared.opts.max_topic_levels) {
-            return Err(reason::TOPIC_NAME_INVALID);
-        }
-        let allowed = !w.msg.topic().starts_with("$SYS/")
-            && l.shared
-                .opts
-                .authorizer
-                .as_deref()
-                .is_none_or(|acl| acl.may_publish(&client, w.msg.topic()));
-        if !allowed {
-            return Err(reason::NOT_AUTHORIZED);
-        }
+        let topic = w.msg.topic();
+        lane.borrow()
+            .shared
+            .opts
+            .may_publish(topic, |acl| acl.may_publish(&client, topic))?;
     }
     {
         let l = lane.borrow();
@@ -272,8 +272,12 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
             c.server_keep_alive = true;
             conn.keep_alive.set(max);
         }
-        if l.phase != Phase::Open {
-            return Err(reason::SERVER_UNAVAILABLE);
+        match l.phase {
+            Phase::Open => {}
+            // A connection taken while the node led, whose CONNECT came
+            // once it no longer did: its client goes to the leader.
+            Phase::Standby => return Err(reason::USE_ANOTHER_SERVER),
+            Phase::Closing | Phase::ShutDown => return Err(reason::SERVER_UNAVAILABLE),
         }
         // A new session that outlives its connection needs room in the state
         // budget.

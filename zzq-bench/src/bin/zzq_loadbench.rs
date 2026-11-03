@@ -11,10 +11,10 @@
 //! the broker's PIDs, comma-separated, for its CPU and memory. `trace=1`
 //! also prints where a window's time went.
 
-use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use zzq_bench::args::Kv;
 use zzq_bench::fixed::{self, Fixed, Report, Scenario};
 
 /// Above this generator CPU (of 200%), results measure the generator.
@@ -74,11 +74,8 @@ fn main() -> ExitCode {
 
 fn parse(args: &[String]) -> Option<(Scenario, Fixed)> {
     let (scenario, rest) = args.split_first()?;
-    let kv = rest
-        .iter()
-        .map(|a| a.split_once('='))
-        .collect::<Option<HashMap<_, _>>>()?;
-    let get = |k: &str| kv.get(k).copied();
+    let kv = Kv::parse(rest)?;
+    let get = |k: &str| kv.get(k);
     let num = |k: &str, d: u64| get(k).map_or(Some(d), |v| v.parse().ok());
     let secs = |k: &str, d: Duration| {
         get(k).map_or(Some(d), |v| {
@@ -109,5 +106,21 @@ fn parse(args: &[String]) -> Option<(Scenario, Fixed)> {
         broker_pids: zzq_bench::cpu::pids(get("cpu_pid").unwrap_or("0"))?,
         trace: get("trace") == Some("1"),
     };
+    kv.finish()?;
     Some((scenario.parse().ok()?, cfg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused() {
+        assert!(parse(&args(&["p2p", "rates=100"])).is_some());
+        assert!(parse(&args(&["p2p", "rate=100"])).is_none());
+    }
 }

@@ -73,7 +73,12 @@ impl Probe {
     ///
     /// If a connection fails.
     pub fn new(addr: &str, pid: u32, v5: bool, sys: Option<Duration>) -> io::Result<Probe> {
-        let (publisher, replies, rmax) = wire::connect(addr, "ram-pub", v5)?;
+        let wire::Conn {
+            s: publisher,
+            rd: replies,
+            rmax,
+            ..
+        } = wire::Conn::open(addr, "ram-pub", v5, wire::Session::Clean)?;
         publisher.set_read_timeout(Some(TIMEOUT))?;
         let gauge = match sys {
             Some(every) => Some(Gauge::new(addr, v5, every + SETTLE)?),
@@ -104,12 +109,12 @@ impl Probe {
         let first = self.sessions;
         let g = self.measure(n, |p| {
             for i in first..first + n {
-                let (mut s, mut rd, _) =
-                    wire::connect_persistent(&p.addr, &format!("ram-{i}"), p.v5)?;
-                s.set_read_timeout(Some(TIMEOUT))?;
-                wire::subscribe(&mut s, &mut rd, &topic(i), 1, p.v5)?;
-                wire::subscribe(&mut s, &mut rd, ALL, 1, p.v5)?;
-                wire::disconnect(s, &mut rd)?;
+                let mut c =
+                    wire::Conn::open(&p.addr, format!("ram-{i}"), p.v5, wire::Session::Kept)?;
+                c.s.set_read_timeout(Some(TIMEOUT))?;
+                c.subscribe(&topic(i), 1)?;
+                c.subscribe(ALL, 1)?;
+                c.disconnect()?;
             }
             Ok(())
         })?;
@@ -259,11 +264,11 @@ struct Gauge {
 impl Gauge {
     /// Subscribes, then waits up to `wait` for the first value.
     fn new(addr: &str, v5: bool, wait: Duration) -> io::Result<Gauge> {
-        let (mut s, mut rd, _) = wire::connect(addr, "ram-sys", v5)?;
-        wire::subscribe(&mut s, &mut rd, "$SYS/broker/state/bytes", 0, v5)?;
+        let mut c = wire::Conn::open(addr, "ram-sys", v5, wire::Session::Clean)?;
+        c.subscribe("$SYS/broker/state/bytes", 0)?;
         let mut g = Gauge {
-            s,
-            rd,
+            s: c.s,
+            rd: c.rd,
             v5,
             last: None,
         };

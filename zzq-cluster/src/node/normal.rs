@@ -96,13 +96,14 @@ impl Node {
             .driver
             .normal()
             .map_or(OpNumber(0), |n| n.snapshot().applied.op);
-        let kept = self.kept(self.now);
+        let kept = self.kept();
         self.log.push(entry, kept, applied);
     }
 
     /// The ops before the first one a live follower or a recovering node
     /// still needs from this log.
-    pub(super) fn kept(&self, now: Duration) -> OpNumber {
+    pub(super) fn kept(&self) -> OpNumber {
+        let now = self.now;
         let window = self.config.timing.election_timeout * 4;
         let mut kept = OpNumber(u64::MAX);
         for side in Side::BOTH {
@@ -119,17 +120,13 @@ impl Node {
         kept
     }
 
-    pub(super) fn on_control(
-        &mut self,
-        from: NodeId,
-        control: Control,
-        now: Duration,
-    ) -> Result<(), NodeError> {
+    pub(super) fn on_control(&mut self, from: NodeId, control: Control) -> Result<(), NodeError> {
+        let now = self.now;
         let received = self.driver.receive(from, control, now);
         match control {
             Control::PrepareOk { ack } if received.is_ok() => {
                 self.lease.heard_at = Some(self.lease.heard_at.map_or(now, |at| at.max(now)));
-                self.note_ack(from, ack.durable.op, now);
+                self.note_ack(from, ack.durable.op);
             }
             // A heartbeat. The ack tells the leader this follower is there,
             // and where it stands when it cannot use the commit: past the
@@ -154,8 +151,8 @@ impl Node {
         from: NodeId,
         batch: PrepareBatch<'_>,
         payload: &Bytes,
-        now: Duration,
     ) -> Result<(), NodeError> {
+        let now = self.now;
         let ops: Vec<PreparedOperation> = batch
             .verified_operations()
             .map(|v| PreparedOperation::from_verified(&v.canonical(), v.body_digest()))
@@ -190,7 +187,8 @@ impl Node {
     /// Leader of its view: no follower acked within the leader timeout.
     /// Its view may be one the others left, which they tell it only by
     /// supporting its exit, so its driver asks them.
-    pub(super) fn check_isolation(&mut self, now: Duration) {
+    pub(super) fn check_isolation(&mut self) {
+        let now = self.now;
         let Some(normal) = self.driver.normal() else {
             return;
         };
@@ -233,7 +231,8 @@ impl Node {
     /// Leader: a follower's ack moved, so its resend timer restarts.
     /// The core counts only acks above its applied ops; a follower behind
     /// them is tracked here, from the ack itself.
-    fn note_ack(&mut self, from: NodeId, op: OpNumber, now: Duration) {
+    fn note_ack(&mut self, from: NodeId, op: OpNumber) {
+        let now = self.now;
         let acked = self.acked(from).max(op);
         if let Some(i) = self.peer_index(from) {
             let peer = &mut self.peers[i];
@@ -300,7 +299,7 @@ impl Node {
 
     /// Leader: sends each follower the ops it lacks, from its ack again
     /// once acks stop for the retransmit interval.
-    pub(super) fn send_prepares(&mut self, now: Duration) {
+    pub(super) fn send_prepares(&mut self) {
         let Some(normal) = self.driver.normal() else {
             return;
         };
@@ -317,13 +316,14 @@ impl Node {
             return;
         }
         for side in Side::BOTH {
-            self.send_to(side, &snapshot, now);
+            self.send_to(side, &snapshot);
         }
     }
 
     /// Leader: sends one follower the ops after what it was sent, from its
     /// ack again once acks stall, or tells it they are gone.
-    fn send_to(&mut self, side: Side, snapshot: &crate::ReplicaSnapshot, now: Duration) {
+    fn send_to(&mut self, side: Side, snapshot: &crate::ReplicaSnapshot) {
+        let now = self.now;
         let retransmit = self.config.timing.retransmit;
         let id = self.peers[side].id;
         let acked = self.acked(id).max(self.peers[side].acked);
@@ -349,7 +349,7 @@ impl Node {
                     fence: HistoryFence::Fetch(RequestId::new()),
                     before: self.log.base(),
                 };
-                if let Some(out) = self.notice_message(id, session, notice) {
+                if let Ok(out) = self.encoder.notice(id, session, notice) {
                     self.out.push_back(out);
                 }
             }

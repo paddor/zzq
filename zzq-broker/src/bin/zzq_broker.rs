@@ -31,8 +31,9 @@
 //! node starts a new epoch from the newest state it has, its state file or
 //! the one it last started from, and the others join once they start
 //! without theirs. What was acked after that state is lost. It says on
-//! stderr when it leads, follows or elects, and when another node forced
-//! an epoch it does not join.
+//! stderr when it leads, follows or elects, when it leads but could not
+//! bind a `--bind` endpoint, and when another node forced an epoch it
+//! does not join.
 //!
 //! Cluster nodes send each other their wall time once a second. Clocks
 //! within `--cluster-max-clock-offset-ms` of each other (1000 by default)
@@ -42,9 +43,10 @@
 //! clock is off the others and while no two clocks agree.
 
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::time::Duration;
 
-use zzq_broker::{Broker, BrokerOptions, Config, Context};
+use zzq_broker::{Broker, BrokerOptions, Config, Context, Endpoint};
 use zzq_cluster::clock::SAMPLE_INTERVAL;
 use zzq_cluster::node::Role;
 
@@ -361,8 +363,9 @@ async fn watch(broker: &Broker, dir: Option<&str>, max_state: usize) {
 }
 
 /// Says on stderr, checked every 100 ms, when cluster node `node` comes to
-/// lead, follow or elect, and once a change of what its clock samples say
-/// lasted a sample interval. Ends never.
+/// lead, follow or elect, when it leads without a client endpoint it could
+/// not bind, and once a change of what its clock samples say lasted a
+/// sample interval. Ends never.
 async fn roles(broker: &Broker, node: Option<&str>) {
     let Some(node) = node else {
         return std::future::pending().await;
@@ -370,6 +373,7 @@ async fn roles(broker: &Broker, node: Option<&str>) {
     let mut tick = tokio::time::interval(Duration::from_millis(100));
     let (mut was, mut told) = (None, None);
     let mut clock = Lasting::new(ClockNote::Agreed);
+    let mut unbound = Vec::new();
     loop {
         tick.tick().await;
         let status = broker.cluster_status();
@@ -396,7 +400,30 @@ async fn roles(broker: &Broker, node: Option<&str>) {
             );
         }
         told = newer;
+        let now = broker.cluster_unbound();
+        for line in unbound_lines(node, &unbound, &now) {
+            eprintln!("{line}");
+        }
+        unbound = now.into_iter().map(|(e, _)| e).collect();
     }
+}
+
+/// What to say about the client endpoints a leading node could not bind,
+/// `now`, but for those `told` already.
+fn unbound_lines(
+    node: &str,
+    told: &[Endpoint],
+    now: &[(Endpoint, Arc<zzq_broker::Error>)],
+) -> Vec<String> {
+    now.iter()
+        .filter(|(e, _)| !told.contains(e))
+        .map(|(e, why)| {
+            format!(
+                "cluster node {node} leads but could not bind {e}: {}",
+                chain(&**why)
+            )
+        })
+        .collect()
 }
 
 /// What the clock samples of a node say, for stderr.
@@ -578,7 +605,7 @@ mod tests {
 
     use super::{
         ClockNote, ClusterArgs, Lasting, clock_line, clock_note, full_change, role_line,
-        room_change,
+        room_change, unbound_lines,
     };
 
     fn status(a: Option<i64>, b: Option<i64>, majority: Option<i64>) -> ClockStatus {
@@ -650,6 +677,18 @@ mod tests {
             role_line("c", Role::Electing).as_deref(),
             Some("cluster node c elects")
         );
+    }
+
+    #[test]
+    fn an_endpoint_a_leader_could_not_bind_is_said_once() {
+        let e: zzq_broker::Endpoint = "tcp://127.0.0.1:1883".parse().unwrap();
+        let why = zzq_broker::Error::InvalidOption("bind");
+        let now = [(e.clone(), std::sync::Arc::new(why))];
+        assert_eq!(
+            unbound_lines("a", &[], &now),
+            ["cluster node a leads but could not bind tcp://127.0.0.1:1883: invalid option: bind"]
+        );
+        assert!(unbound_lines("a", &[e], &now).is_empty(), "said already");
     }
 
     #[test]

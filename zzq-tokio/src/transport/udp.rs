@@ -1,7 +1,5 @@
 //! `udp://` datagram sockets, for MQTT-SN.
 
-use std::io;
-
 use crate::endpoint::Endpoint;
 use crate::{Error, Result};
 
@@ -18,11 +16,5 @@ pub async fn bind(endpoint: &Endpoint) -> Result<tokio::net::UdpSocket> {
     };
     tokio::net::UdpSocket::bind((host.as_str(), *port))
         .await
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::AddrInUse => Error::AddressInUse {
-                endpoint: endpoint.to_string(),
-                source: e,
-            },
-            _ => Error::Io(e),
-        })
+        .map_err(|e| Error::Io(e).at(endpoint))
 }

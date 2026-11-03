@@ -14,8 +14,7 @@ use crate::error::Error;
 use crate::rb::{self, DataType, RbResult};
 use crate::{broker, client, wake};
 
-static TYPE: DataType = DataType::new::<Op>(c"ZZQ::Native::Op");
-static CLASS: OnceLock<usize> = OnceLock::new();
+static TYPE: DataType<Op> = DataType::new(c"ZZQ::Native::Op");
 static PENDING: OnceLock<usize> = OnceLock::new();
 
 /// What a finished op returns to Ruby.
@@ -65,11 +64,11 @@ fn wrap(task: Task) -> RbResult<VALUE> {
     let op = Op {
         task: Mutex::new(Some(task)),
     };
-    TYPE.wrap(*CLASS.get().expect("registered") as VALUE, op)
+    TYPE.wrap(op)
 }
 
 fn get(value: VALUE) -> RbResult<&'static Op> {
-    unsafe { TYPE.get(value) }
+    TYPE.get(value)
 }
 
 fn poll(this: VALUE, wake: VALUE) -> RbResult<VALUE> {
@@ -109,12 +108,10 @@ fn to_ruby(out: Out) -> RbResult<VALUE> {
     }
 }
 
-unsafe extern "C" fn op_poll(this: VALUE, wake: VALUE) -> VALUE {
-    rb::wrap(|| poll(this, wake))
-}
-
-unsafe extern "C" fn op_cancel(this: VALUE) -> VALUE {
-    rb::wrap(|| {
+pub fn register(native: VALUE) -> RbResult<()> {
+    let class = TYPE.register(native, c"Op")?;
+    rb::method!(class, c"poll", |this, wake| poll(this, wake))?;
+    rb::method!(class, c"cancel", |this| {
         let task = get(this)?
             .task
             .lock()
@@ -122,14 +119,7 @@ unsafe extern "C" fn op_cancel(this: VALUE) -> VALUE {
             .take();
         drop(task);
         Ok(rb::qnil())
-    })
-}
-
-pub fn register(native: VALUE) -> RbResult<()> {
-    let class = rb::define_class_under(native, c"Op")?;
-    let _ = CLASS.set(class as usize);
-    rb::define_method(class, c"poll", op_poll as *const (), 1)?;
-    rb::define_method(class, c"cancel", op_cancel as *const (), 0)?;
+    })?;
     let pending = rb::freeze(rb::protect(|| unsafe {
         rb_sys::rb_obj_alloc(rb_sys::rb_cObject)
     })?);

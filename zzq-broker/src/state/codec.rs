@@ -1,14 +1,16 @@
 //! Fields of state records: integers, strings, messages and sessions,
 //! big endian, as the module docs lay out.
 
+use std::time::Instant;
+
 use zzq_proto::topic::{validate_filter, validate_name};
 use zzq_proto::{Properties, QoS, SubscriptionOptions, Version};
 
-use crate::index::SubIds;
+use crate::index::{Grant, SubIds};
 use crate::msg::{Msg, Publication};
-use crate::session::{Kept, Queued, Session, Will};
+use crate::session::{DelayedWill, Kept, Queued, Session, Will};
 
-use super::{Clock, Sent, SessionState, Sub};
+use super::{Clock, Deliveries, Sent, SessionState, Sub};
 
 /// Smallest encodings, which bound counts by the bytes left.
 const MIN_MSG: usize = 4 + 1 + 1 + 8 + 4 + 4;
@@ -36,19 +38,20 @@ pub(super) fn put_bytes(b: &mut Vec<u8>, data: &[u8]) {
     b.extend_from_slice(data);
 }
 
-pub(super) fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
-    put_bytes(b, s.client_id.as_bytes());
-    match &s.username {
-        Some(u) => {
+/// A flag, then the string if there is one.
+pub(super) fn put_opt_str(b: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
             b.push(1);
-            put_bytes(b, u.as_bytes());
+            put_bytes(b, s.as_bytes());
         }
         None => b.push(0),
     }
-    b.push(s.version.level());
-    put_u32(b, s.expiry);
-    put_u64(b, clock.unix_ms(s.expires_at));
-    match &s.will {
+}
+
+/// A flag, then the will's delay and message if there is one.
+pub(super) fn put_will(b: &mut Vec<u8>, w: Option<&Will>, clock: Clock) {
+    match w {
         Some(w) => {
             b.push(1);
             put_u32(b, w.delay);
@@ -56,7 +59,11 @@ pub(super) fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
         }
         None => b.push(0),
     }
-    match &s.delayed_will {
+}
+
+/// A flag, then the delayed will's due time and message if there is one.
+pub(super) fn put_delayed_will(b: &mut Vec<u8>, w: Option<&DelayedWill>, clock: Clock) {
+    match w {
         Some(w) => {
             b.push(1);
             put_u64(b, clock.unix_ms(Some(w.due)));
@@ -64,6 +71,16 @@ pub(super) fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
         }
         None => b.push(0),
     }
+}
+
+pub(super) fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
+    put_bytes(b, s.client_id.as_bytes());
+    put_opt_str(b, s.username.as_deref());
+    b.push(s.version.level());
+    put_u32(b, s.expiry);
+    put_u64(b, clock.unix_ms(s.expires_at));
+    put_will(b, s.will.as_ref(), clock);
+    put_delayed_will(b, s.delayed_will.as_ref(), clock);
     put_u16(b, s.next_pkid());
     let mut subs: Vec<_> = s.subs.iter().collect();
     subs.sort_unstable_by(|a, b| a.0.cmp(b.0));
@@ -92,12 +109,18 @@ pub(super) fn put_session(b: &mut Vec<u8>, s: &Session, clock: Clock) {
 }
 
 pub(super) fn put_item(b: &mut Vec<u8>, q: &Kept, clock: Clock) {
-    b.push(q.qos as u8);
-    b.push(u8::from(q.retain));
-    for slot in q.sub_id.slots() {
+    put_grant(b, q.grant);
+    put_msg(b, &q.msg, clock);
+}
+
+/// What a delivery grants: QoS, retain flag and the four subscription
+/// identifier slots.
+pub(crate) fn put_grant(b: &mut Vec<u8>, g: Grant) {
+    b.push(g.qos as u8);
+    b.push(u8::from(g.retain));
+    for slot in g.sub_id.slots() {
         put_u32(b, slot);
     }
-    put_msg(b, &q.msg, clock);
 }
 
 pub(super) fn put_msg(b: &mut Vec<u8>, m: &Msg, clock: Clock) {
@@ -220,58 +243,45 @@ impl<'a> Decoder<'a> {
 
     /// A QoS 1/2 message a session holds.
     pub(super) fn item(&mut self, clock: Clock) -> Result<Queued, &'static str> {
+        let grant = self.held_grant()?;
+        Ok(Queued {
+            msg: self.msg(clock)?,
+            grant,
+        })
+    }
+
+    /// A [`put_grant`].
+    pub(super) fn grant(&mut self) -> Result<Grant, &'static str> {
         let qos = self.qos()?;
-        if qos == QoS::AtMostOnce {
-            return Err("QoS 0 message held");
-        }
         let retain = self.flag()?;
         let mut sub_id = SubIds::default();
         for _ in 0..4 {
             sub_id.add(self.u32()?);
         }
-        Ok(Queued {
-            msg: self.msg(clock)?,
+        Ok(Grant {
             qos,
             retain,
             sub_id,
         })
     }
 
-    pub(super) fn session(&mut self, clock: Clock) -> Result<SessionState, &'static str> {
-        let client_id = self.str()?;
-        if client_id.is_empty() {
-            return Err("empty client ID");
+    /// A [`put_grant`] of a message a session holds: at QoS 1 or 2.
+    pub(super) fn held_grant(&mut self) -> Result<Grant, &'static str> {
+        let grant = self.grant()?;
+        if grant.qos == QoS::AtMostOnce {
+            return Err("QoS 0 message held");
         }
-        let username = if self.flag()? {
-            Some(self.str()?.into())
-        } else {
-            None
-        };
-        let version = match self.u8()? {
-            3 => Version::V31,
-            4 => Version::V311,
-            5 => Version::V5,
-            _ => return Err("invalid protocol level"),
-        };
+        Ok(grant)
+    }
+
+    pub(super) fn session(&mut self, clock: Clock) -> Result<SessionState, &'static str> {
+        let client_id = self.client_id()?;
+        let username = self.opt_str()?.map(Into::into);
+        let version = self.version()?;
         let expiry = self.u32()?;
         let expires_at = clock.instant(self.u64()?);
-        let will = if self.flag()? {
-            let delay = self.u32()?;
-            Some(Will {
-                msg: self.msg(clock)?,
-                delay,
-            })
-        } else {
-            None
-        };
-        let delayed_will = if self.flag()? {
-            let due = clock
-                .instant(self.u64()?)
-                .ok_or("delayed will without a time")?;
-            Some((due, self.msg(clock)?))
-        } else {
-            None
-        };
+        let will = self.will(clock)?;
+        let delayed_will = self.delayed_will(clock)?;
         let next_pkid = self.u16()?;
         let subs = self.subs()?;
         let awaiting_rel = self.awaiting_rel()?;
@@ -293,11 +303,76 @@ impl<'a> Decoder<'a> {
             next_pkid,
             subs,
             awaiting_rel,
-            inflight,
-            queue,
-            seqs: Vec::new(),
-            last_seq: 0,
+            deliveries: Deliveries {
+                inflight,
+                queue,
+                ..Deliveries::default()
+            },
         })
+    }
+
+    /// A session's client ID, which is never empty.
+    pub(super) fn client_id(&mut self) -> Result<&'a str, &'static str> {
+        let id = self.str()?;
+        if id.is_empty() {
+            return Err("empty client ID");
+        }
+        Ok(id)
+    }
+
+    /// A [`put_opt_str`].
+    pub(super) fn opt_str(&mut self) -> Result<Option<&'a str>, &'static str> {
+        if self.flag()? {
+            self.str().map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// A protocol level byte.
+    pub(super) fn version(&mut self) -> Result<Version, &'static str> {
+        match self.u8()? {
+            3 => Ok(Version::V31),
+            4 => Ok(Version::V311),
+            5 => Ok(Version::V5),
+            _ => Err("invalid protocol level"),
+        }
+    }
+
+    /// A [`put_will`].
+    pub(super) fn will(&mut self, clock: Clock) -> Result<Option<Will>, &'static str> {
+        if !self.flag()? {
+            return Ok(None);
+        }
+        let delay = self.u32()?;
+        Ok(Some(Will {
+            msg: self.msg(clock)?,
+            delay,
+        }))
+    }
+
+    /// A [`put_delayed_will`]: its due time and message.
+    pub(super) fn delayed_will(
+        &mut self,
+        clock: Clock,
+    ) -> Result<Option<(Instant, Msg)>, &'static str> {
+        if !self.flag()? {
+            return Ok(None);
+        }
+        let due = clock
+            .instant(self.u64()?)
+            .ok_or("delayed will without a time")?;
+        Ok(Some((due, self.msg(clock)?)))
+    }
+
+    /// The birth that ends a [`SESSION`](super::journal::SESSION) record:
+    /// 0 for a record written before births were.
+    pub(super) fn birth(&mut self) -> Result<u64, &'static str> {
+        let birth = if self.0.is_empty() { 0 } else { self.u64()? };
+        if birth == u64::MAX {
+            return Err("invalid session birth");
+        }
+        Ok(birth)
     }
 
     pub(super) fn subs(&mut self) -> Result<Vec<Sub>, &'static str> {
@@ -343,7 +418,7 @@ impl<'a> Decoder<'a> {
             seen[word] |= bit;
             let released = self.flag()?;
             let item = self.item(clock)?;
-            if released && item.qos != QoS::ExactlyOnce {
+            if released && item.grant.qos != QoS::ExactlyOnce {
                 return Err("released QoS 1 message");
             }
             inflight.push((pkid, item, released));

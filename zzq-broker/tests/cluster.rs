@@ -75,6 +75,78 @@ fn an_isolated_leader_steps_down_and_drops_its_clients() {
     });
 }
 
+/// A connection node 0 took while it led sends CONNECT once node 0 dropped
+/// its state: it is sent on, not given an empty session there.
+#[test]
+fn a_connect_that_reaches_a_deposed_leader_late_is_refused() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use zzq_proto::encode::{self, ConnectFields};
+    use zzq_proto::{Packet, Version, reason};
+    use zzq_tokio::transport::{self, Stream, TransportOptions};
+
+    simulated(|| async {
+        let c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        let mut held = c.client(0, "held", false).await;
+        let node = "inproc://node-0".parse().unwrap();
+        let opts = TransportOptions::default();
+        let Ok(Stream::Inproc(mut late)) = transport::connect(&c.ctx, &node, &opts).await else {
+            panic!("an inproc stream");
+        };
+        c.isolate(0, true);
+        let end = tokio::time::timeout(Duration::from_secs(5), held.recv()).await;
+        assert!(end.expect("dropped").is_none(), "node 0 dropped its state");
+        let mut connect = Vec::new();
+        let fields = ConnectFields {
+            version: Version::V5,
+            clean_start: false,
+            keep_alive: 0,
+            properties: &[],
+            client_id: "held",
+            will: None,
+            username: None,
+            password: None,
+        };
+        encode::connect(&fields, &mut connect);
+        late.write_all(&connect).await.unwrap();
+        let mut reply = [0; 64];
+        let n = late.read(&mut reply).await.unwrap();
+        let Ok(Some((Packet::ConnAck(ack), _))) = zzq_proto::decode(&reply[..n], Version::V5, 64)
+        else {
+            panic!("CONNACK, got {:?}", &reply[..n]);
+        };
+        assert_eq!(ack.code, reason::USE_ANOTHER_SERVER);
+    });
+}
+
+/// A node whose client endpoint another listener holds leads without it,
+/// and tells which and why.
+#[test]
+fn a_leader_tells_the_endpoint_it_could_not_bind() {
+    use zzq_tokio::transport::{Listener, TransportOptions};
+
+    simulated(|| async {
+        let c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        // A session, so the nodes commit an op to catch up on.
+        c.client(0, "kept", false).await.disconnect().await;
+        let node = "inproc://node-1".parse().unwrap();
+        let held = Listener::bind(&c.ctx, &node, &TransportOptions::default()).await;
+        assert!(held.is_ok());
+        c.lead(1).await;
+        let unbound = c.members[1].broker.as_ref().unwrap().cluster_unbound();
+        assert_eq!(unbound.len(), 1);
+        assert_eq!(unbound[0].0, node);
+        assert!(
+            unbound[0].1.to_string().contains("transport"),
+            "{}",
+            unbound[0].1
+        );
+        let old = c.members[0].broker.as_ref().unwrap().cluster_unbound();
+        assert!(old.is_empty(), "a follower leads without nothing");
+    });
+}
+
 #[test]
 fn a_deposed_leader_rebuilds_its_state_and_serves_it_when_it_leads_again() {
     simulated(|| async {

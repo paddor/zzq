@@ -11,10 +11,9 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use zzq_proto::packet::fixed_header;
 use zzq_proto::{DecodeError, reason};
 
-use super::ConnShared;
+use super::Conn;
 use crate::durable::Due;
-use crate::lane::{Close, LaneRef};
-use crate::slab::Key;
+use crate::lane::Close;
 
 /// Read buffer sizes of a connection with a buffer of its own. It starts
 /// small and doubles while reads fill the buffer.
@@ -108,182 +107,6 @@ fn next_chunk(chunk: usize, read: usize, room: usize) -> usize {
     }
 }
 
-pub(super) async fn read_loop<R: AsyncRead + Unpin>(
-    lane: &LaneRef,
-    key: Key,
-    conn: &ConnShared,
-    r: &mut R,
-    buf: BytesMut,
-) -> Close {
-    let max = lane.borrow().shared.opts.max_packet_size;
-    let mut input = Input {
-        buf,
-        chunk: MIN_CHUNK,
-        own: true,
-    };
-    loop {
-        let (complete, partial) = match complete_len(&input.buf, max) {
-            Ok(n) => n,
-            Err(e) => return Close::Protocol(e.reason_code()),
-        };
-        if complete == 0 {
-            if let Some(close) = output_room(lane, key, conn).await {
-                return close;
-            }
-            if let Some(close) = read_more(lane, conn, r, &mut input, partial).await {
-                return close;
-            }
-            continue;
-        }
-        let mut chunk = input.buf.split_to(complete).freeze();
-        let mut at = 0;
-        while at < chunk.len() {
-            let result = {
-                let mut l = lane.borrow_mut();
-                let result = l.handle_chunk(key, &chunk, at);
-                l.flush();
-                result
-            };
-            match result {
-                // A publish waits for the QoS 2 publish before it.
-                Ok(next) if next < chunk.len() => at = next,
-                // Lets go of the read block for the waits.
-                _ => chunk = Bytes::new(),
-            }
-            if let Err(close) = settle(lane, key, conn).await {
-                return close;
-            }
-            if let Err(close) = result {
-                return close;
-            }
-            if conn.is_closed() {
-                return Close::Kicked;
-            }
-            if at < chunk.len()
-                && let Err(close) = behind_handoff(lane, key, conn).await
-            {
-                return close;
-            }
-        }
-    }
-}
-
-/// Waits until the session's last QoS 2 publish reached its destinations, for
-/// a publish that must not pass it.
-async fn behind_handoff(lane: &LaneRef, key: Key, conn: &ConnShared) -> Result<(), Close> {
-    let (shared, waits) = {
-        let l = lane.borrow();
-        (l.shared.clone(), l.handoff_waits(key))
-    };
-    conn.held.set(true);
-    for w in waits {
-        // Cancel-safe as in `read_more`; a lost wait leaves the record to
-        // its cursor.
-        tokio::select! {
-            biased;
-            () = conn.stop.notified() => return Err(Close::Kicked),
-            _ = shared.cursor(w.journal).wait(w.n) => {}
-        }
-    }
-    conn.held.set(false);
-    conn.last_rx.set(crate::time::now());
-    Ok(())
-}
-
-/// Ships what the connection's last packets routed, then waits for what
-/// their replies and acks need.
-async fn settle(lane: &LaneRef, key: Key, conn: &ConnShared) -> Result<(), Close> {
-    conn.held.set(true);
-    let mut waited = crate::broker::ship(lane).await;
-    // Let other connections on this lane run, such as subscribers whose
-    // acks free up their window.
-    tokio::task::yield_now().await;
-    let held = lane.borrow_mut().take_held(conn.id);
-    waited |= !held.is_empty();
-    for h in held {
-        if let Some(sync) = &h.sync {
-            sync.wait().await;
-        }
-        written(lane, conn, h.due).await?;
-        lane.borrow_mut().release(&h);
-    }
-    waited |= disk_acks(lane, key, conn).await?;
-    conn.held.set(false);
-    // Keep alive counts from the end of a wait the broker made.
-    if waited {
-        conn.last_rx.set(crate::time::now());
-    }
-    Ok(())
-}
-
-/// Waits for the journal write `due`. A failed one closes the connection:
-/// the client learns of it, and a new connection finds the journal
-/// written again.
-async fn written(lane: &LaneRef, conn: &ConnShared, due: Due) -> Result<(), Close> {
-    let w = match due {
-        Due::Now => return Ok(()),
-        Due::After(w) => w,
-        Due::Failed => return Err(Close::Protocol(reason::UNSPECIFIED_ERROR)),
-    };
-    let shared = lane.borrow().shared.clone();
-    // Cancel-safe as in `read_more`.
-    tokio::select! {
-        biased;
-        () = conn.stop.notified() => Err(Close::Kicked),
-        ok = shared.cursor(w.journal).wait(w.n) => {
-            if ok { Ok(()) } else { Err(Close::Protocol(reason::UNSPECIFIED_ERROR)) }
-        }
-    }
-}
-
-/// Waits for the journal writes the connection's held acks need, then
-/// sends them. True if it held any.
-async fn disk_acks(lane: &LaneRef, key: Key, conn: &ConnShared) -> Result<bool, Close> {
-    let (shared, waits) = {
-        let mut l = lane.borrow_mut();
-        let Some(waits) = l.hold_waits(key, conn.id) else {
-            return Ok(false);
-        };
-        (l.shared.clone(), waits)
-    };
-    let mut written = true;
-    for w in waits {
-        // Cancel-safe as in `read_more`; a lost wait leaves the record to
-        // its cursor.
-        tokio::select! {
-            biased;
-            () = conn.stop.notified() => return Err(Close::Kicked),
-            ok = shared.cursor(w.journal).wait(w.n) => written &= ok,
-        }
-    }
-    lane.borrow_mut().release_acks(key, conn.id, written)?;
-    Ok(true)
-}
-
-/// Waits while the session's replies wait over `max_out_bytes` for the
-/// writer: a client that does not read them is not read either. `Some`
-/// once the connection ends.
-async fn output_room(lane: &LaneRef, key: Key, conn: &ConnShared) -> Option<Close> {
-    loop {
-        let full = {
-            let l = lane.borrow();
-            let max = l.shared.opts.max_out_bytes;
-            l.sessions
-                .get(key)
-                .is_some_and(|s| s.has_conn(conn.id) && s.out.buf.len() >= max)
-        };
-        if !full {
-            return None;
-        }
-        // Cancel-safe as in `read_more`.
-        tokio::select! {
-            biased;
-            () = conn.stop.notified() => return Some(Close::Kicked),
-            () = conn.drained.notified() => {}
-        }
-    }
-}
-
 /// A connection's unread bytes, and the size a buffer of its own grows by.
 struct Input {
     buf: BytesMut,
@@ -293,73 +116,249 @@ struct Input {
     own: bool,
 }
 
-/// Reads more into `input`, which holds at most the start of a packet of
-/// `partial` bytes. A connection with nothing left and small reads goes
-/// into the lane's block, and `input` becomes the bytes read; any other
-/// into a buffer of its own, grown by `chunk`. `Some` once the connection
-/// ends.
-async fn read_more<R: AsyncRead + Unpin>(
-    lane: &LaneRef,
-    conn: &ConnShared,
-    r: &mut R,
-    input: &mut Input,
-    partial: usize,
-) -> Option<Close> {
-    let Input { buf, chunk, own } = input;
-    let shared = buf.is_empty() && *chunk == MIN_CHUNK;
-    if shared {
-        // Waits without a buffer.
-        *buf = BytesMut::new();
-        *own = false;
-    } else if !*own {
-        // Sized here: growing a slice of the block would allocate as much
-        // as the block.
-        let mut b =
-            BytesMut::with_capacity((buf.len() + *chunk).max(packet_room(buf.len(), partial)));
-        b.extend_from_slice(buf);
-        *buf = b;
-        *own = true;
-    } else {
-        // Grow only now, when the buffer holds at most a partial packet:
-        // a new buffer copies what is left in the old one.
-        if buf.capacity() - buf.len() < *chunk / 4 {
-            buf.reserve(*chunk);
-        }
-        // Room for a large packet in few allocations.
-        let room = packet_room(buf.len(), partial);
-        if room > buf.capacity() {
-            buf.reserve(room - buf.len());
+impl Conn {
+    pub(super) async fn read_loop<R: AsyncRead + Unpin>(&self, r: &mut R, buf: BytesMut) -> Close {
+        let (lane, key, conn) = (&self.lane, self.key, &self.shared);
+        let max = lane.borrow().shared.opts.max_packet_size;
+        let mut input = Input {
+            buf,
+            chunk: MIN_CHUNK,
+            own: true,
+        };
+        loop {
+            let (complete, partial) = match complete_len(&input.buf, max) {
+                Ok(n) => n,
+                Err(e) => return Close::Protocol(e.reason_code()),
+            };
+            if complete == 0 {
+                if let Some(close) = self.output_room().await {
+                    return close;
+                }
+                if let Some(close) = self.read_more(r, &mut input, partial).await {
+                    return close;
+                }
+                continue;
+            }
+            let mut chunk = input.buf.split_to(complete).freeze();
+            let mut at = 0;
+            while at < chunk.len() {
+                let result = {
+                    let mut l = lane.borrow_mut();
+                    let result = l.handle_chunk(key, &chunk, at);
+                    l.flush();
+                    result
+                };
+                match result {
+                    // A publish waits for the QoS 2 publish before it.
+                    Ok(next) if next < chunk.len() => at = next,
+                    // Lets go of the read block for the waits.
+                    _ => chunk = Bytes::new(),
+                }
+                if let Err(close) = self.settle().await {
+                    return close;
+                }
+                if let Err(close) = result {
+                    return close;
+                }
+                if conn.is_closed() {
+                    return Close::Kicked;
+                }
+                if at < chunk.len()
+                    && let Err(close) = self.behind_handoff().await
+                {
+                    return close;
+                }
+            }
         }
     }
-    let room = buf.capacity() - buf.len();
-    let read = std::future::poll_fn(|cx| {
-        if !shared {
-            return pin!(r.read_buf(&mut *buf)).poll(cx);
-        }
-        let mut l = lane.borrow_mut();
-        let block = l.read_blocks.room();
-        let n = ready!(pin!(r.read_buf(&mut *block)).poll(cx))?;
-        *buf = block.split();
-        Poll::Ready(Ok::<_, io::Error>(n))
-    });
-    // Cancel-safe: a `notify_one` that a dropped `notified()` got passes on
-    // to the next one, and a dropped read took no bytes.
-    tokio::select! {
-        biased;
-        () = conn.stop.notified() => Some(Close::Kicked),
-        n = read => match n {
-            Ok(0) | Err(_) => Some(Close::Lost),
-            Ok(n) => {
-                conn.last_rx.set(crate::time::now());
-                *chunk = if shared {
-                    // A large read makes it a busy connection.
-                    if n > MIN_CHUNK { 2 * MIN_CHUNK } else { MIN_CHUNK }
-                } else {
-                    next_chunk(*chunk, n, room)
-                };
-                None
+
+    /// Waits until the session's last QoS 2 publish reached its destinations, for
+    /// a publish that must not pass it.
+    async fn behind_handoff(&self) -> Result<(), Close> {
+        let (lane, key, conn) = (&self.lane, self.key, &self.shared);
+        let (shared, waits) = {
+            let l = lane.borrow();
+            (l.shared.clone(), l.handoff_waits(key))
+        };
+        conn.held.set(true);
+        for w in waits {
+            // Cancel-safe as in `read_more`; a lost wait leaves the record to
+            // its cursor.
+            tokio::select! {
+                biased;
+                () = conn.stop.notified() => return Err(Close::Kicked),
+                _ = shared.cursor(w.journal).wait(w.n) => {}
             }
-        },
+        }
+        conn.held.set(false);
+        conn.last_rx.set(crate::time::now());
+        Ok(())
+    }
+
+    /// Ships what the connection's last packets routed, then waits for what
+    /// their replies and acks need.
+    async fn settle(&self) -> Result<(), Close> {
+        let (lane, conn) = (&self.lane, &self.shared);
+        conn.held.set(true);
+        let mut waited = crate::broker::ship(lane).await;
+        // Let other connections on this lane run, such as subscribers whose
+        // acks free up their window.
+        tokio::task::yield_now().await;
+        let held = lane.borrow_mut().take_held(conn.id);
+        waited |= !held.is_empty();
+        for h in held {
+            if let Some(sync) = &h.sync {
+                sync.wait().await;
+            }
+            self.written(h.due).await?;
+            lane.borrow_mut().release(&h);
+        }
+        waited |= self.disk_acks().await?;
+        conn.held.set(false);
+        // Keep alive counts from the end of a wait the broker made.
+        if waited {
+            conn.last_rx.set(crate::time::now());
+        }
+        Ok(())
+    }
+
+    /// Waits for the journal write `due`. A failed one closes the connection:
+    /// the client learns of it, and a new connection finds the journal
+    /// written again.
+    async fn written(&self, due: Due) -> Result<(), Close> {
+        let w = match due {
+            Due::Now => return Ok(()),
+            Due::After(w) => w,
+            Due::Failed => return Err(Close::Protocol(reason::UNSPECIFIED_ERROR)),
+        };
+        let shared = self.lane.borrow().shared.clone();
+        // Cancel-safe as in `read_more`.
+        tokio::select! {
+            biased;
+            () = self.shared.stop.notified() => Err(Close::Kicked),
+            ok = shared.cursor(w.journal).wait(w.n) => {
+                if ok { Ok(()) } else { Err(Close::Protocol(reason::UNSPECIFIED_ERROR)) }
+            }
+        }
+    }
+
+    /// Waits for the journal writes the connection's held acks need, then
+    /// sends them. True if it held any.
+    async fn disk_acks(&self) -> Result<bool, Close> {
+        let (lane, key, conn) = (&self.lane, self.key, &self.shared);
+        let (shared, waits) = {
+            let mut l = lane.borrow_mut();
+            let Some(waits) = l.hold_waits(key, conn.id) else {
+                return Ok(false);
+            };
+            (l.shared.clone(), waits)
+        };
+        let mut written = true;
+        for w in waits {
+            // Cancel-safe as in `read_more`; a lost wait leaves the record to
+            // its cursor.
+            tokio::select! {
+                biased;
+                () = conn.stop.notified() => return Err(Close::Kicked),
+                ok = shared.cursor(w.journal).wait(w.n) => written &= ok,
+            }
+        }
+        lane.borrow_mut().release_acks(key, conn.id, written)?;
+        Ok(true)
+    }
+
+    /// Waits while the session's replies wait over `max_out_bytes` for the
+    /// writer: a client that does not read them is not read either. `Some`
+    /// once the connection ends.
+    async fn output_room(&self) -> Option<Close> {
+        let conn = &self.shared;
+        loop {
+            let full = {
+                let l = self.lane.borrow();
+                let max = l.shared.opts.max_out_bytes;
+                l.session_of(self.key, conn.id)
+                    .is_some_and(|s| s.out.buf.len() >= max)
+            };
+            if !full {
+                return None;
+            }
+            // Cancel-safe as in `read_more`.
+            tokio::select! {
+                biased;
+                () = conn.stop.notified() => return Some(Close::Kicked),
+                () = conn.drained.notified() => {}
+            }
+        }
+    }
+
+    /// Reads more into `input`, which holds at most the start of a packet of
+    /// `partial` bytes. A connection with nothing left and small reads goes
+    /// into the lane's block, and `input` becomes the bytes read; any other
+    /// into a buffer of its own, grown by `chunk`. `Some` once the connection
+    /// ends.
+    async fn read_more<R: AsyncRead + Unpin>(
+        &self,
+        r: &mut R,
+        input: &mut Input,
+        partial: usize,
+    ) -> Option<Close> {
+        let (lane, conn) = (&self.lane, &self.shared);
+        let Input { buf, chunk, own } = input;
+        let shared = buf.is_empty() && *chunk == MIN_CHUNK;
+        if shared {
+            // Waits without a buffer.
+            *buf = BytesMut::new();
+            *own = false;
+        } else if !*own {
+            // Sized here: growing a slice of the block would allocate as much
+            // as the block.
+            let mut b =
+                BytesMut::with_capacity((buf.len() + *chunk).max(packet_room(buf.len(), partial)));
+            b.extend_from_slice(buf);
+            *buf = b;
+            *own = true;
+        } else {
+            // Grow only now, when the buffer holds at most a partial packet:
+            // a new buffer copies what is left in the old one.
+            if buf.capacity() - buf.len() < *chunk / 4 {
+                buf.reserve(*chunk);
+            }
+            // Room for a large packet in few allocations.
+            let room = packet_room(buf.len(), partial);
+            if room > buf.capacity() {
+                buf.reserve(room - buf.len());
+            }
+        }
+        let room = buf.capacity() - buf.len();
+        let read = std::future::poll_fn(|cx| {
+            if !shared {
+                return pin!(r.read_buf(&mut *buf)).poll(cx);
+            }
+            let mut l = lane.borrow_mut();
+            let block = l.read_blocks.room();
+            let n = ready!(pin!(r.read_buf(&mut *block)).poll(cx))?;
+            *buf = block.split();
+            Poll::Ready(Ok::<_, io::Error>(n))
+        });
+        // Cancel-safe: a `notify_one` that a dropped `notified()` got passes on
+        // to the next one, and a dropped read took no bytes.
+        tokio::select! {
+            biased;
+            () = conn.stop.notified() => Some(Close::Kicked),
+            n = read => match n {
+                Ok(0) | Err(_) => Some(Close::Lost),
+                Ok(n) => {
+                    conn.last_rx.set(crate::time::now());
+                    *chunk = if shared {
+                        // A large read makes it a busy connection.
+                        if n > MIN_CHUNK { 2 * MIN_CHUNK } else { MIN_CHUNK }
+                    } else {
+                        next_chunk(*chunk, n, room)
+                    };
+                    None
+                }
+            },
+        }
     }
 }
 

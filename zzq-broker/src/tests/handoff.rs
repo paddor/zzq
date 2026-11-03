@@ -5,9 +5,10 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use zzq_proto::encode::ConnectFields;
+use zzq_proto::encode::PublishHeader;
 use zzq_proto::{PacketType, QoS, Version, reason};
 
-use super::support::{Got, Raw, publish_bytes};
+use super::support::{Got, Raw, fields, header, publish, set_dup};
 use super::{Broker, BrokerOptions, Lane, WAIT, durable, id_on, on_disk, on_lane, setup};
 use crate::durable::{JournalId, Wait};
 use crate::msg::Msg;
@@ -22,21 +23,19 @@ fn ack(kind: PacketType, pkid: u16) -> Got {
 
 fn v311(client_id: &str) -> ConnectFields<'_> {
     ConnectFields {
-        version: Version::V311,
         clean_start: false,
-        keep_alive: 0,
-        properties: &[],
-        client_id,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V311, client_id)
     }
 }
 
 fn retained(topic: &str, payload: &[u8], qos: QoS, pkid: u16) -> Vec<u8> {
-    let mut packet = publish_bytes(Version::V5, topic, payload, qos, pkid, &[]);
-    packet[0] |= 1;
-    packet
+    publish(
+        &PublishHeader {
+            retain: true,
+            ..header(Version::V5, topic, qos, pkid)
+        },
+        payload,
+    )
 }
 
 /// The broker lets go of its data directory first.
@@ -90,8 +89,13 @@ async fn a_retried_publish_waits_for_the_newest_handoff_of_its_id() {
             .insert(5);
     })
     .await;
-    let mut packet = publish_bytes(Version::V5, "newest/t", b"x", QoS::ExactlyOnce, 5, &[]);
-    packet[0] |= 0x08;
+    let packet = publish(
+        &PublishHeader {
+            dup: true,
+            ..header(Version::V5, "newest/t", QoS::ExactlyOnce, 5)
+        },
+        b"x",
+    );
     p.send(&packet).await;
     p.quiet(100).await;
     clean_up(broker, dir).await;
@@ -191,12 +195,17 @@ async fn a_failed_qos2_publish_of_a_v311_client_is_new_when_it_comes_again() {
     sub.subscribe("v311/t", QoS::ExactlyOnce.into()).await;
     broker.shared().retained.cursor_of("v311/t").fail(1, 1);
     let id = "v311-pub";
-    let mut packet = publish_bytes(Version::V311, "v311/t", b"x", QoS::ExactlyOnce, 5, &[]);
-    packet[0] |= 1;
+    let mut packet = publish(
+        &PublishHeader {
+            retain: true,
+            ..header(Version::V311, "v311/t", QoS::ExactlyOnce, 5)
+        },
+        b"x",
+    );
     let (mut p, _) = Raw::connect_with(&uri, &v311(id)).await;
     p.send(&packet).await;
     p.closed().await;
-    packet[0] |= 0x08;
+    set_dup(&mut packet);
     let (mut p, _) = Raw::connect_with(&uri, &v311(id)).await;
     p.send(&packet).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec, 5));
@@ -228,13 +237,9 @@ async fn a_full_state_budget_stops_growth_not_live_qos2_traffic() {
         ..v311("budget-v3")
     };
     let (mut v3, _) = Raw::connect_with(&uri, &clean).await;
-    let packet = publish_bytes(
-        Version::V311,
-        "budget/t",
+    let packet = publish(
+        &header(Version::V311, "budget/t", QoS::ExactlyOnce, 2),
         b"three",
-        QoS::ExactlyOnce,
-        2,
-        &[],
     );
     v3.send(&packet).await;
     assert_eq!(v3.next().await, ack(PacketType::PubRec, 2));
@@ -399,8 +404,13 @@ async fn a_retry_of_a_publish_to_its_own_lane_waits_for_the_first_ones_record() 
     first.pub_("retry/t", b"x", QoS::ExactlyOnce, 5).await;
     first.quiet(100).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("retry-pub")).await;
-    let mut packet = publish_bytes(Version::V5, "retry/t", b"x", QoS::ExactlyOnce, 5, &[]);
-    packet[0] |= 0x08;
+    let packet = publish(
+        &PublishHeader {
+            dup: true,
+            ..header(Version::V5, "retry/t", QoS::ExactlyOnce, 5)
+        },
+        b"x",
+    );
     p.send(&packet).await;
     p.quiet(100).await;
     broker.shared().lane_logs[0]
@@ -439,8 +449,13 @@ async fn a_failed_write_of_a_publish_to_its_own_lane_delivers_once_after_the_ret
     );
     sub.closed().await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("failed-pub")).await;
-    let mut packet = publish_bytes(Version::V5, "failed/t", b"x", QoS::ExactlyOnce, 5, &[]);
-    packet[0] |= 0x08;
+    let packet = publish(
+        &PublishHeader {
+            dup: true,
+            ..header(Version::V5, "failed/t", QoS::ExactlyOnce, 5)
+        },
+        b"x",
+    );
     p.send(&packet).await;
     assert_eq!(p.next().await, ack(PacketType::PubRec, 5));
     p.ack(PacketType::PubRel, 5).await;
@@ -467,13 +482,9 @@ async fn a_qos2_publish_does_not_pass_a_retained_one_of_the_same_read() {
     sub.subscribe("order2/t", QoS::ExactlyOnce.into()).await;
     let (mut p, _) = Raw::connect_with(&uri, &durable("order2-pub")).await;
     let mut read = retained("order2/t", b"first", QoS::ExactlyOnce, 1);
-    read.extend(publish_bytes(
-        Version::V5,
-        "order2/t",
+    read.extend(publish(
+        &header(Version::V5, "order2/t", QoS::ExactlyOnce, 2),
         b"second",
-        QoS::ExactlyOnce,
-        2,
-        &[],
     ));
     p.send(&read).await;
     assert_eq!(sub.publish().await.payload, b"first");

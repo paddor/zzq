@@ -16,8 +16,7 @@ use rb_sys::VALUE;
 
 use crate::rb::{self, DataType, RbResult, RubyErr};
 
-static TYPE: DataType = DataType::new::<Wake>(c"ZZQ::Native::Wake");
-static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static TYPE: DataType<Wake> = DataType::new(c"ZZQ::Native::Wake");
 
 /// A pipe one fiber waits on.
 #[derive(Debug)]
@@ -124,32 +123,21 @@ unsafe fn pipe(fds: &mut [RawFd; 2]) -> i32 {
 
 /// The `Wake` inside `value`.
 pub fn get(value: VALUE) -> RbResult<&'static Wake> {
-    unsafe { TYPE.get(value) }
-}
-
-unsafe extern "C" fn wake_new(_class: VALUE) -> VALUE {
-    rb::wrap(|| {
-        let wake = Wake::new().map_err(|e| RubyErr::runtime(format!("pipe failed: {e}")))?;
-        TYPE.wrap(*CLASS.get().expect("registered") as VALUE, wake)
-    })
-}
-
-unsafe extern "C" fn wake_fd(this: VALUE) -> VALUE {
-    rb::wrap(|| Ok(rb::u64_value(get(this)?.pipe.read_fd as u64)))
-}
-
-unsafe extern "C" fn wake_clear(this: VALUE) -> VALUE {
-    rb::wrap(|| {
-        get(this)?.clear();
-        Ok(rb::qnil())
-    })
+    TYPE.get(value)
 }
 
 pub fn register(native: VALUE) -> RbResult<()> {
-    let class = rb::define_class_under(native, c"Wake")?;
-    let _ = CLASS.set(class as usize);
-    rb::define_singleton_method(class, c"new", wake_new as *const (), 0)?;
-    rb::define_method(class, c"fd", wake_fd as *const (), 0)?;
-    rb::define_method(class, c"clear", wake_clear as *const (), 0)?;
+    let class = TYPE.register(native, c"Wake")?;
+    rb::singleton!(class, c"new", |_class| {
+        let wake = Wake::new().map_err(|e| RubyErr::runtime(format!("pipe failed: {e}")))?;
+        TYPE.wrap(wake)
+    })?;
+    rb::method!(class, c"fd", |this| Ok(rb::u64_value(
+        get(this)?.pipe.read_fd as u64
+    )))?;
+    rb::method!(class, c"clear", |this| {
+        get(this)?.clear();
+        Ok(rb::qnil())
+    })?;
     Ok(())
 }

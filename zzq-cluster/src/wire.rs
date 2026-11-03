@@ -6,21 +6,10 @@
 
 #![cfg_attr(not(test), warn(clippy::arithmetic_side_effects))]
 
-mod admission;
-mod election;
-pub use admission::ReceiveFence;
-mod flow;
-pub use flow::flow_state_route;
-mod compact;
-pub use compact::{COMPACT_STATE_BYTES, CompactState};
-mod prepare;
-mod publication;
-pub use publication::{
-    PUBLICATION_BYTES, PUBLICATION_TOPIC_BYTES, decode_publication, encode_publication,
-    publication_topic,
-};
 mod checkpoint;
+mod election;
 mod error;
+mod prepare;
 mod recovery;
 pub use checkpoint::{
     CheckpointMessage, CheckpointRequest, HistoryFence, HistoryRetired, encode_checkpoint,
@@ -30,11 +19,9 @@ mod fields;
 mod transfer;
 
 pub use error::WireError;
-pub use flow::{FlowMessage, FlowProbe, FlowState, encode_flow_probe, encode_flow_state};
 pub use prepare::{
-    Operation, Operations, Prepare, PrepareBatch, PrepareEncoding, PrepareMetadata,
-    VerifiedOperation, encode_flow_prepare, encode_flow_prepare_metadata, encode_prepare,
-    encode_prepare_metadata, encode_prepare_unbound,
+    Operation, Operations, Prepare, PrepareBatch, PrepareEncoding, VerifiedOperation,
+    encode_prepare, encode_prepare_metadata,
 };
 pub use recovery::{
     RecoveryMessage, RecoveryRequest, RecoveryState, encode_recovery, encode_recovery_state,
@@ -46,7 +33,6 @@ use crate::{Envelope, EnvelopeLimits, Opcode};
 use crate::{LinkSessionId, NodeId};
 use fields::{ReadFields, WriteFields, validate_election_view, validate_prefix, validate_scope};
 
-use crate::flow::{FlowError, ReceiveEpoch};
 use crate::{
     Commit, Configuration, DoViewChange, Prefix, PrepareOk, Scope, StartView, StartViewChange,
 };
@@ -62,7 +48,6 @@ pub struct PeerBinding {
     configuration: Configuration,
     peer: NodeId,
     session: LinkSessionId,
-    receive_epoch: Option<ReceiveEpoch>,
 }
 
 impl PeerBinding {
@@ -84,19 +69,7 @@ impl PeerBinding {
             configuration,
             peer,
             session,
-            receive_epoch: None,
         })
-    }
-
-    /// Require epoch-bound normal payloads bound to this locally issued receive epoch.
-    ///
-    /// Set only from the receiver's own current flow state, never incoming fields.
-    /// Rejects legacy PREPARE and stale `PREPARE_FLOW` before decoding/hashing bodies.
-    /// Control and installation-history messages retain their independent rules.
-    #[must_use]
-    pub const fn with_receive_epoch(mut self, epoch: ReceiveEpoch) -> Self {
-        self.receive_epoch = Some(epoch);
-        self
     }
 }
 
@@ -219,8 +192,6 @@ pub enum ReplicaMessage<'a> {
     Checkpoint(CheckpointMessage<'a>),
     /// Fresh lost-state evidence, neither receipt credit nor a normal/election vote.
     Recovery(RecoveryMessage),
-    /// Receipt/credit exchange or epoch-bound data; never durable quorum evidence.
-    Flow(FlowMessage<'a>),
     /// Fixed-size quorum/control evidence from the bound sender.
     Control(Control),
     /// Hash-validated canonical bytes, still requiring application validation.
@@ -319,11 +290,7 @@ pub fn route(packet: crate::Packet<'_>, limits: EnvelopeLimits) -> Result<Scope,
         .validate_frames(packet.metadata.len(), packet.payload.len(), limits)?;
     if !matches!(
         packet.envelope.opcode,
-        Opcode::ReplicaOpen
-            | Opcode::ReplicaState
-            | Opcode::Prepare
-            | Opcode::PrepareFlow
-            | Opcode::PreparePub
+        Opcode::Prepare
             | Opcode::PrepareOk
             | Opcode::Commit
             | Opcode::ExitView
@@ -342,11 +309,7 @@ pub fn route(packet: crate::Packet<'_>, limits: EnvelopeLimits) -> Result<Scope,
     }
     if !matches!(
         packet.envelope.opcode,
-        Opcode::Prepare
-            | Opcode::PrepareFlow
-            | Opcode::PreparePub
-            | Opcode::Ops
-            | Opcode::SnapshotChunk
+        Opcode::Prepare | Opcode::Ops | Opcode::SnapshotChunk
     ) && !packet.payload.is_empty()
     {
         return Err(WireError::Payload);
@@ -389,13 +352,9 @@ pub fn decode<'a>(
             .map(|request| ReplicaMessage::Recovery(RecoveryMessage::Request(request))),
         Opcode::RecoveryState => recovery::decode_state(incoming, binding)
             .map(|state| ReplicaMessage::Recovery(RecoveryMessage::State(state))),
-        Opcode::ReplicaOpen => flow::decode_probe(incoming)
-            .map(|probe| ReplicaMessage::Flow(FlowMessage::Probe(probe))),
-        Opcode::ReplicaState => flow::decode_state(incoming)
-            .map(|state| ReplicaMessage::Flow(FlowMessage::State(state))),
         Opcode::FetchOps => transfer::decode_fetch(incoming, binding).map(ReplicaMessage::FetchOps),
         Opcode::Ops => transfer::decode_ops(incoming, limits).map(ReplicaMessage::Ops),
-        _ => decode_uncorrelated(incoming, binding, limits),
+        _ => decode_uncorrelated(incoming, limits),
     }
 }
 
@@ -412,28 +371,16 @@ fn decode_uncorrelated(
     Incoming {
         scope,
         envelope,
-        mut reader,
+        reader,
         payload,
     }: Incoming<'_>,
-    binding: PeerBinding,
     limits: WireLimits,
 ) -> Result<ReplicaMessage<'_>, WireError> {
     if envelope.response || envelope.request_id.is_some() {
         return Err(WireError::Correlation);
     }
     match envelope.opcode {
-        Opcode::PrepareFlow => {
-            let epoch = ReceiveEpoch::new(u128::from_be_bytes(reader.array()?))?;
-            if binding.receive_epoch != Some(epoch) {
-                return Err(FlowError::Channel.into());
-            }
-            prepare::decode_prepare(scope, reader, payload, limits)
-                .map(|batch| ReplicaMessage::Flow(FlowMessage::Prepare { epoch, batch }))
-        }
         Opcode::Prepare => {
-            if binding.receive_epoch.is_some() {
-                return Err(FlowError::Channel.into());
-            }
             prepare::decode_prepare(scope, reader, payload, limits).map(ReplicaMessage::Prepare)
         }
         _ if !payload.is_empty() => Err(WireError::Payload),

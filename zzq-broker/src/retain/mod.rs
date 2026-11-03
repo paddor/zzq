@@ -16,7 +16,7 @@ use crate::cluster::{GroupWriter, Journal};
 use crate::disk::{self, Append, Completion, DataDir, Log, Record};
 use crate::durable::{Cursor, JournalId, Journaled, RETRY, Wait};
 use crate::msg::{Msg, expired, too_deep};
-use crate::state::{self, Clock};
+use crate::state::{self, Clock, Snapshotted};
 
 mod handoff;
 mod tree;
@@ -182,11 +182,11 @@ impl Retained {
         let replay = Replay::new(max_levels);
         for (i, stripe) in r.stripes.iter().enumerate() {
             let mut st = stripe.lock();
-            let tree = &mut st.tree;
-            let mut snapshot = None;
+            let mut trees = Snapshotted::default();
             let log = dir.journal(&format!("retained-{i}"), |rec| {
-                replay.apply(tree, &mut snapshot, i, rec)
+                replay.apply(&mut trees, i, rec)
             })?;
+            st.tree = trees.live;
             st.log = Some(log);
             r.len.fetch_add(st.tree.len(), Ordering::Relaxed);
         }
@@ -544,16 +544,14 @@ impl State {
 /// leader replicates, until it leads and they go into its store.
 #[derive(Debug)]
 pub(crate) struct Accumulator {
-    trees: Vec<Tree>,
-    snapshots: Vec<Option<Tree>>,
+    trees: Vec<Snapshotted<Tree>>,
     max_levels: usize,
 }
 
 impl Accumulator {
     pub(crate) fn new(max_levels: usize) -> Accumulator {
         Accumulator {
-            trees: (0..STRIPES).map(|_| Tree::default()).collect(),
-            snapshots: (0..STRIPES).map(|_| None).collect(),
+            trees: (0..STRIPES).map(|_| Snapshotted::default()).collect(),
             max_levels,
         }
     }
@@ -566,17 +564,11 @@ impl Accumulator {
         body: &[u8],
         clock: Clock,
     ) -> Result<(), &'static str> {
-        let (Some(tree), Some(snapshot)) =
-            (self.trees.get_mut(stripe), self.snapshots.get_mut(stripe))
-        else {
-            return Err("unknown retained stripe");
-        };
-        Replay::with_clock(clock, self.max_levels).apply(
-            tree,
-            snapshot,
-            stripe,
-            Record { kind, body },
-        )
+        let trees = self
+            .trees
+            .get_mut(stripe)
+            .ok_or("unknown retained stripe")?;
+        Replay::with_clock(clock, self.max_levels).apply(trees, stripe, Record { kind, body })
     }
 
     /// Appends a snapshot of stripe `stripe` to `out`, its deadlines
@@ -587,8 +579,8 @@ impl Accumulator {
         out: &mut impl Append,
         clock: Clock,
     ) -> io::Result<u64> {
-        let tree = self.trees.get(stripe).ok_or(io::ErrorKind::NotFound)?;
-        put_messages(out, tree, &mut Vec::new(), clock)
+        let trees = self.trees.get(stripe).ok_or(io::ErrorKind::NotFound)?;
+        put_messages(out, &trees.live, &mut Vec::new(), clock)
     }
 
     pub(crate) const fn max_levels(&self) -> usize {
@@ -597,7 +589,8 @@ impl Accumulator {
 
     /// Hands the trees to `retained`, in place of its own.
     pub(crate) fn install(self, retained: &Retained) {
-        for (stripe, tree) in retained.stripes.iter().zip(self.trees) {
+        for (stripe, trees) in retained.stripes.iter().zip(self.trees) {
+            let tree = trees.live;
             let mut st = stripe.lock();
             let old = st.tree.len();
             let new = tree.len();
@@ -653,41 +646,46 @@ impl Replay {
         }
     }
 
-    /// Applies record `r` of the journal of stripe `stripe` to `tree`,
-    /// or to `snapshot` while one is being read.
+    /// Applies record `r` of the journal of stripe `stripe` to `trees`.
     fn apply(
         self,
-        tree: &mut Tree,
-        snapshot: &mut Option<Tree>,
+        trees: &mut Snapshotted<Tree>,
         stripe: usize,
         r: Record<'_>,
     ) -> Result<(), &'static str> {
         match r.kind {
-            RECEIPTS => {
-                let into = snapshot.as_mut().unwrap_or(tree);
-                handoff::read_receipts(into, r.body)?;
+            RECEIPTS => handoff::read_receipts(trees.target(), r.body),
+            CLEAR if r.body.is_empty() => {
+                trees.begin();
+                Ok(())
             }
-            CLEAR if r.body.is_empty() => *snapshot = Some(Tree::default()),
             CLEARED if r.body.is_empty() => {
-                if let Some(s) = snapshot.take() {
-                    *tree = s;
-                }
+                trees.end();
+                Ok(())
             }
-            KEPT => {
-                let into = snapshot.as_mut().unwrap_or(tree);
-                return self.apply(
-                    into,
-                    &mut None,
-                    stripe,
-                    Record {
-                        kind: SET,
-                        body: r.body,
-                    },
-                );
-            }
+            KEPT => self.change(
+                trees.target(),
+                stripe,
+                Record {
+                    kind: SET,
+                    body: r.body,
+                },
+            ),
             // Any other record after an unfinished snapshot: the snapshot
             // was cut off, and the stripe went on without it.
-            _ if snapshot.take().is_some() => return self.apply(tree, snapshot, stripe, r),
+            _ if trees.cut() => self.apply(trees, stripe, r),
+            _ => self.change(&mut trees.live, stripe, r),
+        }
+    }
+
+    /// Applies a change, record `r` of stripe `stripe`, to `tree`.
+    pub(super) fn change(
+        self,
+        tree: &mut Tree,
+        stripe: usize,
+        r: Record<'_>,
+    ) -> Result<(), &'static str> {
+        match r.kind {
             ONCE => return handoff::replay(self, tree, stripe, r.body),
             SET => {
                 let m = state::decode_msg(r.body, self.clock)?;
@@ -722,7 +720,7 @@ pub(crate) fn replay_one(data: &[u8]) -> Result<usize, &'static str> {
     let Some((&kind, body)) = data.split_first() else {
         return Ok(0);
     };
-    let mut tree = Tree::default();
+    let mut trees = Snapshotted::default();
     let replay = Replay::new(usize::MAX);
     let message = if kind == ONCE {
         body.get(11..).unwrap_or_default()
@@ -730,8 +728,8 @@ pub(crate) fn replay_one(data: &[u8]) -> Result<usize, &'static str> {
         body
     };
     let stripe = state::decode_msg(message, replay.clock).map_or(0, |m| stripe_of(m.topic()));
-    replay.apply(&mut tree, &mut None, stripe, Record { kind, body })?;
-    Ok(tree.len())
+    replay.apply(&mut trees, stripe, Record { kind, body })?;
+    Ok(trees.live.len())
 }
 
 /// A record of each kind, kind byte first.

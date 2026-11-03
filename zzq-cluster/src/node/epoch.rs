@@ -90,11 +90,8 @@ impl Node {
     /// A HELLO of another configuration of this one. A node without state
     /// joins a newer epoch: empty, while the epoch's history is, else by
     /// recovering. A node with state keeps it and notes the epoch.
-    pub(super) fn other_epoch(
-        &mut self,
-        hello: super::link::Hello,
-        now: Duration,
-    ) -> Result<(), NodeError> {
+    pub(super) fn other_epoch(&mut self, hello: super::link::Hello) -> Result<(), NodeError> {
+        let now = self.now;
         let base = self.epochs.base;
         let config = named(&base, hello.epoch, hello.digest)
             .filter(|c| c.scope().configuration_epoch > self.epoch())
@@ -123,6 +120,6 @@ impl Node {
             node.say_hello(i)?;
         }
         *self = node;
-        self.on_hello(hello, now)
+        self.on_hello(hello)
     }
 }

@@ -15,7 +15,7 @@ use zzq_tokio::{Context, Endpoint};
 
 use crate::disk::DataDir;
 use crate::durable::{Cursor, JournalId};
-use crate::lane::{Control, Lane, LaneLog, LaneRef, LaneStats, Phase, Remote};
+use crate::lane::{Control, Lane, LaneLog, LaneRef, Phase, Remote};
 use crate::mailbox::{self, Mailbox};
 use crate::msg::Msg;
 use crate::options::BrokerOptions;
@@ -139,6 +139,44 @@ pub(crate) struct Shared {
 }
 
 impl Shared {
+    /// Sends lane `i` the control `ask(i, reply)` and waits for every
+    /// reply, in lane order.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Closed`] if a lane stopped.
+    pub(crate) async fn ask_lanes<T>(
+        &self,
+        mut ask: impl FnMut(usize, oneshot::Sender<T>) -> Control,
+    ) -> Result<Vec<T>> {
+        let mut asked = Vec::with_capacity(self.lanes.len());
+        for (i, lane) in self.lanes.iter().enumerate() {
+            let (tx, rx) = oneshot::channel();
+            lane.control.push(ask(i, tx)).map_err(|_| Error::Closed)?;
+            asked.push(rx);
+        }
+        let mut replies = Vec::with_capacity(asked.len());
+        for rx in asked {
+            replies.push(rx.await.map_err(|_| Error::Closed)?);
+        }
+        Ok(replies)
+    }
+
+    /// Sends every lane still running the control `tell(done)` and waits
+    /// until each is done.
+    pub(crate) async fn tell_lanes(&self, mut tell: impl FnMut(oneshot::Sender<()>) -> Control) {
+        let mut told = Vec::with_capacity(self.lanes.len());
+        for lane in &self.lanes {
+            let (tx, rx) = oneshot::channel();
+            if lane.control.push(tell(tx)).is_ok() {
+                told.push(rx);
+            }
+        }
+        for rx in told {
+            let _ = rx.await;
+        }
+    }
+
     /// The cursor of journal `j`.
     pub(crate) fn cursor(&self, j: JournalId) -> &Cursor {
         match j {
@@ -406,6 +444,19 @@ impl Broker {
         *groups.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The client endpoints the broker's node of a cluster leads without,
+    /// as it could not bind them, and why. Engine API for `zzq_broker`.
+    #[doc(hidden)]
+    pub fn cluster_unbound(&self) -> Vec<(Endpoint, Arc<Error>)> {
+        self.shared
+            .cluster
+            .as_ref()
+            .map_or_else(Vec::new, |groups| {
+                let l = groups.listeners.lock();
+                l.unwrap_or_else(PoisonError::into_inner).unbound.clone()
+            })
+    }
+
     /// The ID that tells this broker's lane state apart on a lane thread.
     #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
@@ -516,16 +567,9 @@ impl Broker {
             }
         };
         self.abort_tasks();
-        let mut done = Vec::with_capacity(self.shared.lanes.len());
-        for lane in &self.shared.lanes {
-            let (tx, rx) = oneshot::channel();
-            if lane.control.push(Control::Shutdown(Some(tx))).is_ok() {
-                done.push(rx);
-            }
-        }
-        for rx in done {
-            let _ = rx.await;
-        }
+        self.shared
+            .tell_lanes(|done| Control::Shutdown(Some(done)))
+            .await;
         // Changes up to here, such as wills, reach the disk, and the data
         // directory is free for the next broker.
         if self.shared.data.is_some() {
@@ -558,12 +602,7 @@ impl Broker {
 /// Counters of all lanes.
 pub(crate) async fn collect(shared: &Shared) -> Result<Stats> {
     let mut total = Stats::default();
-    for lane in &shared.lanes {
-        let (tx, rx) = oneshot::channel();
-        lane.control
-            .push(Control::Stats(tx))
-            .map_err(|_| Error::Closed)?;
-        let s: LaneStats = rx.await.map_err(|_| Error::Closed)?;
+    for s in shared.ask_lanes(|_, tx| Control::Stats(tx)).await? {
         total.connections += s.connections;
         total.sessions += s.sessions;
         total.subscriptions = total.subscriptions.max(s.subscriptions);

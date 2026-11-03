@@ -10,6 +10,10 @@
     reason = "test code"
 )]
 
+#[path = "support/fixture.rs"]
+mod fixture;
+
+use fixture::{configuration, node};
 use zzq_cluster::operation::{CanonicalOperation, OperationKind, canonical_body_digest};
 use zzq_cluster::progress::ProgressError;
 use zzq_cluster::{
@@ -19,23 +23,9 @@ use zzq_cluster::{
 };
 use zzq_cluster::{GroupId, NodeId};
 
-const fn node(index: u8) -> NodeId {
-    NodeId::from_bytes([index + 1; 16])
-}
-
-fn config() -> Configuration {
-    Configuration::new(
-        GroupId::from_bytes([7; 16]),
-        1,
-        Digest::from_bytes([8; 32]),
-        [node(0), node(1), node(2)],
-    )
-    .unwrap()
-}
-
 fn replica(index: u8, operations: usize, bytes: usize) -> NormalReplica {
     NormalReplica::bootstrap(
-        config(),
+        configuration(),
         node(index),
         JournalGeneration(u128::from(index) + 1),
         PipelineLimits {
@@ -62,7 +52,7 @@ fn operation(scope: Scope, previous: Prefix, value: u8) -> PreparedOperation {
 
 fn prepare(replica: &mut NormalReplica, operations: &[PreparedOperation]) -> WriteTicket {
     match replica
-        .prepare(node(0), config().scope(), operations)
+        .prepare(node(0), configuration().scope(), operations)
         .unwrap()
     {
         Admission::Write { ticket, .. } => ticket,
@@ -72,7 +62,7 @@ fn prepare(replica: &mut NormalReplica, operations: &[PreparedOperation]) -> Wri
 
 fn ack(through: Prefix) -> PrepareOk {
     PrepareOk {
-        scope: config().scope(),
+        scope: configuration().scope(),
         durable: through,
     }
 }
@@ -86,9 +76,9 @@ fn configuration_rejects_duplicate_voters_empty_digest_and_unknown_local() {
     ] {
         assert_eq!(
             Configuration::new(
-                config().scope().group_id,
+                configuration().scope().group_id,
                 1,
-                config().scope().configuration_digest,
+                configuration().scope().configuration_digest,
                 voters,
             ),
             Err(ReplicationError::InvalidConfiguration)
@@ -96,16 +86,16 @@ fn configuration_rejects_duplicate_voters_empty_digest_and_unknown_local() {
     }
     assert_eq!(
         Configuration::new(
-            config().scope().group_id,
+            configuration().scope().group_id,
             1,
             Digest::ZERO,
-            *config().voters()
+            *configuration().voters()
         ),
         Err(ReplicationError::InvalidConfiguration)
     );
     assert!(matches!(
         NormalReplica::bootstrap(
-            config(),
+            configuration(),
             node(3),
             JournalGeneration(1),
             PipelineLimits {
@@ -116,7 +106,7 @@ fn configuration_rejects_duplicate_voters_empty_digest_and_unknown_local() {
         Err(ReplicationError::UnknownVoter)
     ));
     for view in 0..30 {
-        assert_eq!(config().primary(view), node((view % 3) as u8));
+        assert_eq!(configuration().primary(view), node((view % 3) as u8));
     }
 }
 
@@ -133,7 +123,7 @@ fn zero_pipeline_limits_are_rejected() {
         },
     ] {
         assert!(matches!(
-            NormalReplica::bootstrap(config(), node(0), JournalGeneration(1), limits),
+            NormalReplica::bootstrap(configuration(), node(0), JournalGeneration(1), limits),
             Err(ReplicationError::InvalidLimits)
         ));
     }
@@ -142,20 +132,25 @@ fn zero_pipeline_limits_are_rejected() {
 #[test]
 fn bootstrap_rejects_zero_storage_identities_and_impossible_capacity() {
     for (group, voters) in [
-        (GroupId::from_bytes([0; 16]), *config().voters()),
+        (GroupId::from_bytes([0; 16]), *configuration().voters()),
         (
-            config().scope().group_id,
+            configuration().scope().group_id,
             [NodeId::from_bytes([0; 16]), node(1), node(2)],
         ),
     ] {
         assert_eq!(
-            Configuration::new(group, 1, config().scope().configuration_digest, voters),
+            Configuration::new(
+                group,
+                1,
+                configuration().scope().configuration_digest,
+                voters
+            ),
             Err(ReplicationError::InvalidConfiguration)
         );
     }
     assert!(matches!(
         NormalReplica::bootstrap(
-            config(),
+            configuration(),
             node(0),
             JournalGeneration(1),
             PipelineLimits {
@@ -171,7 +166,7 @@ fn bootstrap_rejects_zero_storage_identities_and_impossible_capacity() {
 fn buffered_copies_are_not_durable_votes() {
     let mut primary = replica(0, 4, 64);
     let mut backup = replica(1, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     let local = prepare(&mut primary, &[op]);
     let remote = prepare(&mut backup, &[op]);
     primary.complete_write(local).unwrap();
@@ -198,7 +193,7 @@ fn buffered_copies_are_not_durable_votes() {
 fn local_disk_alone_cannot_commit_and_either_backup_can_complete_quorum() {
     for voter in [node(1), node(2)] {
         let mut primary = replica(0, 4, 64);
-        let op = operation(config().scope(), Prefix::GENESIS, 1);
+        let op = operation(configuration().scope(), Prefix::GENESIS, 1);
         let ticket = prepare(&mut primary, &[op]);
         primary.complete_durable_write(ticket).unwrap();
         assert_eq!(primary.snapshot().committed, Prefix::GENESIS);
@@ -210,7 +205,7 @@ fn local_disk_alone_cannot_commit_and_either_backup_can_complete_quorum() {
 #[test]
 fn duplicate_backup_votes_cannot_replace_primary_disk() {
     let mut primary = replica(0, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     let ticket = prepare(&mut primary, &[op]);
     for _ in 0..100 {
         primary.receive_ack(node(1), ack(op.prefix())).unwrap();
@@ -243,9 +238,9 @@ fn roles_and_authenticated_membership_are_checked() {
         backup.receive_commit(node(2), primary.announcement().unwrap()),
         Err(ReplicationError::WrongRole)
     );
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     assert_eq!(
-        backup.prepare(node(2), config().scope(), &[op]),
+        backup.prepare(node(2), configuration().scope(), &[op]),
         Err(ReplicationError::WrongRole)
     );
     assert_eq!(backup.snapshot().accepted, Prefix::GENESIS);
@@ -254,11 +249,11 @@ fn roles_and_authenticated_membership_are_checked() {
 #[test]
 fn wrong_group_configuration_or_view_cannot_vote_or_admit() {
     let mut primary = replica(0, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     let ticket = prepare(&mut primary, &[op]);
     primary.complete_durable_write(ticket).unwrap();
     let before = primary.snapshot();
-    let scope = config().scope();
+    let scope = configuration().scope();
     for wrong in [
         Scope {
             group_id: GroupId::from_bytes([9; 16]),
@@ -295,7 +290,7 @@ fn wrong_group_configuration_or_view_cannot_vote_or_admit() {
 #[test]
 fn operation_envelopes_must_match_current_scope() {
     let mut primary = replica(0, 4, 64);
-    let scope = config().scope();
+    let scope = configuration().scope();
     for wrong in [
         Scope {
             group_id: GroupId::from_bytes([9; 16]),
@@ -319,8 +314,8 @@ fn operation_envelopes_must_match_current_scope() {
 #[test]
 fn cumulative_ack_cannot_outrun_captured_sync() {
     let mut primary = replica(0, 4, 64);
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let second = operation(config().scope(), first.prefix(), 2);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let second = operation(configuration().scope(), first.prefix(), 2);
     let a = prepare(&mut primary, &[first]);
     primary.complete_write(a).unwrap();
     let sync_a = primary.begin_sync().unwrap();
@@ -339,13 +334,13 @@ fn cumulative_ack_cannot_outrun_captured_sync() {
 #[test]
 fn follower_commit_waits_for_its_own_durable_prefix() {
     let mut backup = replica(1, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     let ticket = prepare(&mut backup, &[op]);
     backup
         .receive_commit(
             node(0),
             Commit {
-                scope: config().scope(),
+                scope: configuration().scope(),
                 committed: op.prefix(),
             },
         )
@@ -362,18 +357,18 @@ fn follower_commit_waits_for_its_own_durable_prefix() {
 #[test]
 fn missing_prepare_or_commit_history_requests_catch_up_without_mutation() {
     let mut backup = replica(1, 4, 64);
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let second = operation(config().scope(), first.prefix(), 2);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let second = operation(configuration().scope(), first.prefix(), 2);
     let before = backup.snapshot();
     assert_eq!(
-        backup.prepare(node(0), config().scope(), &[second]),
+        backup.prepare(node(0), configuration().scope(), &[second]),
         Err(ReplicationError::HistoryGap)
     );
     assert_eq!(
         backup.receive_commit(
             node(0),
             Commit {
-                scope: config().scope(),
+                scope: configuration().scope(),
                 committed: second.prefix(),
             },
         ),
@@ -387,24 +382,24 @@ fn missing_prepare_or_commit_history_requests_catch_up_without_mutation() {
 #[test]
 fn prepare_group_validation_is_atomic_and_retransmit_can_overlap() {
     let mut primary = replica(0, 4, 64);
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let second = operation(config().scope(), first.prefix(), 2);
-    let third = operation(config().scope(), second.prefix(), 3);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let second = operation(configuration().scope(), first.prefix(), 2);
+    let third = operation(configuration().scope(), second.prefix(), 3);
     let before = primary.snapshot();
     assert_eq!(
-        primary.prepare(node(0), config().scope(), &[first, third]),
+        primary.prepare(node(0), configuration().scope(), &[first, third]),
         Err(ReplicationError::HistoryGap)
     );
     assert_eq!(primary.snapshot(), before);
     prepare(&mut primary, &[first]);
     let retained = primary.snapshot();
     assert_eq!(
-        primary.prepare(node(0), config().scope(), &[first]),
+        primary.prepare(node(0), configuration().scope(), &[first]),
         Ok(Admission::Duplicate)
     );
     assert_eq!(primary.snapshot(), retained);
     let Admission::Write { ticket, first_new } = primary
-        .prepare(node(0), config().scope(), &[first, second, third])
+        .prepare(node(0), configuration().scope(), &[first, second, third])
         .unwrap()
     else {
         panic!("expected new suffix");
@@ -420,14 +415,14 @@ fn prepare_group_validation_is_atomic_and_retransmit_can_overlap() {
 fn operation_and_byte_bounds_hold_until_application_releases_capacity() {
     for (count, bytes) in [(1, 64), (4, 16)] {
         let mut primary = replica(0, count, bytes);
-        let first = operation(config().scope(), Prefix::GENESIS, 1);
-        let second = operation(config().scope(), first.prefix(), 2);
+        let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+        let second = operation(configuration().scope(), first.prefix(), 2);
         let ticket = prepare(&mut primary, &[first]);
         primary.complete_durable_write(ticket).unwrap();
         primary.receive_ack(node(1), ack(first.prefix())).unwrap();
         let before = primary.snapshot();
         assert_eq!(
-            primary.prepare(node(0), config().scope(), &[second]),
+            primary.prepare(node(0), configuration().scope(), &[second]),
             Err(ReplicationError::Capacity)
         );
         assert_eq!(primary.snapshot(), before);
@@ -442,14 +437,14 @@ fn operation_and_byte_bounds_hold_until_application_releases_capacity() {
 fn empty_and_oversized_admissions_leave_state_unchanged() {
     let mut primary = replica(0, 1, 16);
     let before = primary.snapshot();
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let second = operation(config().scope(), first.prefix(), 2);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let second = operation(configuration().scope(), first.prefix(), 2);
     assert_eq!(
-        primary.prepare(node(0), config().scope(), &[]),
+        primary.prepare(node(0), configuration().scope(), &[]),
         Err(ReplicationError::EmptyPrepare)
     );
     assert_eq!(
-        primary.prepare(node(0), config().scope(), &[first, second]),
+        primary.prepare(node(0), configuration().scope(), &[first, second]),
         Err(ReplicationError::Capacity)
     );
     assert_eq!(primary.snapshot(), before);
@@ -458,7 +453,7 @@ fn empty_and_oversized_admissions_leave_state_unchanged() {
 #[test]
 fn application_cannot_advance_over_uncommitted_operations() {
     let mut primary = replica(0, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     prepare(&mut primary, &[op]);
     let before = primary.snapshot();
     assert_eq!(
@@ -470,8 +465,8 @@ fn application_cannot_advance_over_uncommitted_operations() {
 
 #[test]
 fn conflicting_duplicate_or_ack_faults_instead_of_replacing_history() {
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let other = operation(config().scope(), Prefix::GENESIS, 2);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let other = operation(configuration().scope(), Prefix::GENESIS, 2);
     for via_ack in [false, true] {
         let mut primary = replica(0, 4, 64);
         let ticket = prepare(&mut primary, &[first]);
@@ -479,7 +474,7 @@ fn conflicting_duplicate_or_ack_faults_instead_of_replacing_history() {
             primary.receive_ack(node(1), ack(other.prefix()))
         } else {
             primary
-                .prepare(node(0), config().scope(), &[other])
+                .prepare(node(0), configuration().scope(), &[other])
                 .map(|_| ())
         };
         assert_eq!(result, Err(ReplicationError::ConflictingHistory));
@@ -497,11 +492,11 @@ fn conflicting_duplicate_or_ack_faults_instead_of_replacing_history() {
 #[test]
 fn wrong_predecessor_digest_faults_without_admitting_a_partial_group() {
     let mut primary = replica(0, 4, 64);
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let wrong = operation(config().scope(), Prefix::GENESIS, 2);
-    let second = operation(config().scope(), wrong.prefix(), 3);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let wrong = operation(configuration().scope(), Prefix::GENESIS, 2);
+    let second = operation(configuration().scope(), wrong.prefix(), 3);
     assert_eq!(
-        primary.prepare(node(0), config().scope(), &[first, second]),
+        primary.prepare(node(0), configuration().scope(), &[first, second]),
         Err(ReplicationError::ConflictingHistory)
     );
     assert_eq!(primary.snapshot().status, Status::Faulted);
@@ -513,7 +508,7 @@ fn wrong_predecessor_digest_faults_without_admitting_a_partial_group() {
 fn foreign_writer_completions_and_errors_cannot_mutate_this_replica() {
     let mut primary = replica(0, 4, 64);
     let mut backup = replica(1, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     prepare(&mut primary, &[op]);
     let foreign = prepare(&mut backup, &[op]);
     backup.complete_write(foreign).unwrap();
@@ -536,8 +531,8 @@ fn foreign_writer_completions_and_errors_cannot_mutate_this_replica() {
 #[test]
 fn out_of_order_write_completion_cannot_skip_a_missing_prefix() {
     let mut primary = replica(0, 4, 64);
-    let first = operation(config().scope(), Prefix::GENESIS, 1);
-    let second = operation(config().scope(), first.prefix(), 2);
+    let first = operation(configuration().scope(), Prefix::GENESIS, 1);
+    let second = operation(configuration().scope(), first.prefix(), 2);
     let a = prepare(&mut primary, &[first]);
     let b = prepare(&mut primary, &[second]);
     let before = primary.snapshot();
@@ -555,7 +550,7 @@ fn out_of_order_write_completion_cannot_skip_a_missing_prefix() {
 fn fencing_blocks_old_view_votes_commit_and_apply_while_disk_work_settles() {
     for index in [0, 1] {
         let mut replica = replica(index, 4, 64);
-        let op = operation(config().scope(), Prefix::GENESIS, 1);
+        let op = operation(configuration().scope(), Prefix::GENESIS, 1);
         let ticket = prepare(&mut replica, &[op]);
         if index == 0 {
             replica.receive_ack(node(1), ack(op.prefix())).unwrap();
@@ -570,7 +565,7 @@ fn fencing_blocks_old_view_votes_commit_and_apply_while_disk_work_settles() {
         assert_eq!(replica.acknowledgment(), Err(ReplicationError::NotNormal));
         assert_eq!(replica.announcement(), Err(ReplicationError::NotNormal));
         assert_eq!(
-            replica.prepare(node(0), config().scope(), &[op]),
+            replica.prepare(node(0), configuration().scope(), &[op]),
             Err(ReplicationError::NotNormal)
         );
         assert_eq!(
@@ -583,7 +578,7 @@ fn fencing_blocks_old_view_votes_commit_and_apply_while_disk_work_settles() {
 #[test]
 fn io_failure_fences_success_even_if_remote_quorum_has_data() {
     let mut primary = replica(0, 4, 64);
-    let op = operation(config().scope(), Prefix::GENESIS, 1);
+    let op = operation(configuration().scope(), Prefix::GENESIS, 1);
     let ticket = prepare(&mut primary, &[op]);
     primary.receive_ack(node(1), ack(op.prefix())).unwrap();
     primary.receive_ack(node(2), ack(op.prefix())).unwrap();
@@ -603,8 +598,8 @@ fn repeated_pipeline_reuse_preserves_cumulative_votes_and_prefixes() {
     let mut backup = replica(1, 2, 32);
     let mut previous = Prefix::GENESIS;
     for round in 0..1000 {
-        let a = operation(config().scope(), previous, round as u8);
-        let b = operation(config().scope(), a.prefix(), (round + 1) as u8);
+        let a = operation(configuration().scope(), previous, round as u8);
+        let b = operation(configuration().scope(), a.prefix(), (round + 1) as u8);
         let local = prepare(&mut primary, &[a, b]);
         let remote = prepare(&mut backup, &[a, b]);
         backup.complete_durable_write(remote).unwrap();
@@ -633,7 +628,7 @@ fn backup_retains_two_live_windows_behind_the_announced_commit() {
     // backup releases only announced commits, so it retains that window on
     // top of the primary's live one, and never more than the primary can
     // have in flight beyond the commit it announced.
-    let scope = config().scope();
+    let scope = configuration().scope();
     let mut backup = replica(1, 2, 64);
     let first = operation(scope, Prefix::GENESIS, 1);
     let second = operation(scope, first.prefix(), 2);
@@ -670,7 +665,7 @@ fn backup_retains_two_live_windows_behind_the_announced_commit() {
 
 #[test]
 fn backup_body_bytes_stop_at_two_live_windows() {
-    let scope = config().scope();
+    let scope = configuration().scope();
     let mut backup = replica(1, 4, 32);
     let first = operation(scope, Prefix::GENESIS, 1);
     let second = operation(scope, first.prefix(), 2);
@@ -702,7 +697,7 @@ fn commit_past_the_accepted_prefix_releases_a_full_backup_window() {
     // this backup has not accepted. Everything accepted here is committed by
     // that announcement, so the backup applies it and frees its window
     // instead of waiting for an announcement it can never accept.
-    let scope = config().scope();
+    let scope = configuration().scope();
     let mut backup = replica(1, 2, 64);
     let first = operation(scope, Prefix::GENESIS, 1);
     let second = operation(scope, first.prefix(), 2);

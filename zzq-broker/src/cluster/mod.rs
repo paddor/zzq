@@ -68,18 +68,20 @@ pub(crate) async fn bind(shared: &Arc<Shared>, endpoint: Endpoint) -> Result<End
     Ok(endpoint)
 }
 
-/// Binds every client endpoint: the node leads.
+/// Binds every client endpoint: the node leads. Keeps why one did not.
 pub(crate) async fn open_listeners(shared: &Arc<Shared>) {
     let groups = shared.cluster_groups();
     let (endpoints, epoch) = {
         let mut l = lock(&groups.listeners);
         l.leading = true;
         l.epoch += 1;
+        l.unbound.clear();
         (l.endpoints.clone(), l.epoch)
     };
     for endpoint in endpoints {
-        if let Ok((_, task)) = crate::broker::listen(shared, endpoint).await {
-            lock(&groups.listeners).own(task, epoch);
+        match crate::broker::listen(shared, endpoint.clone()).await {
+            Ok((_, task)) => lock(&groups.listeners).own(task, epoch),
+            Err(e) => lock(&groups.listeners).unbound(endpoint, e, epoch),
         }
     }
 }
@@ -90,6 +92,7 @@ pub(crate) fn close_listeners(shared: &Shared) {
     let mut l = lock(&groups.listeners);
     l.leading = false;
     l.epoch += 1;
+    l.unbound.clear();
     for task in l.bound.drain(..) {
         task.abort();
     }

@@ -24,10 +24,10 @@
 //! to the load generator's own CPU. Closed connections and a stalled
 //! publisher go to stderr.
 
-use std::collections::HashMap;
 use std::process::ExitCode;
 use std::time::Duration;
 
+use zzq_bench::args::Kv;
 use zzq_bench::load::{self, Keep, Latency, Load, Scenario, Throughput, Until};
 
 fn main() -> ExitCode {
@@ -36,20 +36,15 @@ fn main() -> ExitCode {
         eprintln!("usage: zzq_brokerbench <pairs|fanout|fanin|rtt> [key=value ...]");
         return ExitCode::FAILURE;
     };
-    let result = match scenario.as_str() {
-        "rtt" => load::latency(&cfg, iters, until).map(|l| print_latency(&cfg, until, &l)),
-        "pairs" => {
-            load::throughput(Scenario::Pairs, &cfg).map(|t| print_throughput("pairs", &cfg, &t))
-        }
-        "fanout" => {
-            load::throughput(Scenario::Fanout, &cfg).map(|t| print_throughput("fanout", &cfg, &t))
-        }
-        "fanin" => {
-            load::throughput(Scenario::Fanin, &cfg).map(|t| print_throughput("fanin", &cfg, &t))
-        }
-        _ => {
-            eprintln!("unknown scenario {scenario}");
-            return ExitCode::FAILURE;
+    let result = if scenario == "rtt" {
+        load::latency(&cfg, iters, until).map(|l| print_latency(&cfg, until, &l))
+    } else {
+        match scenario.parse::<Scenario>() {
+            Ok(s) => load::throughput(s, &cfg).map(|t| print_throughput(s, &cfg, &t)),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
         }
     };
     match result {
@@ -64,11 +59,8 @@ fn main() -> ExitCode {
 /// The scenario, the load, and for `rtt` the round trips and what they time.
 fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
     let (scenario, rest) = args.split_first()?;
-    let kv = rest
-        .iter()
-        .map(|a| a.split_once('='))
-        .collect::<Option<HashMap<_, _>>>()?;
-    let get = |k: &str, d: &'static str| kv.get(k).copied().unwrap_or(d);
+    let kv = Kv::parse(rest)?;
+    let get = |k: &str, d: &'static str| kv.get(k).unwrap_or(d);
     let num = |k: &str, d: &'static str| get(k, d).parse::<u64>().ok();
     let cfg = Load {
         addr: get("addr", "127.0.0.1:1883").to_owned(),
@@ -100,6 +92,7 @@ fn parse(args: &[String]) -> Option<(String, Load, (usize, Until))> {
         Until::Delivered
     };
     let iters = num("iters", "20000")? as usize;
+    kv.finish()?;
     Some((scenario.clone(), cfg, (iters, until)))
 }
 
@@ -123,18 +116,15 @@ fn print_latency(cfg: &Load, until: Until, l: &Latency) {
     );
 }
 
-fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
+fn print_throughput(scenario: Scenario, cfg: &Load, t: &Throughput) {
     for note in &t.notes {
         eprintln!("{note}");
     }
     if t.stalled {
         eprintln!("warning: publisher stuck, shutting sockets down");
     }
-    let (pubs, subs) = match name {
-        "pairs" => (cfg.pubs, cfg.pubs),
-        "fanout" => (1, cfg.subs),
-        _ => (cfg.pubs, 1),
-    };
+    let (pubs, subs) = scenario.conns(cfg);
+    let name = scenario.to_string();
     let secs: Vec<String> = t
         .per_second
         .iter()
@@ -158,4 +148,19 @@ fn print_throughput(name: &str, cfg: &Load, t: &Throughput) {
         t.cpu,
         secs.join(" ")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_misspelled_key_is_refused() {
+        assert!(parse(&args(&["p2p", "persist=1"])).is_some());
+        assert!(parse(&args(&["p2p", "persit=1"])).is_none());
+    }
 }

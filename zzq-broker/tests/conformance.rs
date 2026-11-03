@@ -13,8 +13,9 @@ mod support;
 
 use std::time::{Duration, Instant};
 
-use support::{Got, Raw, client, connect_bytes, next, props, publish_bytes, setup};
+use support::{Got, Raw, client, connect_bytes, fields, header, next, props, publish, setup};
 use zzq_broker::{BrokerOptions, Context};
+use zzq_proto::encode::PublishHeader;
 use zzq_proto::encode::{self, ConnectFields, WillFields};
 use zzq_proto::property::{
     AUTHENTICATION_DATA, AUTHENTICATION_METHOD, CONTENT_TYPE, MAXIMUM_PACKET_SIZE, REASON_STRING,
@@ -73,7 +74,7 @@ async fn first_packet_other_than_connect_closes() {
     let firsts = [
         vec![0xC0, 0],
         vec![0x82, 6, 0, 1, 0, 1, b't', 0],
-        publish_bytes(Version::V5, "t", b"x", QoS::AtMostOnce, 0, &[]),
+        publish(&header(Version::V5, "t", QoS::AtMostOnce, 0), b"x"),
     ];
     for first in firsts {
         send_raw(&uri, Version::V5, &first).await.closed().await;
@@ -137,14 +138,9 @@ async fn malformed_connect_flags_are_refused() {
         payload: b"gone",
     };
     let fields = |version, will, password| ConnectFields {
-        version,
-        clean_start: true,
-        keep_alive: 0,
-        properties: &[],
-        client_id: "flags",
         will,
-        username: None,
         password,
+        ..fields(version, "flags")
     };
     let encoded = |c: &ConnectFields<'_>, flags: u8| {
         let mut out = Vec::new();
@@ -259,13 +255,9 @@ async fn packets_pipelined_behind_connect_are_processed() {
     let qos1 = SubscriptionOptions::from(QoS::AtLeastOnce);
     encode::subscribe(Version::V5, 1, &[], &[("pipe/t", qos1)], &mut bytes);
     let payload = vec![7u8; 100_000];
-    bytes.extend(publish_bytes(
-        Version::V5,
-        "pipe/t",
+    bytes.extend(publish(
+        &header(Version::V5, "pipe/t", QoS::AtLeastOnce, 2),
         &payload,
-        QoS::AtLeastOnce,
-        2,
-        &[],
     ));
     let mut raw = send_raw(&uri, Version::V5, &bytes).await;
     assert!(matches!(raw.next().await, Got::ConnAck { code: 0, .. }));
@@ -298,8 +290,11 @@ async fn packet_dribbled_across_seconds_is_read_whole() {
     }
     assert!(matches!(raw.next().await, Got::ConnAck { code: 0, .. }));
     raw.subscribe("slow/t", QoS::AtMostOnce.into()).await;
-    let publish = publish_bytes(Version::V5, "slow/t", b"dribbled", QoS::AtMostOnce, 0, &[]);
-    for piece in publish.chunks(publish.len() / 3 + 1) {
+    let packet = publish(
+        &header(Version::V5, "slow/t", QoS::AtMostOnce, 0),
+        b"dribbled",
+    );
+    for piece in packet.chunks(packet.len() / 3 + 1) {
         raw.send(piece).await;
         tokio::time::sleep(gap).await;
     }
@@ -364,8 +359,14 @@ async fn duplicate_properties_are_a_protocol_error() {
         Property::Str(CONTENT_TYPE, "a"),
         Property::Str(CONTENT_TYPE, "b"),
     ]);
-    let publish = publish_bytes(Version::V5, "t", b"x", QoS::AtMostOnce, 0, &twice);
-    after_connect(&uri, Version::V5, &publish, &[reason::PROTOCOL_ERROR]).await;
+    let packet = publish(
+        &PublishHeader {
+            properties: &twice,
+            ..header(Version::V5, "t", QoS::AtMostOnce, 0)
+        },
+        b"x",
+    );
+    after_connect(&uri, Version::V5, &packet, &[reason::PROTOCOL_ERROR]).await;
     let sub = subscribe_bytes(
         "t",
         QoS::AtMostOnce.into(),
@@ -389,7 +390,7 @@ async fn duplicate_properties_are_a_protocol_error() {
     let mut raw = Raw::connect(&uri, "users", Version::V5, 0).await;
     raw.subscribe("u", QoS::AtMostOnce.into()).await;
     let users = props(&[Property::User("k", "1"), Property::User("k", "2")]);
-    raw.pub_props("u", b"x", QoS::AtMostOnce, 0, &users).await;
+    raw.pub_props("u", b"x", &users).await;
     let got = raw.publish().await;
     let pairs: Vec<_> = got
         .properties()
@@ -406,8 +407,14 @@ async fn duplicate_properties_are_a_protocol_error() {
 async fn properties_not_allowed_for_the_packet_are_malformed() {
     let (_ctx, _broker, uri) = broker().await;
     let server_ref = props(&[Property::Str(SERVER_REFERENCE, "elsewhere")]);
-    let publish = publish_bytes(Version::V5, "t", b"x", QoS::AtMostOnce, 0, &server_ref);
-    after_connect(&uri, Version::V5, &publish, &[reason::MALFORMED_PACKET]).await;
+    let packet = publish(
+        &PublishHeader {
+            properties: &server_ref,
+            ..header(Version::V5, "t", QoS::AtMostOnce, 0)
+        },
+        b"x",
+    );
+    after_connect(&uri, Version::V5, &packet, &[reason::MALFORMED_PACKET]).await;
     let sub = subscribe_bytes(
         "t",
         QoS::AtMostOnce.into(),
@@ -429,19 +436,19 @@ async fn bad_strings_and_wildcard_topics_disconnect() {
     ];
     // Wildcards in a topic name [MQTT-3.3.2-2].
     for topic in ["a/+", "a/#", "#"] {
-        let publish = publish_bytes(Version::V5, topic, b"x", QoS::AtMostOnce, 0, &[]);
-        after_connect(&uri, Version::V5, &publish, &bad_name).await;
+        let packet = publish(&header(Version::V5, topic, QoS::AtMostOnce, 0), b"x");
+        after_connect(&uri, Version::V5, &packet, &bad_name).await;
     }
     // U+0000 in a topic name or filter [MQTT-1.5.4-2].
-    let publish = publish_bytes(Version::V5, "a\0b", b"x", QoS::AtMostOnce, 0, &[]);
-    after_connect(&uri, Version::V5, &publish, &[reason::MALFORMED_PACKET]).await;
+    let packet = publish(&header(Version::V5, "a\0b", QoS::AtMostOnce, 0), b"x");
+    after_connect(&uri, Version::V5, &packet, &[reason::MALFORMED_PACKET]).await;
     let sub = subscribe_bytes("a\0b", QoS::AtMostOnce.into(), &[]);
     after_connect(&uri, Version::V5, &sub, &[reason::MALFORMED_PACKET]).await;
     // A UTF-16 surrogate, U+D800, in a topic name [MQTT-1.5.4-1].
     let surrogate = [0x30, 7, 0, 3, 0xED, 0xA0, 0x80, 0, b'x'];
     after_connect(&uri, Version::V5, &surrogate, &[reason::MALFORMED_PACKET]).await;
     // An empty topic name needs a topic alias.
-    let empty = publish_bytes(Version::V5, "", b"x", QoS::AtMostOnce, 0, &[]);
+    let empty = publish(&header(Version::V5, "", QoS::AtMostOnce, 0), b"x");
     after_connect(&uri, Version::V5, &empty, &[reason::PROTOCOL_ERROR]).await;
     // Characters outside the Basic Multilingual Plane are fine.
     let mut raw = Raw::connect(&uri, "astral", Version::V5, 0).await;
@@ -455,9 +462,15 @@ async fn response_topic_with_wildcards_is_a_protocol_error() {
     let (_ctx, _broker, uri) = broker().await;
     // [MQTT-3.3.2-14]
     let wild = props(&[Property::Str(RESPONSE_TOPIC, "reply/#")]);
-    let publish = publish_bytes(Version::V5, "t", b"x", QoS::AtMostOnce, 0, &wild);
+    let packet = publish(
+        &PublishHeader {
+            properties: &wild,
+            ..header(Version::V5, "t", QoS::AtMostOnce, 0)
+        },
+        b"x",
+    );
     let reasons = [reason::PROTOCOL_ERROR, reason::TOPIC_NAME_INVALID];
-    after_connect(&uri, Version::V5, &publish, &reasons).await;
+    after_connect(&uri, Version::V5, &packet, &reasons).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -515,8 +528,8 @@ async fn empty_subscribe_and_packet_id_zero_are_malformed() {
     after_connect(&uri, Version::V5, &sub, &bad).await;
     let unsub = vec![0xA2, 6, 0, 0, 0, 0, 1, b't'];
     after_connect(&uri, Version::V5, &unsub, &bad).await;
-    let publish = publish_bytes(Version::V5, "t", b"x", QoS::AtLeastOnce, 0, &[]);
-    after_connect(&uri, Version::V5, &publish, &bad).await;
+    let packet = publish(&header(Version::V5, "t", QoS::AtLeastOnce, 0), b"x");
+    after_connect(&uri, Version::V5, &packet, &bad).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -528,35 +541,39 @@ async fn topic_alias_above_the_maximum_or_after_reconnect_is_invalid() {
     let (_ctx, _broker, uri) = setup(1, opts).await;
     // [MQTT-3.3.2-9]
     let alias = |n| props(&[Property::U16(TOPIC_ALIAS, n)]);
-    let publish = publish_bytes(Version::V5, "t", b"x", QoS::AtMostOnce, 0, &alias(5));
-    after_connect(&uri, Version::V5, &publish, &[reason::TOPIC_ALIAS_INVALID]).await;
+    let packet = publish(
+        &PublishHeader {
+            properties: &alias(5),
+            ..header(Version::V5, "t", QoS::AtMostOnce, 0)
+        },
+        b"x",
+    );
+    after_connect(&uri, Version::V5, &packet, &[reason::TOPIC_ALIAS_INVALID]).await;
     // Aliases end with the connection [MQTT-3.3.2-7].
     let mut raw = Raw::connect(&uri, "alias", Version::V5, 0).await;
     raw.subscribe("t", QoS::AtMostOnce.into()).await;
-    raw.pub_props("t", b"set", QoS::AtMostOnce, 0, &alias(1))
-        .await;
-    raw.pub_props("", b"used", QoS::AtMostOnce, 0, &alias(1))
-        .await;
+    raw.pub_props("t", b"set", &alias(1)).await;
+    raw.pub_props("", b"used", &alias(1)).await;
     assert_eq!(raw.publish().await.payload, b"set");
     assert_eq!(raw.publish().await.payload, b"used");
     raw.disconnect(0, &[]).await;
     raw.closed().await;
-    let publish = publish_bytes(Version::V5, "", b"stale", QoS::AtMostOnce, 0, &alias(1));
-    after_connect(&uri, Version::V5, &publish, &[reason::PROTOCOL_ERROR]).await;
+    let packet = publish(
+        &PublishHeader {
+            properties: &alias(1),
+            ..header(Version::V5, "", QoS::AtMostOnce, 0)
+        },
+        b"stale",
+    );
+    after_connect(&uri, Version::V5, &packet, &[reason::PROTOCOL_ERROR]).await;
 }
 
 /// A raw v5 subscriber with Receive Maximum 1, so each delivery waits for
 /// the ack of the one before.
 async fn one_at_a_time(uri: &str, id: &str, filter: &str, qos: QoS) -> Raw {
     let c = ConnectFields {
-        version: Version::V5,
-        clean_start: true,
-        keep_alive: 0,
         properties: &[Property::U16(RECEIVE_MAXIMUM, 1)],
-        client_id: id,
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, id)
     };
     let (mut raw, code) = Raw::connect_with(uri, &c).await;
     assert_eq!(code, 0);
@@ -638,14 +655,9 @@ async fn wrong_ack_type_is_a_protocol_error() {
     let (ctx, _broker, uri) = broker().await;
     let publ = client(&ctx, &uri, "p", Version::V5).await;
     let persistent = ConnectFields {
-        version: Version::V5,
         clean_start: false,
-        keep_alive: 0,
         properties: &[Property::U32(SESSION_EXPIRY_INTERVAL, 60)],
-        client_id: "wrong",
-        will: None,
-        username: None,
-        password: None,
+        ..fields(Version::V5, "wrong")
     };
     let (mut raw, _) = Raw::connect_with(&uri, &persistent).await;
     raw.subscribe("wrong/#", QoS::ExactlyOnce.into()).await;

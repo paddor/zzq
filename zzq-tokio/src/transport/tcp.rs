@@ -9,9 +9,9 @@ use std::task::{Context, Poll};
 #[cfg(feature = "tls")]
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
+use crate::Result;
 use crate::endpoint::Endpoint;
 use crate::transport::Stream;
-use crate::{Error, Result};
 
 /// A bound TCP endpoint.
 #[derive(Debug)]
@@ -24,15 +24,7 @@ pub struct TcpListener {
 impl TcpListener {
     pub(crate) async fn bind(host: &str, port: u16) -> Result<TcpListener> {
         let addr = (host, port);
-        let inner = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| match e.kind() {
-                io::ErrorKind::AddrInUse => Error::AddressInUse {
-                    endpoint: format!("tcp://{host}:{port}"),
-                    source: e,
-                },
-                _ => Error::Io(e),
-            })?;
+        let inner = tokio::net::TcpListener::bind(addr).await?;
         let port = inner.local_addr()?.port();
         Ok(TcpListener {
             inner,
@@ -56,15 +48,7 @@ impl TcpListener {
 }
 
 pub(crate) async fn connect(host: &str, port: u16) -> Result<Stream> {
-    let s = tokio::net::TcpStream::connect((host, port))
-        .await
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::ConnectionRefused => Error::Refused {
-                endpoint: format!("tcp://{host}:{port}"),
-                source: Some(e.into()),
-            },
-            _ => Error::Io(e),
-        })?;
+    let s = tokio::net::TcpStream::connect((host, port)).await?;
     s.set_nodelay(true)?;
     Ok(Stream::Tcp(s.into_std()?))
 }

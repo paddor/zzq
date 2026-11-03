@@ -98,16 +98,7 @@ impl Replica {
     /// Every lane and stripe journals its whole state, before any client
     /// comes: the followers of a forced epoch start from it.
     async fn rewrite_journals(&self) {
-        let mut done = Vec::new();
-        for lane in &self.shared.lanes {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if lane.control.push(crate::lane::Control::Rewrite(tx)).is_ok() {
-                done.push(rx);
-            }
-        }
-        for rx in done {
-            let _ = rx.await;
-        }
+        self.shared.tell_lanes(crate::lane::Control::Rewrite).await;
         self.shared.retained.rewrite();
     }
 
@@ -137,16 +128,7 @@ impl Replica {
     async fn drop_state(&mut self) {
         self.fail_proposed();
         crate::cluster::close_listeners(&self.shared);
-        let mut done = Vec::new();
-        for lane in &self.shared.lanes {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            if lane.control.push(crate::lane::Control::Reset(tx)).is_ok() {
-                done.push(rx);
-            }
-        }
-        for rx in done {
-            let _ = rx.await;
-        }
+        self.shared.tell_lanes(crate::lane::Control::Reset).await;
         self.shared.retained.reset();
         // What the lanes handed over before they dropped their state goes
         // with it, and the numbers of what they discarded are passed.
