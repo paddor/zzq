@@ -28,17 +28,7 @@ struct Case {
 
 #[derive(Clone, Copy)]
 enum Kind {
-    Throughput {
-        scenario: Scenario,
-        qos: u8,
-        size: usize,
-        pubs: usize,
-        subs: usize,
-        /// Puts each pair on two lanes.
-        cross: bool,
-        /// Topics per publisher.
-        topics: usize,
-    },
+    Throughput(Tput),
     LatencyP50 {
         qos: u8,
         size: usize,
@@ -56,6 +46,31 @@ enum Kind {
     },
 }
 
+/// A throughput run.
+#[derive(Clone, Copy)]
+struct Tput {
+    scenario: Scenario,
+    qos: u8,
+    size: usize,
+    pubs: usize,
+    subs: usize,
+    /// Puts each pair on two lanes.
+    cross: bool,
+    /// Topics per publisher.
+    topics: usize,
+}
+
+/// One pair at QoS 0 with 16 B messages, on one lane, one topic.
+const PAIR: Tput = Tput {
+    scenario: Scenario::Pairs,
+    qos: 0,
+    size: 16,
+    pubs: 1,
+    subs: 1,
+    cross: false,
+    topics: 1,
+};
+
 /// State added to a fresh broker.
 #[derive(Clone, Copy)]
 enum State {
@@ -71,281 +86,122 @@ enum State {
 const SESSIONS: usize = 20_000;
 
 const fn pairs(qos: u8, size: usize, pubs: usize) -> Kind {
-    Kind::Throughput {
-        scenario: Scenario::Pairs,
+    Kind::Throughput(Tput {
         qos,
         size,
         pubs,
-        subs: 1,
-        cross: false,
-        topics: 1,
-    }
+        ..PAIR
+    })
 }
 
 const fn cross(qos: u8, size: usize, pubs: usize) -> Kind {
-    Kind::Throughput {
-        scenario: Scenario::Pairs,
+    Kind::Throughput(Tput {
         qos,
         size,
         pubs,
-        subs: 1,
         cross: true,
-        topics: 1,
-    }
+        ..PAIR
+    })
 }
 
 const fn fanout(qos: u8, size: usize, subs: usize) -> Kind {
-    Kind::Throughput {
+    Kind::Throughput(Tput {
         scenario: Scenario::Fanout,
         qos,
         size,
-        pubs: 1,
         subs,
-        cross: false,
-        topics: 1,
-    }
+        ..PAIR
+    })
 }
 
 const fn fanin(qos: u8, size: usize, pubs: usize) -> Kind {
-    Kind::Throughput {
+    Kind::Throughput(Tput {
         scenario: Scenario::Fanin,
         qos,
         size,
         pubs,
-        subs: 1,
-        cross: false,
-        topics: 1,
-    }
+        ..PAIR
+    })
 }
 
 /// Pairs where each publisher cycles through `topics` topics.
 const fn spread(qos: u8, topics: usize) -> Kind {
-    Kind::Throughput {
-        scenario: Scenario::Pairs,
+    Kind::Throughput(Tput {
         qos,
-        size: 16,
-        pubs: 1,
-        subs: 1,
-        cross: false,
         topics,
-    }
+        ..PAIR
+    })
+}
+
+const fn case(key: &'static str, kind: Kind) -> Case {
+    Case { key, kind }
 }
 
 const ONE_LANE: &[Case] = &[
     // First, so memory freed by earlier cases does not hide the cost.
-    Case {
-        key: "idle_conn_kib",
-        kind: Kind::IdleMemory { conns: 20_000 },
-    },
-    Case {
-        key: "offline_session_bytes",
-        kind: Kind::StateMemory(State::Session),
-    },
-    Case {
-        key: "queued_100b_bytes",
-        kind: Kind::StateMemory(State::Queued),
-    },
-    Case {
-        key: "retained_100b_bytes",
-        kind: Kind::StateMemory(State::Retained),
-    },
-    Case {
-        key: "qos0_16b_msgs_s",
-        kind: pairs(0, 16, 1),
-    },
-    Case {
-        key: "qos0_256b_msgs_s",
-        kind: pairs(0, 256, 1),
-    },
-    Case {
-        key: "qos0_1k_msgs_s",
-        kind: pairs(0, 1024, 1),
-    },
-    Case {
-        key: "qos1_16b_msgs_s",
-        kind: pairs(1, 16, 1),
-    },
-    Case {
-        key: "qos2_16b_msgs_s",
-        kind: pairs(2, 16, 1),
-    },
-    Case {
-        key: "topics100k_qos0_16b_msgs_s",
-        kind: spread(0, 100_000),
-    },
-    Case {
-        key: "topics100k_qos1_16b_msgs_s",
-        kind: spread(1, 100_000),
-    },
-    Case {
-        key: "fanout16_qos0_16b_msgs_s",
-        kind: fanout(0, 16, 16),
-    },
-    Case {
-        key: "fanout16_qos1_16b_msgs_s",
-        kind: fanout(1, 16, 16),
-    },
-    Case {
-        key: "fanout16_qos2_16b_msgs_s",
-        kind: fanout(2, 16, 16),
-    },
-    Case {
-        key: "pairs16_qos0_16b_msgs_s",
-        kind: pairs(0, 16, 16),
-    },
-    Case {
-        key: "pairs16_qos2_16b_msgs_s",
-        kind: pairs(2, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos0_16b_msgs_s",
-        kind: fanin(0, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos1_16b_msgs_s",
-        kind: fanin(1, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos2_16b_msgs_s",
-        kind: fanin(2, 16, 16),
-    },
-    Case {
-        key: "rtt_qos0_16b_p50_us",
-        kind: Kind::LatencyP50 { qos: 0, size: 16 },
-    },
-    Case {
-        key: "rtt_qos1_16b_p50_us",
-        kind: Kind::LatencyP50 { qos: 1, size: 16 },
-    },
+    case("idle_conn_kib", Kind::IdleMemory { conns: 20_000 }),
+    case("offline_session_bytes", Kind::StateMemory(State::Session)),
+    case("queued_100b_bytes", Kind::StateMemory(State::Queued)),
+    case("retained_100b_bytes", Kind::StateMemory(State::Retained)),
+    case("qos0_16b_msgs_s", pairs(0, 16, 1)),
+    case("qos0_256b_msgs_s", pairs(0, 256, 1)),
+    case("qos0_1k_msgs_s", pairs(0, 1024, 1)),
+    case("qos1_16b_msgs_s", pairs(1, 16, 1)),
+    case("qos2_16b_msgs_s", pairs(2, 16, 1)),
+    case("topics100k_qos0_16b_msgs_s", spread(0, 100_000)),
+    case("topics100k_qos1_16b_msgs_s", spread(1, 100_000)),
+    case("fanout16_qos0_16b_msgs_s", fanout(0, 16, 16)),
+    case("fanout16_qos1_16b_msgs_s", fanout(1, 16, 16)),
+    case("fanout16_qos2_16b_msgs_s", fanout(2, 16, 16)),
+    case("pairs16_qos0_16b_msgs_s", pairs(0, 16, 16)),
+    case("pairs16_qos2_16b_msgs_s", pairs(2, 16, 16)),
+    case("fanin16_qos0_16b_msgs_s", fanin(0, 16, 16)),
+    case("fanin16_qos1_16b_msgs_s", fanin(1, 16, 16)),
+    case("fanin16_qos2_16b_msgs_s", fanin(2, 16, 16)),
+    case("rtt_qos0_16b_p50_us", Kind::LatencyP50 { qos: 0, size: 16 }),
+    case("rtt_qos1_16b_p50_us", Kind::LatencyP50 { qos: 1, size: 16 }),
 ];
 
 const TWO_LANES: &[Case] = &[
-    Case {
-        key: "fanout16_behind_rss_kib",
-        kind: Kind::BehindMemory { subs: 16 },
-    },
-    Case {
-        key: "pairs2_qos0_16b_msgs_s",
-        kind: pairs(0, 16, 2),
-    },
-    Case {
-        key: "pairs2_qos1_16b_msgs_s",
-        kind: pairs(1, 16, 2),
-    },
-    Case {
-        key: "cross2_qos0_16b_msgs_s",
-        kind: cross(0, 16, 2),
-    },
-    Case {
-        key: "cross2_qos1_16b_msgs_s",
-        kind: cross(1, 16, 2),
-    },
-    Case {
-        key: "pairs2_qos2_16b_msgs_s",
-        kind: pairs(2, 16, 2),
-    },
-    Case {
-        key: "cross2_qos2_16b_msgs_s",
-        kind: cross(2, 16, 2),
-    },
-    Case {
-        key: "fanout16_qos0_16b_msgs_s",
-        kind: fanout(0, 16, 16),
-    },
-    Case {
-        key: "fanout16_qos2_16b_msgs_s",
-        kind: fanout(2, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos2_16b_msgs_s",
-        kind: fanin(2, 16, 16),
-    },
+    case("fanout16_behind_rss_kib", Kind::BehindMemory { subs: 16 }),
+    case("pairs2_qos0_16b_msgs_s", pairs(0, 16, 2)),
+    case("pairs2_qos1_16b_msgs_s", pairs(1, 16, 2)),
+    case("cross2_qos0_16b_msgs_s", cross(0, 16, 2)),
+    case("cross2_qos1_16b_msgs_s", cross(1, 16, 2)),
+    case("pairs2_qos2_16b_msgs_s", pairs(2, 16, 2)),
+    case("cross2_qos2_16b_msgs_s", cross(2, 16, 2)),
+    case("fanout16_qos0_16b_msgs_s", fanout(0, 16, 16)),
+    case("fanout16_qos2_16b_msgs_s", fanout(2, 16, 16)),
+    case("fanin16_qos2_16b_msgs_s", fanin(2, 16, 16)),
 ];
 
 /// The journal paths, each case on a fresh broker and data directory.
 const ONE_LANE_DURABLE: &[Case] = &[
-    Case {
-        key: "qos1_16b_msgs_s",
-        kind: pairs(1, 16, 1),
-    },
-    Case {
-        key: "qos2_16b_msgs_s",
-        kind: pairs(2, 16, 1),
-    },
-    Case {
-        key: "qos1_4k_msgs_s",
-        kind: pairs(1, 4096, 1),
-    },
-    Case {
-        key: "qos2_4k_msgs_s",
-        kind: pairs(2, 4096, 1),
-    },
-    Case {
-        key: "pairs16_qos1_16b_msgs_s",
-        kind: pairs(1, 16, 16),
-    },
-    Case {
-        key: "pairs16_qos2_16b_msgs_s",
-        kind: pairs(2, 16, 16),
-    },
-    Case {
-        key: "fanout16_qos1_16b_msgs_s",
-        kind: fanout(1, 16, 16),
-    },
-    Case {
-        key: "fanout16_qos2_16b_msgs_s",
-        kind: fanout(2, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos1_16b_msgs_s",
-        kind: fanin(1, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos2_16b_msgs_s",
-        kind: fanin(2, 16, 16),
-    },
-    Case {
-        key: "ack_qos1_16b_p50_us",
-        kind: Kind::LatencyP50 { qos: 1, size: 16 },
-    },
+    case("qos1_16b_msgs_s", pairs(1, 16, 1)),
+    case("qos2_16b_msgs_s", pairs(2, 16, 1)),
+    case("qos1_4k_msgs_s", pairs(1, 4096, 1)),
+    case("qos2_4k_msgs_s", pairs(2, 4096, 1)),
+    case("pairs16_qos1_16b_msgs_s", pairs(1, 16, 16)),
+    case("pairs16_qos2_16b_msgs_s", pairs(2, 16, 16)),
+    case("fanout16_qos1_16b_msgs_s", fanout(1, 16, 16)),
+    case("fanout16_qos2_16b_msgs_s", fanout(2, 16, 16)),
+    case("fanin16_qos1_16b_msgs_s", fanin(1, 16, 16)),
+    case("fanin16_qos2_16b_msgs_s", fanin(2, 16, 16)),
+    case("ack_qos1_16b_p50_us", Kind::LatencyP50 { qos: 1, size: 16 }),
 ];
 
 const TWO_LANES_DURABLE: &[Case] = &[
-    Case {
-        key: "cross2_qos1_16b_msgs_s",
-        kind: cross(1, 16, 2),
-    },
-    Case {
-        key: "cross2_qos2_16b_msgs_s",
-        kind: cross(2, 16, 2),
-    },
-    Case {
-        key: "pairs16_qos1_16b_msgs_s",
-        kind: pairs(1, 16, 16),
-    },
-    Case {
-        key: "pairs16_qos2_16b_msgs_s",
-        kind: pairs(2, 16, 16),
-    },
-    Case {
-        key: "fanout16_qos2_16b_msgs_s",
-        kind: fanout(2, 16, 16),
-    },
-    Case {
-        key: "fanin16_qos2_16b_msgs_s",
-        kind: fanin(2, 16, 16),
-    },
+    case("cross2_qos1_16b_msgs_s", cross(1, 16, 2)),
+    case("cross2_qos2_16b_msgs_s", cross(2, 16, 2)),
+    case("pairs16_qos1_16b_msgs_s", pairs(1, 16, 16)),
+    case("pairs16_qos2_16b_msgs_s", pairs(2, 16, 16)),
+    case("fanout16_qos2_16b_msgs_s", fanout(2, 16, 16)),
+    case("fanin16_qos2_16b_msgs_s", fanin(2, 16, 16)),
 ];
 
 const BUSY: &[Case] = &[
-    Case {
-        key: "rtt_qos0_16b_p50_us",
-        kind: Kind::LatencyP50 { qos: 0, size: 16 },
-    },
-    Case {
-        key: "rtt_qos1_16b_p50_us",
-        kind: Kind::LatencyP50 { qos: 1, size: 16 },
-    },
+    case("rtt_qos0_16b_p50_us", Kind::LatencyP50 { qos: 0, size: 16 }),
+    case("rtt_qos1_16b_p50_us", Kind::LatencyP50 { qos: 1, size: 16 }),
 ];
 
 /// One broker configuration and its cases.
@@ -644,7 +500,7 @@ fn run_load(cpus: &str, addr: &str, sec: &Section, kind: Kind) -> Result<String,
         .arg(sec.lanes.to_string())
         .arg(if sec.durable { "keep" } else { "ram" });
     match kind {
-        Kind::Throughput {
+        Kind::Throughput(Tput {
             scenario,
             qos,
             size,
@@ -652,7 +508,7 @@ fn run_load(cpus: &str, addr: &str, sec: &Section, kind: Kind) -> Result<String,
             subs,
             cross,
             topics,
-        } => {
+        }) => {
             let s = match scenario {
                 Scenario::Pairs => "pairs",
                 Scenario::Fanout => "fanout",
@@ -753,7 +609,7 @@ fn behind_memory(
 
 fn result_value(line: &str, kind: Kind) -> Option<f64> {
     let key = match kind {
-        Kind::Throughput { .. } => "delivered=",
+        Kind::Throughput(_) => "delivered=",
         Kind::LatencyP50 { .. } => "p50=",
         Kind::IdleMemory { .. } => "kib_per_conn=",
         Kind::StateMemory(_) => "bytes_each=",
@@ -902,7 +758,7 @@ mod tests {
             assert!(
                 sec.cases
                     .iter()
-                    .any(|c| matches!(c.kind, Kind::Throughput { qos: 2, .. }))
+                    .any(|c| matches!(c.kind, Kind::Throughput(Tput { qos: 2, .. })))
             );
         }
     }
