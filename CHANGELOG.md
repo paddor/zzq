@@ -40,6 +40,12 @@ Notable changes to zzq. The format follows
   leader's own clock, and followers read it in cluster time, so on a
   node whose clock was off the others the message expired early or
   late there. It now writes cluster time, as other records do.
+- Clustering: a connection a leader took just before it lost the
+  leadership could send CONNECT after the node dropped its state. The
+  node then gave the client a new, empty session and kept it, so a
+  resuming client got none of its queued messages, and its next request
+  failed. Such a node now refuses CONNECT with Use Another Server until
+  it leads again.
 - `zzq-tokio`: `Error::AddressInUse` for a `tls://`, `ws://` or `wss://`
   bind named the endpoint `tcp://`, and TCP and QUIC errors dropped the
   brackets of an IPv6 host. Bind and connect errors now name the

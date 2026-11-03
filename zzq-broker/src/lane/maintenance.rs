@@ -164,8 +164,12 @@ impl Lane {
     }
 
     /// Adds sessions from a state file, with their subscriptions on every
-    /// lane and their delayed wills timed.
+    /// lane and their delayed wills timed. A cluster node's lane serves
+    /// from then on.
     pub(super) fn restore(&mut self, states: LaneState, sync: &Arc<SyncAck>) {
+        if self.phase == Phase::Standby {
+            self.phase = Phase::Open;
+        }
         self.restore_handoffs(states.handoffs);
         let lanes = self.shared.lanes.len();
         let now = crate::time::now();
@@ -196,8 +200,9 @@ impl Lane {
     }
 
     /// Starts over empty, without journaling: the node no longer leads,
-    /// and what the lane holds may not have committed. Connections close;
-    /// their clients go to the new leader.
+    /// and what the lane holds may not have committed. Connections close,
+    /// and the lane refuses new ones until it is restored: their clients
+    /// go to the new leader.
     pub(crate) fn reset(&mut self) {
         let keys: Vec<Key> = self.sessions.keys().collect();
         let mut sessions = std::mem::take(&mut self.sessions);

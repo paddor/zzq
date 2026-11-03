@@ -118,6 +118,9 @@ pub(crate) struct Lane {
 /// Whether a lane serves connections.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Phase {
+    /// A cluster node's lane without a leader's state: it refuses new
+    /// connections until the state is restored to it.
+    Standby,
     Open,
     /// Closing for a state dump: no new connections, and sessions and
     /// delayed wills wait with their due times.
@@ -185,6 +188,11 @@ impl Lane {
         let shared_journals = shared.journals();
         let total = LaneTotal::default();
         let handoffs = handoff::Routing::new(total.clone());
+        let phase = if shared.clustered() {
+            Phase::Standby
+        } else {
+            Phase::Open
+        };
         Lane {
             id,
             epoch: 0,
@@ -206,7 +214,7 @@ impl Lane {
             sweeps: 0,
             ids: Ids::default(),
             wills: BTreeMap::new(),
-            phase: Phase::Open,
+            phase,
             journal_unflushed: false,
             needs: hold::Needs::default(),
             pairs: pairs::Pairs::new(lanes, shared_journals),

@@ -272,8 +272,12 @@ fn establish(lane: &LaneRef, c: &mut OwnedConnect, conn: &Rc<ConnShared>) -> Res
             c.server_keep_alive = true;
             conn.keep_alive.set(max);
         }
-        if l.phase != Phase::Open {
-            return Err(reason::SERVER_UNAVAILABLE);
+        match l.phase {
+            Phase::Open => {}
+            // A connection taken while the node led, whose CONNECT came
+            // once it no longer did: its client goes to the leader.
+            Phase::Standby => return Err(reason::USE_ANOTHER_SERVER),
+            Phase::Closing | Phase::ShutDown => return Err(reason::SERVER_UNAVAILABLE),
         }
         // A new session that outlives its connection needs room in the state
         // budget.
