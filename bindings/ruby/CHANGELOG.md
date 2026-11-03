@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## v0.8.0 — 2026-11-03
+
+- Built on the zzq 0.6 crates. Bind and connect errors name the endpoint
+  as given: a `tls://`, `ws://` or `wss://` bind no longer says `tcp://`,
+  and an IPv6 host keeps its brackets.
+
 ## v0.7.0 — 2026-10-31
 
 - Built on the zzq 0.5 crates, with their fixes. With `data_dir:`, a QoS 2
