@@ -46,6 +46,9 @@ Notable changes to zzq. The format follows
   resuming client got none of its queued messages, and its next request
   failed. Such a node now refuses CONNECT with Use Another Server until
   it leads again.
+- Clustering: a leader that could not bind a client endpoint, as one
+  another process held, said nothing and served no client there.
+  `zzq_broker` now says so on stderr.
 - `zzq-tokio`: `Error::AddressInUse` for a `tls://`, `ws://` or `wss://`
   bind named the endpoint `tcp://`, and TCP and QUIC errors dropped the
   brackets of an IPv6 host. Bind and connect errors now name the

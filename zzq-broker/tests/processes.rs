@@ -92,17 +92,21 @@ struct Cluster {
 
 impl Cluster {
     fn start() -> Cluster {
+        Cluster::binding(NAMES.map(|_| format!("tcp://127.0.0.1:{}", free_port())))
+    }
+
+    /// Three nodes that bind `uris` while they lead.
+    fn binding(uris: [String; 3]) -> Cluster {
         let peers = NAMES
             .map(|n| format!("{n}=tcp://127.0.0.1:{}", free_port()))
             .join(",");
-        let uris = NAMES.map(|_| format!("tcp://127.0.0.1:{}", free_port()));
         let log = Log {
             start: Instant::now(),
             lines: Arc::default(),
         };
         let mut c = Cluster {
             peers,
-            uris: uris.to_vec(),
+            uris: Vec::from(uris),
             nodes: Vec::new(),
             log,
         };
@@ -473,6 +477,19 @@ async fn killed_mid_stream(online: bool) {
     let sub =
         receiving.unwrap_or_else(|| Subscriber::spawn(&finder, &ctx, opts, None, Duration::ZERO));
     sub.wait_all(&want).await;
+}
+
+/// A leader whose client endpoint another socket holds says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_that_cannot_bind_its_endpoint_says_so() {
+    let held: Vec<std::net::TcpListener> = (0..3)
+        .map(|_| std::net::TcpListener::bind(("127.0.0.1", free_port())).unwrap())
+        .collect();
+    let uris = [0, 1, 2].map(|i| format!("tcp://{}", held[i].local_addr().unwrap()));
+    let c = Cluster::binding(uris);
+    c.log
+        .wait_for(0, "leads but could not bind tcp://127.0.0.1:")
+        .await;
 }
 
 /// The leader dies, the next takes more messages, the first comes back

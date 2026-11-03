@@ -444,6 +444,19 @@ impl Broker {
         *groups.status.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// The client endpoints the broker's node of a cluster leads without,
+    /// as it could not bind them, and why. Engine API for `zzq_broker`.
+    #[doc(hidden)]
+    pub fn cluster_unbound(&self) -> Vec<(Endpoint, Arc<Error>)> {
+        self.shared
+            .cluster
+            .as_ref()
+            .map_or_else(Vec::new, |groups| {
+                let l = groups.listeners.lock();
+                l.unwrap_or_else(PoisonError::into_inner).unbound.clone()
+            })
+    }
+
     /// The ID that tells this broker's lane state apart on a lane thread.
     #[cfg(test)]
     pub(crate) fn id(&self) -> u64 {
