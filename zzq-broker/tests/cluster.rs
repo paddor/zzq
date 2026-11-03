@@ -119,6 +119,34 @@ fn a_connect_that_reaches_a_deposed_leader_late_is_refused() {
     });
 }
 
+/// A node whose client endpoint another listener holds leads without it,
+/// and tells which and why.
+#[test]
+fn a_leader_tells_the_endpoint_it_could_not_bind() {
+    use zzq_tokio::transport::{Listener, TransportOptions};
+
+    simulated(|| async {
+        let c = Cluster::new().await;
+        assert!(c.until(2, |c| c.leader() == Some(0)).await);
+        // A session, so the nodes commit an op to catch up on.
+        c.client(0, "kept", false).await.disconnect().await;
+        let node = "inproc://node-1".parse().unwrap();
+        let held = Listener::bind(&c.ctx, &node, &TransportOptions::default()).await;
+        assert!(held.is_ok());
+        c.lead(1).await;
+        let unbound = c.members[1].broker.as_ref().unwrap().cluster_unbound();
+        assert_eq!(unbound.len(), 1);
+        assert_eq!(unbound[0].0, node);
+        assert!(
+            unbound[0].1.to_string().contains("transport"),
+            "{}",
+            unbound[0].1
+        );
+        let old = c.members[0].broker.as_ref().unwrap().cluster_unbound();
+        assert!(old.is_empty(), "a follower leads without nothing");
+    });
+}
+
 #[test]
 fn a_deposed_leader_rebuilds_its_state_and_serves_it_when_it_leads_again() {
     simulated(|| async {
