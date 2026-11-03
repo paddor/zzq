@@ -2,7 +2,7 @@
 //! node. A failing test prints its steps and the nodes' stderr.
 
 #![cfg(all(unix, feature = "cluster"))]
-#![expect(clippy::unwrap_used, clippy::panic, reason = "tests fail loudly")]
+#![expect(clippy::unwrap_used, reason = "tests fail loudly")]
 
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -63,12 +63,12 @@ impl Log {
 /// A free TCP port on the loopback address, below the ephemeral range:
 /// a port-0 bind or a client socket elsewhere could take one in it before
 /// the node binds it. Never the same twice in a process, and each process
-/// counts from its own hundred, so two at once seldom meet.
+/// counts from its own fifty, so two at once seldom meet.
 fn free_port() -> u16 {
     use std::sync::atomic::AtomicU16;
 
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let start = (std::process::id() % 220) as u16 * 100;
+    let start = (std::process::id() % 440) as u16 * 50;
     loop {
         // Relaxed: only the count matters.
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
@@ -249,16 +249,83 @@ fn durable(id: &str) -> ClientOptions {
     }
 }
 
-/// Publishes `{topic}/0` to `{topic}/{n - 1}` to `topic` as QoS 1, each
-/// acked, and returns them.
-async fn batch(c: &Client, topic: &str, n: usize) -> BTreeSet<String> {
-    let mut acked = BTreeSet::new();
-    for i in 0..n {
-        let payload = format!("{topic}/{i}");
-        c.publish(topic, &payload, QoS::AtLeastOnce).await.unwrap();
-        acked.insert(payload);
+/// A client of `opts` subscribed to `filter` at QoS 1 on whichever node
+/// leads, again if the leadership moves first.
+async fn subscribed(finder: &Finder, ctx: &Context, opts: &ClientOptions, filter: &str) -> Client {
+    let end = Instant::now() + PATIENCE;
+    loop {
+        let (_, c) = finder.connect(ctx, opts, None).await;
+        match c.subscribe(filter, QoS::AtLeastOnce).await {
+            Ok(_) => return c,
+            Err(e) => finder
+                .log
+                .say(format_args!("{} subscribe: {e}", opts.client_id)),
+        }
+        assert!(Instant::now() < end, "{} did not subscribe", opts.client_id);
     }
-    acked
+}
+
+/// A publisher on whichever node leads, but `skip`. When the leadership
+/// moves, it connects again and publishes again what was not acked.
+struct Publisher {
+    finder: Finder,
+    ctx: Context,
+    opts: ClientOptions,
+    skip: Option<usize>,
+    /// The client and its node.
+    on: Option<(usize, Client)>,
+}
+
+impl Publisher {
+    fn new(finder: &Finder, ctx: &Context, id: &str, skip: Option<usize>) -> Publisher {
+        Publisher {
+            finder: finder.clone(),
+            ctx: ctx.clone(),
+            opts: options(id),
+            skip,
+            on: None,
+        }
+    }
+
+    /// The node that acked the last publish.
+    const fn node(&self) -> usize {
+        self.on.as_ref().unwrap().0
+    }
+
+    fn into_client(self) -> Client {
+        self.on.unwrap().1
+    }
+
+    /// Publishes `{topic}/0` to `{topic}/{n - 1}` to `topic` as QoS 1,
+    /// each acked, and returns them.
+    async fn batch(&mut self, topic: &str, n: usize) -> BTreeSet<String> {
+        let mut acked = BTreeSet::new();
+        for i in 0..n {
+            let payload = format!("{topic}/{i}");
+            self.publish(topic, &payload).await;
+            acked.insert(payload);
+        }
+        acked
+    }
+
+    /// Publishes until a node acks.
+    async fn publish(&mut self, topic: &str, payload: &str) {
+        let end = Instant::now() + PATIENCE;
+        loop {
+            if self.on.is_none() {
+                let c = self.finder.connect(&self.ctx, &self.opts, self.skip).await;
+                self.on = Some(c);
+            }
+            let (_, c) = self.on.as_ref().unwrap();
+            let Err(e) = c.publish(topic, payload, QoS::AtLeastOnce).await else {
+                return;
+            };
+            let id = &self.opts.client_id;
+            self.finder.log.say(format_args!("{id} {payload}: {e}"));
+            self.on = None;
+            assert!(Instant::now() < end, "no node acked {payload}");
+        }
+    }
 }
 
 /// Publishes `{topic}/0`, `{topic}/1` and so on to `topic` as QoS 1 until
@@ -277,16 +344,26 @@ async fn stream(publisher: Handle, topic: String, acked: Arc<Mutex<BTreeSet<Stri
     }
 }
 
+/// What a subscriber got.
+#[derive(Debug, Default)]
+struct Inbox {
+    /// Payloads as they came, repeats too.
+    payloads: Vec<String>,
+    /// A connect found the session gone.
+    lost: bool,
+}
+
 /// A durable subscriber that receives in a task, across reconnects.
 #[derive(Debug)]
 struct Subscriber {
-    got: Arc<Mutex<BTreeSet<String>>>,
+    inbox: Arc<Mutex<Inbox>>,
     task: JoinHandle<()>,
 }
 
 impl Subscriber {
     /// Receives as `opts` on `sub`, then from whichever node leads each
-    /// time the connection closes. Takes a message per `pace`.
+    /// time the connection closes, which must resume the session. Takes a
+    /// message per `pace`.
     fn spawn(
         finder: &Finder,
         ctx: &Context,
@@ -294,35 +371,51 @@ impl Subscriber {
         mut sub: Option<Client>,
         pace: Duration,
     ) -> Self {
-        let got = Arc::new(Mutex::new(BTreeSet::new()));
-        let (finder, ctx, into) = (finder.clone(), ctx.clone(), got.clone());
+        let inbox = Arc::new(Mutex::new(Inbox::default()));
+        let (finder, ctx, into) = (finder.clone(), ctx.clone(), inbox.clone());
         let task = tokio::spawn(async move {
             loop {
                 if sub.is_none() {
-                    sub = Some(finder.connect(&ctx, &opts, None).await.1);
+                    let (_, c) = finder.connect(&ctx, &opts, None).await;
+                    lock(&into).lost |= !c.connected().session_present;
+                    sub = Some(c);
                 }
                 let Some(m) = sub.as_mut().unwrap().recv().await else {
-                    let n = lock(&into).len();
+                    let n = lock(&into).payloads.len();
                     finder
                         .log
                         .say(format_args!("{} closed, {n} got", opts.client_id));
                     sub = None;
                     continue;
                 };
-                lock(&into).insert(String::from_utf8_lossy(&m.payload).into_owned());
+                let payload = String::from_utf8_lossy(&m.payload).into_owned();
+                lock(&into).payloads.push(payload);
                 tokio::time::sleep(pace).await;
             }
         });
-        Subscriber { got, task }
+        Subscriber { inbox, task }
     }
 
-    /// Waits until it got every one of `want`.
-    async fn wait_all(&self, want: &BTreeSet<String>) {
+    /// Waits until it got every one of `want`, and returns what it got in
+    /// the order each first came.
+    async fn wait_all(&self, want: &BTreeSet<String>) -> Vec<String> {
         let end = Instant::now() + PATIENCE;
         loop {
-            let missing: Vec<String> = want.difference(&lock(&self.got)).cloned().collect();
+            let (first, missing) = {
+                let inbox = lock(&self.inbox);
+                assert!(!inbox.lost, "a reconnect found the session gone");
+                let mut seen = BTreeSet::new();
+                let first: Vec<String> = inbox
+                    .payloads
+                    .iter()
+                    .filter(|p| seen.insert(p.as_str()))
+                    .cloned()
+                    .collect();
+                let missing = want.iter().filter(|w| !seen.contains(w.as_str()));
+                (first, missing.cloned().collect::<Vec<_>>())
+            };
             if missing.is_empty() {
-                return;
+                return first;
             }
             assert!(
                 Instant::now() < end,
@@ -388,33 +481,23 @@ async fn a_cluster_under_cpu_load_keeps_acked_messages_when_the_leader_dies() {
     leader_dies().await;
 }
 
-/// The new leader has the offline subscriber's session, with every
-/// message acked to the publisher, in order, on one connection.
+/// The next leader has the offline subscriber's session, with every
+/// message acked to the publisher, in the order sent.
 async fn leader_dies() {
     let mut c = Cluster::start();
     let finder = c.finder();
     let ctx = Context::new().unwrap();
-    let (_, sub) = finder.connect(&ctx, &durable("c-sub"), None).await;
-    sub.subscribe("q/#", QoS::AtLeastOnce).await.unwrap();
-    sub.disconnect().await;
-    let (leader, publisher) = finder.connect(&ctx, &options("c-pub"), None).await;
-    for i in 0..20 {
-        publisher
-            .publish("q/1", i.to_string(), QoS::AtLeastOnce)
-            .await
-            .unwrap();
-    }
-    c.kill(leader);
-    drop(publisher);
-    let (_, mut sub) = finder.connect(&ctx, &durable("c-sub"), Some(leader)).await;
-    assert!(sub.connected().session_present, "the session is gone");
-    for i in 0..20 {
-        match timeout(Duration::from_secs(5), sub.recv()).await {
-            Ok(Some(m)) => assert_eq!(m.payload, i.to_string()),
-            Ok(None) => panic!("the connection closed after {i} of 20 messages"),
-            Err(e) => panic!("message {i} of 20: {e} after 5 s"),
-        }
-    }
+    let opts = durable("c-sub");
+    subscribed(&finder, &ctx, &opts, "q/#")
+        .await
+        .disconnect()
+        .await;
+    let mut publisher = Publisher::new(&finder, &ctx, "c-pub", None);
+    let want = publisher.batch("q/1", 20).await;
+    c.kill(publisher.node());
+    let sub = Subscriber::spawn(&finder, &ctx, opts, None, Duration::ZERO);
+    let sent: Vec<String> = (0..20).map(|i| format!("q/1/{i}")).collect();
+    assert_eq!(sub.wait_all(&want).await, sent);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -442,8 +525,7 @@ async fn killed_mid_stream(online: bool) {
     let finder = c.finder();
     let ctx = Context::new().unwrap();
     let opts = durable("s-sub");
-    let (_, sub) = finder.connect(&ctx, &opts, None).await;
-    sub.subscribe("s/#", QoS::AtLeastOnce).await.unwrap();
+    let sub = subscribed(&finder, &ctx, &opts, "s/#").await;
     let mut receiving = None;
     if online {
         receiving = Some(Subscriber::spawn(
@@ -483,7 +565,7 @@ async fn killed_mid_stream(online: bool) {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_leader_that_cannot_bind_its_endpoint_says_so() {
     let held: Vec<std::net::TcpListener> = (0..3)
-        .map(|_| std::net::TcpListener::bind(("127.0.0.1", free_port())).unwrap())
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
         .collect();
     let uris = [0, 1, 2].map(|i| format!("tcp://{}", held[i].local_addr().unwrap()));
     let c = Cluster::binding(uris);
@@ -500,14 +582,16 @@ async fn a_restarted_node_keeps_acked_messages_when_the_next_leader_dies() {
     let finder = c.finder();
     let ctx = Context::new().unwrap();
     let opts = durable("r-sub");
-    let (_, sub) = finder.connect(&ctx, &opts, None).await;
-    sub.subscribe("r/#", QoS::AtLeastOnce).await.unwrap();
-    sub.disconnect().await;
-    let (first, publisher) = finder.connect(&ctx, &options("r-pub"), None).await;
-    let mut want = batch(&publisher, "r/1", 20).await;
+    subscribed(&finder, &ctx, &opts, "r/#")
+        .await
+        .disconnect()
+        .await;
+    let mut publisher = Publisher::new(&finder, &ctx, "r-pub", None);
+    let mut want = publisher.batch("r/1", 20).await;
+    let first = publisher.node();
     c.kill(first);
-    let (next, publisher) = finder.connect(&ctx, &options("r-pub"), Some(first)).await;
-    want.extend(batch(&publisher, "r/2", 20).await);
+    want.extend(publisher.batch("r/2", 20).await);
+    let next = publisher.node();
     let mark = c.log.len();
     c.restart(first);
     let follows = format!("cluster node {} follows", NAMES[first]);
@@ -526,18 +610,21 @@ async fn a_stopped_leader_that_goes_on_loses_no_acked_message() {
     let finder = c.finder();
     let ctx = Context::new().unwrap();
     let opts = durable("p-sub");
-    let (_, sub) = finder.connect(&ctx, &opts, None).await;
-    sub.subscribe("p/#", QoS::AtLeastOnce).await.unwrap();
-    sub.disconnect().await;
-    let (first, publisher) = finder.connect(&ctx, &options("p-pub"), None).await;
-    let mut want = batch(&publisher, "p/1", 20).await;
+    subscribed(&finder, &ctx, &opts, "p/#")
+        .await
+        .disconnect()
+        .await;
+    let mut publisher = Publisher::new(&finder, &ctx, "p-pub", None);
+    let mut want = publisher.batch("p/1", 20).await;
+    let first = publisher.node();
     c.signal(first, "-STOP");
+    let old = publisher.into_client();
     let stale = tokio::spawn(async move {
-        let sent = publisher.publish("p/0", "p/stale", QoS::AtLeastOnce);
+        let sent = old.publish("p/0", "p/stale", QoS::AtLeastOnce);
         timeout(PATIENCE, sent).await.is_ok_and(|r| r.is_ok())
     });
-    let (_, next) = finder.connect(&ctx, &options("p-next"), Some(first)).await;
-    want.extend(batch(&next, "p/2", 20).await);
+    let mut next = Publisher::new(&finder, &ctx, "p-next", Some(first));
+    want.extend(next.batch("p/2", 20).await);
     c.signal(first, "-CONT");
     if stale.await.unwrap() {
         c.log.say("the stopped leader acked p/stale");
