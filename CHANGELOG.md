@@ -5,6 +5,8 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-03
+
 ### Added
 
 - Clustering: the nodes send each other their wall time once a second
