@@ -8,6 +8,8 @@ use zzq_proto::{PacketType, QoS, SubscriptionOptions, Version};
 use super::support::{Got, Raw, header, publish, set_dup};
 use super::{Broker, Context, WAIT, durable, id_on, on_disk, setup};
 
+/// A crash image of the running broker's `source`. A file it removes
+/// meanwhile, as a segment a snapshot trimmed, is gone in a crash too.
 fn copy_tree(source: &Path, target: &Path) {
     std::fs::create_dir_all(target).unwrap();
     for entry in std::fs::read_dir(source).unwrap() {
@@ -15,8 +17,8 @@ fn copy_tree(source: &Path, target: &Path) {
         let to = target.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_tree(&entry.path(), &to);
-        } else {
-            std::fs::copy(entry.path(), to).unwrap();
+        } else if let Err(e) = std::fs::copy(entry.path(), to) {
+            assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}");
         }
     }
 }

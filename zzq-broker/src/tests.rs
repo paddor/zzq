@@ -808,9 +808,11 @@ fn on_disk(name: &str) -> (std::path::PathBuf, impl Fn() -> BrokerOptions + use<
     let _ = std::fs::remove_dir_all(&dir);
     let opts = {
         let dir = dir.clone();
+        // Segments take a whole packet: smaller ones keep them small.
         move || BrokerOptions {
             data_dir: Some(dir.clone()),
             sys_interval: None,
+            max_packet_size: 2 << 20,
             ..BrokerOptions::default()
         }
     };

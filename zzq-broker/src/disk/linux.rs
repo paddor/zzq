@@ -9,7 +9,12 @@ pub(crate) use zzq_disk::Record;
 use super::{Completion, Log};
 
 /// Bytes per segment file, unless a packet needs more.
+#[cfg(not(test))]
 const SEGMENT: u64 = 64 << 20;
+/// Small in tests: many run at once, and each journal fills its first
+/// segment with zeros.
+#[cfg(test)]
+const SEGMENT: u64 = 1 << 20;
 /// Room in a segment beyond a packet: framing and alignment.
 const SEGMENT_SLACK: u64 = 1 << 20;
 

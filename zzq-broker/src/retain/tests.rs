@@ -232,9 +232,14 @@ fn malformed_retained_handoffs_are_refused() {
 /// A data directory for the test `name`, or `None` where the temp
 /// directory takes no `O_DIRECT`.
 fn data_dir(name: &str) -> Option<(PathBuf, DataDir)> {
+    data_dir_for(name, 1 << 20)
+}
+
+/// [`data_dir`] with segments that take a `max_packet` message.
+fn data_dir_for(name: &str, max_packet: usize) -> Option<(PathBuf, DataDir)> {
     let path = std::env::temp_dir().join(format!("zzq-retain-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&path);
-    let data = DataDir::open(&path, 1 << 20).unwrap();
+    let data = DataDir::open(&path, max_packet).unwrap();
     match Retained::open(&data, usize::MAX, usize::MAX) {
         Ok(_) => Some((path, data)),
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
@@ -406,7 +411,7 @@ async fn the_cursor_follows_the_writes() {
 
 #[test]
 fn a_stripe_with_much_waiting_for_the_disk_is_crowded() {
-    let Some((path, data)) = data_dir("crowded") else {
+    let Some((path, data)) = data_dir_for("crowded", 2 * CROWDED) else {
         return;
     };
     let r = Retained::open(&data, usize::MAX, usize::MAX).unwrap();
