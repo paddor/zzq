@@ -42,16 +42,17 @@ let message = client.recv().await;
 
 ## Workspace
 
-Six Cargo workspace crates. `zzq-tokio`, `zzq-client` and `zzq-bench`
-forbid unsafe Rust. `zzq-proto` and `zzq-broker` each skip one UTF-8
-check on bytes known to be valid, and `zzq-disk` keeps its Linux AIO calls
-in one module.
+Seven Cargo workspace crates. `zzq-tokio`, `zzq-cluster`, `zzq-client`
+and `zzq-bench` have no unsafe Rust. `zzq-proto` and `zzq-broker` each
+skip one UTF-8 check on bytes known to be valid, and `zzq-disk` keeps its
+Linux AIO calls in one module.
 
 | Crate | What it does |
 | --- | --- |
 | [`zzq-proto`](zzq-proto/) | Sans-I/O `no_std` codec for MQTT 3.1.1, 5.0 and MQTT-SN, topic rules and a topic trie |
 | [`zzq-tokio`](zzq-tokio/) | `Context`, IO lanes and transports |
 | [`zzq-disk`](zzq-disk/) | Durable append-only journals, written with Linux AIO |
+| [`zzq-cluster`](zzq-cluster/) | Viewstamped Replication for a cluster of three |
 | [`zzq-broker`](zzq-broker/) | `Broker`: sessions, retained messages, wills, shared subscriptions, MQTT-SN gateway, auth hooks |
 | [`zzq-client`](zzq-client/) | `Client`, async and blocking, with reconnect and session resume |
 | [`zzq-bench`](zzq-bench/) | Load generators, the benchmark suite, perf gates and charts |
