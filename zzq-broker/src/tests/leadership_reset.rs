@@ -89,7 +89,7 @@ async fn a_reset_pair_waits_for_its_new_delivery_to_be_journaled() {
     use super::support::Got;
     use super::{durable, id_on, on_disk};
 
-    let (dir, opts) = on_disk("reset-pairs");
+    let (_dir, opts) = on_disk("reset-pairs");
     let (ctx, broker, uri) = setup(2, opts()).await;
     let publisher = id_on("pair-p", 0, 2);
     let subscriber = id_on("pair-s", 1, 2);
@@ -133,7 +133,6 @@ async fn a_reset_pair_waits_for_its_new_delivery_to_be_journaled() {
     assert_eq!(p.next().await, ack);
     assert_eq!(sub.publish().await.payload, b"after");
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

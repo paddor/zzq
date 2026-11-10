@@ -23,6 +23,7 @@ use zzq_proto::QoS;
 use crate::lane::Lane;
 use crate::{Broker, BrokerOptions, Context};
 use support::sn::SnClient;
+use support::temp_dir::TempDir;
 use support::{WAIT, fields, header, setup, stats_until};
 
 /// Polls `f` on lane `i` until it returns `Some`. Fails after [`WAIT`].
@@ -272,7 +273,7 @@ async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize, qos: QoS) {
     use support::{Got, Raw};
 
     let name = format!("congested-{lanes}-{qos:?}");
-    let (dir, opts) = on_disk(&name);
+    let (_dir, opts) = on_disk(&name);
     let opts = BrokerOptions {
         max_inflight: 1,
         qos_queue_high: 2,
@@ -322,7 +323,6 @@ async fn acks_wait_for_a_congested_subscriber_on_disk(lanes: usize, qos: QoS) {
     acks(&mut publisher, if lanes == 1 { &[3, 4] } else { &[4] }).await;
     publisher.quiet(100).await;
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A subscriber that never acks and is congested from its third message,
@@ -705,10 +705,9 @@ async fn a_failed_retained_write_nacks_v5_publishers_and_drops_v3_ones() {
 
     use support::{Got, Raw};
 
-    let dir = std::env::temp_dir().join(format!("zzq-failed-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("failed");
     let opts = BrokerOptions {
-        data_dir: Some(dir.clone()),
+        data_dir: Some(dir.to_path_buf()),
         sys_interval: None,
         ..BrokerOptions::default()
     };
@@ -752,7 +751,6 @@ async fn a_failed_retained_write_nacks_v5_publishers_and_drops_v3_ones() {
         .await;
     assert_eq!(ok.next().await, ack(PacketType::PubAck, 1, 0));
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -762,10 +760,9 @@ async fn a_failed_subscription_write_disconnects() {
 
     use support::{Got, Raw};
 
-    let dir = std::env::temp_dir().join(format!("zzq-failed-sub-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("failed-sub");
     let opts = BrokerOptions {
-        data_dir: Some(dir.clone()),
+        data_dir: Some(dir.to_path_buf()),
         sys_interval: None,
         ..BrokerOptions::default()
     };
@@ -798,16 +795,14 @@ async fn a_failed_subscription_write_disconnects() {
         }
     );
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Options of a broker on data directory `name`, and CONNECT fields for
-/// a session that outlives its connection.
-fn on_disk(name: &str) -> (std::path::PathBuf, impl Fn() -> BrokerOptions + use<>) {
-    let dir = std::env::temp_dir().join(format!("zzq-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+/// A data directory `name`, removed on drop, and the options of a broker
+/// on it.
+fn on_disk(name: &str) -> (TempDir, impl Fn() -> BrokerOptions + use<>) {
+    let dir = TempDir::new(name);
     let opts = {
-        let dir = dir.clone();
+        let dir = dir.to_path_buf();
         // Segments take a whole packet: smaller ones keep them small.
         move || BrokerOptions {
             data_dir: Some(dir.clone()),
@@ -817,6 +812,20 @@ fn on_disk(name: &str) -> (std::path::PathBuf, impl Fn() -> BrokerOptions + use<
         }
     };
     (dir, opts)
+}
+
+#[test]
+fn a_data_dir_is_removed_after_a_failed_assert() {
+    let mut path = None;
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (dir, _opts) = on_disk("failed-assert");
+        std::fs::create_dir_all(dir.join("lanes-1")).unwrap();
+        path = Some(dir.to_path_buf());
+        panic!("a failed assert");
+    }));
+    assert!(failed.is_err());
+    let path = path.unwrap();
+    assert!(!path.exists(), "{} is left", path.display());
 }
 
 const EXPIRY: [zzq_proto::Property<'static>; 1] = [zzq_proto::Property::U32(
@@ -839,7 +848,7 @@ async fn a_qos2_publish_repeated_after_a_restart_is_delivered_once() {
 
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("qos2-in");
+    let (_dir, opts) = on_disk("qos2-in");
     let publish = |dup| {
         let h = PublishHeader {
             dup,
@@ -877,7 +886,6 @@ async fn a_qos2_publish_repeated_after_a_restart_is_delivered_once() {
     sub.complete(&m).await;
     sub.quiet(300).await;
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -886,7 +894,7 @@ async fn a_released_delivery_gets_its_pubrel_after_a_restart() {
 
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("qos2-out");
+    let (_dir, opts) = on_disk("qos2-out");
     let pkid = {
         let (_ctx, broker, uri) = setup(1, opts()).await;
         let (mut sub, _) = Raw::connect_with(&uri, &durable("rel-sub")).await;
@@ -916,7 +924,6 @@ async fn a_released_delivery_gets_its_pubrel_after_a_restart() {
     sub.ack(PacketType::PubComp, pkid).await;
     sub.quiet(300).await;
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -960,7 +967,6 @@ async fn a_lane_snapshot_replaces_the_segments_before_it() {
     .await;
     assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The inode of `path`.
@@ -1025,7 +1031,6 @@ async fn a_lane_journal_without_room_for_a_segment_snapshots_into_its_spare() {
     .await;
     assert_eq!(subs, Some(vec!["a".to_owned(), "b".to_owned()]));
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1079,14 +1084,13 @@ async fn a_retained_journal_without_room_for_a_segment_snapshots_into_its_spare(
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload(), b"second");
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
     use zzq_proto::ReasonCode;
 
-    let (dir, opts) = on_disk("room");
+    let (_dir, opts) = on_disk("room");
     let (ctx, broker, uri) = setup(1, opts()).await;
     let durable = |id: &str| ClientOptions {
         clean_start: false,
@@ -1137,7 +1141,6 @@ async fn a_data_dir_short_of_room_stops_growth_not_traffic() {
     assert!(d.connected().session_present);
     assert_eq!(support::next(&mut d).await.payload, "kept");
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1147,7 +1150,7 @@ async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
     use crate::durable::JournalId;
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("lane-fail");
+    let (_dir, opts) = on_disk("lane-fail");
     let sub_id = id_on("fail-sub", 1, 2);
     let ack = |pkid, reason| Got::Ack {
         kind: PacketType::PubAck,
@@ -1183,7 +1186,6 @@ async fn a_failed_lane_write_nacks_publishers_on_other_lanes() {
     );
     while sub.publish().await.payload != b"kept" {}
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1193,7 +1195,7 @@ async fn a_failed_retained_write_rewrites_the_stripe() {
     use crate::durable::JournalId;
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("stripe-fail");
+    let (_dir, opts) = on_disk("stripe-fail");
     let publish = |pkid, payload: &[u8]| {
         let h = zzq_proto::encode::PublishHeader {
             retain: true,
@@ -1223,7 +1225,6 @@ async fn a_failed_retained_write_rewrites_the_stripe() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].payload(), b"second");
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1232,7 +1233,7 @@ async fn a_burst_to_another_lane_is_acked_once_journaled() {
 
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("burst");
+    let (_dir, opts) = on_disk("burst");
     let (_ctx, broker, uri) = setup(2, opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable(&id_on("burst-sub", 1, 2))).await;
     sub.subscribe("b/t", SubscriptionOptions::from(QoS::AtLeastOnce))
@@ -1255,7 +1256,6 @@ async fn a_burst_to_another_lane_is_acked_once_journaled() {
         );
     }
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1264,7 +1264,7 @@ async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
 
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("cross-hold");
+    let (_dir, opts) = on_disk("cross-hold");
     let (ctx, broker, uri) = setup(2, opts()).await;
     let qos1 = SubscriptionOptions::from(QoS::AtLeastOnce);
     let mut plain = Raw::connect(&uri, &id_on("plain-sub", 1, 2), Version::V5, 0).await;
@@ -1300,7 +1300,6 @@ async fn only_journaled_subscribers_on_other_lanes_hold_the_ack() {
     assert_eq!(plain.publish().await.payload, b"x");
     assert_eq!(kept.publish().await.payload, b"x");
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1309,7 +1308,7 @@ async fn acked_deliveries_go_out_with_later_writes() {
 
     use support::{Got, Raw};
 
-    let (dir, opts) = on_disk("done-along");
+    let (_dir, opts) = on_disk("done-along");
     let (ctx, broker, uri) = setup(1, opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable("along-sub")).await;
     sub.subscribe("a/t", SubscriptionOptions::from(QoS::AtLeastOnce))
@@ -1348,15 +1347,13 @@ async fn acked_deliveries_go_out_with_later_writes() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn stored_topics_deeper_than_allowed_are_not_loaded() {
-    let dir = std::env::temp_dir().join(format!("zzq-deep-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("deep");
     let opts = |max_topic_levels| BrokerOptions {
-        data_dir: Some(dir.clone()),
+        data_dir: Some(dir.to_path_buf()),
         max_topic_levels,
         sys_interval: None,
         ..BrokerOptions::default()
@@ -1371,7 +1368,6 @@ async fn stored_topics_deeper_than_allowed_are_not_loaded() {
     let (_ctx, broker, _uri) = setup(1, opts(128)).await;
     assert_eq!(broker.stats().await.unwrap().retained, 1);
     broker.shutdown().await.unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]

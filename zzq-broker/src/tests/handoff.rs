@@ -1,6 +1,5 @@
 //! QoS 2 handoffs: what waits for their journal writes, and what must not.
 
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
@@ -8,6 +7,7 @@ use zzq_proto::encode::ConnectFields;
 use zzq_proto::encode::PublishHeader;
 use zzq_proto::{PacketType, QoS, Version, reason};
 
+use super::support::temp_dir::TempDir;
 use super::support::{Got, Raw, fields, header, publish, set_dup};
 use super::{Broker, BrokerOptions, Lane, WAIT, durable, id_on, on_disk, on_lane, setup};
 use crate::durable::{JournalId, Wait};
@@ -39,9 +39,9 @@ fn retained(topic: &str, payload: &[u8], qos: QoS, pkid: u16) -> Vec<u8> {
 }
 
 /// The broker lets go of its data directory first.
-async fn clean_up(broker: Broker, dir: PathBuf) {
+async fn clean_up(broker: Broker, dir: TempDir) {
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
+    drop(dir);
 }
 
 /// A record of lane 0's journal that never comes.

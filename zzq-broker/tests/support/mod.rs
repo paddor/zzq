@@ -7,6 +7,7 @@
 )]
 
 pub(crate) mod sn;
+pub(crate) mod temp_dir;
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};

@@ -3,10 +3,15 @@
 
 #![expect(clippy::unwrap_used, reason = "tests fail loudly")]
 
+// The broker tests' guard for a test's files.
+#[path = "../../zzq-broker/tests/support/temp_dir.rs"]
+mod temp_dir;
+
 use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use temp_dir::TempDir;
 use zzq_bench::fixed::{self, Fixed, Report};
 use zzq_bench::load::{self, Keep, Load, Scenario, Until};
 use zzq_broker::{Authorizer, Broker, BrokerOptions, ClientInfo, Context, Stats};
@@ -113,10 +118,9 @@ async fn stats_when_idle(broker: &Broker) -> Stats {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rtt_times_the_acks_of_messages_kept_on_disk() {
-    let dir = std::env::temp_dir().join(format!("zzq-smoke-ack-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = TempDir::new("smoke-ack");
     let opts = BrokerOptions {
-        data_dir: Some(dir.clone()),
+        data_dir: Some(dir.to_path_buf()),
         sys_interval: None,
         ..BrokerOptions::default()
     };
@@ -140,7 +144,6 @@ async fn rtt_times_the_acks_of_messages_kept_on_disk() {
     let stats = stats_when_idle(&broker).await;
     assert_eq!((stats.retained, stats.sessions), (1, 1), "{stats:?}");
     drop(broker);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Lets no one publish.
@@ -359,8 +362,8 @@ fn the_perf_gate_runs_one_case() {
     if std::thread::available_parallelism().map_or(1, usize::from) < 2 {
         return;
     }
-    let dir = std::env::temp_dir().join(format!("zzq-gate-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("gate");
+    std::fs::create_dir_all(&*dir).unwrap();
     std::fs::write(dir.join(".perf_hw"), "[broker_1io]\nqos0_16b_msgs_s=1\n").unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_zzq_perf_verify"))
         .current_dir(&dir)
@@ -373,12 +376,11 @@ fn the_perf_gate_runs_one_case() {
         out.status.success() && stdout.contains("perf gate: PASS"),
         "{stdout}"
     );
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
 fn the_chart_tool_draws_every_chart_from_the_cache() {
-    let dir = std::env::temp_dir().join(format!("zzq-chart-{}", std::process::id()));
+    let dir = TempDir::new("chart");
     let cache = dir.join("cache/zzq");
     std::fs::create_dir_all(&cache).unwrap();
     let brokers = [
@@ -428,7 +430,6 @@ fn the_chart_tool_draws_every_chart_from_the_cache() {
             assert!(svg.contains(text), "{file} lacks {text}");
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A port nothing listens on right now.
@@ -477,11 +478,11 @@ fn the_fake_broker_measures_a_client_at_every_qos() {
 #[test]
 fn the_suite_smoke_runs_a_suite_and_records_nothing() {
     let suite = env!("CARGO_BIN_EXE_zzq_suite");
-    let cache = std::env::temp_dir().join(format!("zzq-suite-smoke-{}", std::process::id()));
+    let cache = TempDir::new("suite-smoke");
     let run = |args: &[&str]| {
         Command::new(suite)
             .args(args)
-            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_CACHE_HOME", &*cache)
             .output()
             .unwrap()
     };
@@ -510,5 +511,4 @@ fn the_suite_smoke_runs_a_suite_and_records_nothing() {
     assert!(!run(&["nope"]).status.success());
     assert!(!run(&["all", "nope"]).status.success());
     assert!(!run(&["fixed", "nope"]).status.success());
-    std::fs::remove_dir_all(&cache).unwrap();
 }

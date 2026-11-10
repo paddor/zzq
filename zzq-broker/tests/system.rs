@@ -1428,12 +1428,10 @@ async fn mutual_tls_identifies_clients() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn retained_messages_survive_restart() {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("zzq-retained-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = support::temp_dir::TempDir::new("retained");
     for run in 0..2 {
         let opts = BrokerOptions {
-            data_dir: Some(dir.clone()),
+            data_dir: Some(dir.to_path_buf()),
             ..BrokerOptions::default()
         };
         let (ctx, broker, uri) = support::setup(2, opts).await;
@@ -1456,14 +1454,11 @@ async fn retained_messages_survive_restart() {
         drop(broker);
         drop(ctx);
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sessions_move_lanes_when_the_lane_count_changes() {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("zzq-relane-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
+    let dir = support::temp_dir::TempDir::new("relane");
     let durable = |id: String| ClientOptions {
         clean_start: false,
         session_expiry: 600,
@@ -1472,7 +1467,7 @@ async fn sessions_move_lanes_when_the_lane_count_changes() {
     let ids: Vec<String> = (0..12).map(|i| format!("moving-{i}")).collect();
     for lanes in [2, 3, 1] {
         let opts = BrokerOptions {
-            data_dir: Some(dir.clone()),
+            data_dir: Some(dir.to_path_buf()),
             ..BrokerOptions::default()
         };
         let (ctx, broker, uri) = support::setup(lanes, opts).await;
@@ -1510,7 +1505,6 @@ async fn sessions_move_lanes_when_the_lane_count_changes() {
         .filter(|n| n.starts_with("lanes-"))
         .collect();
     assert_eq!(dirs, ["lanes-1"]);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test(flavor = "multi_thread")]
