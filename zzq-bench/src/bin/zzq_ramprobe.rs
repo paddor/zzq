@@ -15,10 +15,8 @@
 //! brokers other than zzq.
 
 use std::io;
-use std::net::TcpStream;
-use std::process::{Child, Command, ExitCode, Stdio};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::process::{Command, ExitCode};
+use std::time::Duration;
 
 use zzq_bench::args::Kv;
 use zzq_bench::child;
@@ -101,10 +99,9 @@ fn parse(args: &[String]) -> Option<Args> {
 
 /// Measures one step on a fresh broker.
 fn run(a: &Args, step: Step) -> io::Result<()> {
-    let (mut broker, addr) = start(a)?;
-    let grown = measure(a, &addr, broker.id(), step);
-    let _ = broker.kill();
-    let _ = broker.wait();
+    let broker = start(a)?;
+    let grown = measure(a, broker.addr(), broker.id(), step);
+    drop(broker);
     let name = match step {
         Step::Sessions => "offline session, 2 subs".to_owned(),
         Step::Queued(size) => format!("queued {size} B"),
@@ -131,8 +128,8 @@ fn measure(a: &Args, addr: &str, pid: u32, step: Step) -> io::Result<Growth> {
     }
 }
 
-/// Starts the broker and returns its `host:port`.
-fn start(a: &Args) -> io::Result<(Child, String)> {
+/// Starts the broker.
+fn start(a: &Args) -> io::Result<child::Broker> {
     let Some((exe, args)) = a.command.split_first() else {
         let mut cmd = Command::new(std::env::current_exe()?);
         let sys_ms = a.sys.map_or(0, |d| d.as_millis());
@@ -143,20 +140,10 @@ fn start(a: &Args) -> io::Result<(Child, String)> {
     };
     let mut cmd = Command::new(exe);
     cmd.args(args);
-    let Some(addr) = &a.addr else {
-        return child::spawn(cmd);
-    };
-    let mut broker = cmd.stdout(Stdio::null()).spawn()?;
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while TcpStream::connect(addr).is_err() {
-        if Instant::now() > deadline {
-            let _ = broker.kill();
-            let _ = broker.wait();
-            return Err(io::Error::other(format!("nothing listens on {addr}")));
-        }
-        thread::sleep(Duration::from_millis(50));
+    match &a.addr {
+        Some(addr) => child::spawn_on(cmd, addr, Duration::from_secs(10)),
+        None => child::spawn(cmd),
     }
-    Ok((broker, addr.clone()))
 }
 
 fn print(name: &str, g: &Growth) {

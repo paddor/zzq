@@ -5,6 +5,12 @@ Notable changes to zzq. The format follows
 
 ## [Unreleased]
 
+### Fixed
+
+- `zzq-bench`: `zzq_perf_verify` and `zzq_ramprobe` left a broker child
+  running when a run panicked. A guard now kills and reaps it on every
+  exit path.
+
 ## [0.6.0] - 2026-11-03
 
 ### Added
