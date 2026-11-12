@@ -14,8 +14,8 @@ fn nodes_with_right_clocks_agree_and_need_no_correction() {
     let mut sim = Sim::new(1, CLEAN);
     started(&mut sim);
     sim.run(100);
-    for i in 0..3 {
-        let clock = sim.nodes[i].as_ref().unwrap().clock();
+    for (i, node) in sim.nodes.iter().enumerate() {
+        let clock = node.as_ref().unwrap().clock();
         assert_eq!(clock.majority, Some(0), "node {i}");
         for (peer, offset) in clock.offsets {
             let offset = offset.unwrap_or_else(|| panic!("node {i} has no sample of {peer:?}"));

@@ -725,8 +725,8 @@ fn a_node_with_state_stays_out_of_an_epoch_another_forced() {
         (sim.epoch(0), sim.epoch(1), sim.epoch(2)),
         (Some(1), Some(1), Some(2))
     );
-    for i in 0..2 {
-        let status = sim.nodes[i].as_ref().unwrap().status();
+    for (i, node) in sim.nodes[..2].iter().enumerate() {
+        let status = node.as_ref().unwrap().status();
         assert_eq!(status.newer_epoch, Some(2), "node {i} says it saw epoch 2");
     }
     // Alone, the forced node never leads: no follower acks it.

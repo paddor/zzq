@@ -10,7 +10,6 @@ use zzq_broker::{BrokerOptions, Config, Context};
 
 /// Runs a zzq broker on a free port of 127.0.0.1 until the process is
 /// killed. Prints its endpoint first.
-#[must_use]
 pub fn serve(cfg: &Config, opts: BrokerOptions) -> ExitCode {
     let Ok(rt) = tokio::runtime::Builder::new_current_thread()
         .enable_all()

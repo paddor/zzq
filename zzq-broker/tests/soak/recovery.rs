@@ -121,9 +121,9 @@ impl Cluster {
             }
             Kind::Restart => {
                 // Followers stop first so the leader can write its current dump.
-                for i in 0..3 {
+                for (i, node) in self.nodes.iter_mut().enumerate() {
                     if i != leader {
-                        self.nodes[i].stop(true).await;
+                        node.stop(true).await;
                     }
                 }
                 self.nodes[leader].stop(true).await;
