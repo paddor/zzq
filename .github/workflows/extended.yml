@@ -59,6 +59,9 @@ jobs:
       AFL_NO_UI: "1"
       AFL_SKIP_CPUFREQ: "1"
       AFL_I_DONT_CARE_ABOUT_MISSING_CRASHES: "1"
+      # These come after AFL's own flags. `cargo afl` builds for the native
+      # CPU, and the cache may come from a runner with another one.
+      RUSTFLAGS: -D warnings -C target-cpu=x86-64
     steps:
       - uses: actions/checkout@v7
         with:
@@ -69,8 +72,10 @@ jobs:
           workspaces: fuzz/afl
       - name: install cargo-afl
         run: |
-          cargo install cargo-afl --locked --version 0.18.2
-          cargo afl config --build
+          # Again over a cached one: AFL++ builds from the sources the
+          # install fetches.
+          cargo install cargo-afl --locked --version 0.18.2 --force
+          cargo afl config --build --force
       - name: build targets and seeds
         run: |
           cargo afl build --release
