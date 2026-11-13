@@ -70,7 +70,7 @@ fn ack(kind: PacketType) -> Got {
 async fn a_qos2_delivery_waits_for_its_packet_id_to_reach_the_journal() {
     use std::sync::atomic::Ordering;
 
-    let (dir, opts) = on_disk("qos2-output-barrier");
+    let (_dir, opts) = on_disk("qos2-output-barrier");
     let (_ctx, broker, uri) = setup(1, opts()).await;
     let (mut sub, _) = Raw::connect_with(&uri, &durable("barrier-sub")).await;
     sub.subscribe("barrier/t", SubscriptionOptions::from(QoS::ExactlyOnce))
@@ -84,7 +84,6 @@ async fn a_qos2_delivery_waits_for_its_packet_id_to_reach_the_journal() {
     log.paused.store(false, Ordering::Relaxed);
     assert_eq!(sub.publish().await.payload, b"once");
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -144,8 +143,6 @@ async fn missing_destination(name: &str, snapshot: bool, lanes_after: usize) {
     sub.complete(&message).await;
     sub.quiet(100).await;
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    std::fs::remove_dir_all(copy).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -202,8 +199,6 @@ async fn a_committed_destination_does_not_repeat_an_unfinished_source_handoff() 
     assert_eq!(p.next().await, ack(PacketType::PubComp));
     sub.quiet(100).await;
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    std::fs::remove_dir_all(copy).unwrap();
 }
 
 /// The publisher has its PUBREC, so it only sends PUBREL again. The routing
@@ -238,8 +233,6 @@ async fn a_pubrec_sent_before_the_destination_has_it_still_delivers_after_a_cras
         sub.complete(&message).await;
         sub.quiet(100).await;
         broker.shutdown().await.unwrap();
-        std::fs::remove_dir_all(dir).unwrap();
-        std::fs::remove_dir_all(copy).unwrap();
     }
 }
 
@@ -275,8 +268,6 @@ async fn a_written_publish_to_its_own_lane_is_not_repeated_after_a_crash() {
     sub.complete(&got).await;
     sub.quiet(100).await;
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    std::fs::remove_dir_all(copy).unwrap();
 }
 
 /// The crash took the record: the retry is the message's first arrival.
@@ -320,8 +311,6 @@ async fn an_unwritten_publish_to_its_own_lane_is_new_after_a_crash() {
     sub.complete(&got).await;
     sub.quiet(100).await;
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    std::fs::remove_dir_all(copy).unwrap();
 }
 
 /// The crash took the store's write, but the routing decision was on disk.
@@ -363,13 +352,11 @@ async fn a_recovered_handoff_puts_its_retained_message_in_the_store() {
     late.subscribe("store/t", QoS::AtMostOnce.into()).await;
     assert_eq!(late.publish().await.payload, b"once");
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
-    std::fs::remove_dir_all(copy).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_negative_pubrec_releases_the_packet_id_after_restart() {
-    let (dir, opts) = on_disk("qos2-negative-pubrec");
+    let (_dir, opts) = on_disk("qos2-negative-pubrec");
     {
         let (_ctx, broker, uri) = setup(1, opts()).await;
         broker.shared().retained.cursor_of("nack/t").fail(1, 1);
@@ -399,5 +386,4 @@ async fn a_negative_pubrec_releases_the_packet_id_after_restart() {
     assert_eq!(p.next().await, ack(PacketType::PubRec));
     assert_eq!(sub.publish().await.payload, b"new");
     broker.shutdown().await.unwrap();
-    std::fs::remove_dir_all(dir).unwrap();
 }

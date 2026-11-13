@@ -2,6 +2,13 @@
 
 use std::process::{Child, Command};
 
+#[cfg(unix)]
+#[path = "support/temp_dir.rs"]
+mod temp_dir;
+
+#[cfg(unix)]
+use temp_dir::TempDir;
+
 const EXE: &str = env!("CARGO_BIN_EXE_zzq_broker");
 
 /// Kills the broker when the test ends, even on failure.
@@ -35,16 +42,6 @@ fn spawn(args: &[&str]) -> (Running, String) {
     (Running(child), uri.trim().to_owned())
 }
 
-/// A fresh data directory for the test `name`, on the target directory's
-/// file system, which takes `O_DIRECT`.
-#[cfg(unix)]
-fn data_dir(name: &str) -> std::path::PathBuf {
-    let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("zzq-bin-{name}-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    dir
-}
-
 #[test]
 fn bad_flags_print_usage() {
     let out = Command::new(EXE).args(["--nope", "x"]).output().unwrap();
@@ -68,8 +65,8 @@ async fn sigterm_keeps_sessions_in_the_state_file() {
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
-    let dir = std::env::temp_dir().join(format!("zzq-bin-state-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let dir = TempDir::new("bin-state");
+    std::fs::create_dir_all(&*dir).unwrap();
     let file = dir.join("state");
     let start = || spawn(&["--lanes", "2", "--state-file", file.to_str().unwrap()]);
     // SIGTERM, then a clean exit.
@@ -100,7 +97,6 @@ async fn sigterm_keeps_sessions_in_the_state_file() {
     let c = Client::connect(&ctx, &uri, durable).await.unwrap();
     assert!(c.connected().session_present);
     stop(broker);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -112,7 +108,7 @@ async fn sigterm_writes_every_retained_change_first() {
     use zzq_client::{Client, ClientOptions, QoS};
 
     const N: usize = 50_000;
-    let dir = data_dir("retained");
+    let dir = TempDir::new("bin-retained");
     let start = || spawn(&["--lanes", "1", "--data-dir", dir.to_str().unwrap()]);
     let ctx = Context::new().unwrap();
     let (mut broker, uri) = start();
@@ -151,7 +147,6 @@ async fn sigterm_writes_every_retained_change_first() {
         got += 1;
     }
     assert_eq!(got, N + 1, "retained messages after the restart");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -162,7 +157,7 @@ async fn sigkill_keeps_acked_retained_messages() {
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
-    let dir = data_dir("sigkill");
+    let dir = TempDir::new("bin-sigkill");
     let args = ["--data-dir", dir.to_str().unwrap()];
     // Big, so a write behind an early ack would still run when the kill
     // lands.
@@ -190,7 +185,6 @@ async fn sigkill_keeps_acked_retained_messages() {
         .flatten()
         .expect("the acked retained message after the restart");
     assert!(got.payload == payload, "payload changed");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -201,7 +195,7 @@ async fn sigkill_keeps_sessions_and_their_subscriptions() {
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, LastWill, QoS};
 
-    let dir = data_dir("sessions");
+    let dir = TempDir::new("bin-sessions");
     let args = ["--lanes", "2", "--data-dir", dir.to_str().unwrap()];
     let durable = |id: &str| ClientOptions {
         clean_start: false,
@@ -243,7 +237,6 @@ async fn sigkill_keeps_sessions_and_their_subscriptions() {
         .unwrap();
     p.publish("s/1", "after", QoS::AtLeastOnce).await.unwrap();
     assert_eq!(next(&mut c).await.payload, "after");
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Runs the broker with `lanes`, queues acked QoS 1 and 2 messages for an
@@ -257,7 +250,7 @@ async fn acked_messages_survive_sigkill(lanes: &str) {
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
-    let dir = data_dir(&format!("queue-{lanes}"));
+    let dir = TempDir::new(&format!("bin-queue-{lanes}"));
     let args = ["--lanes", lanes, "--data-dir", dir.to_str().unwrap()];
     let durable = |id: &str| ClientOptions {
         clean_start: false,
@@ -298,7 +291,6 @@ async fn acked_messages_survive_sigkill(lanes: &str) {
             assert_eq!(m.payload, i.to_string(), "{id}");
         }
     }
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[cfg(unix)]
@@ -321,15 +313,14 @@ mod tls {
     use zzq_broker::Context;
     use zzq_client::{Client, ClientOptions, QoS};
 
-    use super::{EXE, Running};
+    use super::{EXE, Running, TempDir};
 
     #[tokio::test(flavor = "multi_thread")]
 
     async fn serves_tcp_and_tls_with_retained_messages_on_disk() {
-        let dir = std::path::Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join(format!("zzq-bin-tls-{}", std::process::id()));
+        let dir = TempDir::new("bin-tls");
 
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&*dir).unwrap();
 
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
 
@@ -399,7 +390,5 @@ mod tls {
         };
 
         assert!(Client::connect(&ctx, &tls, anonymous).await.is_err());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

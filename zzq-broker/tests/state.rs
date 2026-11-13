@@ -11,10 +11,11 @@
 mod support;
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use support::temp_dir::TempDir;
 use support::{Got, Raw, WAIT, client, fields, next};
 use tokio::time::timeout;
 use zzq_broker::{Broker, BrokerOptions, Config, Context, Error, lane_for};
@@ -26,11 +27,10 @@ use zzq_proto::{Property, QoS, Version, reason};
 /// A session that outlives its connection by ten minutes.
 const KEEP: Property<'static> = Property::U32(SESSION_EXPIRY_INTERVAL, 600);
 
-/// An empty directory for one test.
-fn dir(name: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!("zzq-state-{}-{name}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&d);
-    std::fs::create_dir_all(&d).unwrap();
+/// An empty directory for one test, removed when it ends.
+fn dir(name: &str) -> TempDir {
+    let d = TempDir::new(&format!("state-{name}"));
+    std::fs::create_dir_all(&*d).unwrap();
     d
 }
 
@@ -138,7 +138,6 @@ async fn sessions_queues_and_retained_survive_a_restart() {
     // The subscription is back on every lane.
     late.publish("q", "live", QoS::AtLeastOnce).await.unwrap();
     assert_eq!(next(&mut sub).await.payload, "live");
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -179,7 +178,6 @@ async fn wills_of_connections_open_at_shutdown_go_out() {
     assert_eq!(next(&mut w).await.topic.to_string(), "will/now");
     assert_eq!(next(&mut w).await.topic.to_string(), "will/later");
     assert!(started.elapsed() >= Duration::from_millis(900));
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 /// Publishes 0, 1, 2, ... at QoS 1 to `stream` until the client closes, and
@@ -247,7 +245,6 @@ async fn messages_acked_before_shutdown_are_kept() {
     let kept: HashSet<u32> = got.into_iter().collect();
     let lost: Vec<u32> = acked.difference(&kept).copied().collect();
     assert!(lost.is_empty(), "{} acked, lost {lost:?}", acked.len());
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -282,7 +279,6 @@ async fn sessions_of_many_frames_on_every_lane_survive() {
             assert_eq!(next(&mut s).await.payload, payload(i), "{id}");
         }
     }
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -302,7 +298,6 @@ async fn a_torn_state_file_stops_the_start_and_stays() {
         assert!(matches!(err, Error::State(_)), "{err:?}");
         assert!(file.exists());
     }
-    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -314,5 +309,4 @@ async fn a_damaged_state_file_stops_the_start_and_stays() {
     let err = Broker::new(&ctx, opts(&file)).await.unwrap_err();
     assert!(matches!(err, Error::State(_)), "{err:?}");
     assert!(file.exists());
-    let _ = std::fs::remove_dir_all(&d);
 }

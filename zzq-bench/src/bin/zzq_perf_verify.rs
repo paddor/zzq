@@ -12,7 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Command, ExitCode, Stdio};
 use std::time::Duration;
 
 use zzq_bench::child;
@@ -364,7 +364,7 @@ fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io:
     let (section, cases) = (sec.name, sec.cases);
     let (broker_cpus, load_cpus) = sec.cpus();
     // A durable case starts its own, on a new data directory.
-    let mut shared = if sec.durable {
+    let shared = if sec.durable {
         None
     } else {
         Some(spawn_broker(&broker_cpus, sec, None)?)
@@ -377,12 +377,12 @@ fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io:
         };
         let tries = if sec.durable { DURABLE_TRIES } else { 1 };
         let measure = || match (&shared, case.kind) {
-            (Some((broker, addr)), Kind::IdleMemory { conns }) => {
-                idle_memory(addr, conns, broker.id())
+            (Some(broker), Kind::IdleMemory { conns }) => {
+                idle_memory(broker.addr(), conns, broker.id())
             }
             (_, Kind::StateMemory(state)) => state_memory(&broker_cpus, sec, state),
             (_, Kind::BehindMemory { subs }) => behind_memory(&broker_cpus, &load_cpus, sec, subs),
-            (Some((_, addr)), kind) => run_load(&load_cpus, addr, sec, kind),
+            (Some(broker), kind) => run_load(&load_cpus, broker.addr(), sec, kind),
             (None, kind) => durable_load(&broker_cpus, &load_cpus, sec, kind),
         };
         let (line, took) = until_passes(tries, measure, |l| meets(l, case, limit));
@@ -409,10 +409,6 @@ fn run_section(sec: &Section, limits: Option<&HashMap<String, f64>>) -> std::io:
             human(limit),
             line.unwrap_or_default()
         );
-    }
-    if let Some((broker, _)) = &mut shared {
-        let _ = broker.kill();
-        let _ = broker.wait();
     }
     Ok(failed)
 }
@@ -446,12 +442,8 @@ fn durable_load(
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let spawned = spawn_broker(broker_cpus, sec, Some(&dir)).map_err(|e| e.to_string());
-    let line = spawned.and_then(|(mut broker, addr)| {
-        let line = run_load(load_cpus, &addr, sec, kind);
-        let _ = broker.kill();
-        let _ = broker.wait();
-        line
-    });
+    // The broker goes before its directory.
+    let line = spawned.and_then(|broker| run_load(load_cpus, broker.addr(), sec, kind));
     let _ = std::fs::remove_dir_all(&dir);
     line
 }
@@ -482,7 +474,7 @@ fn pinned(cpus: &str) -> Command {
     }
 }
 
-fn spawn_broker(cpus: &str, sec: &Section, dir: Option<&Path>) -> std::io::Result<(Child, String)> {
+fn spawn_broker(cpus: &str, sec: &Section, dir: Option<&Path>) -> std::io::Result<child::Broker> {
     let mut cmd = pinned(cpus);
     cmd.arg("--broker-child")
         .arg(sec.lanes.to_string())
@@ -571,14 +563,14 @@ fn idle_memory(addr: &str, conns: usize, broker: u32) -> Result<String, String> 
 /// Adds state to a fresh broker child and reports how much its RSS grew
 /// per item.
 fn state_memory(cpus: &str, sec: &Section, state: State) -> Result<String, String> {
-    let (mut broker, addr) = spawn_broker(cpus, sec, None).map_err(|e| e.to_string())?;
-    let grown = Probe::new(&addr, broker.id(), true, None).and_then(|mut probe| match state {
-        State::Session => probe.sessions(SESSIONS),
-        State::Queued => probe.sessions(SESSIONS).and_then(|_| probe.queued(10, 100)),
-        State::Retained => probe.retained(100_000, 100),
-    });
-    let _ = broker.kill();
-    let _ = broker.wait();
+    let broker = spawn_broker(cpus, sec, None).map_err(|e| e.to_string())?;
+    let grown =
+        Probe::new(broker.addr(), broker.id(), true, None).and_then(|mut probe| match state {
+            State::Session => probe.sessions(SESSIONS),
+            State::Queued => probe.sessions(SESSIONS).and_then(|_| probe.queued(10, 100)),
+            State::Retained => probe.retained(100_000, 100),
+        });
+    drop(broker);
     let g = grown.map_err(|e| e.to_string())?;
     Ok(format!(
         "items={} rss_before_kib={} rss_after_kib={} bytes_each={:.1}",
@@ -597,11 +589,10 @@ fn behind_memory(
     sec: &Section,
     subs: usize,
 ) -> Result<String, String> {
-    let (mut broker, addr) = spawn_broker(broker_cpus, sec, None).map_err(|e| e.to_string())?;
-    let line = run_load(load_cpus, &addr, sec, Kind::BehindMemory { subs });
+    let broker = spawn_broker(broker_cpus, sec, None).map_err(|e| e.to_string())?;
+    let line = run_load(load_cpus, broker.addr(), sec, Kind::BehindMemory { subs });
     let peak = ram::peak_rss(broker.id());
-    let _ = broker.kill();
-    let _ = broker.wait();
+    drop(broker);
     let (line, peak) = (line?, peak.map_err(|e| e.to_string())?);
     Ok(format!("{line} peak_rss_kib={}", peak >> 10))
 }
